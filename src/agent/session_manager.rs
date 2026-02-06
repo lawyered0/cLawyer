@@ -131,6 +131,81 @@ impl SessionManager {
         managers.insert(thread_id, Arc::clone(&mgr));
         mgr
     }
+
+    /// Remove sessions that have been idle for longer than the given duration.
+    ///
+    /// Returns the number of sessions pruned.
+    pub async fn prune_stale_sessions(&self, max_idle: std::time::Duration) -> usize {
+        let cutoff = chrono::Utc::now() - chrono::TimeDelta::seconds(max_idle.as_secs() as i64);
+
+        // Find stale session user_ids
+        let stale_users: Vec<String> = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .iter()
+                .filter_map(|(user_id, session)| {
+                    // Try to lock; skip if contended (someone is actively using it)
+                    let sess = session.try_lock().ok()?;
+                    if sess.last_active_at < cutoff {
+                        Some(user_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        if stale_users.is_empty() {
+            return 0;
+        }
+
+        // Collect thread IDs from stale sessions for cleanup
+        let mut stale_thread_ids: Vec<Uuid> = Vec::new();
+        {
+            let sessions = self.sessions.read().await;
+            for user_id in &stale_users {
+                if let Some(session) = sessions.get(user_id) {
+                    if let Ok(sess) = session.try_lock() {
+                        stale_thread_ids.extend(sess.threads.keys());
+                    }
+                }
+            }
+        }
+
+        // Remove sessions
+        let count = {
+            let mut sessions = self.sessions.write().await;
+            let before = sessions.len();
+            for user_id in &stale_users {
+                sessions.remove(user_id);
+            }
+            before - sessions.len()
+        };
+
+        // Clean up thread mappings that point to stale sessions
+        {
+            let mut thread_map = self.thread_map.write().await;
+            thread_map.retain(|key, _| !stale_users.contains(&key.user_id));
+        }
+
+        // Clean up undo managers for stale threads
+        {
+            let mut undo_managers = self.undo_managers.write().await;
+            for thread_id in &stale_thread_ids {
+                undo_managers.remove(thread_id);
+            }
+        }
+
+        if count > 0 {
+            tracing::info!(
+                "Pruned {} stale session(s) (idle > {}s)",
+                count,
+                max_idle.as_secs()
+            );
+        }
+
+        count
+    }
 }
 
 impl Default for SessionManager {
@@ -182,5 +257,43 @@ mod tests {
         let undo2 = manager.get_undo_manager(thread_id).await;
 
         assert!(Arc::ptr_eq(&undo1, &undo2));
+    }
+
+    #[tokio::test]
+    async fn test_prune_stale_sessions() {
+        let manager = SessionManager::new();
+
+        // Create two sessions and resolve threads (which updates last_active_at)
+        let (_, _thread_id) = manager.resolve_thread("user-active", "cli", None).await;
+        let (s2, _thread_id) = manager.resolve_thread("user-stale", "cli", None).await;
+
+        // Backdate the stale session's last_active_at AFTER thread creation
+        {
+            let mut sess = s2.lock().await;
+            sess.last_active_at = chrono::Utc::now() - chrono::TimeDelta::seconds(86400 * 10); // 10 days ago
+        }
+
+        // Prune with 7-day timeout
+        let pruned = manager
+            .prune_stale_sessions(std::time::Duration::from_secs(86400 * 7))
+            .await;
+        assert_eq!(pruned, 1);
+
+        // Active session should still exist
+        let sessions = manager.sessions.read().await;
+        assert!(sessions.contains_key("user-active"));
+        assert!(!sessions.contains_key("user-stale"));
+    }
+
+    #[tokio::test]
+    async fn test_prune_no_stale_sessions() {
+        let manager = SessionManager::new();
+        let _s1 = manager.get_or_create_session("user-1").await;
+
+        // Nothing should be pruned when timeout is long
+        let pruned = manager
+            .prune_stale_sessions(std::time::Duration::from_secs(86400 * 365))
+            .await;
+        assert_eq!(pruned, 0);
     }
 }

@@ -32,13 +32,11 @@ use uuid::Uuid;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::heartbeat::spawn_heartbeat;
-use crate::agent::self_repair::DefaultSelfRepair;
+use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::agent::session_manager::SessionManager;
 use crate::agent::submission::{Submission, SubmissionParser, SubmissionResult};
-use crate::agent::{
-    HeartbeatConfig as AgentHeartbeatConfig, MessageIntent, RepairTask, Router, Scheduler,
-};
+use crate::agent::{HeartbeatConfig as AgentHeartbeatConfig, MessageIntent, Router, Scheduler};
 use crate::channels::{ChannelManager, IncomingMessage, OutgoingResponse, StatusUpdate};
 use crate::config::{AgentConfig, HeartbeatConfig};
 use crate::context::ContextManager;
@@ -148,16 +146,98 @@ impl Agent {
         // Start channels
         let mut message_stream = self.channels.start_all().await?;
 
-        // Start self-repair task
+        // Start self-repair task with notification forwarding
         let repair = Arc::new(DefaultSelfRepair::new(
             self.context_manager.clone(),
             self.config.stuck_threshold,
             self.config.max_repair_attempts,
         ));
-        let repair_task = RepairTask::new(repair, self.config.repair_check_interval);
-
+        let repair_interval = self.config.repair_check_interval;
+        let repair_channels = self.channels.clone();
         let repair_handle = tokio::spawn(async move {
-            repair_task.run().await;
+            loop {
+                tokio::time::sleep(repair_interval).await;
+
+                // Check stuck jobs
+                let stuck_jobs = repair.detect_stuck_jobs().await;
+                for job in stuck_jobs {
+                    tracing::info!("Attempting to repair stuck job {}", job.job_id);
+                    let result = repair.repair_stuck_job(&job).await;
+                    let notification = match &result {
+                        Ok(RepairResult::Success { message }) => {
+                            tracing::info!("Repair succeeded: {}", message);
+                            Some(format!(
+                                "Job {} was stuck for {}s, recovery succeeded: {}",
+                                job.job_id,
+                                job.stuck_duration.as_secs(),
+                                message
+                            ))
+                        }
+                        Ok(RepairResult::Failed { message }) => {
+                            tracing::error!("Repair failed: {}", message);
+                            Some(format!(
+                                "Job {} was stuck for {}s, recovery failed permanently: {}",
+                                job.job_id,
+                                job.stuck_duration.as_secs(),
+                                message
+                            ))
+                        }
+                        Ok(RepairResult::ManualRequired { message }) => {
+                            tracing::warn!("Manual intervention needed: {}", message);
+                            Some(format!(
+                                "Job {} needs manual intervention: {}",
+                                job.job_id, message
+                            ))
+                        }
+                        Ok(RepairResult::Retry { message }) => {
+                            tracing::warn!("Repair needs retry: {}", message);
+                            None // Don't spam the user on retries
+                        }
+                        Err(e) => {
+                            tracing::error!("Repair error: {}", e);
+                            None
+                        }
+                    };
+
+                    if let Some(msg) = notification {
+                        let response = OutgoingResponse::text(format!("Self-Repair: {}", msg));
+                        let _ = repair_channels.broadcast_all("default", response).await;
+                    }
+                }
+
+                // Check broken tools
+                let broken_tools = repair.detect_broken_tools().await;
+                for tool in broken_tools {
+                    tracing::info!("Attempting to repair broken tool: {}", tool.name);
+                    match repair.repair_broken_tool(&tool).await {
+                        Ok(RepairResult::Success { message }) => {
+                            let response = OutgoingResponse::text(format!(
+                                "Self-Repair: Tool '{}' repaired: {}",
+                                tool.name, message
+                            ));
+                            let _ = repair_channels.broadcast_all("default", response).await;
+                        }
+                        Ok(result) => {
+                            tracing::info!("Tool repair result: {:?}", result);
+                        }
+                        Err(e) => {
+                            tracing::error!("Tool repair error: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Spawn session pruning task
+        let session_mgr = self.session_manager.clone();
+        let session_idle_timeout = self.config.session_idle_timeout;
+        let pruning_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(600)); // Every 10 min
+            interval.tick().await; // Skip immediate first tick
+            loop {
+                interval.tick().await;
+                session_mgr.prune_stale_sessions(session_idle_timeout).await;
+            }
         });
 
         // Spawn heartbeat if enabled
@@ -272,6 +352,7 @@ impl Agent {
         // Cleanup
         tracing::info!("Agent shutting down...");
         repair_handle.abort();
+        pruning_handle.abort();
         if let Some(handle) = heartbeat_handle {
             handle.abort();
         }
@@ -314,6 +395,9 @@ impl Agent {
             Submission::Compact => self.process_compact(session, thread_id).await,
             Submission::Clear => self.process_clear(session, thread_id).await,
             Submission::NewThread => self.process_new_thread(message).await,
+            Submission::Heartbeat => self.process_heartbeat().await,
+            Submission::Summarize => self.process_summarize(session, thread_id).await,
+            Submission::Suggest => self.process_suggest(session, thread_id).await,
             Submission::SwitchThread { thread_id: target } => {
                 self.process_switch_thread(message, target).await
             }
@@ -472,10 +556,21 @@ impl Agent {
 
             let messages = thread.messages();
             if let Some(strategy) = self.context_monitor.suggest_compaction(&messages) {
-                tracing::info!(
-                    "Context at {:.1}% capacity, auto-compacting",
-                    self.context_monitor.usage_percent(&messages)
-                );
+                let pct = self.context_monitor.usage_percent(&messages);
+                tracing::info!("Context at {:.1}% capacity, auto-compacting", pct);
+
+                // Notify the user that compaction is happening
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::Status(format!(
+                            "Context at {:.0}% capacity, compacting...",
+                            pct
+                        )),
+                    )
+                    .await;
+
                 let compactor = ContextCompactor::new(self.llm().clone());
                 if let Err(e) = compactor
                     .compact(thread, strategy, self.workspace().map(|w| w.as_ref()))
@@ -1427,6 +1522,134 @@ impl Agent {
         }
     }
 
+    /// Trigger a manual heartbeat check.
+    async fn process_heartbeat(&self) -> Result<SubmissionResult, Error> {
+        let Some(workspace) = self.workspace() else {
+            return Ok(SubmissionResult::error(
+                "Heartbeat requires a workspace (database must be connected).",
+            ));
+        };
+
+        let runner = crate::agent::HeartbeatRunner::new(
+            crate::agent::HeartbeatConfig::default(),
+            workspace.clone(),
+            self.llm().clone(),
+        );
+
+        match runner.check_heartbeat().await {
+            crate::agent::HeartbeatResult::Ok => Ok(SubmissionResult::ok_with_message(
+                "Heartbeat: all clear, nothing needs attention.",
+            )),
+            crate::agent::HeartbeatResult::NeedsAttention(msg) => Ok(SubmissionResult::response(
+                format!("Heartbeat findings:\n\n{}", msg),
+            )),
+            crate::agent::HeartbeatResult::Skipped => Ok(SubmissionResult::ok_with_message(
+                "Heartbeat skipped: no HEARTBEAT.md checklist found in workspace.",
+            )),
+            crate::agent::HeartbeatResult::Failed(err) => Ok(SubmissionResult::error(format!(
+                "Heartbeat failed: {}",
+                err
+            ))),
+        }
+    }
+
+    /// Summarize the current thread's conversation.
+    async fn process_summarize(
+        &self,
+        session: Arc<Mutex<Session>>,
+        thread_id: Uuid,
+    ) -> Result<SubmissionResult, Error> {
+        let messages = {
+            let sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            thread.messages()
+        };
+
+        if messages.is_empty() {
+            return Ok(SubmissionResult::ok_with_message(
+                "Nothing to summarize (empty thread).",
+            ));
+        }
+
+        // Build a summary prompt with the conversation
+        let mut context = Vec::new();
+        context.push(ChatMessage::system(
+            "Summarize the conversation so far in 3-5 concise bullet points. \
+             Focus on decisions made, actions taken, and key outcomes. \
+             Be brief and factual.",
+        ));
+        // Include the conversation messages (truncate to last 20 to avoid context overflow)
+        let start = if messages.len() > 20 {
+            messages.len() - 20
+        } else {
+            0
+        };
+        context.extend_from_slice(&messages[start..]);
+        context.push(ChatMessage::user("Summarize this conversation."));
+
+        let request = crate::llm::CompletionRequest::new(context)
+            .with_max_tokens(512)
+            .with_temperature(0.3);
+
+        match self.llm().complete(request).await {
+            Ok(response) => Ok(SubmissionResult::response(format!(
+                "Thread Summary:\n\n{}",
+                response.content.trim()
+            ))),
+            Err(e) => Ok(SubmissionResult::error(format!("Summarize failed: {}", e))),
+        }
+    }
+
+    /// Suggest next steps based on the current thread.
+    async fn process_suggest(
+        &self,
+        session: Arc<Mutex<Session>>,
+        thread_id: Uuid,
+    ) -> Result<SubmissionResult, Error> {
+        let messages = {
+            let sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            thread.messages()
+        };
+
+        if messages.is_empty() {
+            return Ok(SubmissionResult::ok_with_message(
+                "Nothing to suggest from (empty thread).",
+            ));
+        }
+
+        let mut context = Vec::new();
+        context.push(ChatMessage::system(
+            "Based on the conversation so far, suggest 2-4 concrete next steps the user could take. \
+             Be actionable and specific. Format as a numbered list.",
+        ));
+        let start = if messages.len() > 20 {
+            messages.len() - 20
+        } else {
+            0
+        };
+        context.extend_from_slice(&messages[start..]);
+        context.push(ChatMessage::user("What should I do next?"));
+
+        let request = crate::llm::CompletionRequest::new(context)
+            .with_max_tokens(512)
+            .with_temperature(0.5);
+
+        match self.llm().complete(request).await {
+            Ok(response) => Ok(SubmissionResult::response(format!(
+                "Suggested Next Steps:\n\n{}",
+                response.content.trim()
+            ))),
+            Err(e) => Ok(SubmissionResult::error(format!("Suggest failed: {}", e))),
+        }
+    }
+
     async fn handle_command(
         &self,
         command: &str,
@@ -1449,6 +1672,10 @@ impl Agent {
   /thread new     - New thread
   /thread <id>    - Switch thread
   /resume <id>    - Resume checkpoint
+
+  /heartbeat      - Run heartbeat check now
+  /summarize      - Summarize current thread
+  /suggest        - Suggest next steps
 
   /quit           - Exit"#
                     .to_string(),

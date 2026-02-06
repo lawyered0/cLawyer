@@ -415,6 +415,8 @@ pub struct AgentConfig {
     pub max_repair_attempts: u32,
     /// Whether to use planning before tool execution.
     pub use_planning: bool,
+    /// Session idle timeout. Sessions inactive longer than this are pruned.
+    pub session_idle_timeout: Duration,
 }
 
 impl AgentConfig {
@@ -478,6 +480,16 @@ impl AgentConfig {
                     message: format!("must be 'true' or 'false': {e}"),
                 })?
                 .unwrap_or(settings.agent.use_planning),
+            session_idle_timeout: Duration::from_secs(
+                optional_env("SESSION_IDLE_TIMEOUT_SECS")?
+                    .map(|s| s.parse())
+                    .transpose()
+                    .map_err(|e| ConfigError::InvalidValue {
+                        key: "SESSION_IDLE_TIMEOUT_SECS".to_string(),
+                        message: format!("must be a positive integer: {e}"),
+                    })?
+                    .unwrap_or(settings.agent.session_idle_timeout_secs),
+            ),
         })
     }
 }

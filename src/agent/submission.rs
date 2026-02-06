@@ -31,6 +31,15 @@ impl SubmissionParser {
         if lower == "/clear" {
             return Submission::Clear;
         }
+        if lower == "/heartbeat" {
+            return Submission::Heartbeat;
+        }
+        if lower == "/summarize" || lower == "/summary" {
+            return Submission::Summarize;
+        }
+        if lower == "/suggest" {
+            return Submission::Suggest;
+        }
         if lower == "/thread new" || lower == "/new" {
             return Submission::NewThread;
         }
@@ -139,6 +148,15 @@ pub enum Submission {
 
     /// Create a new thread.
     NewThread,
+
+    /// Trigger a manual heartbeat check.
+    Heartbeat,
+
+    /// Summarize the current thread.
+    Summarize,
+
+    /// Suggest next steps based on the current thread.
+    Suggest,
 }
 
 impl Submission {
@@ -202,6 +220,9 @@ impl Submission {
                 | Self::Redo
                 | Self::Clear
                 | Self::NewThread
+                | Self::Heartbeat
+                | Self::Summarize
+                | Self::Suggest
         )
     }
 }
@@ -353,6 +374,27 @@ mod tests {
         assert!(
             matches!(submission, Submission::Resume { checkpoint_id } if checkpoint_id == uuid)
         );
+    }
+
+    #[test]
+    fn test_parser_heartbeat() {
+        let submission = SubmissionParser::parse("/heartbeat");
+        assert!(matches!(submission, Submission::Heartbeat));
+    }
+
+    #[test]
+    fn test_parser_summarize() {
+        let submission = SubmissionParser::parse("/summarize");
+        assert!(matches!(submission, Submission::Summarize));
+
+        let submission = SubmissionParser::parse("/summary");
+        assert!(matches!(submission, Submission::Summarize));
+    }
+
+    #[test]
+    fn test_parser_suggest() {
+        let submission = SubmissionParser::parse("/suggest");
+        assert!(matches!(submission, Submission::Suggest));
     }
 
     #[test]

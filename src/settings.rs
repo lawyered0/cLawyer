@@ -229,6 +229,11 @@ pub struct AgentSettings {
     /// Maximum repair attempts.
     #[serde(default = "default_max_repair_attempts")]
     pub max_repair_attempts: u32,
+
+    /// Session idle timeout in seconds (default: 7 days). Sessions inactive
+    /// longer than this are pruned from memory.
+    #[serde(default = "default_session_idle_timeout")]
+    pub session_idle_timeout_secs: u64,
 }
 
 fn default_agent_name() -> String {
@@ -251,6 +256,10 @@ fn default_repair_interval() -> u64 {
     60 // 1 minute
 }
 
+fn default_session_idle_timeout() -> u64 {
+    7 * 24 * 3600 // 7 days
+}
+
 fn default_max_repair_attempts() -> u32 {
     3
 }
@@ -269,6 +278,7 @@ impl Default for AgentSettings {
             use_planning: true,
             repair_check_interval_secs: default_repair_interval(),
             max_repair_attempts: default_max_repair_attempts(),
+            session_idle_timeout_secs: default_session_idle_timeout(),
         }
     }
 }

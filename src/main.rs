@@ -14,7 +14,9 @@ use ironclaw::{
             WasmChannelRuntime, WasmChannelRuntimeConfig, WasmChannelServer,
         },
     },
-    cli::{Cli, Command, run_mcp_command, run_tool_command},
+    cli::{
+        Cli, Command, run_mcp_command, run_memory_command, run_status_command, run_tool_command,
+    },
     config::Config,
     context::ContextManager,
     history::Store,
@@ -61,6 +63,69 @@ async fn main() -> anyhow::Result<()> {
                 .init();
 
             return run_mcp_command(mcp_cmd.clone()).await;
+        }
+        Some(Command::Memory(mem_cmd)) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+                )
+                .init();
+
+            // Memory commands need database (and optionally embeddings)
+            let _ = dotenvy::dotenv();
+            let config = Config::from_env().map_err(|e| anyhow::anyhow!("{}", e))?;
+            let store = ironclaw::history::Store::new(&config.database).await?;
+            store.run_migrations().await?;
+
+            // Set up embeddings if available
+            let session = ironclaw::llm::create_session_manager(ironclaw::llm::SessionConfig {
+                auth_base_url: config.llm.nearai.auth_base_url.clone(),
+                session_path: config.llm.nearai.session_path.clone(),
+                ..Default::default()
+            })
+            .await;
+
+            let embeddings: Option<Arc<dyn ironclaw::workspace::EmbeddingProvider>> =
+                if config.embeddings.enabled {
+                    match config.embeddings.provider.as_str() {
+                        "nearai" => Some(Arc::new(
+                            ironclaw::workspace::NearAiEmbeddings::new(
+                                &config.llm.nearai.base_url,
+                                session,
+                            )
+                            .with_model(&config.embeddings.model, 1536),
+                        )),
+                        _ => {
+                            if let Some(api_key) = config.embeddings.openai_api_key() {
+                                let dim = match config.embeddings.model.as_str() {
+                                    "text-embedding-3-large" => 3072,
+                                    _ => 1536,
+                                };
+                                Some(Arc::new(ironclaw::workspace::OpenAiEmbeddings::with_model(
+                                    api_key,
+                                    &config.embeddings.model,
+                                    dim,
+                                )))
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                } else {
+                    None
+                };
+
+            return run_memory_command(mem_cmd.clone(), store.pool(), embeddings).await;
+        }
+        Some(Command::Status) => {
+            let _ = dotenvy::dotenv();
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+                )
+                .init();
+
+            return run_status_command().await;
         }
         Some(Command::Setup {
             skip_auth,
