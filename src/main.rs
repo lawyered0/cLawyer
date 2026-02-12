@@ -133,40 +133,10 @@ async fn main() -> anyhow::Result<()> {
                 };
 
             // Create a Database-trait-backed workspace for the memory command
-            let db: Arc<dyn ironclaw::db::Database> = match config.database.backend {
-                #[cfg(feature = "libsql")]
-                ironclaw::config::DatabaseBackend::LibSql => {
-                    use ironclaw::db::libsql_backend::LibSqlBackend;
-                    use ironclaw::db::Database as _;
-                    use secrecy::ExposeSecret as _;
-
-                    let default_path = ironclaw::config::default_libsql_path();
-                    let db_path = config.database.libsql_path.as_deref()
-                        .unwrap_or(&default_path);
-
-                    let backend = if let Some(ref url) = config.database.libsql_url {
-                        let token = config.database.libsql_auth_token.as_ref()
-                            .expect("LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set");
-                        LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret()).await?
-                    } else {
-                        LibSqlBackend::new_local(db_path).await?
-                    };
-                    backend.run_migrations().await?;
-                    Arc::new(backend)
-                }
-                #[cfg(feature = "postgres")]
-                _ => {
-                    use ironclaw::db::Database as _;
-                    let pg = ironclaw::db::postgres::PgBackend::new(&config.database).await
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
-                    pg.run_migrations().await.map_err(|e| anyhow::anyhow!("{}", e))?;
-                    Arc::new(pg)
-                }
-                #[cfg(not(feature = "postgres"))]
-                _ => {
-                    anyhow::bail!("No database backend available. Enable 'postgres' or 'libsql' feature.");
-                }
-            };
+            let db: Arc<dyn ironclaw::db::Database> =
+                ironclaw::db::connect_from_config(&config.database)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
             return ironclaw::cli::run_memory_command_with_db(mem_cmd.clone(), db, embeddings).await;
         }
@@ -370,6 +340,11 @@ async fn main() -> anyhow::Result<()> {
     //
     // Creates an `Arc<dyn Database>` that all consumers share.
     // Backend is selected by the `DATABASE_BACKEND` env var / config.
+    //
+    // NOTE: For simpler call sites (CLI commands, Memory handler) use the shared
+    // helper `ironclaw::db::connect_from_config()`. This block is kept inline
+    // because it also captures backend-specific handles (`pg_pool`, `libsql_conn`)
+    // needed by the secrets store.
     #[cfg(feature = "postgres")]
     let mut pg_pool: Option<deadpool_postgres::Pool> = None;
     #[cfg(feature = "libsql")]

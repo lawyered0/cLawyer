@@ -19,6 +19,7 @@ pub mod libsql_backend;
 pub mod libsql_migrations;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -36,6 +37,60 @@ use crate::history::{
 };
 use crate::workspace::{MemoryChunk, MemoryDocument, WorkspaceEntry};
 use crate::workspace::{SearchConfig, SearchResult};
+
+/// Create a database backend from configuration, run migrations, and return it.
+///
+/// This is the shared helper for CLI commands and other call sites that need
+/// a simple `Arc<dyn Database>` without retaining backend-specific handles
+/// (e.g., `pg_pool` or `libsql_conn` for the secrets store). The main agent
+/// startup in `main.rs` uses its own initialization block because it also
+/// captures those backend-specific handles.
+pub async fn connect_from_config(
+    config: &crate::config::DatabaseConfig,
+) -> Result<Arc<dyn Database>, DatabaseError> {
+    match config.backend {
+        #[cfg(feature = "libsql")]
+        crate::config::DatabaseBackend::LibSql => {
+            use secrecy::ExposeSecret as _;
+
+            let default_path = crate::config::default_libsql_path();
+            let db_path = config.libsql_path.as_deref().unwrap_or(&default_path);
+
+            let backend = if let Some(ref url) = config.libsql_url {
+                let token = config.libsql_auth_token.as_ref().ok_or_else(|| {
+                    DatabaseError::Pool(
+                        "LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set".to_string(),
+                    )
+                })?;
+                libsql_backend::LibSqlBackend::new_remote_replica(
+                    db_path,
+                    url,
+                    token.expose_secret(),
+                )
+                .await
+                .map_err(|e| DatabaseError::Pool(e.to_string()))?
+            } else {
+                libsql_backend::LibSqlBackend::new_local(db_path)
+                    .await
+                    .map_err(|e| DatabaseError::Pool(e.to_string()))?
+            };
+            backend.run_migrations().await?;
+            Ok(Arc::new(backend))
+        }
+        #[cfg(feature = "postgres")]
+        _ => {
+            let pg = postgres::PgBackend::new(config)
+                .await
+                .map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            pg.run_migrations().await?;
+            Ok(Arc::new(pg))
+        }
+        #[cfg(not(feature = "postgres"))]
+        _ => Err(DatabaseError::Pool(
+            "No database backend available. Enable 'postgres' or 'libsql' feature.".to_string(),
+        )),
+    }
+}
 
 /// Backend-agnostic database trait.
 ///

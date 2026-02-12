@@ -409,6 +409,8 @@ LIBSQL_AUTH_TOKEN=your-token            # Required when LIBSQL_URL is set
 - **Hybrid search** uses FTS5 only (vector search via libsql_vector_idx not yet implemented)
 - **Settings reload from DB** skipped (Config::from_db requires Store)
 - No incremental migration versioning (schema is CREATE IF NOT EXISTS, no ALTER TABLE support yet)
+- **No encryption at rest** -- The local SQLite database file stores conversation content, job data, workspace memory, and other application data in plaintext. Only secrets (API tokens, credentials) are encrypted via AES-256-GCM before storage. Users handling sensitive data should use full-disk encryption (FileVault, LUKS, BitLocker) or consider the PostgreSQL backend with TDE/encrypted storage.
+- **JSON merge patch vs path-targeted update** -- The libSQL backend uses RFC 7396 JSON Merge Patch (`json_patch`) for metadata updates, while PostgreSQL uses path-targeted `jsonb_set`. Merge patch replaces top-level keys entirely, which may drop nested keys not present in the patch. Callers should avoid relying on partial nested object updates in metadata fields.
 
 ## Safety Layer
 

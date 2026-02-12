@@ -339,8 +339,11 @@ impl SecretsStore for LibSqlSecretsStore {
             .expires_at
             .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
 
-        self.conn
-            .execute(
+        // Start transaction for atomic upsert + read-back
+        let tx = self.conn.transaction().await
+            .map_err(|e| SecretError::Database(e.to_string()))?;
+
+        tx.execute(
                 r#"
                 INSERT INTO secrets (id, user_id, name, encrypted_value, key_salt, provider, expires_at, created_at, updated_at)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
@@ -366,8 +369,7 @@ impl SecretsStore for LibSqlSecretsStore {
             .map_err(|e| SecretError::Database(e.to_string()))?;
 
         // Read back the row (may have been upserted)
-        let mut rows = self
-            .conn
+        let mut rows = tx
             .query(
                 r#"
                 SELECT id, user_id, name, encrypted_value, key_salt, provider, expires_at,
@@ -386,7 +388,12 @@ impl SecretsStore for LibSqlSecretsStore {
             .map_err(|e| SecretError::Database(e.to_string()))?
             .ok_or_else(|| SecretError::Database("Insert succeeded but row not found".into()))?;
 
-        libsql_row_to_secret(&row)
+        let secret = libsql_row_to_secret(&row)?;
+
+        tx.commit().await
+            .map_err(|e| SecretError::Database(e.to_string()))?;
+
+        Ok(secret)
     }
 
     async fn get(&self, user_id: &str, name: &str) -> Result<Secret, SecretError> {

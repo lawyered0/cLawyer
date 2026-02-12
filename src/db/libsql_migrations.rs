@@ -216,7 +216,8 @@ CREATE TRIGGER IF NOT EXISTS update_memory_documents_updated_at
 -- ==================== Workspace: Memory Chunks ====================
 
 CREATE TABLE IF NOT EXISTS memory_chunks (
-    id TEXT PRIMARY KEY,
+    _rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
     document_id TEXT NOT NULL REFERENCES memory_documents(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     content TEXT NOT NULL,
@@ -234,24 +235,24 @@ CREATE INDEX IF NOT EXISTS idx_memory_chunks_embedding
 -- FTS5 virtual table for full-text search
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunks_fts USING fts5(
     content,
-    content=memory_chunks,
-    content_rowid=rowid
+    content='memory_chunks',
+    content_rowid='_rowid'
 );
 
 -- Triggers to keep FTS5 in sync with memory_chunks
 CREATE TRIGGER IF NOT EXISTS memory_chunks_fts_insert AFTER INSERT ON memory_chunks BEGIN
-    INSERT INTO memory_chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+    INSERT INTO memory_chunks_fts(rowid, content) VALUES (new._rowid, new.content);
 END;
 
 CREATE TRIGGER IF NOT EXISTS memory_chunks_fts_delete AFTER DELETE ON memory_chunks BEGIN
     INSERT INTO memory_chunks_fts(memory_chunks_fts, rowid, content)
-        VALUES ('delete', old.rowid, old.content);
+        VALUES ('delete', old._rowid, old.content);
 END;
 
 CREATE TRIGGER IF NOT EXISTS memory_chunks_fts_update AFTER UPDATE ON memory_chunks BEGIN
     INSERT INTO memory_chunks_fts(memory_chunks_fts, rowid, content)
-        VALUES ('delete', old.rowid, old.content);
-    INSERT INTO memory_chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+        VALUES ('delete', old._rowid, old.content);
+    INSERT INTO memory_chunks_fts(rowid, content) VALUES (new._rowid, new.content);
 END;
 
 -- ==================== Workspace: Heartbeat State ====================

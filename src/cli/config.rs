@@ -3,6 +3,8 @@
 //! Commands for viewing and modifying settings.
 //! Settings are stored in the database (env > DB > default).
 
+use std::sync::Arc;
+
 use clap::Subcommand;
 
 use crate::settings::Settings;
@@ -49,7 +51,7 @@ pub async fn run_config_command(cmd: ConfigCommand) -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     // Try to connect to the DB for settings access
-    let db: Option<Box<dyn crate::db::Database>> = match connect_db().await {
+    let db: Option<Arc<dyn crate::db::Database>> = match connect_db().await {
         Ok(d) => Some(d),
         Err(e) => {
             eprintln!(
@@ -71,38 +73,11 @@ pub async fn run_config_command(cmd: ConfigCommand) -> anyhow::Result<()> {
 }
 
 /// Bootstrap a DB connection for config commands (backend-agnostic).
-async fn connect_db() -> anyhow::Result<Box<dyn crate::db::Database>> {
-    use crate::db::Database as _;
+async fn connect_db() -> anyhow::Result<Arc<dyn crate::db::Database>> {
     let config = crate::config::Config::from_env().await.map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    match config.database.backend {
-        #[cfg(feature = "libsql")]
-        crate::config::DatabaseBackend::LibSql => {
-            use secrecy::ExposeSecret as _;
-            let default_path = crate::config::default_libsql_path();
-            let db_path = config.database.libsql_path.as_deref().unwrap_or(&default_path);
-            let backend = if let Some(ref url) = config.database.libsql_url {
-                let token = config.database.libsql_auth_token.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set"))?;
-                crate::db::libsql_backend::LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret()).await?
-            } else {
-                crate::db::libsql_backend::LibSqlBackend::new_local(db_path).await?
-            };
-            backend.run_migrations().await?;
-            Ok(Box::new(backend))
-        }
-        #[cfg(feature = "postgres")]
-        _ => {
-            let pg = crate::db::postgres::PgBackend::new(&config.database).await
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            pg.run_migrations().await.map_err(|e| anyhow::anyhow!("{}", e))?;
-            Ok(Box::new(pg))
-        }
-        #[cfg(not(feature = "postgres"))]
-        _ => {
-            anyhow::bail!("No database backend available. Enable 'postgres' or 'libsql' feature.");
-        }
-    }
+    crate::db::connect_from_config(&config.database)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 const DEFAULT_USER_ID: &str = "default";

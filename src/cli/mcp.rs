@@ -468,33 +468,9 @@ async fn toggle_server(name: String, enable: bool, disable: bool) -> anyhow::Res
 const DEFAULT_USER_ID: &str = "default";
 
 /// Try to connect to the database (backend-agnostic).
-async fn connect_db() -> Option<Box<dyn Database>> {
-    use crate::db::Database as _;
+async fn connect_db() -> Option<Arc<dyn Database>> {
     let config = Config::from_env().await.ok()?;
-    match config.database.backend {
-        #[cfg(feature = "libsql")]
-        crate::config::DatabaseBackend::LibSql => {
-            use secrecy::ExposeSecret as _;
-            let default_path = crate::config::default_libsql_path();
-            let db_path = config.database.libsql_path.as_deref().unwrap_or(&default_path);
-            let backend = if let Some(ref url) = config.database.libsql_url {
-                let token = config.database.libsql_auth_token.as_ref()?;
-                crate::db::libsql_backend::LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret()).await.ok()?
-            } else {
-                crate::db::libsql_backend::LibSqlBackend::new_local(db_path).await.ok()?
-            };
-            backend.run_migrations().await.ok()?;
-            Some(Box::new(backend))
-        }
-        #[cfg(feature = "postgres")]
-        _ => {
-            let pg = crate::db::postgres::PgBackend::new(&config.database).await.ok()?;
-            pg.run_migrations().await.ok()?;
-            Some(Box::new(pg))
-        }
-        #[cfg(not(feature = "postgres"))]
-        _ => None,
-    }
+    crate::db::connect_from_config(&config.database).await.ok()
 }
 
 /// Load MCP servers (DB if available, else disk).
