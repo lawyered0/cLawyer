@@ -100,6 +100,9 @@ http-body-util = "0.1"
 bytes = "1"
 base64 = "0.22.1"
 
+# Headless browser automation via Chrome DevTools Protocol
+chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
+
 # macOS keychain
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"

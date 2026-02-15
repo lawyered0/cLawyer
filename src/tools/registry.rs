@@ -11,10 +11,10 @@ use crate::llm::{LlmProvider, ToolDefinition};
 use crate::safety::SafetyLayer;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobStatusTool, JsonTool,
-    ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
-    ReadFileTool, ShellTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool,
-    ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
+    ApplyPatchTool, BrowserTool, CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobStatusTool,
+    JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool,
+    MemoryWriteTool, ReadFileTool, ShellTool, TimeTool, ToolActivateTool, ToolAuthTool,
+    ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
 };
 use crate::tools::tool::Tool;
 use crate::tools::wasm::{
@@ -131,8 +131,9 @@ impl ToolRegistry {
         self.register_sync(Arc::new(WriteFileTool::new()));
         self.register_sync(Arc::new(ListDirTool::new()));
         self.register_sync(Arc::new(ApplyPatchTool::new()));
+        self.register_sync(Arc::new(BrowserTool::new()));
 
-        tracing::info!("Registered 5 development tools");
+        tracing::info!("Registered 6 development tools (includes browser)");
     }
 
     /// Register memory tools with a workspace.
