@@ -428,7 +428,10 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0], ("DATABASE_BACKEND".to_string(), "libsql".to_string()));
+        assert_eq!(
+            parsed[0],
+            ("DATABASE_BACKEND".to_string(), "libsql".to_string())
+        );
         assert_eq!(
             parsed[1],
             (
