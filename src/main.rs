@@ -488,14 +488,14 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
-    // Inject LLM API keys from the encrypted secrets store into env vars so that
-    // LlmConfig::resolve() picks them up. Then re-resolve LlmConfig with the
-    // newly available keys (backend may have been set during onboarding but the
-    // API key is in the secrets store, not in env vars).
+    // Inject LLM API keys from the encrypted secrets store into a thread-safe
+    // overlay so that optional_env() (used by LlmConfig::resolve()) picks them
+    // up. Then re-resolve LlmConfig with the newly available keys (backend may
+    // have been set during onboarding but the API key is in the secrets store).
     if let Some(ref secrets) = secrets_store {
         ironclaw::config::inject_llm_keys_from_secrets(secrets.as_ref(), "default").await;
 
-        // Re-resolve LlmConfig now that env vars may have been populated
+        // Re-resolve LlmConfig now that secrets overlay has been populated
         if let Some(ref db_ref) = db {
             match Config::from_db(db_ref.as_ref(), "default").await {
                 Ok(refreshed) => {

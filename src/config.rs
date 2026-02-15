@@ -18,8 +18,8 @@ use crate::settings::Settings;
 /// Thread-safe overlay for injected env vars (secrets loaded from DB).
 ///
 /// Used by `inject_llm_keys_from_secrets()` to make API keys available to
-/// `optional_env()` without unsafe `set_var` calls. Read by `optional_env()`
-/// before falling back to `std::env::var()`.
+/// `optional_env()` without unsafe `set_var` calls. `optional_env()` checks
+/// real env vars first, then falls back to this overlay.
 static INJECTED_VARS: OnceLock<HashMap<String, String>> = OnceLock::new();
 
 /// Main configuration for the agent.
@@ -1385,8 +1385,9 @@ pub async fn inject_llm_keys_from_secrets(
     let mut injected = HashMap::new();
 
     for (secret_name, env_var) in mappings {
-        if std::env::var(env_var).is_ok() {
-            continue;
+        match std::env::var(env_var) {
+            Ok(val) if !val.is_empty() => continue,
+            _ => {}
         }
         match secrets.get_decrypted(user_id, secret_name).await {
             Ok(decrypted) => {

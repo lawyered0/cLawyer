@@ -83,7 +83,7 @@ pub struct SetupWizard {
     /// Secrets crypto (created during setup).
     secrets_crypto: Option<Arc<SecretsCrypto>>,
     /// Cached API key from provider setup (used by model fetcher without env mutation).
-    llm_api_key: Option<String>,
+    llm_api_key: Option<SecretString>,
 }
 
 impl SetupWizard {
@@ -745,7 +745,7 @@ impl SetupWizard {
                         tracing::warn!("Failed to persist env key to secrets: {}", e);
                     }
                 }
-                self.llm_api_key = Some(existing);
+                self.llm_api_key = Some(SecretString::from(existing));
                 print_success(&format!("{display_name} configured (from env)"));
                 return Ok(());
             }
@@ -775,7 +775,7 @@ impl SetupWizard {
         }
 
         // Cache key in memory for model fetching later in the wizard
-        self.llm_api_key = Some(key_str.to_string());
+        self.llm_api_key = Some(SecretString::from(key_str.to_string()));
 
         print_success(&format!("{display_name} configured"));
         Ok(())
@@ -883,11 +883,19 @@ impl SetupWizard {
 
         match backend {
             "anthropic" => {
-                let models = fetch_anthropic_models(self.llm_api_key.as_deref()).await;
+                let cached = self
+                    .llm_api_key
+                    .as_ref()
+                    .map(|k| k.expose_secret().to_string());
+                let models = fetch_anthropic_models(cached.as_deref()).await;
                 self.select_from_model_list(&models)?;
             }
             "openai" => {
-                let models = fetch_openai_models(self.llm_api_key.as_deref()).await;
+                let cached = self
+                    .llm_api_key
+                    .as_ref()
+                    .map(|k| k.expose_secret().to_string());
+                let models = fetch_openai_models(cached.as_deref()).await;
                 self.select_from_model_list(&models)?;
             }
             "ollama" => {
@@ -1034,7 +1042,8 @@ impl SetupWizard {
         }
 
         let backend = self.settings.llm_backend.as_deref().unwrap_or("nearai");
-        let has_openai_key = std::env::var("OPENAI_API_KEY").is_ok();
+        let has_openai_key = std::env::var("OPENAI_API_KEY").is_ok()
+            || (backend == "openai" && self.llm_api_key.is_some());
         let has_nearai = backend == "nearai" || self.session_manager.is_some();
 
         // If the LLM backend is OpenAI and we already have a key, default to OpenAI embeddings
