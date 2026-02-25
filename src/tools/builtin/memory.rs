@@ -316,6 +316,21 @@ impl Tool for MemoryWriteTool {
                     path.to_string()
                 };
 
+                // SECURITY: reject path traversal sequences regardless of how the path
+                // was constructed above.  A caller supplying "docs/../../../etc/shadow"
+                // would survive the prefix checks and only be caught (if at all) deep
+                // in the workspace layer.  Block Component::ParentDir here so the
+                // matter-scope boundary cannot be escaped via relative segments.
+                if std::path::Path::new(&resolved_path)
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+                {
+                    return Err(ToolError::NotAuthorized(format!(
+                        "Path '{}' contains directory traversal sequences",
+                        path
+                    )));
+                }
+
                 if append {
                     self.workspace
                         .append(&resolved_path, content)

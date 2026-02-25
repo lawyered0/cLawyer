@@ -132,10 +132,22 @@ impl LegalConfig {
             },
             audit: LegalAuditConfig {
                 enabled: parse_bool_env("LEGAL_AUDIT_ENABLED", settings.legal.audit.enabled)?,
-                path: PathBuf::from(parse_string_env(
-                    "LEGAL_AUDIT_PATH",
-                    settings.legal.audit.path.clone(),
-                )?),
+                path: {
+                    let raw =
+                        parse_string_env("LEGAL_AUDIT_PATH", settings.legal.audit.path.clone())?;
+                    let p = PathBuf::from(&raw);
+                    // SECURITY: reject paths containing '..' components.  The audit log
+                    // path originates from an env var or config file that an operator or
+                    // attacker with env-var access controls.  A path like
+                    // "../../etc/cron.d/evil" must not be accepted.
+                    if p.components().any(|c| c == std::path::Component::ParentDir) {
+                        return Err(ConfigError::InvalidValue {
+                            key: "LEGAL_AUDIT_PATH".to_string(),
+                            message: "audit log path must not contain '..' components".to_string(),
+                        });
+                    }
+                    p
+                },
                 hash_chain: parse_bool_env(
                     "LEGAL_AUDIT_HASH_CHAIN",
                     settings.legal.audit.hash_chain,

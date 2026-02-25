@@ -1,6 +1,9 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::{Mutex, OnceLock};
 
 use chrono::Utc;
@@ -109,11 +112,16 @@ impl AuditLogger {
             return;
         }
 
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
+        // SECURITY: create the log file with owner-read/write only (0o600).
+        // Without an explicit mode the file inherits the process umask, which
+        // is typically 0o022 — leaving the audit log world-readable.  Legal
+        // audit logs contain matter IDs, client actions, and security events
+        // and must never be readable by other users on the system.
+        let mut open_opts = OpenOptions::new();
+        open_opts.create(true).append(true);
+        #[cfg(unix)]
+        open_opts.mode(0o600);
+        match open_opts.open(&self.path) {
             Ok(mut f) => {
                 if let Err(e) = writeln!(f, "{line}") {
                     tracing::warn!("Failed to append legal audit event: {}", e);

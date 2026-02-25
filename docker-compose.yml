@@ -1,13 +1,34 @@
 # Local development only — do NOT use these credentials in production.
+#
+# Network topology:
+#   db-internal  — internal-only network; sandbox containers on the default
+#                  bridge cannot reach postgres directly even if they escape
+#                  the HTTP proxy, because "internal: true" means Docker adds
+#                  no gateway route to this network.
+#   default      — standard bridge used by the clawyer process and sandbox
+#                  containers; has no route to db-internal.
+#
+# SECURITY NOTE (sandbox containers): Docker sandbox containers are launched
+# on the default bridge with network_mode "bridge".  Only HTTP/HTTPS traffic
+# is proxied (via http_proxy/https_proxy env vars); raw TCP/UDP connections
+# bypass the proxy entirely.  This means a container could in principle reach
+# host services on other ports.  Mitigations:
+#   1. postgres is on db-internal (not reachable from bridge)
+#   2. Production deployments should replace "bridge" with a dedicated user-
+#      defined Docker network that has no gateway route to host services
+#      (internal: true), with only the orchestrator/proxy explicitly attached.
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"  # Bind to loopback only — do not expose to LAN
     environment:
       POSTGRES_DB: clawyer
       POSTGRES_USER: clawyer
       POSTGRES_PASSWORD: clawyer  # dev-only, change for any non-local deployment
+    networks:
+      - db-internal
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -15,6 +36,10 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+networks:
+  db-internal:
+    internal: true  # No gateway; sandbox containers on bridge cannot reach this
 
 volumes:
   pgdata:
