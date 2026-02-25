@@ -245,7 +245,10 @@ pub async fn start_server(
             post(pairing_approve_handler),
         )
         // Routines
-        .route("/api/routines", get(routines_list_handler))
+        .route(
+            "/api/routines",
+            get(routines_list_handler).post(routines_create_handler),
+        )
         .route("/api/routines/summary", get(routines_summary_handler))
         .route("/api/routines/{id}", get(routines_detail_handler))
         .route("/api/routines/{id}/trigger", post(routines_trigger_handler))
@@ -2404,6 +2407,128 @@ fn routine_to_info(r: &crate::agent::routine::Routine) -> RoutineInfo {
         consecutive_failures: r.consecutive_failures,
         status: status.to_string(),
     }
+}
+
+async fn routines_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<RoutineCreateRequest>,
+) -> Result<(StatusCode, Json<RoutineInfo>), (StatusCode, String)> {
+    use crate::agent::routine::{
+        NotifyConfig, Routine, RoutineAction, RoutineGuardrails, Trigger, next_cron_fire,
+    };
+
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name is required".to_string()));
+    }
+
+    // Build trigger
+    let trigger = match req.trigger_type.as_str() {
+        "cron" => {
+            let schedule = req.schedule.as_deref().ok_or((
+                StatusCode::BAD_REQUEST,
+                "schedule is required for cron trigger".to_string(),
+            ))?;
+            next_cron_fire(schedule).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid cron schedule: {e}"),
+                )
+            })?;
+            Trigger::Cron {
+                schedule: schedule.to_string(),
+            }
+        }
+        "event" => {
+            let pattern = req.event_pattern.as_deref().ok_or((
+                StatusCode::BAD_REQUEST,
+                "event_pattern is required for event trigger".to_string(),
+            ))?;
+            regex::Regex::new(pattern)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid regex: {e}")))?;
+            Trigger::Event {
+                pattern: pattern.to_string(),
+                channel: req.event_channel.clone(),
+            }
+        }
+        "webhook" => Trigger::Webhook {
+            path: None,
+            secret: None,
+        },
+        "manual" => Trigger::Manual,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown trigger_type: {other}"),
+            ));
+        }
+    };
+
+    // Compute next fire time for cron triggers
+    let next_fire = if let Trigger::Cron { ref schedule } = trigger {
+        next_cron_fire(schedule).unwrap_or(None)
+    } else {
+        None
+    };
+
+    // Build action
+    let action_type = req.action_type.as_deref().unwrap_or("lightweight");
+    let context_paths = req.context_paths.unwrap_or_default();
+    let action = match action_type {
+        "lightweight" => RoutineAction::Lightweight {
+            prompt: req.prompt.clone(),
+            context_paths,
+            max_tokens: 4096,
+        },
+        "full_job" => RoutineAction::FullJob {
+            title: name.clone(),
+            description: req.prompt.clone(),
+            max_iterations: 10,
+        },
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown action_type: {other}"),
+            ));
+        }
+    };
+
+    let cooldown_secs = req.cooldown_secs.unwrap_or(300);
+    let now = chrono::Utc::now();
+    let routine = Routine {
+        id: Uuid::new_v4(),
+        name: name.clone(),
+        description: req.description.unwrap_or_default(),
+        user_id: state.user_id.clone(),
+        enabled: true,
+        trigger,
+        action,
+        guardrails: RoutineGuardrails {
+            cooldown: std::time::Duration::from_secs(cooldown_secs),
+            max_concurrent: 1,
+            dedup_window: None,
+        },
+        notify: NotifyConfig::default(),
+        last_run_at: None,
+        next_fire_at: next_fire,
+        run_count: 0,
+        consecutive_failures: 0,
+        state: serde_json::json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+
+    store
+        .create_routine(&routine)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok((StatusCode::CREATED, Json(routine_to_info(&routine))))
 }
 
 // --- Settings handlers ---
