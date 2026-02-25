@@ -5,12 +5,12 @@ Requires=cloud-sql-proxy.service
 
 [Service]
 Type=simple
-ExecStartPre=/usr/bin/docker pull ghcr.io/lawyered0/clawyer:latest
+ExecStartPre=/usr/bin/docker pull us-central1-docker.pkg.dev/clawyer-prod/clawyer/agent:latest
 ExecStart=/usr/bin/docker run --rm \
   --name clawyer \
   --env-file /opt/clawyer/.env \
   --network=host \
-  ghcr.io/lawyered0/clawyer:latest \
+  us-central1-docker.pkg.dev/clawyer-prod/clawyer/agent:latest \
   --no-onboard
 ExecStop=/usr/bin/docker stop clawyer
 Restart=always
