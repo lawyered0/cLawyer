@@ -5,13 +5,13 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_DB: ironclaw
-      POSTGRES_USER: ironclaw
-      POSTGRES_PASSWORD: ironclaw  # dev-only, change for any non-local deployment
+      POSTGRES_DB: clawyer
+      POSTGRES_USER: clawyer
+      POSTGRES_PASSWORD: clawyer  # dev-only, change for any non-local deployment
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ironclaw"]
+      test: ["CMD-SHELL", "pg_isready -U clawyer"]
       interval: 5s
       timeout: 3s
       retries: 5

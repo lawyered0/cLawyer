@@ -79,12 +79,12 @@ cLawyer is the AI assistant you can actually trust with your personal and profes
 
 ## Download or Build
 
-Visit [Releases page](https://github.com/nearai/clawyer/releases/) to see the latest updates.
+Visit [Releases page](https://github.com/lawyered0/cLawyer/releases/) to see the latest updates.
 
 <details>
   <summary>Install via Windows Installer (Windows)</summary>
 
-Download the [Windows Installer](https://github.com/nearai/clawyer/releases/latest/download/clawyer-x86_64-pc-windows-msvc.msi) and run it.
+Download the [Windows Installer](https://github.com/lawyered0/cLawyer/releases/latest/download/clawyer-x86_64-pc-windows-msvc.msi) and run it.
 
 </details>
 
@@ -92,7 +92,7 @@ Download the [Windows Installer](https://github.com/nearai/clawyer/releases/late
   <summary>Install via powershell script (Windows)</summary>
 
 ```sh
-irm https://github.com/nearai/clawyer/releases/latest/download/clawyer-installer.ps1 | iex
+irm https://github.com/lawyered0/cLawyer/releases/latest/download/clawyer-installer.ps1 | iex
 ```
 
 </details>
@@ -101,7 +101,7 @@ irm https://github.com/nearai/clawyer/releases/latest/download/clawyer-installer
   <summary>Install via shell script (macOS, Linux, Windows/WSL)</summary>
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nearai/clawyer/releases/latest/download/clawyer-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/lawyered0/cLawyer/releases/latest/download/clawyer-installer.sh | sh
 ```
 </details>
 
@@ -121,7 +121,7 @@ Install it with `cargo`, just make sure you have [Rust](https://rustup.rs) insta
 
 ```bash
 # Clone the repository
-git clone https://github.com/nearai/clawyer.git
+git clone https://github.com/lawyered0/cLawyer.git
 cd clawyer
 
 # Build

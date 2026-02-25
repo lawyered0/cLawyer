@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build IronClaw and all bundled channels.
+# Build cLawyer and all bundled channels.
 #
 # Run this before release or when channel sources have changed.
 # The main binary bundles telegram.wasm via include_bytes!; it must exist.
@@ -14,8 +14,8 @@ if [ -d "channels-src/telegram" ]; then
 fi
 
 echo ""
-echo "Building IronClaw..."
+echo "Building cLawyer..."
 cargo build --release
 
 echo ""
-echo "Done. Binary: target/release/ironclaw"
+echo "Done. Binary: target/release/clawyer"

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# VM bootstrap script for IronClaw on GCP Compute Engine.
+# VM bootstrap script for cLawyer on GCP Compute Engine.
 #
 # Run on a fresh Debian 12 VM after SSH:
 #   sudo bash setup.sh
 #
 # Prerequisites:
-#   - VM has the ironclaw-vm service account attached
+#   - VM has the clawyer-vm service account attached
 #   - Cloud SQL Auth Proxy accessible via IAM
 #   - Artifact Registry image pushed
 
@@ -30,7 +30,7 @@ chmod +x /usr/local/bin/cloud-sql-proxy
 
 echo "==> Installing systemd services"
 cp /tmp/deploy/cloud-sql-proxy.service /etc/systemd/system/
-cp /tmp/deploy/ironclaw.service /etc/systemd/system/
+cp /tmp/deploy/clawyer.service /etc/systemd/system/
 systemctl daemon-reload
 
 echo "==> Starting Cloud SQL Auth Proxy"
@@ -43,26 +43,26 @@ gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 
 echo "==> Creating config directory"
 # Owned by root, readable only by root. Docker reads --env-file as root
-# before dropping to uid 1000 (ironclaw) inside the container.
-mkdir -p /opt/ironclaw
-chmod 700 /opt/ironclaw
+# before dropping to uid 1000 (clawyer) inside the container.
+mkdir -p /opt/clawyer
+chmod 700 /opt/clawyer
 
-if [ ! -f /opt/ironclaw/.env ]; then
-  echo "WARNING: /opt/ironclaw/.env does not exist."
-  echo "Create it with your configuration before starting IronClaw."
+if [ ! -f /opt/clawyer/.env ]; then
+  echo "WARNING: /opt/clawyer/.env does not exist."
+  echo "Create it with your configuration before starting cLawyer."
   echo "See deploy/env.example for the required variables."
   echo ""
-  echo "Then run: systemctl enable ironclaw && systemctl start ironclaw"
+  echo "Then run: systemctl enable clawyer && systemctl start clawyer"
 else
-  chmod 600 /opt/ironclaw/.env
-  echo "==> Starting IronClaw"
-  systemctl enable ironclaw
-  systemctl start ironclaw
+  chmod 600 /opt/clawyer/.env
+  echo "==> Starting cLawyer"
+  systemctl enable clawyer
+  systemctl start clawyer
 fi
 
 echo "==> Setup complete"
 echo ""
 echo "Verify with:"
 echo "  systemctl status cloud-sql-proxy"
-echo "  systemctl status ironclaw"
-echo "  docker logs ironclaw"
+echo "  systemctl status clawyer"
+echo "  docker logs clawyer"

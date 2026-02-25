@@ -1,0 +1,20 @@
+[Unit]
+Description=cLawyer AI Assistant
+After=cloud-sql-proxy.service docker.service
+Requires=cloud-sql-proxy.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/docker pull ghcr.io/lawyered0/clawyer:latest
+ExecStart=/usr/bin/docker run --rm \
+  --name clawyer \
+  --env-file /opt/clawyer/.env \
+  --network=host \
+  ghcr.io/lawyered0/clawyer:latest \
+  --no-onboard
+ExecStop=/usr/bin/docker stop clawyer
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

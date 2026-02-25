@@ -1,6 +1,6 @@
 # LLM Provider Configuration
 
-IronClaw defaults to NEAR AI for model access, but supports any OpenAI-compatible
+cLawyer defaults to NEAR AI for model access, but supports any OpenAI-compatible
 endpoint as well as Anthropic and Ollama directly. This guide covers the most common
 configurations.
 
@@ -22,8 +22,8 @@ configurations.
 
 ## NEAR AI (default)
 
-No additional configuration required. On first run, `ironclaw onboard` opens a browser
-for OAuth authentication. Credentials are saved to `~/.ironclaw/session.json`.
+No additional configuration required. On first run, `clawyer onboard` opens a browser
+for OAuth authentication. Credentials are saved to `~/.clawyer/session.json`.
 
 ```env
 NEARAI_MODEL=claude-3-5-sonnet-20241022
@@ -164,7 +164,7 @@ LLM_MODEL=llama-3.2-3b-instruct-q4_K_M
 Instead of editing `.env` manually, run the onboarding wizard:
 
 ```bash
-ironclaw onboard
+clawyer onboard
 ```
 
 Select **"OpenAI-compatible"** for OpenRouter, Together AI, Fireworks, vLLM, LiteLLM,

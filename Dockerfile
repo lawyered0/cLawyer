@@ -1,10 +1,10 @@
-# Multi-stage Dockerfile for the IronClaw agent (cloud deployment).
+# Multi-stage Dockerfile for the cLawyer agent (cloud deployment).
 #
 # Build:
-#   docker build --platform linux/amd64 -t ironclaw:latest .
+#   docker build --platform linux/amd64 -t clawyer:latest .
 #
 # Run:
-#   docker run --env-file .env -p 3000:3000 ironclaw:latest
+#   docker run --env-file .env -p 3000:3000 clawyer:latest
 
 # Stage 1: Build
 FROM rust:1.92-slim-bookworm AS builder
@@ -29,7 +29,7 @@ COPY registry/ registry/
 COPY channels-src/ channels-src/
 COPY wit/ wit/
 
-RUN cargo build --release --bin ironclaw
+RUN cargo build --release --bin clawyer
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -38,15 +38,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/ironclaw /usr/local/bin/ironclaw
+COPY --from=builder /app/target/release/clawyer /usr/local/bin/clawyer
 COPY --from=builder /app/migrations /app/migrations
 
 # Non-root user
-RUN useradd -m -u 1000 -s /bin/bash ironclaw
-USER ironclaw
+RUN useradd -m -u 1000 -s /bin/bash clawyer
+USER clawyer
 
 EXPOSE 3000
 
-ENV RUST_LOG=ironclaw=info
+ENV RUST_LOG=clawyer=info
 
-ENTRYPOINT ["ironclaw"]
+ENTRYPOINT ["clawyer"]
