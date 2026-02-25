@@ -1,6 +1,9 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::{Mutex, OnceLock};
 
 use chrono::Utc;
@@ -109,12 +112,25 @@ impl AuditLogger {
             return;
         }
 
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
+        // SECURITY: create the log file with owner-read/write only (0o600).
+        // Without an explicit mode the file inherits the process umask, which
+        // is typically 0o022 — leaving the audit log world-readable.  Legal
+        // audit logs contain matter IDs, client actions, and security events
+        // and must never be readable by other users on the system.
+        let mut open_opts = OpenOptions::new();
+        open_opts.create(true).append(true);
+        #[cfg(unix)]
+        open_opts.mode(0o600);
+        match open_opts.open(&self.path) {
             Ok(mut f) => {
+                #[cfg(unix)]
+                if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!(
+                        "Failed to enforce 0o600 permissions on legal audit log {:?}: {}",
+                        self.path,
+                        e
+                    );
+                }
                 if let Err(e) = writeln!(f, "{line}") {
                     tracing::warn!("Failed to append legal audit event: {}", e);
                 }
@@ -207,5 +223,38 @@ mod tests {
             .expect("second prev_hash");
         assert_eq!(second_prev, first_hash);
         assert!(second.get("hash").and_then(|v| v.as_str()).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_enforces_0600_permissions_on_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        fs::write(&path, "existing\n").expect("seed existing file");
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set permissive mode");
+
+        let logger = AuditLogger::new(path.clone(), false);
+        logger.write("event", serde_json::json!({"kind": "perm_fix"}));
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_enforces_0600_permissions_on_new_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit-new.jsonl");
+        let logger = AuditLogger::new(path.clone(), false);
+
+        logger.write("event", serde_json::json!({"kind": "create"}));
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

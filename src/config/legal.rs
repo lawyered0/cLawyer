@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 use crate::config::helpers::{optional_env, parse_bool_env, parse_string_env};
 use crate::error::ConfigError;
@@ -80,6 +80,53 @@ fn parse_domains_csv(raw: &str) -> Vec<String> {
         .collect()
 }
 
+fn validate_audit_path(raw: &str) -> Result<PathBuf, ConfigError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            key: "LEGAL_AUDIT_PATH".to_string(),
+            message: "audit log path must not be empty".to_string(),
+        });
+    }
+
+    let raw_path = PathBuf::from(trimmed);
+    if raw_path.is_absolute() {
+        return Err(ConfigError::InvalidValue {
+            key: "LEGAL_AUDIT_PATH".to_string(),
+            message: "audit log path must be relative to the workspace".to_string(),
+        });
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in raw_path.components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(ConfigError::InvalidValue {
+                    key: "LEGAL_AUDIT_PATH".to_string(),
+                    message: "audit log path must not contain '..' components".to_string(),
+                });
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(ConfigError::InvalidValue {
+                    key: "LEGAL_AUDIT_PATH".to_string(),
+                    message: "audit log path must be relative to the workspace".to_string(),
+                });
+            }
+        }
+    }
+
+    if normalized.components().count() < 2 || !normalized.starts_with("logs") {
+        return Err(ConfigError::InvalidValue {
+            key: "LEGAL_AUDIT_PATH".to_string(),
+            message: "audit log path must be under 'logs/' and include a filename".to_string(),
+        });
+    }
+
+    Ok(normalized)
+}
+
 impl LegalConfig {
     pub(crate) fn resolve(settings: &Settings) -> Result<Self, ConfigError> {
         let hardening_raw = parse_string_env("LEGAL_HARDENING", settings.legal.hardening.clone())?;
@@ -132,10 +179,11 @@ impl LegalConfig {
             },
             audit: LegalAuditConfig {
                 enabled: parse_bool_env("LEGAL_AUDIT_ENABLED", settings.legal.audit.enabled)?,
-                path: PathBuf::from(parse_string_env(
-                    "LEGAL_AUDIT_PATH",
-                    settings.legal.audit.path.clone(),
-                )?),
+                path: {
+                    let raw =
+                        parse_string_env("LEGAL_AUDIT_PATH", settings.legal.audit.path.clone())?;
+                    validate_audit_path(&raw)?
+                },
                 hash_chain: parse_bool_env(
                     "LEGAL_AUDIT_HASH_CHAIN",
                     settings.legal.audit.hash_chain,
@@ -159,6 +207,9 @@ impl LegalConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use crate::error::ConfigError;
     use crate::settings::Settings;
 
     #[test]
@@ -175,5 +226,55 @@ mod tests {
         assert!(config.network.deny_by_default);
         assert!(config.audit.enabled);
         assert!(config.audit.hash_chain);
+    }
+
+    #[test]
+    fn validate_audit_path_accepts_normalized_logs_subpaths() {
+        let path = super::validate_audit_path("./logs//cases/./audit.jsonl/")
+            .expect("path should be accepted");
+        assert_eq!(path, PathBuf::from("logs/cases/audit.jsonl"));
+    }
+
+    #[test]
+    fn validate_audit_path_rejects_parent_dir_traversal() {
+        let err = super::validate_audit_path("logs/../audit.jsonl").expect_err("must reject '..'");
+        let ConfigError::InvalidValue { key, message } = err else {
+            panic!("expected InvalidValue");
+        };
+        assert_eq!(key, "LEGAL_AUDIT_PATH");
+        assert!(message.contains(".."), "unexpected message: {message}");
+    }
+
+    #[test]
+    fn validate_audit_path_rejects_absolute_paths() {
+        let absolute = if cfg!(windows) {
+            r"C:\tmp\audit.jsonl"
+        } else {
+            "/tmp/audit.jsonl"
+        };
+        let err =
+            super::validate_audit_path(absolute).expect_err("absolute paths must be rejected");
+        let ConfigError::InvalidValue { key, message } = err else {
+            panic!("expected InvalidValue");
+        };
+        assert_eq!(key, "LEGAL_AUDIT_PATH");
+        assert!(
+            message.contains("relative to the workspace"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_audit_path_rejects_paths_outside_logs_allowlist() {
+        let err =
+            super::validate_audit_path("tmp/legal_audit.jsonl").expect_err("must stay under logs/");
+        let ConfigError::InvalidValue { key, message } = err else {
+            panic!("expected InvalidValue");
+        };
+        assert_eq!(key, "LEGAL_AUDIT_PATH");
+        assert!(
+            message.contains("under 'logs/'"),
+            "unexpected message: {message}"
+        );
     }
 }

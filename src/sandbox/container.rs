@@ -276,6 +276,18 @@ impl ContainerRunner {
             memory: Some((limits.memory_bytes) as i64),
             cpu_shares: Some(limits.cpu_shares as i64),
             auto_remove: Some(true),
+            // SECURITY: "bridge" allows the container to reach the Docker host
+            // gateway (172.17.0.1 / host.docker.internal) on any port via raw
+            // TCP or UDP.  Only HTTP/HTTPS is intercepted by the proxy (set via
+            // http_proxy env vars); tools using raw sockets bypass it entirely.
+            //
+            // Recommended production hardening: replace "bridge" with a named
+            // user-defined Docker network created per-sandbox run (bollard
+            // create_network + connect_container), configured with
+            // Options { internal: true } so Docker adds no gateway route.
+            // The orchestrator and proxy containers should be the only other
+            // members of that network.  docker-compose.yml already places
+            // postgres on a separate internal network as a partial mitigation.
             network_mode: Some("bridge".to_string()),
             // Security: drop all capabilities and add back only what's needed
             cap_drop: Some(vec!["ALL".to_string()]),

@@ -26,6 +26,32 @@ use crate::workspace::{Workspace, paths};
 const PROTECTED_IDENTITY_FILES: &[&str] =
     &[paths::IDENTITY, paths::SOUL, paths::AGENTS, paths::USER];
 
+/// Normalize user-supplied memory paths for policy checks.
+///
+/// This mirrors workspace normalization semantics that strip leading/trailing
+/// slashes, collapse duplicate separators, and ignore `.` segments.
+/// `..` segments are preserved and rejected separately by traversal guards.
+fn normalize_policy_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for component in std::path::Path::new(path.trim()).components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            std::path::Component::ParentDir => parts.push("..".to_string()),
+            std::path::Component::CurDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {}
+        }
+    }
+    parts.join("/")
+}
+
+fn is_protected_identity_path(path: &str) -> bool {
+    let normalized = normalize_policy_path(path);
+    PROTECTED_IDENTITY_FILES
+        .iter()
+        .any(|protected| normalized.eq_ignore_ascii_case(protected))
+}
+
 /// Tool for searching workspace memory.
 ///
 /// Performs hybrid search (FTS + semantic) across all memory documents.
@@ -222,7 +248,7 @@ impl Tool for MemoryWriteTool {
         // Reject writes to identity files that are loaded into the system prompt.
         // An attacker could use prompt injection to trick the agent into overwriting
         // these, poisoning future conversations.
-        if PROTECTED_IDENTITY_FILES.contains(&target) {
+        if is_protected_identity_path(target) {
             return Err(ToolError::NotAuthorized(format!(
                 "writing to '{}' is not allowed (identity file protected from tool writes)",
                 target,
@@ -286,24 +312,11 @@ impl Tool for MemoryWriteTool {
                 heartbeat_path
             }
             path => {
-                // Protect identity files from LLM overwrites (prompt injection defense).
-                // These files are injected into the system prompt, so poisoning them
-                // would let an attacker rewrite the agent's core instructions.
-                let normalized = path.trim_start_matches('/');
-                if PROTECTED_IDENTITY_FILES
-                    .iter()
-                    .any(|p| normalized.eq_ignore_ascii_case(p))
-                {
-                    return Err(ToolError::NotAuthorized(format!(
-                        "writing to '{}' is not allowed (identity file protected from tool access)",
-                        path
-                    )));
-                }
+                let normalized = normalize_policy_path(path);
 
                 let resolved_path = if let Some(prefix) = matter_prefix.as_ref() {
-                    let normalized = path.trim_start_matches('/');
                     if normalized.starts_with(&format!("{}/", prefix)) {
-                        normalized.to_string()
+                        normalized.clone()
                     } else if normalized.starts_with("matters/") {
                         return Err(ToolError::NotAuthorized(format!(
                             "Path '{}' is outside the active matter scope '{}'",
@@ -313,8 +326,23 @@ impl Tool for MemoryWriteTool {
                         format!("{}/{}", prefix, normalized)
                     }
                 } else {
-                    path.to_string()
+                    normalized
                 };
+
+                // SECURITY: reject path traversal sequences regardless of how the path
+                // was constructed above.  A caller supplying "docs/../../../etc/shadow"
+                // would survive the prefix checks and only be caught (if at all) deep
+                // in the workspace layer.  Block Component::ParentDir here so the
+                // matter-scope boundary cannot be escaped via relative segments.
+                if std::path::Path::new(&resolved_path)
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+                {
+                    return Err(ToolError::NotAuthorized(format!(
+                        "Path '{}' contains directory traversal sequences",
+                        path
+                    )));
+                }
 
                 if append {
                     self.workspace
@@ -536,6 +564,44 @@ impl Tool for MemoryTreeTool {
 
     fn requires_sanitization(&self) -> bool {
         false // Internal tool
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::{is_protected_identity_path, normalize_policy_path};
+
+    #[test]
+    fn protected_identity_check_rejects_normalized_equivalents() {
+        let blocked = [
+            "AGENTS.md/",
+            "/AGENTS.md",
+            "//./AGENTS.md//",
+            "./SOUL.md",
+            "IDENTITY.md///",
+            "././USER.md/",
+        ];
+
+        for candidate in blocked {
+            assert!(
+                is_protected_identity_path(candidate),
+                "expected '{}' to resolve to a protected identity file",
+                candidate
+            );
+        }
+    }
+
+    #[test]
+    fn policy_path_normalization_preserves_parent_segments_for_traversal_guard() {
+        assert_eq!(
+            normalize_policy_path("notes/../AGENTS.md"),
+            "notes/../AGENTS.md"
+        );
+        assert_eq!(
+            normalize_policy_path(" /./docs//notes.md/ "),
+            "docs/notes.md"
+        );
+        assert!(!is_protected_identity_path("docs/AGENTS.md"));
     }
 }
 
