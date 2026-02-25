@@ -11,7 +11,7 @@
 //! Full-job routines are delegated to the existing `Scheduler`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -42,6 +42,8 @@ pub struct RoutineEngine {
     running_count: Arc<AtomicUsize>,
     /// Compiled event regex cache: routine_id -> compiled regex.
     event_cache: Arc<RwLock<Vec<(Uuid, Routine, Regex)>>>,
+    /// Last successful event-cache refresh timestamp (unix seconds).
+    last_event_cache_refresh: Arc<AtomicU64>,
     /// Scheduler for dispatching jobs (FullJob mode).
     scheduler: Option<Arc<Scheduler>>,
 }
@@ -63,6 +65,7 @@ impl RoutineEngine {
             notify_tx,
             running_count: Arc::new(AtomicUsize::new(0)),
             event_cache: Arc::new(RwLock::new(Vec::new())),
+            last_event_cache_refresh: Arc::new(AtomicU64::new(0)),
             scheduler,
         }
     }
@@ -88,6 +91,8 @@ impl RoutineEngine {
                 }
                 let count = cache.len();
                 *self.event_cache.write().await = cache;
+                self.last_event_cache_refresh
+                    .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
                 tracing::debug!("Refreshed event cache: {} routines", count);
             }
             Err(e) => {
@@ -101,6 +106,14 @@ impl RoutineEngine {
     /// Called synchronously from the main loop after handle_message(). The actual
     /// execution is spawned async so this returns quickly.
     pub async fn check_event_triggers(&self, message: &IncomingMessage) -> usize {
+        // Keep event cache fresh for routes that write directly to DB (e.g. web API).
+        // Throttled to avoid a DB hit on every incoming message.
+        let now = Utc::now().timestamp().max(0) as u64;
+        let last = self.last_event_cache_refresh.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 5 {
+            self.refresh_event_cache().await;
+        }
+
         let cache = self.event_cache.read().await;
         let mut fired = 0;
 

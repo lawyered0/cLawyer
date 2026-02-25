@@ -3347,6 +3347,10 @@ function openRoutineCreateModal() {
       return;
     }
 
+    var parsedCooldown = parseInt(cooldownInput.value, 10);
+    if (Number.isNaN(parsedCooldown)) parsedCooldown = 300;
+    parsedCooldown = Math.max(0, parsedCooldown);
+
     var body = {
       name: name,
       description: descInput.value.trim() || undefined,
@@ -3356,7 +3360,7 @@ function openRoutineCreateModal() {
       event_channel: (triggerType === 'event' && channelInput.value.trim()) ? channelInput.value.trim() : undefined,
       action_type: actionSel.value,
       prompt: prompt,
-      cooldown_secs: parseInt(cooldownInput.value, 10) || 300,
+      cooldown_secs: parsedCooldown,
     };
 
     saveBtn.disabled = true;
