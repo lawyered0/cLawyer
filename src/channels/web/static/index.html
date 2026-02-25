@@ -43,6 +43,7 @@
       <button data-tab="routines">Routines</button>
       <button data-tab="extensions">Extensions</button>
       <button data-tab="skills">Skills</button>
+      <button data-tab="settings">Settings</button>
       <div class="spacer"></div>
       <button class="status-logs-btn" data-tab="logs" title="Logs">Logs</button>
       <div class="tee-shield" id="tee-shield" style="display:none" title="Running in a Trusted Execution Environment">
@@ -229,6 +230,26 @@
             <tbody id="tools-tbody"></tbody>
           </table>
           <div class="empty-state" id="tools-empty" style="display:none">No tools registered</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Tab -->
+    <div class="tab-panel" id="tab-settings">
+      <div class="extensions-container">
+        <div class="extensions-section">
+          <div class="section-header-row">
+            <h3>Settings</h3>
+            <div class="section-header-actions">
+              <button class="btn-ext" id="settings-add-btn">+ New</button>
+              <button class="btn-ext" id="settings-export-btn">Export</button>
+              <button class="btn-ext" id="settings-import-btn">Import</button>
+              <input type="file" id="settings-import-file" accept=".json" style="display:none">
+            </div>
+          </div>
+          <div id="settings-list">
+            <div class="empty-state">Loading…</div>
+          </div>
         </div>
       </div>
     </div>

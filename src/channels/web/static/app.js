@@ -98,6 +98,7 @@ function apiFetch(path, options) {
         throw new Error(body || (res.status + ' ' + res.statusText));
       });
     }
+    if (res.status === 204) return null;
     return res.json();
   });
 }
@@ -851,6 +852,7 @@ function switchTab(tab) {
   if (tab === 'logs') applyLogFilters();
   if (tab === 'extensions') loadExtensions();
   if (tab === 'skills') loadSkills();
+  if (tab === 'settings') loadSettings();
 }
 
 // --- Memory (filesystem tree) ---
@@ -3047,10 +3049,10 @@ document.addEventListener('keydown', (e) => {
   const tag = (e.target.tagName || '').toLowerCase();
   const inInput = tag === 'input' || tag === 'textarea';
 
-  // Mod+1-6: switch tabs
-  if (mod && e.key >= '1' && e.key <= '6') {
+  // Mod+1-7: switch tabs
+  if (mod && e.key >= '1' && e.key <= '7') {
     e.preventDefault();
-    const tabs = ['chat', 'memory', 'jobs', 'routines', 'extensions', 'skills'];
+    const tabs = ['chat', 'memory', 'jobs', 'routines', 'extensions', 'skills', 'settings'];
     const idx = parseInt(e.key) - 1;
     if (tabs[idx]) switchTab(tabs[idx]);
     return;
@@ -3114,3 +3116,288 @@ function formatDate(isoString) {
   const d = new Date(isoString);
   return d.toLocaleString();
 }
+
+// --- Settings ---
+
+function loadSettings() {
+  var el = document.getElementById('settings-list');
+  el.innerHTML = '<div class="empty-state">Loading\u2026</div>';
+  apiFetch('/api/settings').then(function(data) {
+    if (!data.settings || data.settings.length === 0) {
+      el.innerHTML = '<div class="empty-state">No settings configured. Use \u201c+ New\u201d to add one.</div>';
+      return;
+    }
+    var tbl = document.createElement('table');
+    tbl.className = 'routines-table';
+    tbl.innerHTML = '<thead><tr><th>Key</th><th>Value</th><th>Updated</th><th></th></tr></thead>';
+    var tbody = document.createElement('tbody');
+    data.settings.forEach(function(s) {
+      tbody.appendChild(renderSettingRow(s));
+    });
+    tbl.appendChild(tbody);
+    el.innerHTML = '';
+    el.appendChild(tbl);
+  }).catch(function(err) {
+    el.innerHTML = '<div class="empty-state">Failed to load: ' + escapeHtml(err.message) + '</div>';
+  });
+}
+
+function renderSettingRow(s) {
+  var tr = document.createElement('tr');
+  tr.style.cursor = 'pointer';
+  tr.addEventListener('click', function(e) {
+    if (e.target.tagName === 'BUTTON') return;
+    openSettingModal(s.key, s.value);
+  });
+
+  var keyTd = document.createElement('td');
+  keyTd.style.fontFamily = 'var(--font-mono)';
+  keyTd.textContent = s.key;
+
+  var valTd = document.createElement('td');
+  valTd.style.maxWidth = '340px';
+  valTd.style.overflow = 'hidden';
+  valTd.style.textOverflow = 'ellipsis';
+  valTd.style.whiteSpace = 'nowrap';
+  valTd.style.color = 'var(--text-secondary)';
+  valTd.style.fontFamily = 'var(--font-mono)';
+  var display = typeof s.value === 'string' ? s.value : JSON.stringify(s.value);
+  valTd.textContent = display;
+
+  var timeTd = document.createElement('td');
+  timeTd.style.color = 'var(--text-secondary)';
+  timeTd.textContent = formatDate(s.updated_at);
+
+  var actionTd = document.createElement('td');
+  var delBtn = document.createElement('button');
+  delBtn.className = 'btn-ext remove';
+  delBtn.textContent = 'Delete';
+  delBtn.addEventListener('click', function() { deleteSetting(s.key); });
+  actionTd.appendChild(delBtn);
+
+  tr.appendChild(keyTd);
+  tr.appendChild(valTd);
+  tr.appendChild(timeTd);
+  tr.appendChild(actionTd);
+  return tr;
+}
+
+function openSettingModal(key, value) {
+  closeSettingModal();
+  var isNew = key === null;
+
+  var overlay = document.createElement('div');
+  overlay.className = 'configure-overlay';
+  overlay.id = 'setting-modal-overlay';
+  overlay.addEventListener('click', function(e) {
+    if (e.target === overlay) closeSettingModal();
+  });
+
+  var modal = document.createElement('div');
+  modal.className = 'configure-modal';
+
+  var header = document.createElement('h3');
+  header.textContent = isNew ? 'New Setting' : 'Edit Setting';
+  modal.appendChild(header);
+
+  var form = document.createElement('div');
+  form.className = 'configure-form';
+
+  // Key field
+  var keyField = document.createElement('div');
+  keyField.className = 'configure-field';
+  var keyLabel = document.createElement('label');
+  keyLabel.textContent = 'Key';
+  keyField.appendChild(keyLabel);
+  var keyInput;
+  if (isNew) {
+    keyInput = document.createElement('input');
+    keyInput.type = 'text';
+    keyInput.className = 'configure-input';
+    keyInput.placeholder = 'e.g. model, system_prompt, max_tokens';
+    keyInput.style.fontFamily = 'var(--font-mono)';
+  } else {
+    keyInput = document.createElement('div');
+    keyInput.style.fontFamily = 'var(--font-mono)';
+    keyInput.style.color = 'var(--text-secondary)';
+    keyInput.style.padding = '8px 0';
+    keyInput.style.fontSize = '13px';
+    keyInput.textContent = key;
+  }
+  keyField.appendChild(keyInput);
+  form.appendChild(keyField);
+
+  // Value field
+  var valField = document.createElement('div');
+  valField.className = 'configure-field';
+  var valLabel = document.createElement('label');
+  valLabel.textContent = 'Value (JSON)';
+  valField.appendChild(valLabel);
+  var valInput = document.createElement('textarea');
+  valInput.className = 'configure-input';
+  valInput.rows = 6;
+  valInput.style.fontFamily = 'var(--font-mono)';
+  valInput.style.fontSize = '12px';
+  valInput.style.resize = 'vertical';
+  if (!isNew) {
+    valInput.value = typeof value === 'string' ? JSON.stringify(value) : JSON.stringify(value, null, 2);
+  }
+  valField.appendChild(valInput);
+
+  // Inline error
+  var errMsg = document.createElement('div');
+  errMsg.style.color = 'var(--danger)';
+  errMsg.style.fontSize = '12px';
+  errMsg.style.marginTop = '4px';
+  errMsg.style.display = 'none';
+  valField.appendChild(errMsg);
+  form.appendChild(valField);
+  modal.appendChild(form);
+
+  // Actions
+  var actions = document.createElement('div');
+  actions.className = 'configure-actions';
+
+  var saveBtn = document.createElement('button');
+  saveBtn.className = 'btn-ext activate';
+  saveBtn.textContent = 'Save';
+  saveBtn.addEventListener('click', function() {
+    var resolvedKey = isNew ? keyInput.value.trim() : key;
+    if (!resolvedKey) {
+      errMsg.textContent = 'Key is required.';
+      errMsg.style.display = 'block';
+      keyInput.focus();
+      return;
+    }
+    var parsed;
+    try {
+      parsed = JSON.parse(valInput.value);
+    } catch (e) {
+      errMsg.textContent = 'Invalid JSON: ' + e.message;
+      errMsg.style.display = 'block';
+      valInput.focus();
+      return;
+    }
+    errMsg.style.display = 'none';
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving\u2026';
+    apiFetch('/api/settings/' + encodeURIComponent(resolvedKey), {
+      method: 'PUT',
+      body: { value: parsed },
+    }).then(function() {
+      closeSettingModal();
+      showToast('Setting saved', 'success');
+      loadSettings();
+    }).catch(function(err) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Save';
+      errMsg.textContent = 'Save failed: ' + err.message;
+      errMsg.style.display = 'block';
+    });
+  });
+  actions.appendChild(saveBtn);
+
+  var cancelBtn = document.createElement('button');
+  cancelBtn.className = 'btn-ext';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', closeSettingModal);
+  actions.appendChild(cancelBtn);
+
+  modal.appendChild(actions);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  // Focus the right input
+  if (isNew) {
+    keyInput.focus();
+  } else {
+    valInput.focus();
+    valInput.setSelectionRange(0, 0);
+  }
+}
+
+function closeSettingModal() {
+  var existing = document.getElementById('setting-modal-overlay');
+  if (existing) existing.remove();
+}
+
+function deleteSetting(key) {
+  if (!confirm('Delete setting \u201c' + key + '\u201d?')) return;
+  apiFetch('/api/settings/' + encodeURIComponent(key), { method: 'DELETE' })
+    .then(function() {
+      showToast('Setting deleted', 'success');
+      loadSettings();
+    })
+    .catch(function(err) {
+      showToast('Delete failed: ' + err.message, 'error');
+    });
+}
+
+function exportSettings() {
+  apiFetch('/api/settings/export').then(function(data) {
+    var blob = new Blob([JSON.stringify(data.settings, null, 2)], { type: 'application/json' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'settings.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }).catch(function(err) {
+    showToast('Export failed: ' + err.message, 'error');
+  });
+}
+
+function importSettings(file) {
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    var parsed;
+    try {
+      parsed = JSON.parse(e.target.result);
+    } catch (err) {
+      showToast('Invalid JSON file', 'error');
+      return;
+    }
+    // Accept either { settings: {...} } (export format) or a plain object
+    var settingsMap = (parsed && typeof parsed.settings === 'object' && !Array.isArray(parsed.settings))
+      ? parsed.settings
+      : parsed;
+    if (settingsMap === null || typeof settingsMap !== 'object' || Array.isArray(settingsMap)) {
+      showToast('Unrecognised format — expected a JSON object', 'error');
+      return;
+    }
+    var count = Object.keys(settingsMap).length;
+    apiFetch('/api/settings/import', {
+      method: 'POST',
+      body: { settings: settingsMap },
+    }).then(function() {
+      showToast('Imported ' + count + ' setting' + (count === 1 ? '' : 's'), 'success');
+      loadSettings();
+    }).catch(function(err) {
+      showToast('Import failed: ' + err.message, 'error');
+    });
+  };
+  reader.readAsText(file);
+}
+
+// Wire up Settings action buttons after DOM is ready
+document.addEventListener('DOMContentLoaded', function() {
+  var addBtn = document.getElementById('settings-add-btn');
+  if (addBtn) addBtn.addEventListener('click', function() { openSettingModal(null, null); });
+
+  var exportBtn = document.getElementById('settings-export-btn');
+  if (exportBtn) exportBtn.addEventListener('click', exportSettings);
+
+  var importBtn = document.getElementById('settings-import-btn');
+  var importFile = document.getElementById('settings-import-file');
+  if (importBtn && importFile) {
+    importBtn.addEventListener('click', function() { importFile.click(); });
+    importFile.addEventListener('change', function() {
+      if (importFile.files && importFile.files[0]) {
+        importSettings(importFile.files[0]);
+        importFile.value = '';
+      }
+    });
+  }
+});
