@@ -5,7 +5,7 @@
 <h1 align="center">cLawyer</h1>
 
 <p align="center">
-  <strong>Your secure personal AI assistant, always on your side</strong>
+  <strong>Local-first legal AI assistant for law firms: matter-scoped, citation-required, and auditable by default</strong>
 </p>
 
 <p align="center">
@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <a href="#philosophy">Philosophy</a> •
+  <a href="#about">About</a> •
   <a href="#features">Features</a> •
   <a href="#installation">Installation</a> •
   <a href="#configuration">Configuration</a> •
@@ -25,18 +25,18 @@
 
 ---
 
-## Philosophy
+## About
 
-cLawyer is built on a simple principle: **your AI assistant should work for you, not against you**.
+cLawyer is a hardened, local-first fork of IronClaw/OpenClaw built for legal teams.
 
-In a world where AI systems are increasingly opaque about data handling and aligned with corporate interests, cLawyer takes a different approach:
+Version 1 defaults to a U.S.-general legal profile with max-lockdown guardrails so law firm staff can run secure workflows for intake, chronology, contract review, litigation support, and research synthesis.
 
-- **Your data stays yours** - All information is stored locally, encrypted, and never leaves your control
-- **Transparency by design** - Open source, auditable, no hidden telemetry or data harvesting
-- **Self-expanding capabilities** - Build new tools on the fly without waiting for vendor updates
-- **Defense in depth** - Multiple security layers protect against prompt injection and data exfiltration
+- **Matter-first by default** - Work is scoped to `matters/<matter_id>/...` with matter metadata and conflict-check hooks
+- **Citation discipline** - Legal outputs require source references and uncertainty/risk sections
+- **Max-lockdown hardening** - Deny-by-default network, approval-gated sensitive actions, and strict write boundaries
+- **Auditability built in** - Append-only legal audit log with hash-chain integrity and security counters
 
-cLawyer is the AI assistant you can actually trust with your personal and professional life.
+cLawyer is designed for confidential, defensible legal work product on a single-tenant local deployment.
 
 ## Features
 

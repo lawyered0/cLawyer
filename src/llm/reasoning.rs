@@ -1587,10 +1587,10 @@ That's my plan."#;
 
     #[test]
     fn test_clean_response_thinking_tags_reasoning_properly_tagged() {
-        let input = "<thinking>The user is asking about my name.</thinking>\n\nI'm cLawyer, a secure personal AI assistant.";
+        let input = "<thinking>The user is asking about my name.</thinking>\n\nI'm cLawyer, a local-first legal AI assistant.";
         assert_eq!(
             clean_response(input),
-            "I'm cLawyer, a secure personal AI assistant."
+            "I'm cLawyer, a local-first legal AI assistant."
         );
     }
 
