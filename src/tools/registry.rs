@@ -23,7 +23,7 @@ use crate::tools::builtin::{
     ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
-use crate::tools::tool::{Tool, ToolDomain};
+use crate::tools::tool::{ApprovalRequirement, Tool, ToolDomain};
 use crate::tools::wasm::{
     Capabilities, OAuthRefreshConfig, ResourceLimits, SharedCredentialRegistry, WasmError,
     WasmStorageError, WasmToolRuntime, WasmToolStore, WasmToolWrapper,
@@ -84,6 +84,12 @@ pub struct ToolRegistry {
     legal: Option<crate::config::LegalConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolApprovalDecision {
+    pub needs_approval: bool,
+    pub legal_forced: bool,
+}
+
 impl ToolRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
@@ -122,6 +128,59 @@ impl ToolRegistry {
     /// Get the shared rate limiter for checking built-in tool limits.
     pub fn rate_limiter(&self) -> &RateLimiter {
         &self.rate_limiter
+    }
+
+    /// Whether legal policy forces explicit approval for a tool.
+    pub fn is_legal_approval_forced(&self, tool_name: &str) -> bool {
+        self.is_legal_approval_forced_with_legal(tool_name, None)
+    }
+
+    /// Whether legal policy forces explicit approval for a tool using an
+    /// optional runtime legal override.
+    pub fn is_legal_approval_forced_with_legal(
+        &self,
+        tool_name: &str,
+        legal_override: Option<&crate::config::LegalConfig>,
+    ) -> bool {
+        legal_override
+            .or(self.legal.as_ref())
+            .is_some_and(|legal| crate::legal::policy::requires_explicit_approval(legal, tool_name))
+    }
+
+    /// Resolve final approval behavior from tool requirement + legal policy.
+    pub fn approval_decision_for(
+        &self,
+        tool_name: &str,
+        requirement: ApprovalRequirement,
+        is_auto_approved: bool,
+    ) -> ToolApprovalDecision {
+        self.approval_decision_for_with_legal(tool_name, requirement, is_auto_approved, None)
+    }
+
+    /// Resolve final approval behavior from tool requirement + legal policy
+    /// using an optional runtime legal override.
+    pub fn approval_decision_for_with_legal(
+        &self,
+        tool_name: &str,
+        requirement: ApprovalRequirement,
+        is_auto_approved: bool,
+        legal_override: Option<&crate::config::LegalConfig>,
+    ) -> ToolApprovalDecision {
+        let legal_forced = self.is_legal_approval_forced_with_legal(tool_name, legal_override);
+        let needs_approval = if legal_forced {
+            true
+        } else {
+            match requirement {
+                ApprovalRequirement::Never => false,
+                ApprovalRequirement::UnlessAutoApproved => !is_auto_approved,
+                ApprovalRequirement::Always => true,
+            }
+        };
+
+        ToolApprovalDecision {
+            needs_approval,
+            legal_forced,
+        }
     }
 
     /// Register a tool. Rejects dynamic tools that try to shadow a built-in name.
@@ -634,6 +693,7 @@ impl std::fmt::Debug for ToolRegistry {
 mod tests {
     use super::*;
     use crate::tools::registry::EchoTool;
+    use crate::tools::tool::ApprovalRequirement;
 
     #[tokio::test]
     async fn test_register_and_get() {
@@ -712,5 +772,76 @@ mod tests {
             .to_string();
         assert_eq!(desc, original_desc);
         assert_ne!(desc, "EVIL SHADOW");
+    }
+
+    fn legal_for_test() -> crate::config::LegalConfig {
+        crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve")
+    }
+
+    #[test]
+    fn test_approval_decision_respects_auto_approve_for_non_legal_forced() {
+        let registry = ToolRegistry::new().with_legal_policy(legal_for_test());
+        let decision = registry.approval_decision_for(
+            "memory_read",
+            ApprovalRequirement::UnlessAutoApproved,
+            true,
+        );
+
+        assert!(!decision.legal_forced);
+        assert!(!decision.needs_approval);
+    }
+
+    #[test]
+    fn test_approval_decision_forces_max_lockdown_side_effects() {
+        let registry = ToolRegistry::new().with_legal_policy(legal_for_test());
+        let decision =
+            registry.approval_decision_for("write_file", ApprovalRequirement::Never, true);
+
+        assert!(decision.legal_forced);
+        assert!(decision.needs_approval);
+    }
+
+    #[test]
+    fn test_approval_decision_forces_privilege_guard_scope_with_active_matter() {
+        let mut legal = legal_for_test();
+        legal.hardening = crate::config::LegalHardeningProfile::Standard;
+        legal.active_matter = Some("demo".to_string());
+        legal.privilege_guard = true;
+        let registry = ToolRegistry::new().with_legal_policy(legal);
+
+        let shell = registry.approval_decision_for("shell", ApprovalRequirement::Never, true);
+        let read = registry.approval_decision_for("read_file", ApprovalRequirement::Never, true);
+        let memory =
+            registry.approval_decision_for("memory_search", ApprovalRequirement::Never, true);
+
+        assert!(shell.legal_forced && shell.needs_approval);
+        assert!(read.legal_forced && read.needs_approval);
+        assert!(memory.legal_forced && memory.needs_approval);
+    }
+
+    #[test]
+    fn test_approval_decision_uses_runtime_legal_override() {
+        let mut base = legal_for_test();
+        base.hardening = crate::config::LegalHardeningProfile::Standard;
+        base.active_matter = None;
+        base.privilege_guard = true;
+        let registry = ToolRegistry::new().with_legal_policy(base.clone());
+
+        let default_decision =
+            registry.approval_decision_for("read_file", ApprovalRequirement::Never, true);
+        assert!(!default_decision.legal_forced);
+        assert!(!default_decision.needs_approval);
+
+        let mut runtime = base;
+        runtime.active_matter = Some("demo".to_string());
+        let override_decision = registry.approval_decision_for_with_legal(
+            "read_file",
+            ApprovalRequirement::Never,
+            true,
+            Some(&runtime),
+        );
+        assert!(override_decision.legal_forced);
+        assert!(override_decision.needs_approval);
     }
 }

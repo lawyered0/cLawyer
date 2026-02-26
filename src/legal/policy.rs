@@ -1,6 +1,10 @@
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 use crate::config::{LegalConfig, LegalHardeningProfile};
 
-const SIDE_EFFECT_TOOLS: &[&str] = &[
+const MAX_LOCKDOWN_SIDE_EFFECT_TOOLS: &[&str] = &[
     "http",
     "shell",
     "write_file",
@@ -17,6 +21,17 @@ const SIDE_EFFECT_TOOLS: &[&str] = &[
     "routine_update",
     "routine_delete",
 ];
+const PRIVILEGE_GUARD_EGRESS_TOOLS: &[&str] = &["http", "shell", "create_job"];
+const PRIVILEGE_GUARD_CONFIDENTIAL_TOOLS: &[&str] = &[
+    "read_file",
+    "write_file",
+    "list_dir",
+    "apply_patch",
+    "memory_read",
+    "memory_write",
+    "memory_search",
+    "memory_tree",
+];
 
 /// True when legal hardening is in max-lockdown mode.
 pub fn is_max_lockdown(config: &LegalConfig) -> bool {
@@ -25,7 +40,27 @@ pub fn is_max_lockdown(config: &LegalConfig) -> bool {
 
 /// Whether a tool should always require explicit approval in legal max-lockdown mode.
 pub fn requires_explicit_approval(config: &LegalConfig, tool_name: &str) -> bool {
-    is_max_lockdown(config) && SIDE_EFFECT_TOOLS.contains(&tool_name)
+    if !config.enabled {
+        return false;
+    }
+
+    if is_max_lockdown(config) && MAX_LOCKDOWN_SIDE_EFFECT_TOOLS.contains(&tool_name) {
+        return true;
+    }
+
+    let active_matter_set = config
+        .active_matter
+        .as_deref()
+        .is_some_and(|m| !m.trim().is_empty());
+    if config.privilege_guard
+        && active_matter_set
+        && (PRIVILEGE_GUARD_EGRESS_TOOLS.contains(&tool_name)
+            || PRIVILEGE_GUARD_CONFIDENTIAL_TOOLS.contains(&tool_name))
+    {
+        return true;
+    }
+
+    false
 }
 
 /// Normalize a domain for allowlist comparisons.
@@ -99,16 +134,22 @@ pub fn is_non_trivial_request(content: &str) -> bool {
     .any(|k| lower.contains(k))
 }
 
-/// Heuristic citation check for generated responses.
+static CITATION_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    vec![
+        // Canonical bracketed references: [doc: ...], [authority: ...], etc.
+        Regex::new(r"(?i)\[(?:doc|authority|source|citation)\s*:\s*[^\]\n]{3,}\]").unwrap(),
+        // Parenthesized variant for prose contexts.
+        Regex::new(r"(?i)\((?:doc|authority|source|citation)\s*:\s*[^\)\n]{3,}\)").unwrap(),
+        // Legacy bracketed style retained for compatibility, e.g. [doc 4 page 2].
+        Regex::new(r"(?i)\[doc(?:ument)?\s+\d+[^\]\n]*\]").unwrap(),
+    ]
+});
+
+/// Structured citation format check for generated responses.
 pub fn response_has_citation_markers(response: &str) -> bool {
-    let lower = response.to_ascii_lowercase();
-    lower.contains("source:")
-        || lower.contains("sources:")
-        || lower.contains("citation:")
-        || lower.contains("citations:")
-        || lower.contains("[doc")
-        || lower.contains("(doc")
-        || lower.contains("[§")
+    CITATION_PATTERNS
+        .iter()
+        .any(|pattern| pattern.is_match(response))
 }
 
 #[cfg(test)]
@@ -155,11 +196,56 @@ mod tests {
     }
 
     #[test]
-    fn citation_heuristic_detects_common_markers() {
-        assert!(response_has_citation_markers("Source: Contract §2.1"));
+    fn max_lockdown_still_forces_side_effect_approval() {
+        let mut cfg = legal_for_test();
+        cfg.privilege_guard = false;
+        cfg.active_matter = None;
+        assert!(requires_explicit_approval(&cfg, "write_file"));
+        assert!(!requires_explicit_approval(&cfg, "memory_read"));
+    }
+
+    #[test]
+    fn privilege_guard_forces_approval_for_sensitive_tools_with_active_matter() {
+        let mut cfg = legal_for_test();
+        cfg.hardening = LegalHardeningProfile::Standard;
+        cfg.active_matter = Some("demo".to_string());
+        cfg.privilege_guard = true;
+
+        assert!(requires_explicit_approval(&cfg, "http"));
+        assert!(requires_explicit_approval(&cfg, "read_file"));
+        assert!(requires_explicit_approval(&cfg, "memory_write"));
+        assert!(!requires_explicit_approval(&cfg, "echo"));
+    }
+
+    #[test]
+    fn privilege_guard_does_not_force_without_active_matter() {
+        let mut cfg = legal_for_test();
+        cfg.hardening = LegalHardeningProfile::Standard;
+        cfg.active_matter = None;
+        cfg.privilege_guard = true;
+
+        assert!(!requires_explicit_approval(&cfg, "shell"));
+        assert!(!requires_explicit_approval(&cfg, "read_file"));
+    }
+
+    #[test]
+    fn citation_detection_accepts_structured_formats() {
+        assert!(response_has_citation_markers(
+            "See [doc: MSA.pdf page:2 section:payment-terms]"
+        ));
+        assert!(response_has_citation_markers(
+            "Authority is [authority: Restatement §2.1]."
+        ));
         assert!(response_has_citation_markers("See [doc 4 page 2]"));
+    }
+
+    #[test]
+    fn citation_detection_rejects_unstructured_source_language() {
         assert!(!response_has_citation_markers(
-            "This paragraph has no supporting references."
+            "There are no sources for this claim."
+        ));
+        assert!(!response_has_citation_markers(
+            "sources: not available in this draft"
         ));
     }
 

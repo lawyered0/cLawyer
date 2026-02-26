@@ -36,11 +36,19 @@ pub struct SafetyLayer {
 impl SafetyLayer {
     /// Create a new safety layer with the given configuration.
     pub fn new(config: &SafetyConfig) -> Self {
+        Self::new_with_legal_redaction(config, None)
+    }
+
+    /// Create a new safety layer with optional legal redaction toggles.
+    pub fn new_with_legal_redaction(
+        config: &SafetyConfig,
+        redaction: Option<&crate::config::LegalRedactionConfig>,
+    ) -> Self {
         Self {
             sanitizer: Sanitizer::new(),
             validator: Validator::new(),
             policy: Policy::default(),
-            leak_detector: LeakDetector::new(),
+            leak_detector: LeakDetector::new_with_legal_redaction(redaction),
             config: config.clone(),
         }
     }

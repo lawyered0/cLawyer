@@ -28,7 +28,7 @@
 2. cLawyer checks: active matter (for non-trivial legal requests), conflict list, tool approval policy, and domain allowlist.
 3. Sensitive tool calls are approval-gated in `max_lockdown`.
 4. Memory/file writes are scoped to `matters/<matter_id>/...` when matter context is required.
-5. Output is scanned for leakage and citation markers.
+5. Output is scanned for leakage and structured citation-format markers.
 6. Audit events are appended to JSONL with hash-chain links.
 
 ## Matter Model
@@ -47,6 +47,21 @@ Required metadata fields:
 - `retention`
 
 If metadata is missing or invalid, legal task execution is blocked with guidance.
+
+## Conflict Check Limits
+
+- Conflict detection currently reads the workspace-global `conflicts.json` (not a per-matter conflict graph).
+- Matching is normalized and boundary-aware, but still heuristic; short aliases are intentionally ignored to reduce false positives.
+
+## Citation Check Limits
+
+- Citation enforcement checks for structured citation formats in generated text.
+- This check does not verify the truth, existence, or legal validity of cited sources.
+
+## Deferred Architecture Items
+
+- Self-repair stuck-job handling is still attempt-count based; time-threshold stuck detection is not implemented yet.
+- Conflict checks still use workspace-global `conflicts.json`; a per-matter conflict-graph model is deferred.
 
 ## Bundled Legal Skills
 

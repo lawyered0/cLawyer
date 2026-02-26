@@ -64,6 +64,7 @@ impl Agent {
 
         // Select and prepare active skills (if skills system is enabled)
         let active_skills = self.select_active_skills(&message.content);
+        let effective_legal_config = self.effective_legal_config_for(message);
 
         // Build skill context block
         let skill_context = if !active_skills.is_empty() {
@@ -113,7 +114,7 @@ impl Agent {
         let mut reasoning = Reasoning::new(self.llm().clone(), self.safety().clone())
             .with_channel(message.channel.clone())
             .with_model_name(self.llm().active_model_name())
-            .with_legal_config(self.deps.legal_config.clone())
+            .with_legal_config(effective_legal_config.clone())
             .with_group_chat(is_group_chat);
         if let Some(prompt) = system_prompt {
             reasoning = reasoning.with_system_prompt(prompt);
@@ -398,35 +399,28 @@ impl Agent {
                         }
 
                         // Check if tool requires approval on the final (post-hook)
-                        // parameters. Skipped when auto_approve_tools is set.
-                        if !self.config.auto_approve_tools
-                            && let Some(tool) = self.tools().get(&tc.name).await
-                        {
-                            use crate::tools::ApprovalRequirement;
-                            let legal_forced = crate::legal::policy::requires_explicit_approval(
-                                &self.deps.legal_config,
-                                &tc.name,
-                            );
-                            let needs_approval = if legal_forced {
+                        // parameters. Legal-forced approvals are never bypassed.
+                        if let Some(tool) = self.tools().get(&tc.name).await {
+                            let is_auto_approved = if self.config.auto_approve_tools {
                                 true
                             } else {
-                                match tool.requires_approval(&tc.arguments) {
-                                    ApprovalRequirement::Never => false,
-                                    ApprovalRequirement::UnlessAutoApproved => {
-                                        let sess = session.lock().await;
-                                        !sess.is_tool_auto_approved(&tc.name)
-                                    }
-                                    ApprovalRequirement::Always => true,
-                                }
+                                let sess = session.lock().await;
+                                sess.is_tool_auto_approved(&tc.name)
                             };
+                            let decision = self.tools().approval_decision_for_with_legal(
+                                &tc.name,
+                                tool.requires_approval(&tc.arguments),
+                                is_auto_approved,
+                                Some(&effective_legal_config),
+                            );
 
-                            if needs_approval {
+                            if decision.needs_approval {
                                 crate::legal::audit::inc_approval_required();
                                 crate::legal::audit::record(
                                     "approval_required",
                                     serde_json::json!({
                                         "tool_name": tc.name,
-                                        "legal_forced": legal_forced,
+                                        "legal_forced": decision.legal_forced,
                                     }),
                                 );
                                 approval_needed = Some((idx, tc, tool));
@@ -981,7 +975,7 @@ mod tests {
     }
 
     /// Build a minimal `Agent` for unit testing (no DB, no workspace, no extensions).
-    fn make_test_agent() -> Agent {
+    fn make_test_agent_with_legal(legal_config: crate::config::LegalConfig) -> Agent {
         let deps = AgentDeps {
             store: None,
             llm: Arc::new(StaticLlmProvider),
@@ -996,9 +990,7 @@ mod tests {
             skill_registry: None,
             skill_catalog: None,
             skills_config: SkillsConfig::default(),
-            legal_config:
-                crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
-                    .expect("default legal config should resolve"),
+            legal_config,
             hooks: Arc::new(HookRegistry::new()),
             cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
         };
@@ -1027,6 +1019,12 @@ mod tests {
             Some(Arc::new(ContextManager::new(1))),
             None,
         )
+    }
+
+    fn make_test_agent() -> Agent {
+        let legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        make_test_agent_with_legal(legal)
     }
 
     #[test]
@@ -1220,6 +1218,34 @@ mod tests {
         .to_string());
 
         assert!(check_auth_required("tool_activate", &result).is_none());
+    }
+
+    #[test]
+    fn test_effective_legal_config_uses_message_active_matter_override() {
+        let agent = make_test_agent();
+        let message = crate::channels::IncomingMessage::new("gateway", "user-1", "hello")
+            .with_metadata(serde_json::json!({
+                "active_matter": "Acme v. Foo!!!"
+            }));
+
+        let effective = agent.effective_legal_config_for(&message);
+        assert_eq!(effective.active_matter.as_deref(), Some("acme-v--foo"));
+    }
+
+    #[test]
+    fn test_effective_legal_config_null_override_clears_active_matter() {
+        let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        legal.active_matter = Some("demo".to_string());
+        let agent = make_test_agent_with_legal(legal);
+
+        let message = crate::channels::IncomingMessage::new("gateway", "user-1", "hello")
+            .with_metadata(serde_json::json!({
+                "active_matter": null
+            }));
+
+        let effective = agent.effective_legal_config_for(&message);
+        assert_eq!(effective.active_matter, None);
     }
 
     #[tokio::test]

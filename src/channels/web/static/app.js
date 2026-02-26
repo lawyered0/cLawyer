@@ -159,6 +159,13 @@ bindClick('auth-connect-btn', authenticate);
   bindClick('skill-search-btn', searchClawHub);
   bindClick('skill-install-btn', installSkillFromForm);
   bindClick('matters-clear-btn', clearActiveMatter);
+  var mattersCreateForm = byId('matters-create-form');
+  if (mattersCreateForm) {
+    mattersCreateForm.addEventListener('submit', function(e) {
+      e.preventDefault();
+      createMatterFromForm();
+    });
+  }
 })();
 
 // --- API helper ---
@@ -3630,6 +3637,28 @@ var mattersCache = [];
 /** Currently active matter ID (string) or null. */
 var activeMatterId = null;
 
+function parseCsvList(raw) {
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map(function(v) { return v.trim(); })
+    .filter(function(v) { return !!v; });
+}
+
+function setCreateMatterBusy(isBusy) {
+  var form = document.getElementById('matters-create-form');
+  var button = document.getElementById('matters-create-btn');
+  if (form) {
+    var fields = form.querySelectorAll('input, button');
+    for (var i = 0; i < fields.length; i++) {
+      fields[i].disabled = isBusy;
+    }
+  }
+  if (button) {
+    button.textContent = isBusy ? 'Creating…' : 'Create & Activate';
+  }
+}
+
 /**
  * Load (or reload) the Matters tab: fetches list and active matter in
  * parallel, then renders the panel and updates the badge.
@@ -3678,7 +3707,7 @@ function renderMatters() {
   if (!list) return;
 
   if (mattersCache.length === 0) {
-    list.innerHTML = '<div class="empty-state">No matters found. Ask the assistant to create one, or add a <code>matters/&lt;id&gt;/matter.yaml</code> file via the Memory tab.</div>';
+    list.innerHTML = '<div class="empty-state">No matters found yet. Use the Create Matter form above to start one.</div>';
     return;
   }
 
@@ -3735,6 +3764,44 @@ function renderMatters() {
       viewMatterInMemory(mattersCache[idx].id);
     });
   }
+}
+
+function createMatterFromForm() {
+  var matterId = byId('matter-create-id') ? byId('matter-create-id').value.trim() : '';
+  var client = byId('matter-create-client') ? byId('matter-create-client').value.trim() : '';
+  var confidentiality = byId('matter-create-confidentiality') ? byId('matter-create-confidentiality').value.trim() : '';
+  var retention = byId('matter-create-retention') ? byId('matter-create-retention').value.trim() : '';
+  var team = parseCsvList(byId('matter-create-team') ? byId('matter-create-team').value : '');
+  var adversaries = parseCsvList(byId('matter-create-adversaries') ? byId('matter-create-adversaries').value : '');
+
+  if (!matterId || !client || !confidentiality || !retention) {
+    showToast('Matter ID, client, confidentiality, and retention are required.', 'error');
+    return;
+  }
+
+  setCreateMatterBusy(true);
+  apiFetch('/api/matters', {
+    method: 'POST',
+    body: {
+      matter_id: matterId,
+      client: client,
+      confidentiality: confidentiality,
+      retention: retention,
+      team: team,
+      adversaries: adversaries,
+    },
+  }).then(function(data) {
+    var createdId = data && data.active_matter_id ? data.active_matter_id : matterId;
+    activeMatterId = createdId;
+    var form = byId('matters-create-form');
+    if (form) form.reset();
+    showToast('Matter created and activated: ' + createdId, 'success');
+    loadMatters();
+  }).catch(function(err) {
+    showToast('Failed to create matter: ' + err.message, 'error');
+  }).finally(function() {
+    setCreateMatterBusy(false);
+  });
 }
 
 /**

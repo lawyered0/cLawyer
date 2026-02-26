@@ -290,6 +290,26 @@ pub struct SetActiveMatterRequest {
     pub matter_id: Option<String>,
 }
 
+/// Request body for `POST /api/matters`.
+#[derive(Debug, Deserialize)]
+pub struct CreateMatterRequest {
+    pub matter_id: String,
+    pub client: String,
+    pub confidentiality: String,
+    pub retention: String,
+    #[serde(default)]
+    pub team: Vec<String>,
+    #[serde(default)]
+    pub adversaries: Vec<String>,
+}
+
+/// Response body for `POST /api/matters`.
+#[derive(Debug, Serialize)]
+pub struct CreateMatterResponse {
+    pub matter: MatterInfo,
+    pub active_matter_id: String,
+}
+
 // --- Memory upload ---
 
 /// One successfully uploaded file entry in the upload response.

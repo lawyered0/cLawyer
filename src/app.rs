@@ -321,7 +321,10 @@ impl AppBuilder {
         ),
         anyhow::Error,
     > {
-        let safety = Arc::new(SafetyLayer::new(&self.config.safety));
+        let safety = Arc::new(SafetyLayer::new_with_legal_redaction(
+            &self.config.safety,
+            Some(&self.config.legal.redaction),
+        ));
         tracing::info!("Safety layer initialized");
 
         // Initialize tool registry with credential injection support

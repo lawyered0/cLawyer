@@ -43,6 +43,8 @@ use std::ops::Range;
 use aho_corasick::AhoCorasick;
 use regex::Regex;
 
+use crate::config::LegalRedactionConfig;
+
 /// Action to take when a leak is detected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeakAction {
@@ -140,6 +142,17 @@ impl LeakDetector {
     /// Create a new detector with default patterns.
     pub fn new() -> Self {
         Self::with_patterns(default_patterns())
+    }
+
+    /// Create a detector with legal redaction class toggles applied.
+    ///
+    /// Secret/API credential patterns remain active regardless of legal toggles.
+    pub fn new_with_legal_redaction(redaction: Option<&LegalRedactionConfig>) -> Self {
+        let patterns = default_patterns()
+            .into_iter()
+            .filter(|pattern| pattern_enabled_for_legal_config(&pattern.name, redaction))
+            .collect();
+        Self::with_patterns(patterns)
     }
 
     /// Create a detector with custom patterns.
@@ -402,6 +415,44 @@ fn extract_literal_prefix(pattern: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegalRedactionClass {
+    Always,
+    Pii,
+    Phi,
+    Financial,
+    GovernmentId,
+}
+
+fn legal_redaction_class(pattern_name: &str) -> LegalRedactionClass {
+    match pattern_name {
+        "us_ssn" => LegalRedactionClass::Pii,
+        "medical_record_labeled" => LegalRedactionClass::Phi,
+        "credit_card_like" | "routing_number_labeled" | "account_number_labeled" => {
+            LegalRedactionClass::Financial
+        }
+        "drivers_license_labeled" => LegalRedactionClass::GovernmentId,
+        _ => LegalRedactionClass::Always,
+    }
+}
+
+fn pattern_enabled_for_legal_config(
+    pattern_name: &str,
+    redaction: Option<&LegalRedactionConfig>,
+) -> bool {
+    let Some(redaction) = redaction else {
+        return true;
+    };
+
+    match legal_redaction_class(pattern_name) {
+        LegalRedactionClass::Always => true,
+        LegalRedactionClass::Pii => redaction.pii,
+        LegalRedactionClass::Phi => redaction.phi,
+        LegalRedactionClass::Financial => redaction.financial,
+        LegalRedactionClass::GovernmentId => redaction.government_id,
+    }
+}
+
 /// Default leak detection patterns.
 fn default_patterns() -> Vec<LeakPattern> {
     vec![
@@ -565,6 +616,7 @@ fn default_patterns() -> Vec<LeakPattern> {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::LegalRedactionConfig;
     use crate::safety::leak_detector::{LeakDetector, LeakSeverity};
 
     #[test]
@@ -793,5 +845,57 @@ mod tests {
                 .any(|m| m.pattern_name == "account_number_labeled")
         );
         assert!(!result.should_block);
+    }
+
+    #[test]
+    fn test_legal_pii_redaction_toggle_disables_ssn_pattern() {
+        let detector = LeakDetector::new_with_legal_redaction(Some(&LegalRedactionConfig {
+            pii: false,
+            phi: true,
+            financial: true,
+            government_id: true,
+        }));
+
+        let result = detector.scan("Client SSN is 123-45-6789.");
+        assert!(
+            result.matches.is_empty(),
+            "SSN detection should be disabled when pii=false"
+        );
+    }
+
+    #[test]
+    fn test_legal_financial_redaction_toggle_disables_financial_patterns() {
+        let detector = LeakDetector::new_with_legal_redaction(Some(&LegalRedactionConfig {
+            pii: true,
+            phi: true,
+            financial: false,
+            government_id: true,
+        }));
+
+        let result = detector.scan("routing number: 021000021 account number: 123456789012");
+        assert!(
+            !result
+                .matches
+                .iter()
+                .any(|m| m.pattern_name == "routing_number_labeled"
+                    || m.pattern_name == "account_number_labeled"),
+            "financial detectors should be disabled when financial=false"
+        );
+    }
+
+    #[test]
+    fn test_legal_redaction_toggles_do_not_disable_secret_blocking() {
+        let detector = LeakDetector::new_with_legal_redaction(Some(&LegalRedactionConfig {
+            pii: false,
+            phi: false,
+            financial: false,
+            government_id: false,
+        }));
+
+        let result = detector.scan_and_clean("sk-proj-test1234567890abcdefghij");
+        assert!(
+            result.is_err(),
+            "API credential blocking must remain enabled even with legal class toggles disabled"
+        );
     }
 }

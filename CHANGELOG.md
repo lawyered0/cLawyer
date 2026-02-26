@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- sync web-selected `legal.active_matter` into per-message runtime legal checks and approval gating (no restart required)
+- surface `POST /api/matters` duplicate-precheck storage/list failures as `500` instead of treating them as empty results
+
 ## [0.11.1](https://github.com/nearai/ironclaw/compare/v0.11.0...v0.11.1) - 2026-02-23
 
 ### Other

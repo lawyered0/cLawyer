@@ -160,6 +160,34 @@ impl Agent {
         &self.deps.tools
     }
 
+    /// Resolve legal config for the current message, allowing metadata to
+    /// override the active matter at runtime.
+    pub(super) fn effective_legal_config_for(
+        &self,
+        message: &IncomingMessage,
+    ) -> crate::config::LegalConfig {
+        let mut legal = self.deps.legal_config.clone();
+        if let Some(active_matter) = message.metadata.get("active_matter") {
+            match active_matter {
+                serde_json::Value::Null => {
+                    legal.active_matter = None;
+                }
+                serde_json::Value::String(raw) => {
+                    let sanitized = crate::legal::policy::sanitize_matter_id(raw);
+                    legal.active_matter = if sanitized.is_empty() {
+                        None
+                    } else {
+                        Some(sanitized)
+                    };
+                }
+                _ => {
+                    tracing::warn!("Ignoring non-string 'active_matter' metadata override");
+                }
+            }
+        }
+        legal
+    }
+
     pub(super) fn workspace(&self) -> Option<&Arc<Workspace>> {
         self.deps.workspace.as_ref()
     }

@@ -211,7 +211,10 @@ pub async fn start_server(
             post(memory_upload_handler).layer(DefaultBodyLimit::max(UPLOAD_FILE_SIZE_LIMIT)),
         )
         // Matters
-        .route("/api/matters", get(matters_list_handler))
+        .route(
+            "/api/matters",
+            get(matters_list_handler).post(matters_create_handler),
+        )
         .route(
             "/api/matters/active",
             get(matters_active_get_handler).post(matters_active_set_handler),
@@ -436,6 +439,30 @@ async fn health_handler() -> Json<HealthResponse> {
 
 // --- Chat handlers ---
 
+async fn load_active_matter_for_chat(state: &GatewayState) -> Option<String> {
+    let store = state.store.as_ref()?;
+    let value = match store
+        .get_setting(&state.user_id, MATTER_ACTIVE_SETTING)
+        .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                "Failed to load active matter setting for chat metadata: {}",
+                err
+            );
+            return None;
+        }
+    }?;
+    let raw = value.as_str()?;
+    let sanitized = crate::legal::policy::sanitize_matter_id(raw);
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
 async fn chat_send_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<SendMessageRequest>,
@@ -448,11 +475,23 @@ async fn chat_send_handler(
     }
 
     let mut msg = IncomingMessage::new("gateway", &state.user_id, &req.content);
+    let mut metadata = serde_json::Map::new();
 
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
-        msg = msg.with_metadata(serde_json::json!({"thread_id": thread_id}));
+        metadata.insert(
+            "thread_id".to_string(),
+            serde_json::Value::String(thread_id.clone()),
+        );
     }
+    metadata.insert(
+        "active_matter".to_string(),
+        load_active_matter_for_chat(state.as_ref())
+            .await
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    msg = msg.with_metadata(serde_json::Value::Object(metadata));
 
     let msg_id = msg.id;
 
@@ -1114,6 +1153,10 @@ async fn memory_write_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    if crate::legal::matter::is_workspace_conflicts_path(&req.path) {
+        crate::legal::matter::invalidate_conflict_cache();
+    }
+
     Ok(Json(MemoryWriteResponse {
         path: req.path,
         status: "written",
@@ -1295,6 +1338,143 @@ async fn matters_list_handler(
     Ok(Json(MattersListResponse { matters }))
 }
 
+fn parse_required_matter_field(
+    field_name: &str,
+    value: &str,
+) -> Result<String, (StatusCode, String)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' is required", field_name),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn parse_matter_list(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+fn list_existing_matters_for_create(
+    result: Result<Vec<crate::workspace::WorkspaceEntry>, crate::error::WorkspaceError>,
+) -> Result<Vec<crate::workspace::WorkspaceEntry>, (StatusCode, String)> {
+    match result {
+        Ok(entries) => Ok(entries),
+        Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => Ok(Vec::new()),
+        Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    }
+}
+
+async fn matters_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<CreateMatterRequest>,
+) -> Result<(StatusCode, Json<CreateMatterResponse>), (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let raw_matter_id = parse_required_matter_field("matter_id", &req.matter_id)?;
+    let sanitized = crate::legal::policy::sanitize_matter_id(&raw_matter_id);
+    if sanitized.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Matter ID is empty after sanitization".to_string(),
+        ));
+    }
+
+    let existing = list_existing_matters_for_create(workspace.list(MATTER_ROOT).await)?;
+    let matter_prefix = format!("{MATTER_ROOT}/{sanitized}");
+    if existing
+        .iter()
+        .any(|entry| entry.is_directory && entry.path == matter_prefix)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("Matter '{}' already exists", sanitized),
+        ));
+    }
+
+    let client = parse_required_matter_field("client", &req.client)?;
+    let confidentiality = parse_required_matter_field("confidentiality", &req.confidentiality)?;
+    let retention = parse_required_matter_field("retention", &req.retention)?;
+    let team = parse_matter_list(req.team);
+    let adversaries = parse_matter_list(req.adversaries);
+
+    let metadata = crate::legal::matter::MatterMetadata {
+        matter_id: sanitized.clone(),
+        client: client.clone(),
+        team: team.clone(),
+        confidentiality: confidentiality.clone(),
+        adversaries: adversaries.clone(),
+        retention: retention.clone(),
+    };
+    let matter_yaml = serde_yml::to_string(&metadata)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let scaffold = vec![
+        (
+            format!("{matter_prefix}/matter.yaml"),
+            format!(
+                "# Matter metadata schema\n# Required: matter_id, client, confidentiality, retention\n{}",
+                matter_yaml
+            ),
+        ),
+        (
+            format!("{matter_prefix}/README.md"),
+            format!(
+                "# Matter {}\n\nClient: {}\n\nThis workspace stores privileged legal work product.\n",
+                sanitized, client
+            ),
+        ),
+        (
+            format!("{matter_prefix}/templates/research_memo.md"),
+            "# Research Memo Template\n\n## Question Presented\n\n## Brief Answer\n\n## Facts (Cited)\n\n## Analysis\n\n## Authorities\n\n## Open Questions\n".to_string(),
+        ),
+        (
+            format!("{matter_prefix}/templates/chronology.md"),
+            "# Chronology\n\n| Date | Event | Source |\n|---|---|---|\n".to_string(),
+        ),
+    ];
+
+    for (path, content) in scaffold {
+        workspace
+            .write(&path, &content)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    let value = serde_json::json!(sanitized);
+    store
+        .set_setting(&state.user_id, MATTER_ACTIVE_SETTING, &value)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateMatterResponse {
+            matter: MatterInfo {
+                id: sanitized.clone(),
+                client: Some(client),
+                confidentiality: Some(confidentiality),
+                team,
+                adversaries,
+                retention: Some(retention),
+            },
+            active_matter_id: sanitized,
+        }),
+    ))
+}
+
 async fn matters_active_get_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<ActiveMatterResponse>, (StatusCode, String)> {
@@ -1335,12 +1515,37 @@ async fn matters_active_set_handler(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
         Some(id) => {
+            let workspace = state.workspace.as_ref().ok_or((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Workspace not available".to_string(),
+            ))?;
             let sanitized = crate::legal::policy::sanitize_matter_id(id);
             if sanitized.is_empty() {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     "Matter ID is empty after sanitization".to_string(),
                 ));
+            }
+            match crate::legal::matter::read_matter_metadata_for_root(
+                workspace.as_ref(),
+                MATTER_ROOT,
+                &sanitized,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(crate::legal::matter::MatterMetadataValidationError::Missing { path }) => {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        format!("Matter '{}' not found (missing '{}')", sanitized, path),
+                    ));
+                }
+                Err(err @ crate::legal::matter::MatterMetadataValidationError::Invalid { .. }) => {
+                    return Err((StatusCode::UNPROCESSABLE_ENTITY, err.to_string()));
+                }
+                Err(err @ crate::legal::matter::MatterMetadataValidationError::Storage { .. }) => {
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+                }
             }
             store
                 .set_setting(
@@ -3079,5 +3284,376 @@ mod tests {
                 pattern
             );
         }
+    }
+
+    #[cfg(feature = "libsql")]
+    fn test_gateway_state_with_store_and_workspace(
+        store: Arc<dyn crate::db::Database>,
+        workspace: Arc<Workspace>,
+    ) -> Arc<GatewayState> {
+        Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: SseManager::new(),
+            workspace: Some(workspace),
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: Some(store),
+            job_manager: None,
+            prompt_queue: None,
+            user_id: "test-user".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: Some(Arc::new(
+                crate::channels::web::ws::WsConnectionTracker::new(),
+            )),
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            chat_rate_limiter: RateLimiter::new(30, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            startup_time: std::time::Instant::now(),
+        })
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_active_set_rejects_missing_matter() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let result = matters_active_set_handler(
+            State(state),
+            Json(SetActiveMatterRequest {
+                matter_id: Some("does-not-exist".to_string()),
+            }),
+        )
+        .await;
+
+        let err = result.expect_err("missing matter should be rejected");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(err.1.contains("not found"));
+        assert!(err.1.contains("matter.yaml"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_active_set_rejects_invalid_metadata() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        workspace
+            .write(
+                "matters/demo/matter.yaml",
+                "matter_id: demo\nclient: Demo Client\n",
+            )
+            .await
+            .expect("seed invalid matter metadata");
+
+        let result = matters_active_set_handler(
+            State(state),
+            Json(SetActiveMatterRequest {
+                matter_id: Some("demo".to_string()),
+            }),
+        )
+        .await;
+
+        let err = result.expect_err("invalid matter metadata should be rejected");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err.1.contains("matter.yaml"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_active_set_accepts_valid_metadata() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        workspace
+            .write(
+                "matters/demo/matter.yaml",
+                "matter_id: demo\nclient: Demo Client\nteam:\n  - Lead Counsel\nconfidentiality: attorney-client-privileged\nadversaries:\n  - Example Co\nretention: follow-firm-policy\n",
+            )
+            .await
+            .expect("seed valid matter metadata");
+
+        let status = matters_active_set_handler(
+            State(Arc::clone(&state)),
+            Json(SetActiveMatterRequest {
+                matter_id: Some("demo".to_string()),
+            }),
+        )
+        .await
+        .expect("valid metadata should succeed");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let stored = state
+            .store
+            .as_ref()
+            .expect("store")
+            .get_setting("test-user", MATTER_ACTIVE_SETTING)
+            .await
+            .expect("read setting");
+        assert_eq!(
+            stored.and_then(|v| v.as_str().map(|s| s.to_string())),
+            Some("demo".to_string())
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn chat_send_includes_active_matter_metadata_when_setting_exists() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let raw_matter = "Acme v. Foo!!!";
+        let expected = crate::legal::policy::sanitize_matter_id(raw_matter);
+        state
+            .store
+            .as_ref()
+            .expect("store")
+            .set_setting(
+                "test-user",
+                MATTER_ACTIVE_SETTING,
+                &serde_json::Value::String(raw_matter.to_string()),
+            )
+            .await
+            .expect("set active matter setting");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        *state.msg_tx.write().await = Some(tx);
+
+        let (status, _resp) = chat_send_handler(
+            State(Arc::clone(&state)),
+            Json(SendMessageRequest {
+                content: "draft a memo".to_string(),
+                thread_id: Some("thread-123".to_string()),
+            }),
+        )
+        .await
+        .expect("chat send should succeed");
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let sent = rx.recv().await.expect("message should be forwarded");
+        assert_eq!(sent.thread_id.as_deref(), Some("thread-123"));
+        assert_eq!(
+            sent.metadata.get("thread_id").and_then(|v| v.as_str()),
+            Some("thread-123")
+        );
+        assert_eq!(
+            sent.metadata.get("active_matter").and_then(|v| v.as_str()),
+            Some(expected.as_str())
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn chat_send_sets_active_matter_metadata_to_null_when_missing() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        *state.msg_tx.write().await = Some(tx);
+
+        let (status, _resp) = chat_send_handler(
+            State(Arc::clone(&state)),
+            Json(SendMessageRequest {
+                content: "hello".to_string(),
+                thread_id: None,
+            }),
+        )
+        .await
+        .expect("chat send should succeed");
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let sent = rx.recv().await.expect("message should be forwarded");
+        assert_eq!(
+            sent.metadata.get("active_matter"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_create_creates_scaffold_and_sets_active() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let (status, Json(response)) = matters_create_handler(
+            State(Arc::clone(&state)),
+            Json(CreateMatterRequest {
+                matter_id: "Acme v. Foo".to_string(),
+                client: "Acme Corp".to_string(),
+                confidentiality: "attorney-client-privileged".to_string(),
+                retention: "follow-firm-policy".to_string(),
+                team: vec!["Lead Counsel".to_string()],
+                adversaries: vec!["Foo LLC".to_string()],
+            }),
+        )
+        .await
+        .expect("create matter should succeed");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(response.active_matter_id, "acme-v--foo");
+        assert_eq!(response.matter.id, "acme-v--foo");
+
+        let metadata = workspace
+            .read("matters/acme-v--foo/matter.yaml")
+            .await
+            .expect("matter.yaml should exist");
+        assert!(metadata.content.contains("matter_id: acme-v--foo"));
+
+        let stored = state
+            .store
+            .as_ref()
+            .expect("store")
+            .get_setting("test-user", MATTER_ACTIVE_SETTING)
+            .await
+            .expect("read setting");
+        assert_eq!(
+            stored.and_then(|v| v.as_str().map(|s| s.to_string())),
+            Some("acme-v--foo".to_string())
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_create_rejects_duplicate() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let _created = matters_create_handler(
+            State(Arc::clone(&state)),
+            Json(CreateMatterRequest {
+                matter_id: "demo".to_string(),
+                client: "Demo".to_string(),
+                confidentiality: "privileged".to_string(),
+                retention: "policy".to_string(),
+                team: vec![],
+                adversaries: vec![],
+            }),
+        )
+        .await
+        .expect("first create should succeed");
+
+        let err = matters_create_handler(
+            State(state),
+            Json(CreateMatterRequest {
+                matter_id: "demo".to_string(),
+                client: "Demo".to_string(),
+                confidentiality: "privileged".to_string(),
+                retention: "policy".to_string(),
+                team: vec![],
+                adversaries: vec![],
+            }),
+        )
+        .await
+        .expect_err("duplicate should fail");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("already exists"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_create_rejects_empty_after_sanitize() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let err = matters_create_handler(
+            State(state),
+            Json(CreateMatterRequest {
+                matter_id: "!!!".to_string(),
+                client: "Demo".to_string(),
+                confidentiality: "privileged".to_string(),
+                retention: "policy".to_string(),
+                team: vec![],
+                adversaries: vec![],
+            }),
+        )
+        .await
+        .expect_err("invalid matter id should fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("empty after sanitization"));
+    }
+
+    #[test]
+    fn list_existing_matters_for_create_returns_500_for_storage_errors() {
+        let err =
+            list_existing_matters_for_create(Err(crate::error::WorkspaceError::SearchFailed {
+                reason: "boom".to_string(),
+            }))
+            .expect_err("search errors should map to 500");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.contains("Search failed"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn memory_write_handler_invalidates_conflict_cache() {
+        crate::legal::matter::reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Alpha Holdings","aliases":["Alpha"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        legal.active_matter = None;
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+
+        let first =
+            crate::legal::matter::detect_conflict(workspace.as_ref(), &legal, "Alpha Holdings")
+                .await;
+        assert_eq!(first.as_deref(), Some("Alpha Holdings"));
+        assert_eq!(
+            crate::legal::matter::conflict_cache_refresh_count_for_tests(),
+            1
+        );
+
+        let write_result = memory_write_handler(
+            State(state),
+            Json(MemoryWriteRequest {
+                path: "conflicts.json".to_string(),
+                content: r#"[{"name":"Beta Partners","aliases":["Beta"]}]"#.to_string(),
+            }),
+        )
+        .await
+        .expect("memory write should succeed");
+        assert_eq!(write_result.path, "conflicts.json");
+
+        let second =
+            crate::legal::matter::detect_conflict(workspace.as_ref(), &legal, "Beta Partners")
+                .await;
+        assert_eq!(second.as_deref(), Some("Beta Partners"));
+        assert_eq!(
+            crate::legal::matter::conflict_cache_refresh_count_for_tests(),
+            2
+        );
     }
 }
