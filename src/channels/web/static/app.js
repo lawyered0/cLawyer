@@ -864,7 +864,6 @@ function switchTab(tab) {
   if (tab === 'skills') loadSkills();
   if (tab === 'matters') loadMatters();
   if (tab === 'settings') loadSettings();
-  if (tab === 'matters') loadMatters();
 }
 
 // --- Memory (filesystem tree) ---
@@ -1007,6 +1006,55 @@ function readMemoryFile(path) {
   }).catch((err) => {
     currentMemoryContent = null;
     document.getElementById('memory-viewer').innerHTML = '<div class="empty">Error: ' + escapeHtml(err.message) + '</div>';
+  });
+}
+
+function openMemoryDirectory(path) {
+  currentMemoryPath = null;
+  currentMemoryContent = null;
+  cancelMemoryEdit();
+  document.getElementById('memory-edit-btn').style.display = 'none';
+  document.getElementById('memory-breadcrumb-path').textContent = 'workspace / ' + path + ' /';
+
+  const viewer = document.getElementById('memory-viewer');
+  viewer.classList.remove('rendered');
+  viewer.innerHTML = '<div class="empty">Loading directory…</div>';
+
+  apiFetch('/api/memory/list?path=' + encodeURIComponent(path)).then((data) => {
+    const entries = (data && data.entries) ? data.entries : [];
+    if (entries.length === 0) {
+      viewer.innerHTML = '<div class="empty">No files found in ' + escapeHtml(path) + '.</div>';
+      return;
+    }
+
+    const container = document.createElement('div');
+    const hint = document.createElement('div');
+    hint.className = 'empty';
+    hint.style.marginBottom = '10px';
+    hint.textContent = 'Select a file to view or edit.';
+    container.appendChild(hint);
+
+    entries.forEach((entry) => {
+      const row = document.createElement('div');
+      row.style.marginBottom = '8px';
+      const btn = document.createElement('button');
+      btn.className = 'btn-ext';
+      btn.textContent = entry.is_dir ? '[dir] ' + entry.name : entry.name;
+      btn.addEventListener('click', () => {
+        if (entry.is_dir) {
+          openMemoryDirectory(entry.path);
+        } else {
+          readMemoryFile(entry.path);
+        }
+      });
+      row.appendChild(btn);
+      container.appendChild(row);
+    });
+
+    viewer.innerHTML = '';
+    viewer.appendChild(container);
+  }).catch((err) => {
+    viewer.innerHTML = '<div class="empty">Error: ' + escapeHtml(err.message) + '</div>';
   });
 }
 
@@ -3265,7 +3313,7 @@ function clearActiveMatter() {
  */
 function viewMatterInMemory(id) {
   switchTab('memory');
-  readMemoryFile('matters/' + id);
+  openMemoryDirectory('matters/' + id);
 }
 
 // Fetch the active matter on startup so the badge appears immediately if set.
