@@ -463,6 +463,27 @@ async fn load_active_matter_for_chat(state: &GatewayState) -> Option<String> {
     }
 }
 
+async fn build_chat_message_metadata(
+    state: &GatewayState,
+    thread_id: Option<&str>,
+) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    if let Some(thread_id) = thread_id {
+        metadata.insert(
+            "thread_id".to_string(),
+            serde_json::Value::String(thread_id.to_string()),
+        );
+    }
+    metadata.insert(
+        "active_matter".to_string(),
+        load_active_matter_for_chat(state)
+            .await
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    serde_json::Value::Object(metadata)
+}
+
 async fn chat_send_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<SendMessageRequest>,
@@ -475,23 +496,12 @@ async fn chat_send_handler(
     }
 
     let mut msg = IncomingMessage::new("gateway", &state.user_id, &req.content);
-    let mut metadata = serde_json::Map::new();
 
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
-        metadata.insert(
-            "thread_id".to_string(),
-            serde_json::Value::String(thread_id.clone()),
-        );
     }
-    metadata.insert(
-        "active_matter".to_string(),
-        load_active_matter_for_chat(state.as_ref())
-            .await
-            .map(serde_json::Value::String)
-            .unwrap_or(serde_json::Value::Null),
-    );
-    msg = msg.with_metadata(serde_json::Value::Object(metadata));
+    msg = msg
+        .with_metadata(build_chat_message_metadata(state.as_ref(), req.thread_id.as_deref()).await);
 
     let msg_id = msg.id;
 
@@ -559,6 +569,8 @@ async fn chat_approval_handler(
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
     }
+    msg = msg
+        .with_metadata(build_chat_message_metadata(state.as_ref(), req.thread_id.as_deref()).await);
 
     let msg_id = msg.id;
 
@@ -1296,7 +1308,7 @@ async fn matters_list_handler(
     // List top-level entries under the matter root. Treat a missing
     // directory as an empty list rather than an error — the matters/ dir
     // is seeded lazily on first use.
-    let entries = workspace.list(MATTER_ROOT).await.unwrap_or_default();
+    let entries = list_matters_root_entries(workspace.list(MATTER_ROOT).await)?;
 
     let mut matters: Vec<MatterInfo> = Vec::new();
     for entry in entries {
@@ -1360,7 +1372,7 @@ fn parse_matter_list(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn list_existing_matters_for_create(
+fn list_matters_root_entries(
     result: Result<Vec<crate::workspace::WorkspaceEntry>, crate::error::WorkspaceError>,
 ) -> Result<Vec<crate::workspace::WorkspaceEntry>, (StatusCode, String)> {
     match result {
@@ -1392,7 +1404,7 @@ async fn matters_create_handler(
         ));
     }
 
-    let existing = list_existing_matters_for_create(workspace.list(MATTER_ROOT).await)?;
+    let existing = list_matters_root_entries(workspace.list(MATTER_ROOT).await)?;
     let matter_prefix = format!("{MATTER_ROOT}/{sanitized}");
     if existing
         .iter()
@@ -3485,6 +3497,70 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn chat_approval_includes_active_matter_metadata_when_setting_exists() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let raw_matter = "Acme v. Foo!!!";
+        let expected = crate::legal::policy::sanitize_matter_id(raw_matter);
+        state
+            .store
+            .as_ref()
+            .expect("store")
+            .set_setting(
+                "test-user",
+                MATTER_ACTIVE_SETTING,
+                &serde_json::Value::String(raw_matter.to_string()),
+            )
+            .await
+            .expect("set active matter setting");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        *state.msg_tx.write().await = Some(tx);
+
+        let request_id = Uuid::new_v4();
+        let (status, _resp) = chat_approval_handler(
+            State(Arc::clone(&state)),
+            Json(ApprovalRequest {
+                request_id: request_id.to_string(),
+                action: "approve".to_string(),
+                thread_id: Some("thread-approval".to_string()),
+            }),
+        )
+        .await
+        .expect("approval send should succeed");
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let sent = rx.recv().await.expect("message should be forwarded");
+        assert_eq!(sent.thread_id.as_deref(), Some("thread-approval"));
+        assert_eq!(
+            sent.metadata.get("thread_id").and_then(|v| v.as_str()),
+            Some("thread-approval")
+        );
+        assert_eq!(
+            sent.metadata.get("active_matter").and_then(|v| v.as_str()),
+            Some(expected.as_str())
+        );
+
+        let submission: crate::agent::submission::Submission =
+            serde_json::from_str(&sent.content).expect("approval payload should parse");
+        match submission {
+            crate::agent::submission::Submission::ExecApproval {
+                request_id: parsed_id,
+                approved,
+                always,
+            } => {
+                assert_eq!(parsed_id, request_id);
+                assert!(approved);
+                assert!(!always);
+            }
+            other => panic!("expected ExecApproval payload, got {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     async fn matters_create_creates_scaffold_and_sets_active() {
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
@@ -3594,14 +3670,24 @@ mod tests {
     }
 
     #[test]
-    fn list_existing_matters_for_create_returns_500_for_storage_errors() {
-        let err =
-            list_existing_matters_for_create(Err(crate::error::WorkspaceError::SearchFailed {
-                reason: "boom".to_string(),
-            }))
-            .expect_err("search errors should map to 500");
+    fn list_matters_root_entries_returns_500_for_storage_errors() {
+        let err = list_matters_root_entries(Err(crate::error::WorkspaceError::SearchFailed {
+            reason: "boom".to_string(),
+        }))
+        .expect_err("search errors should map to 500");
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.1.contains("Search failed"));
+    }
+
+    #[test]
+    fn list_matters_root_entries_allows_document_not_found_as_empty() {
+        let entries =
+            list_matters_root_entries(Err(crate::error::WorkspaceError::DocumentNotFound {
+                doc_type: MATTER_ROOT.to_string(),
+                user_id: "test-user".to_string(),
+            }))
+            .expect("missing matter root should be treated as empty");
+        assert!(entries.is_empty());
     }
 
     #[cfg(feature = "libsql")]
