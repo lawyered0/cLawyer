@@ -359,6 +359,10 @@ impl Tool for MemoryWriteTool {
             }
         };
 
+        if crate::legal::matter::is_workspace_conflicts_path(&path) {
+            crate::legal::matter::invalidate_conflict_cache();
+        }
+
         let output = serde_json::json!({
             "status": "written",
             "path": path,
@@ -680,5 +684,65 @@ mod tests {
         assert!(schema["properties"]["path"].is_object());
         assert!(schema["properties"]["depth"].is_object());
         assert_eq!(schema["properties"]["depth"]["default"], 1);
+    }
+}
+
+#[cfg(all(test, feature = "libsql"))]
+mod libsql_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::config::LegalConfig;
+    use crate::context::JobContext;
+    use crate::legal::matter::{
+        conflict_cache_refresh_count_for_tests, detect_conflict, reset_conflict_cache_for_tests,
+    };
+    use crate::settings::Settings;
+    use crate::tools::Tool;
+
+    #[tokio::test]
+    async fn memory_write_conflicts_json_invalidates_conflict_cache() {
+        reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Alpha Corp","aliases":["Alpha"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.active_matter = None;
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+
+        let first = detect_conflict(workspace.as_ref(), &legal, "Issue with Alpha Corp").await;
+        assert_eq!(first.as_deref(), Some("Alpha Corp"));
+        assert_eq!(conflict_cache_refresh_count_for_tests(), 1);
+
+        let tool = MemoryWriteTool::new(Arc::clone(&workspace));
+        let ctx = JobContext::with_user("test-user", "test", "cache invalidation");
+        tool.execute(
+            serde_json::json!({
+                "content": "[{\"name\":\"Beta LLC\",\"aliases\":[\"Beta\"]}]",
+                "target": "./conflicts.json",
+                "append": false
+            }),
+            &ctx,
+        )
+        .await
+        .expect("memory write should succeed");
+
+        let second = detect_conflict(workspace.as_ref(), &legal, "Escalate Beta LLC").await;
+        assert_eq!(second.as_deref(), Some("Beta LLC"));
+        assert_eq!(
+            conflict_cache_refresh_count_for_tests(),
+            2,
+            "writing conflicts.json via memory_write should invalidate and refresh cache"
+        );
     }
 }

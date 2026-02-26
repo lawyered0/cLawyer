@@ -1114,6 +1114,10 @@ async fn memory_write_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    if crate::legal::matter::is_workspace_conflicts_path(&req.path) {
+        crate::legal::matter::invalidate_conflict_cache();
+    }
+
     Ok(Json(MemoryWriteResponse {
         path: req.path,
         status: "written",
@@ -3224,6 +3228,59 @@ mod tests {
         assert_eq!(
             stored.and_then(|v| v.as_str().map(|s| s.to_string())),
             Some("demo".to_string())
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn memory_write_handler_invalidates_conflict_cache() {
+        crate::legal::matter::reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Alpha Holdings","aliases":["Alpha"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        legal.active_matter = None;
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+
+        let first =
+            crate::legal::matter::detect_conflict(workspace.as_ref(), &legal, "Alpha Holdings")
+                .await;
+        assert_eq!(first.as_deref(), Some("Alpha Holdings"));
+        assert_eq!(
+            crate::legal::matter::conflict_cache_refresh_count_for_tests(),
+            1
+        );
+
+        let write_result = memory_write_handler(
+            State(state),
+            Json(MemoryWriteRequest {
+                path: "conflicts.json".to_string(),
+                content: r#"[{"name":"Beta Partners","aliases":["Beta"]}]"#.to_string(),
+            }),
+        )
+        .await
+        .expect("memory write should succeed");
+        assert_eq!(write_result.path, "conflicts.json");
+
+        let second =
+            crate::legal::matter::detect_conflict(workspace.as_ref(), &legal, "Beta Partners")
+                .await;
+        assert_eq!(second.as_deref(), Some("Beta Partners"));
+        assert_eq!(
+            crate::legal::matter::conflict_cache_refresh_count_for_tests(),
+            2
         );
     }
 }

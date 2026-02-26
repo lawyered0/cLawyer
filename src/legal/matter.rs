@@ -1,4 +1,7 @@
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -6,6 +9,29 @@ use crate::config::LegalConfig;
 use crate::error::WorkspaceError;
 use crate::legal::policy::sanitize_matter_id;
 use crate::workspace::Workspace;
+
+const CONFLICT_CACHE_REFRESH_WINDOW: Duration = Duration::from_secs(30);
+const MIN_ALIAS_SINGLE_TOKEN_LEN: usize = 4;
+
+#[derive(Debug, Clone)]
+struct ConflictEntry {
+    canonical_name: String,
+    terms: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct ConflictCacheState {
+    entries: Vec<ConflictEntry>,
+    generation: u64,
+    refreshed_at: Option<Instant>,
+    ready: bool,
+}
+
+static CONFLICT_CACHE: LazyLock<Mutex<ConflictCacheState>> =
+    LazyLock::new(|| Mutex::new(ConflictCacheState::default()));
+static CONFLICT_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+static CONFLICT_CACHE_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatterMetadata {
@@ -291,7 +317,199 @@ pub async fn seed_legal_workspace(
     Ok(())
 }
 
-/// Check conflicts.json for obvious conflict hits in message or active matter.
+/// Invalidate the cached conflicts.json parse result.
+pub fn invalidate_conflict_cache() {
+    CONFLICT_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// True when the path resolves to the workspace-global `conflicts.json`.
+pub fn is_workspace_conflicts_path(path: &str) -> bool {
+    normalize_workspace_path(path) == "conflicts.json"
+}
+
+fn normalize_workspace_path(path: &str) -> String {
+    let replaced = path.trim().replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for component in replaced.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        parts.push(component);
+    }
+    parts.join("/")
+}
+
+fn normalize_conflict_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_was_sep = true;
+
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push(' ');
+            last_was_sep = true;
+        }
+    }
+
+    out.trim().to_string()
+}
+
+fn alias_is_matchable(alias: &str) -> bool {
+    let mut token_count = 0usize;
+    let mut first_token_len = 0usize;
+    for token in alias.split_whitespace() {
+        if token.is_empty() {
+            continue;
+        }
+        token_count += 1;
+        if token_count == 1 {
+            first_token_len = token.len();
+        }
+    }
+
+    if token_count == 0 {
+        return false;
+    }
+
+    if token_count > 1 {
+        return true;
+    }
+
+    first_token_len >= MIN_ALIAS_SINGLE_TOKEN_LEN || alias.chars().any(|c| c.is_ascii_digit())
+}
+
+fn parse_conflict_entries(raw: &str) -> Option<Vec<ConflictEntry>> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let entries = value.as_array()?;
+
+    let mut parsed = Vec::new();
+    for entry in entries {
+        let canonical_name = entry
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim();
+        if canonical_name.is_empty() {
+            continue;
+        }
+
+        let normalized_name = normalize_conflict_text(canonical_name);
+        if normalized_name.is_empty() {
+            continue;
+        }
+
+        let mut terms = vec![normalized_name.clone()];
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(normalized_name);
+
+        if let Some(aliases) = entry.get("aliases").and_then(|v| v.as_array()) {
+            for alias in aliases.iter().filter_map(|v| v.as_str()) {
+                let normalized_alias = normalize_conflict_text(alias);
+                if normalized_alias.is_empty()
+                    || !alias_is_matchable(&normalized_alias)
+                    || !seen.insert(normalized_alias.clone())
+                {
+                    continue;
+                }
+                terms.push(normalized_alias);
+            }
+        }
+
+        parsed.push(ConflictEntry {
+            canonical_name: canonical_name.to_string(),
+            terms,
+        });
+    }
+
+    Some(parsed)
+}
+
+fn contains_term_with_boundaries(haystack: &str, term: &str) -> bool {
+    if term.is_empty() {
+        return false;
+    }
+
+    let mut offset = 0usize;
+    while let Some(rel_pos) = haystack[offset..].find(term) {
+        let start = offset + rel_pos;
+        let end = start + term.len();
+        let before_ok = start == 0 || haystack.as_bytes()[start - 1] == b' ';
+        let after_ok = end == haystack.len() || haystack.as_bytes()[end] == b' ';
+        if before_ok && after_ok {
+            return true;
+        }
+        offset = start + 1;
+    }
+
+    false
+}
+
+fn detect_conflict_in_entries(
+    entries: &[ConflictEntry],
+    message: &str,
+    active_matter: Option<&str>,
+) -> Option<String> {
+    let normalized_message = normalize_conflict_text(message);
+    let normalized_active_matter = active_matter
+        .map(normalize_conflict_text)
+        .unwrap_or_default();
+
+    for entry in entries {
+        for term in &entry.terms {
+            if contains_term_with_boundaries(&normalized_message, term)
+                || contains_term_with_boundaries(&normalized_active_matter, term)
+            {
+                return Some(entry.canonical_name.clone());
+            }
+        }
+    }
+
+    None
+}
+
+fn cache_snapshot() -> Option<(Vec<ConflictEntry>, bool)> {
+    let generation = CONFLICT_CACHE_GENERATION.load(Ordering::Relaxed);
+    let cache = CONFLICT_CACHE.lock().ok()?;
+    if !cache.ready {
+        return None;
+    }
+
+    let within_window = cache
+        .refreshed_at
+        .is_some_and(|t| t.elapsed() <= CONFLICT_CACHE_REFRESH_WINDOW);
+    let stale = cache.generation != generation || !within_window;
+    Some((cache.entries.clone(), stale))
+}
+
+fn store_conflict_cache(entries: Vec<ConflictEntry>) {
+    let generation = CONFLICT_CACHE_GENERATION.load(Ordering::Relaxed);
+    if let Ok(mut cache) = CONFLICT_CACHE.lock() {
+        cache.entries = entries;
+        cache.generation = generation;
+        cache.refreshed_at = Some(Instant::now());
+        cache.ready = true;
+    }
+    #[cfg(test)]
+    {
+        CONFLICT_CACHE_REFRESH_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn mark_conflict_cache_refresh_failure() {
+    let generation = CONFLICT_CACHE_GENERATION.load(Ordering::Relaxed);
+    if let Ok(mut cache) = CONFLICT_CACHE.lock()
+        && cache.ready
+    {
+        // Keep the stale snapshot for a bounded fallback window so temporary
+        // read/parse failures do not cause repeated filesystem churn.
+        cache.generation = generation;
+        cache.refreshed_at = Some(Instant::now());
+    }
+}
+
+/// Check conflicts.json for conflict hits in message or active matter.
 pub async fn detect_conflict(
     workspace: &Workspace,
     config: &LegalConfig,
@@ -301,53 +519,50 @@ pub async fn detect_conflict(
         return None;
     }
 
-    let doc = workspace.read("conflicts.json").await.ok()?;
-    let value: serde_json::Value = serde_json::from_str(&doc.content).ok()?;
-    let entries = value.as_array()?;
+    let active_matter = config.active_matter.as_deref();
 
-    let message_lc = message.to_ascii_lowercase();
-    let active_matter_lc = config
-        .active_matter
-        .as_ref()
-        .map(|m| m.to_ascii_lowercase())
-        .unwrap_or_default();
+    if let Some((entries, stale)) = cache_snapshot()
+        && !stale
+    {
+        return detect_conflict_in_entries(&entries, message, active_matter);
+    }
 
-    for entry in entries {
-        let name = entry
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let aliases: Vec<String> = entry
-            .get("aliases")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_ascii_lowercase())
-                    .collect()
-            })
-            .unwrap_or_default();
+    if let Some(doc) = workspace.read("conflicts.json").await.ok()
+        && let Some(parsed) = parse_conflict_entries(&doc.content)
+    {
+        store_conflict_cache(parsed.clone());
+        return detect_conflict_in_entries(&parsed, message, active_matter);
+    }
 
-        let name_lc = name.to_ascii_lowercase();
-        if !name_lc.is_empty()
-            && (message_lc.contains(&name_lc) || active_matter_lc.contains(&name_lc))
-        {
-            return Some(name.to_string());
-        }
-
-        for alias in aliases {
-            if message_lc.contains(&alias) || active_matter_lc.contains(&alias) {
-                return Some(name.to_string());
-            }
-        }
+    mark_conflict_cache_refresh_failure();
+    if let Some((entries, _)) = cache_snapshot() {
+        return detect_conflict_in_entries(&entries, message, active_matter);
     }
 
     None
 }
 
 #[cfg(test)]
+pub(crate) fn reset_conflict_cache_for_tests() {
+    CONFLICT_CACHE_GENERATION.store(1, Ordering::Relaxed);
+    CONFLICT_CACHE_REFRESH_COUNT.store(0, Ordering::Relaxed);
+    if let Ok(mut cache) = CONFLICT_CACHE.lock() {
+        *cache = ConflictCacheState::default();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn conflict_cache_refresh_count_for_tests() -> u64 {
+    CONFLICT_CACHE_REFRESH_COUNT.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
 mod tests {
-    use super::{MatterMetadata, matter_metadata_path_for_root};
+    use super::{
+        MatterMetadata, alias_is_matchable, contains_term_with_boundaries,
+        is_workspace_conflicts_path, matter_metadata_path_for_root, normalize_conflict_text,
+        parse_conflict_entries,
+    };
 
     #[test]
     fn matter_metadata_requires_core_fields() {
@@ -377,6 +592,117 @@ mod tests {
         assert_eq!(
             matter_metadata_path_for_root("matters", "Acme v. Foo"),
             "matters/acme-v--foo/matter.yaml"
+        );
+    }
+
+    #[test]
+    fn conflict_path_normalization_handles_variants() {
+        assert!(is_workspace_conflicts_path("conflicts.json"));
+        assert!(is_workspace_conflicts_path("./conflicts.json"));
+        assert!(is_workspace_conflicts_path("///./conflicts.json///"));
+        assert!(!is_workspace_conflicts_path("matters/demo/conflicts.json"));
+    }
+
+    #[test]
+    fn conflict_match_normalization_and_boundaries_work() {
+        let haystack = normalize_conflict_text("Counsel discussed Example-Co, Inc. today.");
+        assert!(contains_term_with_boundaries(
+            &haystack,
+            &normalize_conflict_text("example co inc")
+        ));
+        assert!(!contains_term_with_boundaries(
+            &haystack,
+            &normalize_conflict_text("ample")
+        ));
+    }
+
+    #[test]
+    fn short_alias_guardrails_skip_noisy_single_token_aliases() {
+        assert!(!alias_is_matchable("ab"));
+        assert!(!alias_is_matchable("xyz"));
+        assert!(alias_is_matchable("acme"));
+        assert!(alias_is_matchable("acme co"));
+    }
+
+    #[test]
+    fn parse_conflicts_applies_alias_guardrails() {
+        let parsed = parse_conflict_entries(
+            r#"[{"name":"Example Adverse Party","aliases":["EA","Example Co","x1"]}]"#,
+        )
+        .expect("valid conflicts json");
+
+        assert_eq!(parsed.len(), 1);
+        let terms = &parsed[0].terms;
+        assert!(terms.iter().any(|t| t == "example adverse party"));
+        assert!(terms.iter().any(|t| t == "example co"));
+        assert!(!terms.iter().any(|t| t == "ea"));
+    }
+}
+
+#[cfg(all(test, feature = "libsql"))]
+mod cache_tests {
+    use std::sync::Arc;
+
+    use super::{
+        conflict_cache_refresh_count_for_tests, detect_conflict, invalidate_conflict_cache,
+        reset_conflict_cache_for_tests,
+    };
+    use crate::config::LegalConfig;
+    use crate::settings::Settings;
+    use crate::workspace::Workspace;
+
+    #[tokio::test]
+    async fn detect_conflict_uses_cache_until_invalidated() {
+        reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Example Co","aliases":["Example Company","ExCo"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.active_matter = None;
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+
+        let first = detect_conflict(workspace.as_ref(), &legal, "Representing Example Co").await;
+        assert_eq!(first.as_deref(), Some("Example Co"));
+        assert_eq!(
+            conflict_cache_refresh_count_for_tests(),
+            1,
+            "first lookup should parse conflicts.json once"
+        );
+
+        let second =
+            detect_conflict(workspace.as_ref(), &legal, "Example Company is mentioned").await;
+        assert_eq!(second.as_deref(), Some("Example Co"));
+        assert_eq!(
+            conflict_cache_refresh_count_for_tests(),
+            1,
+            "second lookup should reuse cached conflicts parse"
+        );
+
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Beta Corp","aliases":["Beta"]}]"#,
+            )
+            .await
+            .expect("update conflicts");
+        invalidate_conflict_cache();
+
+        let third = detect_conflict(workspace.as_ref(), &legal, "New issue with Beta Corp").await;
+        assert_eq!(third.as_deref(), Some("Beta Corp"));
+        assert_eq!(
+            conflict_cache_refresh_count_for_tests(),
+            2,
+            "cache invalidation should force a refresh on next lookup"
         );
     }
 }

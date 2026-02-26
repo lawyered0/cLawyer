@@ -48,6 +48,11 @@ Required metadata fields:
 
 If metadata is missing or invalid, legal task execution is blocked with guidance.
 
+## Conflict Check Limits
+
+- Conflict detection currently reads the workspace-global `conflicts.json` (not a per-matter conflict graph).
+- Matching is normalized and boundary-aware, but still heuristic; short aliases are intentionally ignored to reduce false positives.
+
 ## Bundled Legal Skills
 
 Trusted bundled skills:
