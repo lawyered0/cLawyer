@@ -3,6 +3,7 @@
 //! Handles all API routes: chat, memory, jobs, health, and static file serving.
 
 use std::convert::Infallible;
+use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +19,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
@@ -158,6 +160,8 @@ pub struct GatewayState {
     pub cost_guard: Option<Arc<crate::agent::cost_guard::CostGuard>>,
     /// Server startup time for uptime calculation.
     pub startup_time: std::time::Instant,
+    /// Legal config for legal-policy-aware web endpoints.
+    pub legal_config: Option<crate::config::LegalConfig>,
 }
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
@@ -219,6 +223,11 @@ pub async fn start_server(
             "/api/matters/active",
             get(matters_active_get_handler).post(matters_active_set_handler),
         )
+        .route(
+            "/api/matters/conflicts/check",
+            post(matters_conflicts_check_handler),
+        )
+        .route("/api/legal/audit", get(legal_audit_list_handler))
         // Jobs
         .route("/api/jobs", get(jobs_list_handler))
         .route("/api/jobs/summary", get(jobs_summary_handler))
@@ -1296,6 +1305,56 @@ async fn memory_upload_handler(
 const MATTER_ROOT: &str = "matters";
 /// Settings key used to persist the active matter ID.
 const MATTER_ACTIVE_SETTING: &str = "legal.active_matter";
+/// Maximum number of audit log lines scanned per request.
+const MAX_AUDIT_SCAN_LINES: usize = 10_000;
+
+fn legal_config_for_gateway(state: &GatewayState) -> crate::config::LegalConfig {
+    state.legal_config.clone().unwrap_or_else(|| {
+        crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve")
+    })
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LegalAuditQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    event_type: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegalAuditEventLine {
+    ts: String,
+    event_type: String,
+    details: serde_json::Value,
+    metrics: serde_json::Value,
+    #[serde(default)]
+    prev_hash: Option<String>,
+    #[serde(default)]
+    hash: Option<String>,
+}
+
+fn parse_utc_query_ts(
+    field_name: &str,
+    raw: Option<&str>,
+) -> Result<Option<DateTime<Utc>>, (StatusCode, String)> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let parsed = DateTime::parse_from_rfc3339(trimmed).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("'{}' must be a valid RFC3339 timestamp", field_name),
+        )
+    })?;
+    Ok(Some(parsed.with_timezone(&Utc)))
+}
 
 async fn matters_list_handler(
     State(state): State<Arc<GatewayState>>,
@@ -1571,6 +1630,203 @@ async fn matters_active_set_handler(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn matters_conflicts_check_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<MatterConflictCheckRequest>,
+) -> Result<Json<MatterConflictCheckResponse>, (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+
+    let text = req.text.trim();
+    if text.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'text' must not be empty".to_string(),
+        ));
+    }
+
+    let mut legal = legal_config_for_gateway(state.as_ref());
+    if !legal.enabled || !legal.conflict_check_enabled {
+        return Err((
+            StatusCode::CONFLICT,
+            "Conflict check is disabled by legal policy".to_string(),
+        ));
+    }
+
+    let effective_matter_id = if let Some(override_id) = req.matter_id {
+        let trimmed = override_id.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            let sanitized = crate::legal::policy::sanitize_matter_id(trimmed);
+            if sanitized.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "'matter_id' is empty after sanitization".to_string(),
+                ));
+            }
+            Some(sanitized)
+        }
+    } else {
+        load_active_matter_for_chat(state.as_ref()).await
+    };
+
+    legal.active_matter = effective_matter_id.clone();
+
+    match workspace.read("conflicts.json").await {
+        Ok(_) | Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => {}
+        Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    }
+
+    let conflict = crate::legal::matter::detect_conflict(workspace.as_ref(), &legal, text).await;
+    Ok(Json(MatterConflictCheckResponse {
+        matched: conflict.is_some(),
+        conflict,
+        matter_id: effective_matter_id,
+    }))
+}
+
+async fn legal_audit_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(query): Query<LegalAuditQuery>,
+) -> Result<Json<LegalAuditListResponse>, (StatusCode, String)> {
+    let legal = legal_config_for_gateway(state.as_ref());
+    if !legal.audit.enabled {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Legal audit logging is disabled".to_string(),
+        ));
+    }
+
+    let limit = query.limit.unwrap_or(50);
+    if limit == 0 || limit > 200 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'limit' must be between 1 and 200".to_string(),
+        ));
+    }
+    let offset = query.offset.unwrap_or(0);
+    let event_type_filter = query.event_type.as_ref().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    let from_ts = parse_utc_query_ts("from", query.from.as_deref())?;
+    let to_ts = parse_utc_query_ts("to", query.to.as_deref())?;
+
+    if let (Some(from), Some(to)) = (from_ts, to_ts)
+        && from > to
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'from' must be earlier than or equal to 'to'".to_string(),
+        ));
+    }
+
+    let path = &legal.audit.path;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Json(LegalAuditListResponse {
+                events: Vec::new(),
+                total: 0,
+                next_offset: None,
+                parse_errors: 0,
+                truncated: false,
+            }));
+        }
+        Err(err) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to open legal audit log {:?}: {}", path, err),
+            ));
+        }
+    };
+
+    let mut parse_errors = 0usize;
+    let mut truncated = false;
+    let mut filtered: Vec<LegalAuditEventInfo> = Vec::new();
+
+    for (idx, line_res) in BufReader::new(file).lines().enumerate() {
+        if idx >= MAX_AUDIT_SCAN_LINES {
+            truncated = true;
+            break;
+        }
+        let line_no = idx + 1;
+        let line = line_res.map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read legal audit log {:?}: {}", path, err),
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let parsed: LegalAuditEventLine = match serde_json::from_str(&line) {
+            Ok(event) => event,
+            Err(_) => {
+                parse_errors += 1;
+                continue;
+            }
+        };
+        let ts = match DateTime::parse_from_rfc3339(&parsed.ts) {
+            Ok(ts) => ts.with_timezone(&Utc),
+            Err(_) => {
+                parse_errors += 1;
+                continue;
+            }
+        };
+
+        if let Some(ref wanted) = event_type_filter
+            && &parsed.event_type != wanted
+        {
+            continue;
+        }
+        if let Some(from) = from_ts
+            && ts < from
+        {
+            continue;
+        }
+        if let Some(to) = to_ts
+            && ts > to
+        {
+            continue;
+        }
+
+        filtered.push(LegalAuditEventInfo {
+            line_no,
+            ts: parsed.ts,
+            event_type: parsed.event_type,
+            details: parsed.details,
+            metrics: parsed.metrics,
+            prev_hash: parsed.prev_hash,
+            hash: parsed.hash,
+        });
+    }
+
+    let total = filtered.len();
+    let events: Vec<LegalAuditEventInfo> = filtered.into_iter().skip(offset).take(limit).collect();
+    let next_offset = if offset + events.len() < total {
+        Some(offset + events.len())
+    } else {
+        None
+    };
+
+    Ok(Json(LegalAuditListResponse {
+        events,
+        total,
+        next_offset,
+        parse_errors,
+        truncated,
+    }))
 }
 
 // --- Jobs handlers ---
@@ -3163,6 +3419,9 @@ struct GatewayStatusResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io::Write;
+
     use super::*;
     use regex::Regex;
 
@@ -3299,9 +3558,16 @@ mod tests {
     }
 
     #[cfg(feature = "libsql")]
-    fn test_gateway_state_with_store_and_workspace(
+    fn test_legal_config() -> crate::config::LegalConfig {
+        crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve")
+    }
+
+    #[cfg(feature = "libsql")]
+    fn test_gateway_state_with_store_workspace_and_legal(
         store: Arc<dyn crate::db::Database>,
         workspace: Arc<Workspace>,
+        legal_config: crate::config::LegalConfig,
     ) -> Arc<GatewayState> {
         Arc::new(GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
@@ -3327,7 +3593,16 @@ mod tests {
             registry_entries: Vec::new(),
             cost_guard: None,
             startup_time: std::time::Instant::now(),
+            legal_config: Some(legal_config),
         })
+    }
+
+    #[cfg(feature = "libsql")]
+    fn test_gateway_state_with_store_and_workspace(
+        store: Arc<dyn crate::db::Database>,
+        workspace: Arc<Workspace>,
+    ) -> Arc<GatewayState> {
+        test_gateway_state_with_store_workspace_and_legal(store, workspace, test_legal_config())
     }
 
     #[cfg(feature = "libsql")]
@@ -3667,6 +3942,195 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("empty after sanitization"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conflicts_check_returns_hit_for_matching_entry() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Alpha Holdings","aliases":["Alpha"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let Json(resp) = matters_conflicts_check_handler(
+            State(state),
+            Json(MatterConflictCheckRequest {
+                text: "Draft strategy for Alpha Holdings".to_string(),
+                matter_id: None,
+            }),
+        )
+        .await
+        .expect("conflicts check should succeed");
+
+        assert!(resp.matched);
+        assert_eq!(resp.conflict.as_deref(), Some("Alpha Holdings"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conflicts_check_rejects_empty_text() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let err = matters_conflicts_check_handler(
+            State(state),
+            Json(MatterConflictCheckRequest {
+                text: "   ".to_string(),
+                matter_id: None,
+            }),
+        )
+        .await
+        .expect_err("empty text should fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("must not be empty"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conflicts_check_respects_disabled_config() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let mut legal = test_legal_config();
+        legal.conflict_check_enabled = false;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let err = matters_conflicts_check_handler(
+            State(state),
+            Json(MatterConflictCheckRequest {
+                text: "Alpha".to_string(),
+                matter_id: None,
+            }),
+        )
+        .await
+        .expect_err("disabled conflict check should fail");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("disabled"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn legal_audit_list_returns_empty_when_missing() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut legal = test_legal_config();
+        legal.audit.enabled = true;
+        legal.audit.path = dir.path().join("missing-audit.jsonl");
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let Json(resp) = legal_audit_list_handler(State(state), Query(LegalAuditQuery::default()))
+            .await
+            .expect("missing file should not error");
+
+        assert!(resp.events.is_empty());
+        assert_eq!(resp.total, 0);
+        assert_eq!(resp.next_offset, None);
+        assert_eq!(resp.parse_errors, 0);
+        assert!(!resp.truncated);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn legal_audit_list_supports_filters_and_paging() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+
+        let mut file = fs::File::create(&path).expect("create audit file");
+        writeln!(
+            file,
+            r#"{{"ts":"2026-01-01T00:00:00Z","event_type":"prompt_received","details":{{}},"metrics":{{}}}}"#
+        )
+        .expect("write line");
+        writeln!(
+            file,
+            r#"{{"ts":"2026-01-02T00:00:00Z","event_type":"approval_required","details":{{"id":1}},"metrics":{{"approval_required":1}}}}"#
+        )
+        .expect("write line");
+        writeln!(
+            file,
+            r#"{{"ts":"2026-01-03T00:00:00Z","event_type":"approval_required","details":{{"id":2}},"metrics":{{"approval_required":2}}}}"#
+        )
+        .expect("write line");
+        writeln!(
+            file,
+            r#"{{"ts":"2026-01-04T00:00:00Z","event_type":"approval_required","details":{{"id":3}},"metrics":{{"approval_required":3}}}}"#
+        )
+        .expect("write line");
+
+        let mut legal = test_legal_config();
+        legal.audit.enabled = true;
+        legal.audit.path = path;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let Json(resp) = legal_audit_list_handler(
+            State(state),
+            Query(LegalAuditQuery {
+                limit: Some(1),
+                offset: Some(0),
+                event_type: Some("approval_required".to_string()),
+                from: Some("2026-01-02T00:00:00Z".to_string()),
+                to: Some("2026-01-03T23:59:59Z".to_string()),
+            }),
+        )
+        .await
+        .expect("audit list should succeed");
+
+        assert_eq!(resp.total, 2);
+        assert_eq!(resp.events.len(), 1);
+        assert_eq!(resp.next_offset, Some(1));
+        assert_eq!(resp.events[0].line_no, 2);
+        assert_eq!(resp.events[0].event_type, "approval_required");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn legal_audit_list_tracks_parse_errors() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+
+        let mut file = fs::File::create(&path).expect("create audit file");
+        writeln!(
+            file,
+            r#"{{"ts":"2026-01-01T00:00:00Z","event_type":"prompt_received","details":{{}},"metrics":{{}}}}"#
+        )
+        .expect("write valid line");
+        writeln!(file, "not-json").expect("write invalid json line");
+        writeln!(
+            file,
+            r#"{{"ts":"not-a-timestamp","event_type":"prompt_received","details":{{}},"metrics":{{}}}}"#
+        )
+        .expect("write invalid ts line");
+
+        let mut legal = test_legal_config();
+        legal.audit.enabled = true;
+        legal.audit.path = path;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let Json(resp) = legal_audit_list_handler(State(state), Query(LegalAuditQuery::default()))
+            .await
+            .expect("audit list should succeed");
+
+        assert_eq!(resp.total, 1);
+        assert_eq!(resp.events.len(), 1);
+        assert_eq!(resp.parse_errors, 2);
     }
 
     #[test]
