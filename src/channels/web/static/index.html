@@ -168,6 +168,27 @@
           <button id="logs-clear-btn" type="button">Clear</button>
         </div>
         <div class="logs-output" id="logs-output"></div>
+        <div class="logs-audit-panel">
+          <div class="logs-audit-title-row">
+            <h4>Legal Audit</h4>
+            <button id="legal-audit-refresh-btn" type="button">Refresh</button>
+          </div>
+          <div class="logs-audit-filters">
+            <input type="text" id="legal-audit-event-type" placeholder="Event type (optional)">
+            <input type="datetime-local" id="legal-audit-from">
+            <input type="datetime-local" id="legal-audit-to">
+            <input type="number" id="legal-audit-limit" min="1" max="200" value="50" title="Rows per page">
+          </div>
+          <div class="logs-audit-pagination">
+            <button id="legal-audit-prev-btn" type="button">Previous</button>
+            <button id="legal-audit-next-btn" type="button">Next</button>
+            <span id="legal-audit-page-meta"></span>
+          </div>
+          <div class="logs-audit-list" id="legal-audit-list">
+            <div class="empty-state">Select Logs tab to load legal audit events.</div>
+          </div>
+          <pre class="logs-audit-detail" id="legal-audit-detail"></pre>
+        </div>
       </div>
     </div>
 
@@ -334,8 +355,30 @@
           <span id="matters-active-name" class="matters-active-name">None</span>
           <button class="matters-clear-btn" id="matters-clear-btn" style="display:none" type="button">Clear</button>
         </div>
-        <div class="matters-list" id="matters-list">
-          <div class="empty-state">Loading matters…</div>
+        <div class="matters-toolbar">
+          <label class="matters-group-toggle">
+            <input id="matters-group-by-client" type="checkbox">
+            Group by client
+          </label>
+        </div>
+        <div class="matters-conflict-panel">
+          <h4>Conflict Check</h4>
+          <form id="matters-conflict-form" autocomplete="off">
+            <textarea id="matters-conflict-text" rows="3" placeholder="Paste matter facts, party names, or text to check against conflicts.json"></textarea>
+            <div class="matters-conflict-actions">
+              <select id="matters-conflict-matter"></select>
+              <button id="matters-conflict-btn" type="submit">Check Conflict</button>
+            </div>
+          </form>
+          <div id="matters-conflict-result" class="matters-conflict-result"></div>
+        </div>
+        <div class="matters-content">
+          <div class="matters-list" id="matters-list">
+            <div class="empty-state">Loading matters…</div>
+          </div>
+          <aside class="matter-detail-panel" id="matter-detail-panel">
+            <div class="empty-state">Select a matter to view documents and templates.</div>
+          </aside>
         </div>
       </div>
     </div>

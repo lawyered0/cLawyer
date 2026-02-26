@@ -53,6 +53,8 @@ const requestVersions = {
   routinesList: 0,
   routineDetail: 0,
   matters: 0,
+  matterDetail: 0,
+  legalAudit: 0,
   settings: 0,
   extensions: 0,
   skills: 0,
@@ -159,6 +161,20 @@ bindClick('auth-connect-btn', authenticate);
   bindClick('skill-search-btn', searchClawHub);
   bindClick('skill-install-btn', installSkillFromForm);
   bindClick('matters-clear-btn', clearActiveMatter);
+  bindClick('legal-audit-refresh-btn', function() { loadLegalAudit(0); });
+  bindClick('legal-audit-prev-btn', function() {
+    var next = Math.max(0, legalAuditOffset - legalAuditLimit);
+    loadLegalAudit(next);
+  });
+  bindClick('legal-audit-next-btn', function() {
+    if (legalAuditNextOffset == null) return;
+    loadLegalAudit(legalAuditNextOffset);
+  });
+  bindChange('matters-group-by-client', function(e) {
+    mattersGroupByClient = !!(e && e.target && e.target.checked);
+    localStorage.setItem(MATTERS_GROUP_KEY, mattersGroupByClient ? '1' : '0');
+    renderMatters();
+  });
   var mattersCreateForm = byId('matters-create-form');
   if (mattersCreateForm) {
     mattersCreateForm.addEventListener('submit', function(e) {
@@ -166,6 +182,55 @@ bindClick('auth-connect-btn', authenticate);
       createMatterFromForm();
     });
   }
+  var mattersConflictForm = byId('matters-conflict-form');
+  if (mattersConflictForm) {
+    mattersConflictForm.addEventListener('submit', function(e) {
+      e.preventDefault();
+      runMatterConflictCheck();
+    });
+  }
+  delegate(byId('matters-list'), 'click', 'button[data-matter-action]', function(e, button) {
+    e.preventDefault();
+    var idx = parseInt(button.getAttribute('data-matter-index'), 10);
+    if (isNaN(idx) || !mattersCache[idx]) return;
+    var matter = mattersCache[idx];
+    var action = button.getAttribute('data-matter-action');
+    if (action === 'select') {
+      selectMatter(matter.id);
+      return;
+    }
+    if (action === 'browse') {
+      viewMatterInMemory(matter.id);
+      return;
+    }
+    if (action === 'detail') {
+      openMatterDetail(matter.id);
+    }
+  });
+  delegate(byId('matter-detail-panel'), 'click', 'button[data-matter-detail-action]', function(e, button) {
+    e.preventDefault();
+    var action = button.getAttribute('data-matter-detail-action');
+    if (action === 'open-doc') {
+      var path = button.getAttribute('data-path');
+      if (path) openMatterPathInMemory(path);
+      return;
+    }
+    if (action === 'preview-template') {
+      var templatePath = button.getAttribute('data-path');
+      if (templatePath) openMatterPathInMemory(templatePath);
+      return;
+    }
+    if (action === 'apply-template') {
+      var templateName = button.getAttribute('data-template-name');
+      if (templateName) applyMatterTemplate(templateName);
+    }
+  });
+  delegate(byId('legal-audit-list'), 'click', 'button[data-audit-index]', function(e, button) {
+    e.preventDefault();
+    var idx = parseInt(button.getAttribute('data-audit-index'), 10);
+    if (isNaN(idx) || !legalAuditEvents[idx]) return;
+    renderLegalAuditDetail(legalAuditEvents[idx]);
+  });
 })();
 
 // --- API helper ---
@@ -1189,7 +1254,10 @@ function switchTab(tab) {
   if (tab === 'memory') loadMemoryTree();
   if (tab === 'jobs') loadJobs();
   if (tab === 'routines') loadRoutines();
-  if (tab === 'logs') applyLogFilters();
+  if (tab === 'logs') {
+    applyLogFilters();
+    loadLegalAudit(0);
+  }
   if (tab === 'extensions') loadExtensions();
   if (tab === 'skills') loadSkills();
   if (tab === 'matters') loadMatters();
@@ -1647,6 +1715,110 @@ function loadServerLogLevel() {
       document.getElementById('logs-server-level').value = data.level;
     })
     .catch(() => {}); // ignore if not available
+}
+
+let legalAuditOffset = 0;
+let legalAuditNextOffset = null;
+let legalAuditLimit = 50;
+let legalAuditTotal = 0;
+let legalAuditEvents = [];
+
+function toRfc3339FromLocalInput(raw) {
+  if (!raw) return null;
+  var dt = new Date(raw);
+  if (isNaN(dt.getTime())) return null;
+  return dt.toISOString();
+}
+
+function buildLegalAuditQuery(offset) {
+  var params = new URLSearchParams();
+  var eventType = byId('legal-audit-event-type') ? byId('legal-audit-event-type').value.trim() : '';
+  var fromRaw = byId('legal-audit-from') ? byId('legal-audit-from').value : '';
+  var toRaw = byId('legal-audit-to') ? byId('legal-audit-to').value : '';
+  var limitRaw = byId('legal-audit-limit') ? parseInt(byId('legal-audit-limit').value, 10) : 50;
+  legalAuditLimit = (!isNaN(limitRaw) && limitRaw > 0) ? Math.min(200, limitRaw) : 50;
+
+  params.set('offset', String(Math.max(0, offset || 0)));
+  params.set('limit', String(legalAuditLimit));
+  if (eventType) params.set('event_type', eventType);
+  var fromIso = toRfc3339FromLocalInput(fromRaw);
+  var toIso = toRfc3339FromLocalInput(toRaw);
+  if (fromIso) params.set('from', fromIso);
+  if (toIso) params.set('to', toIso);
+  return params.toString();
+}
+
+function loadLegalAudit(offset) {
+  var requestVersion = beginRequest('legalAudit');
+  legalAuditOffset = Math.max(0, offset || 0);
+  var list = byId('legal-audit-list');
+  if (list) list.innerHTML = '<div class="empty-state">Loading legal audit events…</div>';
+  var query = buildLegalAuditQuery(legalAuditOffset);
+  apiFetch('/api/legal/audit?' + query).then(function(data) {
+    if (!isCurrentRequest('legalAudit', requestVersion)) return;
+    legalAuditEvents = (data && data.events) ? data.events : [];
+    legalAuditNextOffset = (data && data.next_offset != null) ? data.next_offset : null;
+    legalAuditTotal = data && typeof data.total === 'number' ? data.total : 0;
+    renderLegalAuditList(data || {});
+  }).catch(function(err) {
+    if (!isCurrentRequest('legalAudit', requestVersion)) return;
+    legalAuditEvents = [];
+    legalAuditNextOffset = null;
+    legalAuditTotal = 0;
+    if (list) {
+      list.innerHTML = '<div class="empty-state" style="color:var(--error)">Failed to load legal audit: ' + escapeHtml(err.message) + '</div>';
+    }
+    var pageMeta = byId('legal-audit-page-meta');
+    if (pageMeta) pageMeta.textContent = '';
+    var detail = byId('legal-audit-detail');
+    if (detail) detail.textContent = '';
+  });
+}
+
+function renderLegalAuditList(data) {
+  var list = byId('legal-audit-list');
+  var pageMeta = byId('legal-audit-page-meta');
+  var prevBtn = byId('legal-audit-prev-btn');
+  var nextBtn = byId('legal-audit-next-btn');
+
+  if (prevBtn) prevBtn.disabled = legalAuditOffset <= 0;
+  if (nextBtn) nextBtn.disabled = legalAuditNextOffset == null;
+
+  var parseErrors = data && data.parse_errors ? data.parse_errors : 0;
+  var truncated = !!(data && data.truncated);
+  if (pageMeta) {
+    var start = legalAuditTotal === 0 ? 0 : legalAuditOffset + 1;
+    var end = legalAuditOffset + legalAuditEvents.length;
+    var meta = 'Showing ' + start + '-' + end + ' of ' + legalAuditTotal;
+    if (parseErrors > 0) meta += ' · parse errors: ' + parseErrors;
+    if (truncated) meta += ' · truncated';
+    pageMeta.textContent = meta;
+  }
+
+  if (!list) return;
+  if (!legalAuditEvents.length) {
+    list.innerHTML = '<div class="empty-state">No matching legal audit events.</div>';
+    var detail = byId('legal-audit-detail');
+    if (detail) detail.textContent = '';
+    return;
+  }
+
+  var html = '';
+  for (var i = 0; i < legalAuditEvents.length; i++) {
+    var event = legalAuditEvents[i];
+    html += '<div class="legal-audit-row">';
+    html += '<span class="legal-audit-ts">' + escapeHtml(formatDate(event.ts)) + '</span>';
+    html += '<span class="legal-audit-type">' + escapeHtml(event.event_type || '') + '</span>';
+    html += '<button data-audit-index="' + i + '">View</button>';
+    html += '</div>';
+  }
+  list.innerHTML = html;
+}
+
+function renderLegalAuditDetail(event) {
+  var detail = byId('legal-audit-detail');
+  if (!detail) return;
+  detail.textContent = JSON.stringify(event, null, 2);
 }
 
 // --- Extensions ---
@@ -3636,6 +3808,22 @@ function showToast(message, type) {
 var mattersCache = [];
 /** Currently active matter ID (string) or null. */
 var activeMatterId = null;
+/** Currently selected matter in the detail panel. */
+var selectedMatterId = null;
+/** Last loaded matter document index entries. */
+var currentMatterDocuments = [];
+/** Last loaded matter templates. */
+var currentMatterTemplates = [];
+/** Persisted key for grouped matters rendering preference. */
+var MATTERS_GROUP_KEY = 'clawyer_matters_group_by_client';
+/** Grouping preference in Matters tab. */
+var mattersGroupByClient = (function() {
+  try {
+    return localStorage.getItem(MATTERS_GROUP_KEY) === '1';
+  } catch (_) {
+    return false;
+  }
+})();
 
 function parseCsvList(raw) {
   if (!raw) return [];
@@ -3659,6 +3847,224 @@ function setCreateMatterBusy(isBusy) {
   }
 }
 
+function setMattersGroupToggleFromState() {
+  var checkbox = byId('matters-group-by-client');
+  if (!checkbox) return;
+  checkbox.checked = mattersGroupByClient;
+}
+
+function normalizeMatterClient(client) {
+  var normalized = (client || '').trim();
+  return normalized || 'Unspecified client';
+}
+
+function buildGroupedMatters() {
+  var groups = {};
+  for (var i = 0; i < mattersCache.length; i++) {
+    var matter = mattersCache[i];
+    var key = normalizeMatterClient(matter.client);
+    if (!groups[key]) groups[key] = [];
+    groups[key].push({ matter: matter, index: i });
+  }
+  return Object.keys(groups)
+    .sort(function(a, b) { return a.localeCompare(b); })
+    .map(function(key) {
+      groups[key].sort(function(a, b) { return a.matter.id.localeCompare(b.matter.id); });
+      return { title: key, items: groups[key] };
+    });
+}
+
+function renderMatterCardHtml(matter, index) {
+  var isActive = matter.id === activeMatterId;
+  var isSelected = matter.id === selectedMatterId;
+  var html = '<div class="matter-card'
+    + (isActive ? ' matter-card--active' : '')
+    + (isSelected ? ' matter-card--selected' : '')
+    + '">';
+  html += '<div class="matter-card-header">';
+  html += '<span class="matter-card-id">' + escapeHtml(matter.id) + '</span>';
+  if (isActive) html += '<span class="matter-active-chip">Active</span>';
+  html += '</div>';
+  if (matter.client) {
+    html += '<div class="matter-card-row"><span class="matter-card-label">Client</span><span>' + escapeHtml(matter.client) + '</span></div>';
+  }
+  if (matter.confidentiality) {
+    html += '<div class="matter-card-row"><span class="matter-card-label">Confidentiality</span><span>' + escapeHtml(matter.confidentiality) + '</span></div>';
+  }
+  if (matter.team && matter.team.length) {
+    html += '<div class="matter-card-row"><span class="matter-card-label">Team</span><span>' + escapeHtml(matter.team.join(', ')) + '</span></div>';
+  }
+  if (matter.adversaries && matter.adversaries.length) {
+    html += '<div class="matter-card-row"><span class="matter-card-label">Adversaries</span><span>' + escapeHtml(matter.adversaries.join(', ')) + '</span></div>';
+  }
+  if (matter.retention) {
+    html += '<div class="matter-card-row"><span class="matter-card-label">Retention</span><span>' + escapeHtml(matter.retention) + '</span></div>';
+  }
+  html += '<div class="matter-card-actions">';
+  if (!isActive) {
+    html += '<button class="btn-ext activate" data-matter-action="select" data-matter-index="' + index + '">Select</button>';
+  }
+  html += '<button class="btn-ext" data-matter-action="detail" data-matter-index="' + index + '">Details</button>';
+  html += '<button class="btn-ext" data-matter-action="browse" data-matter-index="' + index + '">Browse Files</button>';
+  html += '</div>';
+  html += '</div>';
+  return html;
+}
+
+function populateMatterConflictSelector() {
+  var select = byId('matters-conflict-matter');
+  if (!select) return;
+  var selected = select.value;
+  var html = '';
+  var activeLabel = activeMatterId
+    ? ('Use active matter (' + activeMatterId + ')')
+    : 'Use active matter (none)';
+  html += '<option value="">' + escapeHtml(activeLabel) + '</option>';
+  for (var i = 0; i < mattersCache.length; i++) {
+    var matter = mattersCache[i];
+    var label = matter.id + (matter.client ? (' — ' + matter.client) : '');
+    html += '<option value="' + escapeHtml(matter.id) + '">' + escapeHtml(label) + '</option>';
+  }
+  select.innerHTML = html;
+  if (selected) select.value = selected;
+}
+
+function renderMatterDetailPlaceholder(message) {
+  var panel = byId('matter-detail-panel');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty-state">' + escapeHtml(message) + '</div>';
+}
+
+function renderMatterDetail() {
+  var panel = byId('matter-detail-panel');
+  if (!panel) return;
+  if (!selectedMatterId) {
+    renderMatterDetailPlaceholder('Select a matter to view documents and templates.');
+    return;
+  }
+
+  var html = '<div class="matter-detail-header">';
+  html += '<h4>' + escapeHtml(selectedMatterId) + '</h4>';
+  html += '<button data-matter-detail-action="open-doc" data-path="' + escapeHtml('matters/' + selectedMatterId + '/matter.yaml') + '">Open matter.yaml</button>';
+  html += '</div>';
+
+  html += '<div class="matter-detail-section">';
+  html += '<h5>Documents</h5>';
+  if (!currentMatterDocuments.length) {
+    html += '<div class="empty-state">No indexed documents yet.</div>';
+  } else {
+    html += '<div class="matter-item-list">';
+    for (var i = 0; i < currentMatterDocuments.length; i++) {
+      var doc = currentMatterDocuments[i];
+      html += '<div class="matter-item-row">';
+      html += '<span class="matter-item-path">' + escapeHtml(doc.path) + '</span>';
+      if (!doc.is_dir) {
+        html += '<button data-matter-detail-action="open-doc" data-path="' + escapeHtml(doc.path) + '">Open</button>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="matter-detail-section">';
+  html += '<h5>Templates</h5>';
+  if (!currentMatterTemplates.length) {
+    html += '<div class="empty-state">No templates found for this matter.</div>';
+  } else {
+    html += '<div class="matter-item-list">';
+    for (var t = 0; t < currentMatterTemplates.length; t++) {
+      var template = currentMatterTemplates[t];
+      html += '<div class="matter-item-row">';
+      html += '<span class="matter-item-path">' + escapeHtml(template.path) + '</span>';
+      html += '<button data-matter-detail-action="preview-template" data-path="' + escapeHtml(template.path) + '">Preview</button>';
+      html += '<button data-matter-detail-action="apply-template" data-template-name="' + escapeHtml(template.name) + '">Apply</button>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  panel.innerHTML = html;
+}
+
+function openMatterDetail(id) {
+  if (!id) return;
+  selectedMatterId = id;
+  currentMatterDocuments = [];
+  currentMatterTemplates = [];
+  renderMatters();
+  renderMatterDetailPlaceholder('Loading detail for ' + id + '…');
+
+  var requestVersion = beginRequest('matterDetail');
+  Promise.all([
+    apiFetch('/api/matters/' + encodeURIComponent(id) + '/documents?include_templates=false'),
+    apiFetch('/api/matters/' + encodeURIComponent(id) + '/templates'),
+  ]).then(function (results) {
+    if (!isCurrentRequest('matterDetail', requestVersion)) return;
+    var docsData = results[0];
+    var templatesData = results[1];
+    currentMatterDocuments = (docsData && docsData.documents) ? docsData.documents : [];
+    currentMatterTemplates = (templatesData && templatesData.templates) ? templatesData.templates : [];
+    renderMatterDetail();
+    renderMatters();
+  }).catch(function (err) {
+    if (!isCurrentRequest('matterDetail', requestVersion)) return;
+    renderMatterDetailPlaceholder('Failed to load matter detail: ' + err.message);
+  });
+}
+
+function openMatterPathInMemory(path) {
+  if (!path) return;
+  switchTab('memory');
+  readMemoryFile(path);
+}
+
+function applyMatterTemplate(templateName) {
+  if (!selectedMatterId || !templateName) return;
+  apiFetch('/api/matters/' + encodeURIComponent(selectedMatterId) + '/templates/apply', {
+    method: 'POST',
+    body: { template_name: templateName },
+  }).then(function (data) {
+    showToast('Template applied to ' + data.path, 'success');
+    openMatterDetail(selectedMatterId);
+  }).catch(function (err) {
+    showToast('Failed to apply template: ' + err.message, 'error');
+  });
+}
+
+function runMatterConflictCheck() {
+  var text = byId('matters-conflict-text') ? byId('matters-conflict-text').value.trim() : '';
+  var matterSelect = byId('matters-conflict-matter');
+  var matterOverride = matterSelect ? matterSelect.value : '';
+  var result = byId('matters-conflict-result');
+
+  if (!text) {
+    if (result) result.textContent = 'Enter text to run a conflict check.';
+    return;
+  }
+  if (result) result.textContent = 'Checking…';
+
+  apiFetch('/api/matters/conflicts/check', {
+    method: 'POST',
+    body: {
+      text: text,
+      matter_id: matterOverride || null,
+    },
+  }).then(function (data) {
+    var context = data && data.matter_id ? data.matter_id : (activeMatterId || 'none');
+    if (data && data.matched) {
+      if (result) result.textContent = 'Potential conflict detected: ' + data.conflict + ' (context: ' + context + ')';
+      showToast('Conflict detected: ' + data.conflict, 'error');
+      return;
+    }
+    if (result) result.textContent = 'No conflict hit (context: ' + context + ').';
+    showToast('No conflict hit detected.', 'success');
+  }).catch(function (err) {
+    if (result) result.textContent = 'Conflict check failed: ' + err.message;
+  });
+}
+
 /**
  * Load (or reload) the Matters tab: fetches list and active matter in
  * parallel, then renders the panel and updates the badge.
@@ -3674,12 +4080,23 @@ function loadMatters() {
     var activeData = results[1];
     mattersCache = (listData && listData.matters) ? listData.matters : [];
     activeMatterId = (activeData && activeData.matter_id) ? activeData.matter_id : null;
+    if (selectedMatterId && !mattersCache.some(function(m) { return m.id === selectedMatterId; })) {
+      selectedMatterId = null;
+      currentMatterDocuments = [];
+      currentMatterTemplates = [];
+    }
     renderMatters();
     updateMatterBadge();
+    if (selectedMatterId) {
+      openMatterDetail(selectedMatterId);
+    } else {
+      renderMatterDetailPlaceholder('Select a matter to view documents and templates.');
+    }
   }).catch(function (err) {
     if (!isCurrentRequest('matters', requestVersion)) return;
     var list = document.getElementById('matters-list');
     if (list) list.innerHTML = '<div class="empty-state" style="color:var(--error)">Failed to load matters: ' + escapeHtml(err.message) + '</div>';
+    renderMatterDetailPlaceholder('Failed to load matters.');
   });
 }
 
@@ -3698,6 +4115,9 @@ function updateMatterBadge() {
 
 /** Render the matters list and active-bar inside the Matters tab panel. */
 function renderMatters() {
+  setMattersGroupToggleFromState();
+  populateMatterConflictSelector();
+
   var activeName = document.getElementById('matters-active-name');
   var clearBtn = document.getElementById('matters-clear-btn');
   if (activeName) activeName.textContent = activeMatterId || 'None';
@@ -3712,58 +4132,23 @@ function renderMatters() {
   }
 
   var html = '';
-  for (var i = 0; i < mattersCache.length; i++) {
-    var m = mattersCache[i];
-    var isActive = m.id === activeMatterId;
-    html += '<div class="matter-card' + (isActive ? ' matter-card--active' : '') + '">';
-    html += '<div class="matter-card-header">';
-    html += '<span class="matter-card-id">' + escapeHtml(m.id) + '</span>';
-    if (isActive) {
-      html += '<span class="matter-active-chip">Active</span>';
+  if (mattersGroupByClient) {
+    var groups = buildGroupedMatters();
+    for (var g = 0; g < groups.length; g++) {
+      var group = groups[g];
+      html += '<section class="matter-group">';
+      html += '<h5 class="matter-group-title">' + escapeHtml(group.title) + '</h5>';
+      for (var j = 0; j < group.items.length; j++) {
+        html += renderMatterCardHtml(group.items[j].matter, group.items[j].index);
+      }
+      html += '</section>';
     }
-    html += '</div>';
-    if (m.client) {
-      html += '<div class="matter-card-row"><span class="matter-card-label">Client</span><span>' + escapeHtml(m.client) + '</span></div>';
+  } else {
+    for (var i = 0; i < mattersCache.length; i++) {
+      html += renderMatterCardHtml(mattersCache[i], i);
     }
-    if (m.confidentiality) {
-      html += '<div class="matter-card-row"><span class="matter-card-label">Confidentiality</span><span>' + escapeHtml(m.confidentiality) + '</span></div>';
-    }
-    if (m.team && m.team.length) {
-      html += '<div class="matter-card-row"><span class="matter-card-label">Team</span><span>' + escapeHtml(m.team.join(', ')) + '</span></div>';
-    }
-    if (m.adversaries && m.adversaries.length) {
-      html += '<div class="matter-card-row"><span class="matter-card-label">Adversaries</span><span>' + escapeHtml(m.adversaries.join(', ')) + '</span></div>';
-    }
-    if (m.retention) {
-      html += '<div class="matter-card-row"><span class="matter-card-label">Retention</span><span>' + escapeHtml(m.retention) + '</span></div>';
-    }
-    html += '<div class="matter-card-actions">';
-    if (!isActive) {
-      html += '<button class="btn-ext activate js-select-matter" data-matter-index="' + i + '">Select</button>';
-    }
-    html += '<button class="btn-ext js-browse-matter" data-matter-index="' + i + '">Browse Files</button>';
-    html += '</div>';
-    html += '</div>';
   }
   list.innerHTML = html;
-
-  var selectButtons = list.querySelectorAll('button.js-select-matter');
-  for (var s = 0; s < selectButtons.length; s++) {
-    selectButtons[s].addEventListener('click', function (e) {
-      var idx = parseInt(e.currentTarget.getAttribute('data-matter-index'), 10);
-      if (isNaN(idx) || !mattersCache[idx]) return;
-      selectMatter(mattersCache[idx].id);
-    });
-  }
-
-  var browseButtons = list.querySelectorAll('button.js-browse-matter');
-  for (var b = 0; b < browseButtons.length; b++) {
-    browseButtons[b].addEventListener('click', function (e) {
-      var idx = parseInt(e.currentTarget.getAttribute('data-matter-index'), 10);
-      if (isNaN(idx) || !mattersCache[idx]) return;
-      viewMatterInMemory(mattersCache[idx].id);
-    });
-  }
 }
 
 function createMatterFromForm() {
@@ -3793,6 +4178,7 @@ function createMatterFromForm() {
   }).then(function(data) {
     var createdId = data && data.active_matter_id ? data.active_matter_id : matterId;
     activeMatterId = createdId;
+    selectedMatterId = createdId;
     var form = byId('matters-create-form');
     if (form) form.reset();
     showToast('Matter created and activated: ' + createdId, 'success');
@@ -3814,9 +4200,11 @@ function selectMatter(id) {
     body: { matter_id: id },
   }).then(function () {
     activeMatterId = id;
+    selectedMatterId = id;
     showToast('Active matter set to ' + id, 'success');
     updateMatterBadge();
     renderMatters();
+    openMatterDetail(id);
   }).catch(function (err) {
     showToast('Failed to select matter: ' + err.message, 'error');
   });
@@ -3851,6 +4239,7 @@ function viewMatterInMemory(id) {
   apiFetch('/api/matters/active').then(function (data) {
     activeMatterId = (data && data.matter_id) ? data.matter_id : null;
     updateMatterBadge();
+    populateMatterConflictSelector();
   }).catch(function () {});
 }());
 
