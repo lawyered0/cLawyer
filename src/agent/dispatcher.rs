@@ -921,9 +921,14 @@ mod tests {
     use crate::agent::agent_loop::{Agent, AgentDeps};
     use crate::agent::cost_guard::{CostGuard, CostGuardConfig};
     use crate::agent::session::Session;
+    use crate::agent::submission::SubmissionResult;
     use crate::channels::ChannelManager;
+    use crate::channels::IncomingMessage;
     use crate::config::{AgentConfig, SafetyConfig, SkillsConfig};
     use crate::context::ContextManager;
+    use crate::db::Database;
+    #[cfg(feature = "libsql")]
+    use crate::db::libsql::LibSqlBackend;
     use crate::error::Error;
     use crate::hooks::HookRegistry;
     use crate::llm::{
@@ -932,6 +937,7 @@ mod tests {
     };
     use crate::safety::SafetyLayer;
     use crate::tools::ToolRegistry;
+    use crate::workspace::Workspace;
 
     use super::check_auth_required;
 
@@ -974,18 +980,65 @@ mod tests {
         }
     }
 
-    /// Build a minimal `Agent` for unit testing (no DB, no workspace, no extensions).
-    fn make_test_agent_with_legal(legal_config: crate::config::LegalConfig) -> Agent {
+    /// LLM provider that always requests a shell tool call.
+    struct ShellToolCallLlmProvider;
+
+    #[async_trait]
+    impl LlmProvider for ShellToolCallLlmProvider {
+        fn model_name(&self) -> &str {
+            "tool-call-mock"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::LlmError> {
+            Ok(CompletionResponse {
+                content: "tool call".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+            Ok(ToolCompletionResponse {
+                content: Some("running shell".to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "call_shell_1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: serde_json::json!({ "command": "echo hello" }),
+                }],
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+            })
+        }
+    }
+
+    fn make_test_agent_with_components(
+        llm: Arc<dyn LlmProvider>,
+        tools: Arc<ToolRegistry>,
+        workspace: Option<Arc<Workspace>>,
+        legal_config: crate::config::LegalConfig,
+    ) -> Agent {
         let deps = AgentDeps {
             store: None,
-            llm: Arc::new(StaticLlmProvider),
+            llm,
             cheap_llm: None,
             safety: Arc::new(SafetyLayer::new(&SafetyConfig {
                 max_output_length: 100_000,
                 injection_check_enabled: true,
             })),
-            tools: Arc::new(ToolRegistry::new()),
-            workspace: None,
+            tools,
+            workspace,
             extension_manager: None,
             skill_registry: None,
             skill_catalog: None,
@@ -1018,6 +1071,16 @@ mod tests {
             None,
             Some(Arc::new(ContextManager::new(1))),
             None,
+        )
+    }
+
+    /// Build a minimal `Agent` for unit testing (no DB, no workspace, no extensions).
+    fn make_test_agent_with_legal(legal_config: crate::config::LegalConfig) -> Agent {
+        make_test_agent_with_components(
+            Arc::new(StaticLlmProvider),
+            Arc::new(ToolRegistry::new()),
+            None,
+            legal_config,
         )
     }
 
@@ -1246,6 +1309,171 @@ mod tests {
 
         let effective = agent.effective_legal_config_for(&message);
         assert_eq!(effective.active_matter, None);
+    }
+
+    #[cfg(feature = "libsql")]
+    async fn make_test_workspace(user_id: &str) -> Arc<Workspace> {
+        let db_path = std::env::temp_dir().join(format!(
+            "clawyer-dispatcher-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db: Arc<dyn Database> = Arc::new(
+            LibSqlBackend::new_local(&db_path)
+                .await
+                .expect("local libsql should initialize"),
+        );
+        db.run_migrations()
+            .await
+            .expect("libsql migrations should run");
+        Arc::new(Workspace::new_with_db(user_id, db))
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn chat_flow_still_blocks_on_conflict_after_ui_additions() {
+        crate::legal::matter::reset_conflict_cache_for_tests();
+        let workspace = make_test_workspace("user-1").await;
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Acme Corp","aliases":["Acme"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = true;
+
+        let agent = make_test_agent_with_components(
+            Arc::new(StaticLlmProvider),
+            Arc::new(ToolRegistry::new()),
+            Some(workspace),
+            legal,
+        );
+
+        let session = Arc::new(tokio::sync::Mutex::new(Session::new("user-1")));
+        let thread_id = {
+            let mut s = session.lock().await;
+            s.get_or_create_thread().id
+        };
+
+        let message = IncomingMessage::new(
+            "gateway",
+            "user-1",
+            "Please analyze Acme Corp exposure in this dispute.",
+        );
+        let result = agent
+            .process_user_input(&message, session, thread_id, &message.content)
+            .await
+            .expect("process_user_input should succeed");
+
+        match result {
+            SubmissionResult::Error { message } => {
+                assert!(
+                    message.contains("Potential conflict detected"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("expected conflict block error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_flow_still_appends_citation_warning_when_missing_structured_markers() {
+        let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = false;
+        legal.citation_required = true;
+
+        let agent = make_test_agent_with_components(
+            Arc::new(StaticLlmProvider),
+            Arc::new(ToolRegistry::new()),
+            None,
+            legal,
+        );
+
+        let session = Arc::new(tokio::sync::Mutex::new(Session::new("user-1")));
+        let thread_id = {
+            let mut s = session.lock().await;
+            s.get_or_create_thread().id
+        };
+        let message = IncomingMessage::new(
+            "gateway",
+            "user-1",
+            "Draft a legal memo on contract interpretation principles.",
+        );
+        let result = agent
+            .process_user_input(&message, session, thread_id, &message.content)
+            .await
+            .expect("process_user_input should succeed");
+
+        match result {
+            SubmissionResult::Response { content } => {
+                assert!(
+                    content.contains("Draft status: structured citations not detected"),
+                    "missing citation warning in response: {content}"
+                );
+            }
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_flow_still_emits_approval_needed_for_forced_tools() {
+        let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = false;
+        legal.hardening = crate::config::LegalHardeningProfile::MaxLockdown;
+
+        let registry = ToolRegistry::new().with_legal_policy(legal.clone());
+        registry.register_builtin_tools();
+        registry.register_dev_tools();
+
+        let agent = make_test_agent_with_components(
+            Arc::new(ShellToolCallLlmProvider),
+            Arc::new(registry),
+            None,
+            legal,
+        );
+
+        let session = Arc::new(tokio::sync::Mutex::new(Session::new("user-1")));
+        let thread_id = {
+            let mut s = session.lock().await;
+            s.get_or_create_thread().id
+        };
+        let message = IncomingMessage::new("gateway", "user-1", "run a quick command");
+
+        let result = agent
+            .process_user_input(&message, Arc::clone(&session), thread_id, &message.content)
+            .await
+            .expect("process_user_input should succeed");
+
+        match result {
+            SubmissionResult::NeedApproval { tool_name, .. } => {
+                assert_eq!(tool_name, "shell");
+            }
+            other => panic!("expected NeedApproval, got {other:?}"),
+        }
+
+        let sess = session.lock().await;
+        let thread = sess
+            .threads
+            .get(&thread_id)
+            .expect("thread should exist after processing");
+        assert!(
+            matches!(
+                thread.state,
+                crate::agent::session::ThreadState::AwaitingApproval
+            ),
+            "thread should remain awaiting approval"
+        );
     }
 
     #[tokio::test]

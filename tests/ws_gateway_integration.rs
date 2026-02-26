@@ -24,13 +24,49 @@ use clawyer::channels::web::server::{GatewayState, start_server};
 use clawyer::channels::web::sse::SseManager;
 use clawyer::channels::web::types::SseEvent;
 use clawyer::channels::web::ws::WsConnectionTracker;
+use clawyer::db::Database;
+#[cfg(feature = "libsql")]
+use clawyer::db::libsql::LibSqlBackend;
+use clawyer::workspace::Workspace;
 
 const AUTH_TOKEN: &str = "test-token-12345";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+fn legal_config_for_tests() -> clawyer::config::LegalConfig {
+    clawyer::config::LegalConfig {
+        enabled: true,
+        jurisdiction: "us-general".to_string(),
+        hardening: clawyer::config::LegalHardeningProfile::MaxLockdown,
+        require_matter_context: true,
+        citation_required: true,
+        matter_root: "matters".to_string(),
+        active_matter: None,
+        privilege_guard: true,
+        conflict_check_enabled: true,
+        network: clawyer::config::LegalNetworkConfig {
+            deny_by_default: true,
+            allowed_domains: Vec::new(),
+        },
+        audit: clawyer::config::LegalAuditConfig {
+            enabled: true,
+            path: std::path::PathBuf::from("logs/legal_audit.jsonl"),
+            hash_chain: true,
+        },
+        redaction: clawyer::config::LegalRedactionConfig {
+            pii: true,
+            phi: true,
+            financial: true,
+            government_id: true,
+        },
+    }
+}
+
 /// Start a gateway server on a random port and return the bound address + agent
 /// message receiver.
-async fn start_test_server() -> (
+async fn start_test_server_with_overrides(
+    workspace: Option<Arc<Workspace>>,
+    legal_config: Option<clawyer::config::LegalConfig>,
+) -> (
     SocketAddr,
     Arc<GatewayState>,
     mpsc::Receiver<IncomingMessage>,
@@ -40,7 +76,7 @@ async fn start_test_server() -> (
     let state = Arc::new(GatewayState {
         msg_tx: tokio::sync::RwLock::new(Some(agent_tx)),
         sse: SseManager::new(),
-        workspace: None,
+        workspace,
         session_manager: None,
         log_broadcaster: None,
         log_level_handle: None,
@@ -59,7 +95,7 @@ async fn start_test_server() -> (
         registry_entries: Vec::new(),
         cost_guard: None,
         startup_time: std::time::Instant::now(),
-        legal_config: None,
+        legal_config,
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -68,6 +104,29 @@ async fn start_test_server() -> (
         .expect("Failed to start test server");
 
     (bound_addr, state, agent_rx)
+}
+
+/// Start a basic gateway server with default legal config and no workspace.
+async fn start_test_server() -> (
+    SocketAddr,
+    Arc<GatewayState>,
+    mpsc::Receiver<IncomingMessage>,
+) {
+    start_test_server_with_overrides(None, None).await
+}
+
+#[cfg(feature = "libsql")]
+async fn make_test_workspace(user_id: &str) -> Arc<Workspace> {
+    let db_path = std::env::temp_dir().join(format!("clawyer-ws-test-{}.db", uuid::Uuid::new_v4()));
+    let db: Arc<dyn Database> = Arc::new(
+        LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("local libsql should initialize"),
+    );
+    db.run_migrations()
+        .await
+        .expect("libsql migrations should run");
+    Arc::new(Workspace::new_with_db(user_id, db))
 }
 
 /// Connect a WebSocket client with auth token in query parameter.
@@ -315,6 +374,164 @@ async fn test_root_response_has_csp_header() {
         !script_src.contains("'unsafe-inline'"),
         "script-src unexpectedly allows 'unsafe-inline': {}",
         script_src
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn gateway_legal_audit_endpoint_requires_auth_and_returns_data() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let logs_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&logs_dir).expect("create logs dir");
+    let audit_path = logs_dir.join("legal_audit.jsonl");
+    std::fs::write(
+        &audit_path,
+        r#"{"ts":"2026-02-25T12:00:00Z","event_type":"prompt_received","details":{"thread_id":"t1"},"metrics":{"blocked_actions":0,"approval_required":0,"redaction_events":0}}"#,
+    )
+    .expect("write audit fixture");
+
+    let mut legal = legal_config_for_tests();
+    legal.enabled = true;
+    legal.audit.enabled = true;
+    legal.audit.path = audit_path;
+
+    let (addr, _state, _agent_rx) = start_test_server_with_overrides(None, Some(legal)).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/api/legal/audit?limit=10", addr);
+
+    let unauth = client.get(&url).send().await.expect("unauth request");
+    assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", AUTH_TOKEN))
+        .send()
+        .await
+        .expect("auth request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body: serde_json::Value = resp.json().await.expect("audit response json");
+    let events = body["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["event_type"], "prompt_received");
+    assert_eq!(body["total"], 1);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn gateway_matters_conflict_check_endpoint_happy_path() {
+    let workspace = make_test_workspace("test-user").await;
+    workspace
+        .write(
+            "conflicts.json",
+            r#"[{"name":"Acme Corp","aliases":["Acme","Acme Corporation"]}]"#,
+        )
+        .await
+        .expect("seed conflicts");
+
+    let mut legal = legal_config_for_tests();
+    legal.enabled = true;
+    legal.require_matter_context = false;
+    legal.conflict_check_enabled = true;
+
+    let (addr, _state, _agent_rx) =
+        start_test_server_with_overrides(Some(workspace), Some(legal)).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/api/matters/conflicts/check", addr);
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", AUTH_TOKEN))
+        .json(&serde_json::json!({
+            "text": "Please review exposure for Acme Corp in this contract dispute."
+        }))
+        .send()
+        .await
+        .expect("conflict check response");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body: serde_json::Value = resp.json().await.expect("conflict response json");
+    assert_eq!(body["matched"], true);
+    assert_eq!(body["conflict"], "Acme Corp");
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn gateway_matter_template_apply_flow_end_to_end() {
+    let workspace = make_test_workspace("test-user").await;
+    workspace
+        .write(
+            "matters/demo/matter.yaml",
+            "matter_id: demo\nclient: Demo Client\nteam:\n  - Lead Counsel\nconfidentiality: attorney-client-privileged\nadversaries:\n  - Other Party\nretention: follow-firm-policy\n",
+        )
+        .await
+        .expect("seed matter metadata");
+    workspace
+        .write(
+            "matters/demo/templates/research_memo.md",
+            "# Research Memo\n\n## Issue\n\n## Analysis\n",
+        )
+        .await
+        .expect("seed template");
+
+    let mut legal = legal_config_for_tests();
+    legal.enabled = true;
+    let (addr, _state, _agent_rx) =
+        start_test_server_with_overrides(Some(Arc::clone(&workspace)), Some(legal)).await;
+    let client = reqwest::Client::new();
+
+    let list_resp = client
+        .get(format!("http://{}/api/matters/demo/templates", addr))
+        .header("Authorization", format!("Bearer {}", AUTH_TOKEN))
+        .send()
+        .await
+        .expect("templates list response");
+    assert_eq!(list_resp.status(), reqwest::StatusCode::OK);
+    let list_body: serde_json::Value = list_resp.json().await.expect("templates list json");
+    assert_eq!(list_body["matter_id"], "demo");
+    let templates = list_body["templates"].as_array().expect("templates array");
+    assert!(
+        templates.iter().any(|v| v["name"] == "research_memo.md"),
+        "expected research_memo.md in templates list: {templates:?}"
+    );
+
+    let apply_resp = client
+        .post(format!("http://{}/api/matters/demo/templates/apply", addr))
+        .header("Authorization", format!("Bearer {}", AUTH_TOKEN))
+        .json(&serde_json::json!({ "template_name": "research_memo.md" }))
+        .send()
+        .await
+        .expect("apply response");
+    assert_eq!(apply_resp.status(), reqwest::StatusCode::CREATED);
+    let apply_body: serde_json::Value = apply_resp.json().await.expect("apply json");
+    let created_path = apply_body["path"].as_str().expect("created path");
+    assert!(
+        created_path.starts_with("matters/demo/drafts/research_memo-"),
+        "unexpected created path: {created_path}"
+    );
+
+    let created_doc = workspace
+        .read(created_path)
+        .await
+        .expect("created draft should exist");
+    assert!(created_doc.content.contains("# Research Memo"));
+
+    let docs_resp = client
+        .get(format!(
+            "http://{}/api/matters/demo/documents?include_templates=false",
+            addr
+        ))
+        .header("Authorization", format!("Bearer {}", AUTH_TOKEN))
+        .send()
+        .await
+        .expect("documents list response");
+    assert_eq!(docs_resp.status(), reqwest::StatusCode::OK);
+    let docs_body: serde_json::Value = docs_resp.json().await.expect("documents list json");
+    let docs = docs_body["documents"].as_array().expect("documents array");
+    assert!(
+        docs.iter()
+            .any(|v| v["path"].as_str() == Some(created_path) && v["is_dir"] == false),
+        "expected created draft in documents list: {docs:?}"
     );
 }
 
