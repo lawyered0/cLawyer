@@ -32,7 +32,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::agent::SessionManager;
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
-use crate::config::GatewayConfig;
+use crate::config::{GatewayConfig, LegalConfig};
 use crate::db::Database;
 use crate::error::ChannelError;
 use crate::extensions::ExtensionManager;
@@ -93,6 +93,7 @@ impl GatewayChannel {
             registry_entries: Vec::new(),
             cost_guard: None,
             startup_time: std::time::Instant::now(),
+            legal_config: None,
         });
 
         Self {
@@ -126,6 +127,7 @@ impl GatewayChannel {
             registry_entries: self.state.registry_entries.clone(),
             cost_guard: self.state.cost_guard.clone(),
             startup_time: self.state.startup_time,
+            legal_config: self.state.legal_config.clone(),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -222,6 +224,12 @@ impl GatewayChannel {
     /// Inject the cost guard for token/cost tracking in the status popover.
     pub fn with_cost_guard(mut self, cg: Arc<crate::agent::cost_guard::CostGuard>) -> Self {
         self.rebuild_state(|s| s.cost_guard = Some(cg));
+        self
+    }
+
+    /// Inject legal config for web legal-policy endpoints.
+    pub fn with_legal_config(mut self, legal_config: LegalConfig) -> Self {
+        self.rebuild_state(|s| s.legal_config = Some(legal_config));
         self
     }
 

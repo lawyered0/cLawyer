@@ -310,6 +310,45 @@ pub struct CreateMatterResponse {
     pub active_matter_id: String,
 }
 
+/// Request body for `POST /api/matters/conflicts/check`.
+#[derive(Debug, Deserialize)]
+pub struct MatterConflictCheckRequest {
+    pub text: String,
+    pub matter_id: Option<String>,
+}
+
+/// Response body for `POST /api/matters/conflicts/check`.
+#[derive(Debug, Serialize)]
+pub struct MatterConflictCheckResponse {
+    pub matched: bool,
+    pub conflict: Option<String>,
+    pub matter_id: Option<String>,
+}
+
+// --- Legal audit ---
+
+#[derive(Debug, Serialize)]
+pub struct LegalAuditEventInfo {
+    pub line_no: usize,
+    pub ts: String,
+    pub event_type: String,
+    pub details: serde_json::Value,
+    pub metrics: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LegalAuditListResponse {
+    pub events: Vec<LegalAuditEventInfo>,
+    pub total: usize,
+    pub next_offset: Option<usize>,
+    pub parse_errors: usize,
+    pub truncated: bool,
+}
+
 // --- Memory upload ---
 
 /// One successfully uploaded file entry in the upload response.
