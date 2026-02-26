@@ -5,6 +5,7 @@
 use std::convert::Infallible;
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
+use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -222,6 +223,12 @@ pub async fn start_server(
         .route(
             "/api/matters/active",
             get(matters_active_get_handler).post(matters_active_set_handler),
+        )
+        .route("/api/matters/{id}/documents", get(matter_documents_handler))
+        .route("/api/matters/{id}/templates", get(matter_templates_handler))
+        .route(
+            "/api/matters/{id}/templates/apply",
+            post(matter_template_apply_handler),
         )
         .route(
             "/api/matters/conflicts/check",
@@ -1356,6 +1363,152 @@ fn parse_utc_query_ts(
     Ok(Some(parsed.with_timezone(&Utc)))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct MatterDocumentsQuery {
+    include_templates: Option<bool>,
+}
+
+fn sanitize_matter_id_for_route(raw: &str) -> Result<String, (StatusCode, String)> {
+    let sanitized = crate::legal::policy::sanitize_matter_id(raw);
+    if sanitized.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "Matter not found".to_string()));
+    }
+    Ok(sanitized)
+}
+
+async fn ensure_existing_matter_for_route(
+    workspace: &Workspace,
+    raw_matter_id: &str,
+) -> Result<String, (StatusCode, String)> {
+    let matter_id = sanitize_matter_id_for_route(raw_matter_id)?;
+    match crate::legal::matter::read_matter_metadata_for_root(workspace, MATTER_ROOT, &matter_id)
+        .await
+    {
+        Ok(_) => Ok(matter_id),
+        Err(crate::legal::matter::MatterMetadataValidationError::Missing { path }) => Err((
+            StatusCode::NOT_FOUND,
+            format!("Matter '{}' not found (missing '{}')", matter_id, path),
+        )),
+        Err(crate::legal::matter::MatterMetadataValidationError::Invalid { .. }) => Err((
+            StatusCode::NOT_FOUND,
+            format!("Matter '{}' metadata is invalid", matter_id),
+        )),
+        Err(err @ crate::legal::matter::MatterMetadataValidationError::Storage { .. }) => {
+            Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+        }
+    }
+}
+
+fn parse_template_name(raw: &str) -> Result<String, (StatusCode, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'template_name' must not be empty".to_string(),
+        ));
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'template_name' must be a basename under templates/".to_string(),
+        ));
+    }
+    let path = FsPath::new(trimmed);
+    let basename = path.file_name().and_then(|value| value.to_str()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "'template_name' must be valid UTF-8".to_string(),
+    ))?;
+    if basename != trimmed {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'template_name' must be a basename under templates/".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+async fn choose_template_apply_destination(
+    workspace: &Workspace,
+    matter_prefix: &str,
+    template_name: &str,
+    timestamp: &str,
+) -> Result<String, (StatusCode, String)> {
+    let template_path = FsPath::new(template_name);
+    let stem = template_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "'template_name' must include a valid file stem".to_string(),
+        ))?;
+    let ext = template_path.extension().and_then(|value| value.to_str());
+
+    for counter in 1usize..=999 {
+        let suffix = if counter == 1 {
+            String::new()
+        } else {
+            format!("-{}", counter)
+        };
+        let file_name = match ext {
+            Some(ext) if !ext.is_empty() => format!("{stem}-{timestamp}{suffix}.{ext}"),
+            _ => format!("{stem}-{timestamp}{suffix}"),
+        };
+        let candidate = format!("{matter_prefix}/drafts/{file_name}");
+        match workspace.read(&candidate).await {
+            Ok(_) => continue,
+            Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => return Ok(candidate),
+            Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+        }
+    }
+
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Failed to pick a unique destination for applied template".to_string(),
+    ))
+}
+
+async fn list_matter_documents_recursive(
+    workspace: &Workspace,
+    matter_prefix: &str,
+    include_templates: bool,
+) -> Result<Vec<MatterDocumentInfo>, (StatusCode, String)> {
+    let mut pending = vec![matter_prefix.to_string()];
+    let mut documents = Vec::new();
+    let templates_prefix = format!("{matter_prefix}/templates");
+
+    while let Some(path) = pending.pop() {
+        let entries = workspace
+            .list(&path)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+        for entry in entries {
+            if !include_templates && entry.path.starts_with(&templates_prefix) {
+                continue;
+            }
+
+            let name = entry.path.rsplit('/').next().unwrap_or("").to_string();
+            if name.is_empty() {
+                continue;
+            }
+
+            documents.push(MatterDocumentInfo {
+                name,
+                path: entry.path.clone(),
+                is_dir: entry.is_directory,
+                updated_at: entry.updated_at.map(|dt| dt.to_rfc3339()),
+            });
+
+            if entry.is_directory {
+                pending.push(entry.path);
+            }
+        }
+    }
+
+    documents.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(documents)
+}
+
 async fn matters_list_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<MattersListResponse>, (StatusCode, String)> {
@@ -1630,6 +1783,116 @@ async fn matters_active_set_handler(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn matter_documents_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Query(query): Query<MatterDocumentsQuery>,
+) -> Result<Json<MatterDocumentsResponse>, (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let include_templates = query.include_templates.unwrap_or(false);
+    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let documents =
+        list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, include_templates)
+            .await?;
+
+    Ok(Json(MatterDocumentsResponse {
+        matter_id,
+        documents,
+    }))
+}
+
+async fn matter_templates_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MatterTemplatesResponse>, (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let templates_path = format!("{MATTER_ROOT}/{matter_id}/templates");
+
+    let entries = match workspace.list(&templates_path).await {
+        Ok(entries) => entries,
+        Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => Vec::new(),
+        Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    };
+
+    let mut templates: Vec<MatterTemplateInfo> = entries
+        .into_iter()
+        .filter(|entry| !entry.is_directory)
+        .filter_map(|entry| {
+            let name = entry.path.rsplit('/').next()?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            Some(MatterTemplateInfo {
+                name,
+                path: entry.path,
+                updated_at: entry.updated_at.map(|dt| dt.to_rfc3339()),
+            })
+        })
+        .collect();
+    templates.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(Json(MatterTemplatesResponse {
+        matter_id,
+        templates,
+    }))
+}
+
+async fn matter_template_apply_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<MatterTemplateApplyRequest>,
+) -> Result<(StatusCode, Json<MatterTemplateApplyResponse>), (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let template_name = parse_template_name(&req.template_name)?;
+    let template_path = format!("{matter_prefix}/templates/{template_name}");
+
+    let template_doc = workspace
+        .read(&template_path)
+        .await
+        .map_err(|err| match err {
+            crate::error::WorkspaceError::DocumentNotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                format!("Template '{}' not found", template_name),
+            ),
+            other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let destination = choose_template_apply_destination(
+        workspace.as_ref(),
+        &matter_prefix,
+        &template_name,
+        &timestamp,
+    )
+    .await?;
+
+    workspace
+        .write(&destination, &template_doc.content)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(MatterTemplateApplyResponse {
+            path: destination,
+            status: "created",
+        }),
+    ))
 }
 
 async fn matters_conflicts_check_handler(
@@ -3606,6 +3869,38 @@ mod tests {
     }
 
     #[cfg(feature = "libsql")]
+    async fn seed_valid_matter(workspace: &Workspace, matter_id: &str) {
+        let metadata = format!(
+            "matter_id: {matter_id}\nclient: Demo Client\nteam:\n  - Lead Counsel\nconfidentiality: attorney-client-privileged\nadversaries:\n  - Example Co\nretention: follow-firm-policy\n"
+        );
+        workspace
+            .write(&format!("matters/{matter_id}/matter.yaml"), &metadata)
+            .await
+            .expect("seed matter metadata");
+        workspace
+            .write(
+                &format!("matters/{matter_id}/templates/research_memo.md"),
+                "# Research Memo Template\n",
+            )
+            .await
+            .expect("seed research template");
+        workspace
+            .write(
+                &format!("matters/{matter_id}/templates/chronology.md"),
+                "# Chronology Template\n",
+            )
+            .await
+            .expect("seed chronology template");
+        workspace
+            .write(
+                &format!("matters/{matter_id}/notes.md"),
+                "matter notes content",
+            )
+            .await
+            .expect("seed notes document");
+    }
+
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn matters_active_set_rejects_missing_matter() {
         let (db, _tmp) = crate::testing::test_db().await;
@@ -4131,6 +4426,152 @@ mod tests {
         assert_eq!(resp.total, 1);
         assert_eq!(resp.events.len(), 1);
         assert_eq!(resp.parse_errors, 2);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_documents_excludes_templates_by_default() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let Json(resp) = matter_documents_handler(
+            State(state),
+            Path("demo".to_string()),
+            Query(MatterDocumentsQuery::default()),
+        )
+        .await
+        .expect("documents request should succeed");
+
+        assert_eq!(resp.matter_id, "demo");
+        assert!(
+            !resp
+                .documents
+                .iter()
+                .any(|doc| doc.path.contains("/templates/"))
+        );
+        assert!(
+            resp.documents
+                .iter()
+                .any(|doc| doc.path == "matters/demo/notes.md")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_documents_includes_templates_when_requested() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let Json(resp) = matter_documents_handler(
+            State(state),
+            Path("demo".to_string()),
+            Query(MatterDocumentsQuery {
+                include_templates: Some(true),
+            }),
+        )
+        .await
+        .expect("documents request should succeed");
+
+        assert!(
+            resp.documents
+                .iter()
+                .any(|doc| doc.path == "matters/demo/templates/research_memo.md")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_templates_list_returns_expected_entries() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let Json(resp) = matter_templates_handler(State(state), Path("demo".to_string()))
+            .await
+            .expect("templates request should succeed");
+
+        assert_eq!(resp.matter_id, "demo");
+        assert_eq!(resp.templates.len(), 2);
+        assert_eq!(resp.templates[0].name, "chronology.md");
+        assert_eq!(resp.templates[1].name, "research_memo.md");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_template_apply_creates_timestamped_draft() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let (status, Json(resp)) = matter_template_apply_handler(
+            State(state),
+            Path("demo".to_string()),
+            Json(MatterTemplateApplyRequest {
+                template_name: "chronology.md".to_string(),
+            }),
+        )
+        .await
+        .expect("apply template should succeed");
+
+        assert_eq!(status, StatusCode::CREATED);
+        let re = Regex::new(r"^matters/demo/drafts/chronology-\d{8}-\d{6}(-\d+)?\.md$")
+            .expect("valid regex");
+        assert!(
+            re.is_match(&resp.path),
+            "unexpected draft path: {}",
+            resp.path
+        );
+        let written = workspace
+            .read(&resp.path)
+            .await
+            .expect("draft should exist");
+        assert!(written.content.contains("# Chronology Template"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_template_apply_avoids_overwrite_collisions() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let matter_prefix = "matters/demo";
+        let fixed_ts = "20260226-120000";
+
+        let first = choose_template_apply_destination(
+            workspace.as_ref(),
+            matter_prefix,
+            "chronology.md",
+            fixed_ts,
+        )
+        .await
+        .expect("first destination");
+        workspace
+            .write(&first, "existing draft")
+            .await
+            .expect("seed collision");
+
+        let second = choose_template_apply_destination(
+            workspace.as_ref(),
+            matter_prefix,
+            "chronology.md",
+            fixed_ts,
+        )
+        .await
+        .expect("second destination");
+
+        assert_ne!(first, second);
+        assert!(
+            second.ends_with("-2.md"),
+            "expected -2 suffix, got {}",
+            second
+        );
     }
 
     #[test]

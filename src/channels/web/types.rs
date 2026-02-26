@@ -349,6 +349,44 @@ pub struct LegalAuditListResponse {
     pub truncated: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub struct MatterDocumentInfo {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterDocumentsResponse {
+    pub matter_id: String,
+    pub documents: Vec<MatterDocumentInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterTemplateInfo {
+    pub name: String,
+    pub path: String,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterTemplatesResponse {
+    pub matter_id: String,
+    pub templates: Vec<MatterTemplateInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MatterTemplateApplyRequest {
+    pub template_name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterTemplateApplyResponse {
+    pub path: String,
+    pub status: &'static str,
+}
+
 // --- Memory upload ---
 
 /// One successfully uploaded file entry in the upload response.
