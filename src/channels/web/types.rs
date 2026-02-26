@@ -729,6 +729,23 @@ pub struct RoutineRunInfo {
     pub tokens_used: Option<i32>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RoutineCreateRequest {
+    pub name: String,
+    pub description: Option<String>,
+    // Trigger
+    pub trigger_type: String,
+    pub schedule: Option<String>,
+    pub event_pattern: Option<String>,
+    pub event_channel: Option<String>,
+    // Action
+    pub action_type: Option<String>,
+    pub prompt: String,
+    pub context_paths: Option<Vec<String>>,
+    // Guardrails
+    pub cooldown_secs: Option<u64>,
+}
+
 // --- Settings ---
 
 #[derive(Debug, Serialize)]
