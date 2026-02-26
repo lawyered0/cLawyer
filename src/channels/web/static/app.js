@@ -3194,13 +3194,31 @@ function renderMatters() {
     }
     html += '<div class="matter-card-actions">';
     if (!isActive) {
-      html += '<button class="btn-ext activate" onclick=\'selectMatter(' + JSON.stringify(m.id) + ')\'>Select</button>';
+      html += '<button class="btn-ext activate js-select-matter" data-matter-index="' + i + '">Select</button>';
     }
-    html += '<button class="btn-ext" onclick=\'viewMatterInMemory(' + JSON.stringify(m.id) + ')\'>Browse Files</button>';
+    html += '<button class="btn-ext js-browse-matter" data-matter-index="' + i + '">Browse Files</button>';
     html += '</div>';
     html += '</div>';
   }
   list.innerHTML = html;
+
+  var selectButtons = list.querySelectorAll('button.js-select-matter');
+  for (var s = 0; s < selectButtons.length; s++) {
+    selectButtons[s].addEventListener('click', function (e) {
+      var idx = parseInt(e.currentTarget.getAttribute('data-matter-index'), 10);
+      if (isNaN(idx) || !mattersCache[idx]) return;
+      selectMatter(mattersCache[idx].id);
+    });
+  }
+
+  var browseButtons = list.querySelectorAll('button.js-browse-matter');
+  for (var b = 0; b < browseButtons.length; b++) {
+    browseButtons[b].addEventListener('click', function (e) {
+      var idx = parseInt(e.currentTarget.getAttribute('data-matter-index'), 10);
+      if (isNaN(idx) || !mattersCache[idx]) return;
+      viewMatterInMemory(mattersCache[idx].id);
+    });
+  }
 }
 
 /**
