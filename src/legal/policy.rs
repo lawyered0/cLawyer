@@ -1,3 +1,7 @@
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 use crate::config::{LegalConfig, LegalHardeningProfile};
 
 const MAX_LOCKDOWN_SIDE_EFFECT_TOOLS: &[&str] = &[
@@ -130,16 +134,22 @@ pub fn is_non_trivial_request(content: &str) -> bool {
     .any(|k| lower.contains(k))
 }
 
-/// Heuristic citation check for generated responses.
+static CITATION_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    vec![
+        // Canonical bracketed references: [doc: ...], [authority: ...], etc.
+        Regex::new(r"(?i)\[(?:doc|authority|source|citation)\s*:\s*[^\]\n]{3,}\]").unwrap(),
+        // Parenthesized variant for prose contexts.
+        Regex::new(r"(?i)\((?:doc|authority|source|citation)\s*:\s*[^\)\n]{3,}\)").unwrap(),
+        // Legacy bracketed style retained for compatibility, e.g. [doc 4 page 2].
+        Regex::new(r"(?i)\[doc(?:ument)?\s+\d+[^\]\n]*\]").unwrap(),
+    ]
+});
+
+/// Structured citation format check for generated responses.
 pub fn response_has_citation_markers(response: &str) -> bool {
-    let lower = response.to_ascii_lowercase();
-    lower.contains("source:")
-        || lower.contains("sources:")
-        || lower.contains("citation:")
-        || lower.contains("citations:")
-        || lower.contains("[doc")
-        || lower.contains("(doc")
-        || lower.contains("[§")
+    CITATION_PATTERNS
+        .iter()
+        .any(|pattern| pattern.is_match(response))
 }
 
 #[cfg(test)]
@@ -219,11 +229,23 @@ mod tests {
     }
 
     #[test]
-    fn citation_heuristic_detects_common_markers() {
-        assert!(response_has_citation_markers("Source: Contract §2.1"));
+    fn citation_detection_accepts_structured_formats() {
+        assert!(response_has_citation_markers(
+            "See [doc: MSA.pdf page:2 section:payment-terms]"
+        ));
+        assert!(response_has_citation_markers(
+            "Authority is [authority: Restatement §2.1]."
+        ));
         assert!(response_has_citation_markers("See [doc 4 page 2]"));
+    }
+
+    #[test]
+    fn citation_detection_rejects_unstructured_source_language() {
         assert!(!response_has_citation_markers(
-            "This paragraph has no supporting references."
+            "There are no sources for this claim."
+        ));
+        assert!(!response_has_citation_markers(
+            "sources: not available in this draft"
         ));
     }
 

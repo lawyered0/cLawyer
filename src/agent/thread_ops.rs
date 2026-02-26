@@ -393,7 +393,7 @@ impl Agent {
                         }),
                     );
                     response.push_str(
-                        "\n\n[Draft status: citations not detected. Verify sources before relying on this output.]",
+                        "\n\n[Draft status: structured citations not detected. Verify sources and supporting authority before relying on this output.]",
                     );
                 }
 
@@ -1153,7 +1153,7 @@ impl Agent {
                             }),
                         );
                         response.push_str(
-                            "\n\n[Draft status: citations not detected. Verify sources before relying on this output.]",
+                            "\n\n[Draft status: structured citations not detected. Verify sources and supporting authority before relying on this output.]",
                         );
                     }
                     thread.complete_turn(&response);
