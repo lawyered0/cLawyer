@@ -103,6 +103,7 @@ function authenticate() {
       loadThreads();
       loadMemoryTree();
       loadJobs();
+      refreshActiveMatterState();
       // Apply URL log_level param if present, otherwise just sync the dropdown
       if (urlLogLevel) {
         setServerLogLevel(urlLogLevel);
@@ -4234,13 +4235,17 @@ function viewMatterInMemory(id) {
   openMemoryDirectory('matters/' + id);
 }
 
-// Fetch the active matter on startup so the badge appears immediately if set.
-(function () {
-  apiFetch('/api/matters/active').then(function (data) {
+function refreshActiveMatterState() {
+  return apiFetch('/api/matters/active').then(function (data) {
     activeMatterId = (data && data.matter_id) ? data.matter_id : null;
     updateMatterBadge();
     populateMatterConflictSelector();
   }).catch(function () {});
+}
+
+// Fetch the active matter on startup so the badge appears immediately if set.
+(function () {
+  refreshActiveMatterState();
 }());
 
 // --- Memory upload ---
