@@ -5,7 +5,9 @@
 <h1 align="center">cLawyer</h1>
 
 <p align="center">
-  <strong>Local-first legal AI assistant for law firms: matter-scoped, citation-required, and auditable by default</strong>
+  <strong>Local-first legal AI assistant for law firms: matter-scoped, citation-required, and auditable by default.</strong>
+  <br />
+  <strong>Experimental software: not safe for production use. Use at your own risk.</strong>
 </p>
 
 <p align="center">
