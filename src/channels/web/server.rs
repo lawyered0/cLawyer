@@ -204,6 +204,12 @@ pub async fn start_server(
         .route("/api/memory/read", get(memory_read_handler))
         .route("/api/memory/write", post(memory_write_handler))
         .route("/api/memory/search", post(memory_search_handler))
+        // Matters
+        .route("/api/matters", get(matters_list_handler))
+        .route(
+            "/api/matters/active",
+            get(matters_active_get_handler).post(matters_active_set_handler),
+        )
         // Jobs
         .route("/api/jobs", get(jobs_list_handler))
         .route("/api/jobs/summary", get(jobs_summary_handler))
@@ -1126,6 +1132,127 @@ async fn memory_search_handler(
         .collect();
 
     Ok(Json(MemorySearchResponse { results: hits }))
+}
+
+// --- Matter handlers ---
+
+/// The workspace path prefix where matter directories live.
+const MATTER_ROOT: &str = "matters";
+/// Settings key used to persist the active matter ID.
+const MATTER_ACTIVE_SETTING: &str = "legal.active_matter";
+
+async fn matters_list_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<MattersListResponse>, (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+
+    // List top-level entries under the matter root.  Treat a missing
+    // directory as an empty list rather than an error — the matters/ dir
+    // is seeded lazily on first use.
+    let entries = workspace.list(MATTER_ROOT).await.unwrap_or_default();
+
+    let mut matters: Vec<MatterInfo> = Vec::new();
+    for entry in entries {
+        if !entry.is_directory {
+            continue;
+        }
+        let dir_name = entry.path.rsplit('/').next().unwrap_or("").to_string();
+        // Skip the template scaffold directory written by seed_legal_workspace.
+        if dir_name.is_empty() || dir_name == "_template" {
+            continue;
+        }
+
+        // Read matter.yaml for rich metadata; fall back to ID-only if missing
+        // or malformed (e.g. the matter was created manually without a YAML).
+        let meta: Option<crate::legal::matter::MatterMetadata> = {
+            let yaml_path = format!("{MATTER_ROOT}/{dir_name}/matter.yaml");
+            workspace
+                .read(&yaml_path)
+                .await
+                .ok()
+                .and_then(|doc| serde_yml::from_str(&doc.content).ok())
+        };
+
+        matters.push(MatterInfo {
+            id: dir_name,
+            client: meta.as_ref().map(|m| m.client.clone()),
+            confidentiality: meta.as_ref().map(|m| m.confidentiality.clone()),
+            team: meta.as_ref().map(|m| m.team.clone()).unwrap_or_default(),
+            adversaries: meta
+                .as_ref()
+                .map(|m| m.adversaries.clone())
+                .unwrap_or_default(),
+            retention: meta.as_ref().map(|m| m.retention.clone()),
+        });
+    }
+
+    matters.sort_by(|a, b| a.id.cmp(&b.id));
+
+    Ok(Json(MattersListResponse { matters }))
+}
+
+async fn matters_active_get_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<ActiveMatterResponse>, (StatusCode, String)> {
+    let matter_id = if let Some(store) = state.store.as_ref() {
+        store
+            .get_setting(&state.user_id, MATTER_ACTIVE_SETTING)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+    } else {
+        None
+    };
+
+    Ok(Json(ActiveMatterResponse { matter_id }))
+}
+
+async fn matters_active_set_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<SetActiveMatterRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let trimmed = req
+        .matter_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    match trimmed {
+        None => {
+            // Clear active matter.
+            store
+                .delete_setting(&state.user_id, MATTER_ACTIVE_SETTING)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        Some(id) => {
+            let sanitized = crate::legal::policy::sanitize_matter_id(id);
+            if sanitized.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Matter ID is empty after sanitization".to_string(),
+                ));
+            }
+            store
+                .set_setting(
+                    &state.user_id,
+                    MATTER_ACTIVE_SETTING,
+                    &serde_json::Value::String(sanitized),
+                )
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // --- Jobs handlers ---

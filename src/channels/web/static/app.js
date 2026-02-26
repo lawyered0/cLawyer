@@ -98,7 +98,15 @@ function apiFetch(path, options) {
         throw new Error(body || (res.status + ' ' + res.statusText));
       });
     }
-    return res.json();
+    if (res.status === 204) return null;
+    return res.text().then(function(body) {
+      if (!body) return null;
+      try {
+        return JSON.parse(body);
+      } catch (_) {
+        return body;
+      }
+    });
   });
 }
 
@@ -851,6 +859,7 @@ function switchTab(tab) {
   if (tab === 'logs') applyLogFilters();
   if (tab === 'extensions') loadExtensions();
   if (tab === 'skills') loadSkills();
+  if (tab === 'matters') loadMatters();
 }
 
 // --- Memory (filesystem tree) ---
@@ -3047,10 +3056,10 @@ document.addEventListener('keydown', (e) => {
   const tag = (e.target.tagName || '').toLowerCase();
   const inInput = tag === 'input' || tag === 'textarea';
 
-  // Mod+1-6: switch tabs
-  if (mod && e.key >= '1' && e.key <= '6') {
+  // Mod+1-7: switch tabs
+  if (mod && e.key >= '1' && e.key <= '7') {
     e.preventDefault();
-    const tabs = ['chat', 'memory', 'jobs', 'routines', 'extensions', 'skills'];
+    const tabs = ['chat', 'memory', 'jobs', 'routines', 'extensions', 'skills', 'matters'];
     const idx = parseInt(e.key) - 1;
     if (tabs[idx]) switchTab(tabs[idx]);
     return;
@@ -3100,6 +3109,167 @@ function showToast(message, type) {
     toast.addEventListener('transitionend', () => toast.remove());
   }, 4000);
 }
+
+// --- Matters ---
+
+/** In-memory cache: array of MatterInfo from the last loadMatters() call. */
+var mattersCache = [];
+/** Currently active matter ID (string) or null. */
+var activeMatterId = null;
+
+/**
+ * Load (or reload) the Matters tab: fetches list and active matter in
+ * parallel, then renders the panel and updates the badge.
+ */
+function loadMatters() {
+  Promise.all([
+    apiFetch('/api/matters'),
+    apiFetch('/api/matters/active'),
+  ]).then(function (results) {
+    var listData = results[0];
+    var activeData = results[1];
+    mattersCache = (listData && listData.matters) ? listData.matters : [];
+    activeMatterId = (activeData && activeData.matter_id) ? activeData.matter_id : null;
+    renderMatters();
+    updateMatterBadge();
+  }).catch(function (err) {
+    var list = document.getElementById('matters-list');
+    if (list) list.innerHTML = '<div class="empty-state" style="color:var(--error)">Failed to load matters: ' + escapeHtml(err.message) + '</div>';
+  });
+}
+
+/** Update the compact matter badge in the tab bar. */
+function updateMatterBadge() {
+  var badge = document.getElementById('matter-badge');
+  var label = document.getElementById('matter-badge-label');
+  if (!badge || !label) return;
+  if (activeMatterId) {
+    label.textContent = activeMatterId;
+    badge.style.display = 'flex';
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+/** Render the matters list and active-bar inside the Matters tab panel. */
+function renderMatters() {
+  var activeName = document.getElementById('matters-active-name');
+  var clearBtn = document.getElementById('matters-clear-btn');
+  if (activeName) activeName.textContent = activeMatterId || 'None';
+  if (clearBtn) clearBtn.style.display = activeMatterId ? 'inline-block' : 'none';
+
+  var list = document.getElementById('matters-list');
+  if (!list) return;
+
+  if (mattersCache.length === 0) {
+    list.innerHTML = '<div class="empty-state">No matters found. Ask the assistant to create one, or add a <code>matters/&lt;id&gt;/matter.yaml</code> file via the Memory tab.</div>';
+    return;
+  }
+
+  var html = '';
+  for (var i = 0; i < mattersCache.length; i++) {
+    var m = mattersCache[i];
+    var isActive = m.id === activeMatterId;
+    html += '<div class="matter-card' + (isActive ? ' matter-card--active' : '') + '">';
+    html += '<div class="matter-card-header">';
+    html += '<span class="matter-card-id">' + escapeHtml(m.id) + '</span>';
+    if (isActive) {
+      html += '<span class="matter-active-chip">Active</span>';
+    }
+    html += '</div>';
+    if (m.client) {
+      html += '<div class="matter-card-row"><span class="matter-card-label">Client</span><span>' + escapeHtml(m.client) + '</span></div>';
+    }
+    if (m.confidentiality) {
+      html += '<div class="matter-card-row"><span class="matter-card-label">Confidentiality</span><span>' + escapeHtml(m.confidentiality) + '</span></div>';
+    }
+    if (m.team && m.team.length) {
+      html += '<div class="matter-card-row"><span class="matter-card-label">Team</span><span>' + escapeHtml(m.team.join(', ')) + '</span></div>';
+    }
+    if (m.adversaries && m.adversaries.length) {
+      html += '<div class="matter-card-row"><span class="matter-card-label">Adversaries</span><span>' + escapeHtml(m.adversaries.join(', ')) + '</span></div>';
+    }
+    if (m.retention) {
+      html += '<div class="matter-card-row"><span class="matter-card-label">Retention</span><span>' + escapeHtml(m.retention) + '</span></div>';
+    }
+    html += '<div class="matter-card-actions">';
+    if (!isActive) {
+      html += '<button class="btn-ext activate js-select-matter" data-matter-index="' + i + '">Select</button>';
+    }
+    html += '<button class="btn-ext js-browse-matter" data-matter-index="' + i + '">Browse Files</button>';
+    html += '</div>';
+    html += '</div>';
+  }
+  list.innerHTML = html;
+
+  var selectButtons = list.querySelectorAll('button.js-select-matter');
+  for (var s = 0; s < selectButtons.length; s++) {
+    selectButtons[s].addEventListener('click', function (e) {
+      var idx = parseInt(e.currentTarget.getAttribute('data-matter-index'), 10);
+      if (isNaN(idx) || !mattersCache[idx]) return;
+      selectMatter(mattersCache[idx].id);
+    });
+  }
+
+  var browseButtons = list.querySelectorAll('button.js-browse-matter');
+  for (var b = 0; b < browseButtons.length; b++) {
+    browseButtons[b].addEventListener('click', function (e) {
+      var idx = parseInt(e.currentTarget.getAttribute('data-matter-index'), 10);
+      if (isNaN(idx) || !mattersCache[idx]) return;
+      viewMatterInMemory(mattersCache[idx].id);
+    });
+  }
+}
+
+/**
+ * Set the active matter to `id`.
+ * @param {string} id - Matter directory name (server sanitizes before storing).
+ */
+function selectMatter(id) {
+  apiFetch('/api/matters/active', {
+    method: 'POST',
+    body: { matter_id: id },
+  }).then(function () {
+    activeMatterId = id;
+    showToast('Active matter set to ' + id, 'success');
+    updateMatterBadge();
+    renderMatters();
+  }).catch(function (err) {
+    showToast('Failed to select matter: ' + err.message, 'error');
+  });
+}
+
+/** Clear the active matter selection. */
+function clearActiveMatter() {
+  apiFetch('/api/matters/active', {
+    method: 'POST',
+    body: { matter_id: null },
+  }).then(function () {
+    activeMatterId = null;
+    showToast('Active matter cleared', 'success');
+    updateMatterBadge();
+    renderMatters();
+  }).catch(function (err) {
+    showToast('Failed to clear matter: ' + err.message, 'error');
+  });
+}
+
+/**
+ * Jump to the Memory tab with the matter's directory pre-selected.
+ * @param {string} id - Matter ID.
+ */
+function viewMatterInMemory(id) {
+  switchTab('memory');
+  readMemoryFile('matters/' + id);
+}
+
+// Fetch the active matter on startup so the badge appears immediately if set.
+(function () {
+  apiFetch('/api/matters/active').then(function (data) {
+    activeMatterId = (data && data.matter_id) ? data.matter_id : null;
+    updateMatterBadge();
+  }).catch(function () {});
+}());
 
 // --- Utilities ---
 
