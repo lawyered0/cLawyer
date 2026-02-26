@@ -15,6 +15,59 @@ let jobListRefreshTimer = null;
 const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
 
+function byId(id) {
+  return document.getElementById(id);
+}
+
+function bindClick(id, handler) {
+  const el = byId(id);
+  if (el) el.addEventListener('click', handler);
+}
+
+function bindChange(id, handler) {
+  const el = byId(id);
+  if (el) el.addEventListener('change', handler);
+}
+
+function bindKeydown(id, handler) {
+  const el = byId(id);
+  if (el) el.addEventListener('keydown', handler);
+}
+
+function delegate(container, eventType, selector, handler) {
+  if (!container) return;
+  container.addEventListener(eventType, function(event) {
+    const target = event.target.closest(selector);
+    if (!target || !container.contains(target)) return;
+    handler(event, target);
+  });
+}
+
+const requestVersions = {
+  memoryTree: 0,
+  memorySearch: 0,
+  memoryRead: 0,
+  memoryDirectory: 0,
+  jobsList: 0,
+  jobDetail: 0,
+  routinesList: 0,
+  routineDetail: 0,
+  matters: 0,
+  settings: 0,
+  extensions: 0,
+  skills: 0,
+  gatewayStatus: 0,
+};
+
+function beginRequest(key) {
+  requestVersions[key] = (requestVersions[key] || 0) + 1;
+  return requestVersions[key];
+}
+
+function isCurrentRequest(key, version) {
+  return requestVersions[key] === version;
+}
+
 // --- Auth ---
 
 function authenticate() {
@@ -58,9 +111,10 @@ function authenticate() {
     });
 }
 
-document.getElementById('token-input').addEventListener('keydown', (e) => {
+bindKeydown('token-input', (e) => {
   if (e.key === 'Enter') authenticate();
 });
+bindClick('auth-connect-btn', authenticate);
 
 // Auto-authenticate from URL param or saved session
 (function autoAuth() {
@@ -80,6 +134,26 @@ document.getElementById('token-input').addEventListener('keydown', (e) => {
     document.getElementById('app').style.display = 'flex';
     authenticate();
   }
+})();
+
+(function bindStaticUiEvents() {
+  bindClick('matter-badge', function() { switchTab('matters'); });
+  bindClick('thread-new-btn', createNewThread);
+  bindClick('thread-toggle-btn', toggleThreadSidebar);
+  bindClick('assistant-thread', switchToAssistant);
+  bindClick('send-btn', sendMessage);
+  bindClick('memory-edit-btn', startMemoryEdit);
+  bindClick('memory-upload-btn', triggerMemoryUpload);
+  bindClick('memory-save-btn', saveMemoryEdit);
+  bindClick('memory-cancel-btn', cancelMemoryEdit);
+  bindChange('logs-server-level', function(e) { setServerLogLevel(e.target.value); });
+  bindClick('logs-pause-btn', toggleLogsPause);
+  bindClick('logs-clear-btn', clearLogs);
+  bindClick('wasm-install-btn', installWasmExtension);
+  bindClick('mcp-install-btn', addMcpServer);
+  bindClick('skill-search-btn', searchClawHub);
+  bindClick('skill-install-btn', installSkillFromForm);
+  bindClick('matters-clear-btn', clearActiveMatter);
 })();
 
 // --- API helper ---
@@ -322,7 +396,10 @@ function renderMarkdown(text) {
     // Sanitize HTML output to prevent XSS from tool output or LLM responses.
     html = sanitizeRenderedHtml(html);
     // Inject copy buttons into <pre> blocks
-    html = html.replace(/<pre>/g, '<pre class="code-block-wrapper"><button class="copy-btn" onclick="copyCodeBlock(this)">Copy</button>');
+    html = html.replace(
+      /<pre>/g,
+      '<pre class="code-block-wrapper"><button class="copy-btn" type="button" data-copy-code="1">Copy</button>'
+    );
     return html;
   }
   return escapeHtml(text);
@@ -833,6 +910,11 @@ document.getElementById('chat-messages').addEventListener('scroll', function () 
   }
 });
 
+delegate(byId('chat-messages'), 'click', 'button[data-copy-code]', function(event, button) {
+  event.preventDefault();
+  copyCodeBlock(button);
+});
+
 function autoResizeTextarea(el) {
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, 120) + 'px';
@@ -885,9 +967,28 @@ document.getElementById('memory-search').addEventListener('input', (e) => {
   memorySearchTimeout = setTimeout(() => searchMemory(query), 300);
 });
 
+delegate(
+  byId('memory-breadcrumb-path'),
+  'click',
+  'a[data-memory-nav-root],a[data-memory-nav-path]',
+  function(event, link) {
+    event.preventDefault();
+    if (link.hasAttribute('data-memory-nav-root')) {
+      loadMemoryTree();
+      return;
+    }
+    const encoded = link.getAttribute('data-memory-nav-path');
+    if (!encoded) return;
+    readMemoryFile(decodeURIComponent(encoded));
+  }
+);
+
 function loadMemoryTree() {
+  const requestVersion = beginRequest('memoryTree');
+  beginRequest('memorySearch');
   // Only load top-level on first load (or refresh)
   apiFetch('/api/memory/list?path=').then((data) => {
+    if (!isCurrentRequest('memoryTree', requestVersion)) return;
     memoryTreeState = data.entries.map((e) => ({
       name: e.name,
       path: e.path,
@@ -897,7 +998,9 @@ function loadMemoryTree() {
       loaded: false,
     }));
     renderTree();
-  }).catch(() => {});
+  }).catch(() => {
+    if (!isCurrentRequest('memoryTree', requestVersion)) return;
+  });
 }
 
 function renderTree() {
@@ -984,6 +1087,8 @@ function toggleExpand(node) {
 }
 
 function readMemoryFile(path) {
+  const requestVersion = beginRequest('memoryRead');
+  beginRequest('memoryDirectory');
   currentMemoryPath = path;
   // Update breadcrumb
   document.getElementById('memory-breadcrumb-path').innerHTML = buildBreadcrumb(path);
@@ -993,6 +1098,7 @@ function readMemoryFile(path) {
   cancelMemoryEdit();
 
   apiFetch('/api/memory/read?path=' + encodeURIComponent(path)).then((data) => {
+    if (!isCurrentRequest('memoryRead', requestVersion)) return;
     currentMemoryContent = data.content;
     const viewer = document.getElementById('memory-viewer');
     // Render markdown if it's a .md file
@@ -1004,12 +1110,15 @@ function readMemoryFile(path) {
       viewer.classList.remove('rendered');
     }
   }).catch((err) => {
+    if (!isCurrentRequest('memoryRead', requestVersion)) return;
     currentMemoryContent = null;
     document.getElementById('memory-viewer').innerHTML = '<div class="empty">Error: ' + escapeHtml(err.message) + '</div>';
   });
 }
 
 function openMemoryDirectory(path) {
+  const requestVersion = beginRequest('memoryDirectory');
+  beginRequest('memoryRead');
   currentMemoryPath = null;
   currentMemoryContent = null;
   cancelMemoryEdit();
@@ -1021,6 +1130,7 @@ function openMemoryDirectory(path) {
   viewer.innerHTML = '<div class="empty">Loading directory…</div>';
 
   apiFetch('/api/memory/list?path=' + encodeURIComponent(path)).then((data) => {
+    if (!isCurrentRequest('memoryDirectory', requestVersion)) return;
     const entries = (data && data.entries) ? data.entries : [];
     if (entries.length === 0) {
       viewer.innerHTML = '<div class="empty">No files found in ' + escapeHtml(path) + '.</div>';
@@ -1054,6 +1164,7 @@ function openMemoryDirectory(path) {
     viewer.innerHTML = '';
     viewer.appendChild(container);
   }).catch((err) => {
+    if (!isCurrentRequest('memoryDirectory', requestVersion)) return;
     viewer.innerHTML = '<div class="empty">Error: ' + escapeHtml(err.message) + '</div>';
   });
 }
@@ -1090,11 +1201,12 @@ function saveMemoryEdit() {
 
 function buildBreadcrumb(path) {
   const parts = path.split('/');
-  let html = '<a onclick="loadMemoryTree()">workspace</a>';
+  let html = '<a href="#" data-memory-nav-root="1">workspace</a>';
   let current = '';
   for (const part of parts) {
     current += (current ? '/' : '') + part;
-    html += ' / <a onclick="readMemoryFile(\'' + escapeHtml(current) + '\')">' + escapeHtml(part) + '</a>';
+    html += ' / <a href="#" data-memory-nav-path="' + encodeURIComponent(current) + '">'
+      + escapeHtml(part) + '</a>';
   }
   return html;
 }
@@ -1102,11 +1214,13 @@ function buildBreadcrumb(path) {
 function searchMemory(query) {
   const normalizedQuery = normalizeSearchQuery(query);
   if (!normalizedQuery) return;
+  const requestVersion = beginRequest('memorySearch');
 
   apiFetch('/api/memory/search', {
     method: 'POST',
     body: { query: normalizedQuery, limit: 20 },
   }).then((data) => {
+    if (!isCurrentRequest('memorySearch', requestVersion)) return;
     const tree = document.getElementById('memory-tree');
     tree.innerHTML = '';
     if (data.results.length === 0) {
@@ -1122,7 +1236,9 @@ function searchMemory(query) {
       item.addEventListener('click', () => readMemoryFile(result.path));
       tree.appendChild(item);
     }
-  }).catch(() => {});
+  }).catch(() => {
+    if (!isCurrentRequest('memorySearch', requestVersion)) return;
+  });
 }
 
 function normalizeSearchQuery(query) {
@@ -1269,10 +1385,8 @@ function applyLogFilters() {
 function setServerLogLevel(level) {
   apiFetch('/api/logs/level', {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ level: level }),
+    body: { level: level },
   })
-    .then(r => r.json())
     .then(data => {
       document.getElementById('logs-server-level').value = data.level;
     })
@@ -1281,7 +1395,6 @@ function setServerLogLevel(level) {
 
 function loadServerLogLevel() {
   apiFetch('/api/logs/level')
-    .then(r => r.json())
     .then(data => {
       document.getElementById('logs-server-level').value = data.level;
     })
@@ -1291,6 +1404,7 @@ function loadServerLogLevel() {
 // --- Extensions ---
 
 function loadExtensions() {
+  const requestVersion = beginRequest('extensions');
   const extList = document.getElementById('extensions-list');
   const wasmList = document.getElementById('available-wasm-list');
   const mcpList = document.getElementById('mcp-servers-list');
@@ -1303,6 +1417,7 @@ function loadExtensions() {
     apiFetch('/api/extensions/tools').catch(() => ({ tools: [] })),
     apiFetch('/api/extensions/registry').catch(function(err) { console.warn('registry fetch failed:', err); return { entries: [] }; }),
   ]).then(([extData, toolData, registryData]) => {
+    if (!isCurrentRequest('extensions', requestVersion)) return;
     // Render installed extensions
     if (extData.extensions.length === 0) {
       extList.innerHTML = '<div class="empty-state">No extensions installed</div>';
@@ -1348,6 +1463,8 @@ function loadExtensions() {
         '<tr><td>' + escapeHtml(t.name) + '</td><td>' + escapeHtml(t.description) + '</td></tr>'
       ).join('');
     }
+  }).catch(() => {
+    if (!isCurrentRequest('extensions', requestVersion)) return;
   });
 }
 
@@ -1808,7 +1925,42 @@ let currentJobId = null;
 let currentJobSubTab = 'overview';
 let jobFilesTreeState = null;
 
+delegate(byId('jobs-tbody'), 'click', 'button[data-job-action]', function(event, button) {
+  event.preventDefault();
+  const action = button.getAttribute('data-job-action');
+  const jobId = button.getAttribute('data-job-id');
+  if (!jobId) return;
+  if (action === 'cancel') {
+    cancelJob(jobId);
+    return;
+  }
+  if (action === 'restart') {
+    restartJob(jobId);
+  }
+});
+
+delegate(byId('jobs-tbody'), 'click', 'tr.job-row[data-job-id]', function(event, row) {
+  if (event.target.closest('button[data-job-action]')) return;
+  const jobId = row.getAttribute('data-job-id');
+  if (jobId) openJobDetail(jobId);
+});
+
+delegate(document.querySelector('.jobs-container'), 'click', 'button[data-job-detail-action]', function(event, button) {
+  event.preventDefault();
+  const action = button.getAttribute('data-job-detail-action');
+  if (action === 'back') {
+    closeJobDetail();
+    return;
+  }
+  if (action === 'restart') {
+    const jobId = button.getAttribute('data-job-id');
+    if (jobId) restartJob(jobId);
+  }
+});
+
 function loadJobs() {
+  const requestVersion = beginRequest('jobsList');
+  beginRequest('jobDetail');
   currentJobId = null;
   jobFilesTreeState = null;
 
@@ -1827,9 +1979,12 @@ function loadJobs() {
     apiFetch('/api/jobs/summary'),
     apiFetch('/api/jobs'),
   ]).then(([summary, jobList]) => {
+    if (!isCurrentRequest('jobsList', requestVersion)) return;
     renderJobsSummary(summary);
     renderJobsList(jobList.jobs);
-  }).catch(() => {});
+  }).catch(() => {
+    if (!isCurrentRequest('jobsList', requestVersion)) return;
+  });
 }
 
 function renderJobsSummary(s) {
@@ -1862,16 +2017,17 @@ function renderJobsList(jobs) {
   tbody.innerHTML = jobs.map((job) => {
     const shortId = job.id.substring(0, 8);
     const stateClass = job.state.replace(' ', '_');
+    const escapedId = escapeHtml(job.id);
 
     let actionBtns = '';
     if (job.state === 'pending' || job.state === 'in_progress') {
-      actionBtns = '<button class="btn-cancel" onclick="event.stopPropagation(); cancelJob(\'' + job.id + '\')">Cancel</button>';
+      actionBtns = '<button class="btn-cancel" type="button" data-job-action="cancel" data-job-id="' + escapedId + '">Cancel</button>';
     } else if (job.state === 'failed' || job.state === 'interrupted') {
-      actionBtns = '<button class="btn-restart" onclick="event.stopPropagation(); restartJob(\'' + job.id + '\')">Restart</button>';
+      actionBtns = '<button class="btn-restart" type="button" data-job-action="restart" data-job-id="' + escapedId + '">Restart</button>';
     }
 
-    return '<tr class="job-row" onclick="openJobDetail(\'' + job.id + '\')">'
-      + '<td title="' + escapeHtml(job.id) + '">' + shortId + '</td>'
+    return '<tr class="job-row" data-job-id="' + escapedId + '">'
+      + '<td title="' + escapedId + '">' + shortId + '</td>'
       + '<td>' + escapeHtml(job.title) + '</td>'
       + '<td><span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span></td>'
       + '<td>' + formatDate(job.created_at) + '</td>'
@@ -1905,11 +2061,14 @@ function restartJob(jobId) {
 }
 
 function openJobDetail(jobId) {
+  const requestVersion = beginRequest('jobDetail');
   currentJobId = jobId;
   currentJobSubTab = 'activity';
   apiFetch('/api/jobs/' + jobId).then((job) => {
+    if (!isCurrentRequest('jobDetail', requestVersion)) return;
     renderJobDetail(job);
   }).catch((err) => {
+    if (!isCurrentRequest('jobDetail', requestVersion)) return;
     addMessage('system', 'Failed to load job: ' + err.message);
     closeJobDetail();
   });
@@ -1931,12 +2090,12 @@ function renderJobDetail(job) {
   const header = document.createElement('div');
   header.className = 'job-detail-header';
 
-  let headerHtml = '<button class="btn-back" onclick="closeJobDetail()">&larr; Back</button>'
+  let headerHtml = '<button class="btn-back" type="button" data-job-detail-action="back">&larr; Back</button>'
     + '<h2>' + escapeHtml(job.title) + '</h2>'
     + '<span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span>';
 
   if (job.state === 'failed' || job.state === 'interrupted') {
-    headerHtml += '<button class="btn-restart" onclick="restartJob(\'' + job.id + '\')">Restart</button>';
+    headerHtml += '<button class="btn-restart" type="button" data-job-detail-action="restart" data-job-id="' + escapeHtml(job.id) + '">Restart</button>';
   }
   if (job.browse_url) {
     headerHtml += '<a class="btn-browse" href="' + escapeHtml(job.browse_url) + '" target="_blank">Browse Files</a>';
@@ -2342,7 +2501,47 @@ function sendJobPrompt(jobId, done) {
 
 let currentRoutineId = null;
 
+delegate(byId('routines-tbody'), 'click', 'button[data-routine-action]', function(event, button) {
+  event.preventDefault();
+  const action = button.getAttribute('data-routine-action');
+  const id = button.getAttribute('data-routine-id');
+  if (!id) return;
+  if (action === 'toggle') {
+    toggleRoutine(id);
+    return;
+  }
+  if (action === 'run') {
+    triggerRoutine(id);
+    return;
+  }
+  if (action === 'delete') {
+    deleteRoutine(id, button.getAttribute('data-routine-name') || id);
+  }
+});
+
+delegate(byId('routines-tbody'), 'click', 'tr.routine-row[data-routine-id]', function(event, row) {
+  if (event.target.closest('button[data-routine-action]')) return;
+  const id = row.getAttribute('data-routine-id');
+  if (id) openRoutineDetail(id);
+});
+
+delegate(byId('routine-detail'), 'click', 'button[data-routine-detail-action],a[data-routine-job-id]', function(event, target) {
+  event.preventDefault();
+  if (target.matches('button[data-routine-detail-action="back"]')) {
+    closeRoutineDetail();
+    return;
+  }
+  if (target.matches('a[data-routine-job-id]')) {
+    const jobId = target.getAttribute('data-routine-job-id');
+    if (!jobId) return;
+    switchTab('jobs');
+    openJobDetail(jobId);
+  }
+});
+
 function loadRoutines() {
+  const requestVersion = beginRequest('routinesList');
+  beginRequest('routineDetail');
   currentRoutineId = null;
 
   // Restore list view if detail was open
@@ -2355,9 +2554,12 @@ function loadRoutines() {
     apiFetch('/api/routines/summary'),
     apiFetch('/api/routines'),
   ]).then(([summary, listData]) => {
+    if (!isCurrentRequest('routinesList', requestVersion)) return;
     renderRoutinesSummary(summary);
     renderRoutinesList(listData.routines);
-  }).catch(() => {});
+  }).catch(() => {
+    if (!isCurrentRequest('routinesList', requestVersion)) return;
+  });
 }
 
 function renderRoutinesSummary(s) {
@@ -2387,9 +2589,11 @@ function renderRoutinesList(routines) {
 
     const toggleLabel = r.enabled ? 'Disable' : 'Enable';
     const toggleClass = r.enabled ? 'btn-cancel' : 'btn-restart';
+    const escapedId = escapeHtml(r.id);
+    const escapedName = escapeHtml(r.name);
 
-    return '<tr class="routine-row" onclick="openRoutineDetail(\'' + r.id + '\')">'
-      + '<td>' + escapeHtml(r.name) + '</td>'
+    return '<tr class="routine-row" data-routine-id="' + escapedId + '">'
+      + '<td>' + escapedName + '</td>'
       + '<td>' + escapeHtml(r.trigger_summary) + '</td>'
       + '<td>' + escapeHtml(r.action_type) + '</td>'
       + '<td>' + formatRelativeTime(r.last_run_at) + '</td>'
@@ -2397,19 +2601,22 @@ function renderRoutinesList(routines) {
       + '<td>' + r.run_count + '</td>'
       + '<td><span class="badge ' + statusClass + '">' + escapeHtml(r.status) + '</span></td>'
       + '<td>'
-      + '<button class="' + toggleClass + '" onclick="event.stopPropagation(); toggleRoutine(\'' + r.id + '\')">' + toggleLabel + '</button> '
-      + '<button class="btn-restart" onclick="event.stopPropagation(); triggerRoutine(\'' + r.id + '\')">Run</button> '
-      + '<button class="btn-cancel" onclick="event.stopPropagation(); deleteRoutine(\'' + r.id + '\', \'' + escapeHtml(r.name) + '\')">Delete</button>'
+      + '<button class="' + toggleClass + '" type="button" data-routine-action="toggle" data-routine-id="' + escapedId + '">' + toggleLabel + '</button> '
+      + '<button class="btn-restart" type="button" data-routine-action="run" data-routine-id="' + escapedId + '">Run</button> '
+      + '<button class="btn-cancel" type="button" data-routine-action="delete" data-routine-id="' + escapedId + '" data-routine-name="' + escapedName + '">Delete</button>'
       + '</td>'
       + '</tr>';
   }).join('');
 }
 
 function openRoutineDetail(id) {
+  const requestVersion = beginRequest('routineDetail');
   currentRoutineId = id;
   apiFetch('/api/routines/' + id).then((routine) => {
+    if (!isCurrentRequest('routineDetail', requestVersion)) return;
     renderRoutineDetail(routine);
   }).catch((err) => {
+    if (!isCurrentRequest('routineDetail', requestVersion)) return;
     showToast('Failed to load routine: ' + err.message, 'error');
   });
 }
@@ -2435,7 +2642,7 @@ function renderRoutineDetail(routine) {
     : 'active';
 
   let html = '<div class="job-detail-header">'
-    + '<button class="btn-back" onclick="closeRoutineDetail()">&larr; Back</button>'
+    + '<button class="btn-back" type="button" data-routine-detail-action="back">&larr; Back</button>'
     + '<h2>' + escapeHtml(routine.name) + '</h2>'
     + '<span class="badge ' + statusClass + '">' + escapeHtml(statusLabel) + '</span>'
     + '</div>';
@@ -2482,7 +2689,7 @@ function renderRoutineDetail(routine) {
         + '<td>' + formatDate(run.completed_at) + '</td>'
         + '<td><span class="badge ' + runStatusClass + '">' + escapeHtml(run.status) + '</span></td>'
         + '<td>' + escapeHtml(run.result_summary || '-')
-          + (run.job_id ? ' <a href="#" onclick="event.preventDefault(); switchTab(\'jobs\'); openJobDetail(\'' + run.job_id + '\')">[view job]</a>' : '')
+          + (run.job_id ? ' <a href="#" data-routine-job-id="' + escapeHtml(run.job_id) + '">[view job]</a>' : '')
           + '</td>'
         + '<td>' + (run.tokens_used != null ? run.tokens_used : '-') + '</td>'
         + '</tr>';
@@ -2573,7 +2780,9 @@ function shortModelName(model) {
 }
 
 function fetchGatewayStatus() {
+  const requestVersion = beginRequest('gatewayStatus');
   apiFetch('/api/gateway/status').then(function(data) {
+    if (!isCurrentRequest('gatewayStatus', requestVersion)) return;
     var popover = document.getElementById('gateway-popover');
     var html = '';
 
@@ -2615,7 +2824,9 @@ function fetchGatewayStatus() {
     }
 
     popover.innerHTML = html;
-  }).catch(function() {});
+  }).catch(function() {
+    if (!isCurrentRequest('gatewayStatus', requestVersion)) return;
+  });
 }
 
 // Show/hide popover on hover
@@ -2699,7 +2910,7 @@ function renderTeePopover(report) {
     + '<div class="tee-field"><div class="tee-field-label">VM Config</div>'
     + '<div class="tee-field-value">' + escapeHtml(vmConfig) + '</div></div>'
     + '<div class="tee-popover-actions">'
-    + '<button class="tee-btn-copy" onclick="copyTeeReport()">Copy Full Report</button></div>';
+    + '<button class="tee-btn-copy" type="button" data-tee-action="copy-report">Copy Full Report</button></div>';
 }
 
 function copyTeeReport() {
@@ -2711,6 +2922,11 @@ function copyTeeReport() {
     showToast('Failed to copy report', 'error');
   });
 }
+
+delegate(byId('tee-popover'), 'click', 'button[data-tee-action="copy-report"]', function(event) {
+  event.preventDefault();
+  copyTeeReport();
+});
 
 document.getElementById('tee-shield').addEventListener('mouseenter', function() {
   fetchTeeReport();
@@ -2783,8 +2999,10 @@ function addMcpServer() {
 // --- Skills ---
 
 function loadSkills() {
+  var requestVersion = beginRequest('skills');
   var skillsList = document.getElementById('skills-list');
   apiFetch('/api/skills').then(function(data) {
+    if (!isCurrentRequest('skills', requestVersion)) return;
     if (!data.skills || data.skills.length === 0) {
       skillsList.innerHTML = '<div class="empty-state">No skills installed</div>';
       return;
@@ -2794,6 +3012,7 @@ function loadSkills() {
       skillsList.appendChild(renderSkillCard(data.skills[i]));
     }
   }).catch(function(err) {
+    if (!isCurrentRequest('skills', requestVersion)) return;
     skillsList.innerHTML = '<div class="empty-state">Failed to load skills: ' + escapeHtml(err.message) + '</div>';
   });
 }
@@ -3175,10 +3394,12 @@ var activeMatterId = null;
  * parallel, then renders the panel and updates the badge.
  */
 function loadMatters() {
+  var requestVersion = beginRequest('matters');
   Promise.all([
     apiFetch('/api/matters'),
     apiFetch('/api/matters/active'),
   ]).then(function (results) {
+    if (!isCurrentRequest('matters', requestVersion)) return;
     var listData = results[0];
     var activeData = results[1];
     mattersCache = (listData && listData.matters) ? listData.matters : [];
@@ -3186,6 +3407,7 @@ function loadMatters() {
     renderMatters();
     updateMatterBadge();
   }).catch(function (err) {
+    if (!isCurrentRequest('matters', requestVersion)) return;
     var list = document.getElementById('matters-list');
     if (list) list.innerHTML = '<div class="empty-state" style="color:var(--error)">Failed to load matters: ' + escapeHtml(err.message) + '</div>';
   });
@@ -3398,9 +3620,11 @@ function formatDate(isoString) {
 // --- Settings ---
 
 function loadSettings() {
+  var requestVersion = beginRequest('settings');
   var el = document.getElementById('settings-list');
   el.innerHTML = '<div class="empty-state">Loading\u2026</div>';
   apiFetch('/api/settings').then(function(data) {
+    if (!isCurrentRequest('settings', requestVersion)) return;
     if (!data.settings || data.settings.length === 0) {
       el.innerHTML = '<div class="empty-state">No settings configured. Use \u201c+ New\u201d to add one.</div>';
       return;
@@ -3416,6 +3640,7 @@ function loadSettings() {
     el.innerHTML = '';
     el.appendChild(tbl);
   }).catch(function(err) {
+    if (!isCurrentRequest('settings', requestVersion)) return;
     el.innerHTML = '<div class="empty-state">Failed to load: ' + escapeHtml(err.message) + '</div>';
   });
 }

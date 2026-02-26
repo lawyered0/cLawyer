@@ -281,6 +281,43 @@ async fn test_gateway_status_endpoint() {
 }
 
 #[tokio::test]
+async fn test_root_response_has_csp_header() {
+    let (addr, _state, _agent_rx) = start_test_server().await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{}/", addr))
+        .send()
+        .await
+        .expect("Failed to fetch root page");
+
+    assert_eq!(resp.status(), 200);
+
+    let csp = resp
+        .headers()
+        .get(reqwest::header::CONTENT_SECURITY_POLICY)
+        .expect("missing Content-Security-Policy header")
+        .to_str()
+        .expect("invalid CSP header value");
+
+    assert!(csp.contains("default-src 'self'"));
+    assert!(csp.contains("script-src 'self' https://cdn.jsdelivr.net"));
+    assert!(csp.contains("object-src 'none'"));
+    assert!(csp.contains("frame-ancestors 'none'"));
+
+    let script_src = csp
+        .split(';')
+        .map(str::trim)
+        .find(|directive| directive.starts_with("script-src"))
+        .expect("missing script-src directive");
+    assert!(
+        !script_src.contains("'unsafe-inline'"),
+        "script-src unexpectedly allows 'unsafe-inline': {}",
+        script_src
+    );
+}
+
+#[tokio::test]
 async fn test_ws_no_auth_rejected() {
     let (addr, _state, _agent_rx) = start_test_server().await;
 
