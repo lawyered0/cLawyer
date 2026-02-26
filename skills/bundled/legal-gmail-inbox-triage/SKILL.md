@@ -20,6 +20,7 @@ Requirements:
 - Keep facts separate from analysis and mark assumptions explicitly.
 - Cite each material point with message provenance in the form `[gmail:<message_id>]`.
 - Write only under `matters/<matter_id>/communications/`.
+- If support is missing or conflicting, state `insufficient evidence` and identify what corroboration is needed.
 - If no relevant emails are found, state `no relevant messages` and include the query scope used.
 
 Workflow:
