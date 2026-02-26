@@ -194,9 +194,11 @@ impl Agent {
             return self.handle_job_or_command(intent, message).await;
         }
 
-        if self.deps.legal_config.enabled
-            && self.deps.legal_config.require_matter_context
-            && self.deps.legal_config.active_matter.is_none()
+        let effective_legal_config = self.effective_legal_config_for(message);
+
+        if effective_legal_config.enabled
+            && effective_legal_config.require_matter_context
+            && effective_legal_config.active_matter.is_none()
             && crate::legal::policy::is_non_trivial_request(content)
         {
             crate::legal::audit::inc_blocked_action();
@@ -212,13 +214,13 @@ impl Agent {
             ));
         }
 
-        if self.deps.legal_config.enabled
-            && self.deps.legal_config.require_matter_context
+        if effective_legal_config.enabled
+            && effective_legal_config.require_matter_context
             && crate::legal::policy::is_non_trivial_request(content)
             && let Some(ws) = self.workspace()
             && let Err(reason) = crate::legal::matter::validate_active_matter_metadata(
                 ws.as_ref(),
-                &self.deps.legal_config,
+                &effective_legal_config,
             )
             .await
         {
@@ -237,7 +239,7 @@ impl Agent {
 
         if let Some(ws) = self.workspace()
             && let Some(conflict) =
-                crate::legal::matter::detect_conflict(ws.as_ref(), &self.deps.legal_config, content)
+                crate::legal::matter::detect_conflict(ws.as_ref(), &effective_legal_config, content)
                     .await
         {
             crate::legal::audit::inc_blocked_action();
@@ -382,8 +384,8 @@ impl Agent {
                     }
                 };
 
-                if self.deps.legal_config.enabled
-                    && self.deps.legal_config.citation_required
+                if effective_legal_config.enabled
+                    && effective_legal_config.citation_required
                     && !crate::legal::policy::response_has_citation_markers(&response)
                 {
                     crate::legal::audit::record(
@@ -665,6 +667,8 @@ impl Agent {
         approved: bool,
         always: bool,
     ) -> Result<SubmissionResult, Error> {
+        let effective_legal_config = self.effective_legal_config_for(message);
+
         // Get pending approval for this thread
         let pending = {
             let mut sess = session.lock().await;
@@ -702,7 +706,10 @@ impl Agent {
         if approved {
             // If always, add to auto-approved set
             if always {
-                let legal_forced = self.tools().is_legal_approval_forced(&pending.tool_name);
+                let legal_forced = self.tools().is_legal_approval_forced_with_legal(
+                    &pending.tool_name,
+                    Some(&effective_legal_config),
+                );
                 if !legal_forced {
                     let mut sess = session.lock().await;
                     sess.auto_approve_tool(&pending.tool_name);
@@ -870,10 +877,11 @@ impl Agent {
                         let sess = session.lock().await;
                         sess.is_tool_auto_approved(&tc.name)
                     };
-                    let decision = self.tools().approval_decision_for(
+                    let decision = self.tools().approval_decision_for_with_legal(
                         &tc.name,
                         tool.requires_approval(&tc.arguments),
                         is_auto_approved,
+                        Some(&effective_legal_config),
                     );
 
                     if decision.needs_approval {
@@ -1142,8 +1150,8 @@ impl Agent {
 
             match result {
                 Ok(AgenticLoopResult::Response(mut response)) => {
-                    if self.deps.legal_config.enabled
-                        && self.deps.legal_config.citation_required
+                    if effective_legal_config.enabled
+                        && effective_legal_config.citation_required
                         && !crate::legal::policy::response_has_citation_markers(&response)
                     {
                         crate::legal::audit::record(

@@ -439,6 +439,30 @@ async fn health_handler() -> Json<HealthResponse> {
 
 // --- Chat handlers ---
 
+async fn load_active_matter_for_chat(state: &GatewayState) -> Option<String> {
+    let store = state.store.as_ref()?;
+    let value = match store
+        .get_setting(&state.user_id, MATTER_ACTIVE_SETTING)
+        .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                "Failed to load active matter setting for chat metadata: {}",
+                err
+            );
+            return None;
+        }
+    }?;
+    let raw = value.as_str()?;
+    let sanitized = crate::legal::policy::sanitize_matter_id(raw);
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
 async fn chat_send_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<SendMessageRequest>,
@@ -451,11 +475,23 @@ async fn chat_send_handler(
     }
 
     let mut msg = IncomingMessage::new("gateway", &state.user_id, &req.content);
+    let mut metadata = serde_json::Map::new();
 
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
-        msg = msg.with_metadata(serde_json::json!({"thread_id": thread_id}));
+        metadata.insert(
+            "thread_id".to_string(),
+            serde_json::Value::String(thread_id.clone()),
+        );
     }
+    metadata.insert(
+        "active_matter".to_string(),
+        load_active_matter_for_chat(state.as_ref())
+            .await
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    msg = msg.with_metadata(serde_json::Value::Object(metadata));
 
     let msg_id = msg.id;
 
@@ -3358,6 +3394,82 @@ mod tests {
         assert_eq!(
             stored.and_then(|v| v.as_str().map(|s| s.to_string())),
             Some("demo".to_string())
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn chat_send_includes_active_matter_metadata_when_setting_exists() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let raw_matter = "Acme v. Foo!!!";
+        let expected = crate::legal::policy::sanitize_matter_id(raw_matter);
+        state
+            .store
+            .as_ref()
+            .expect("store")
+            .set_setting(
+                "test-user",
+                MATTER_ACTIVE_SETTING,
+                &serde_json::Value::String(raw_matter.to_string()),
+            )
+            .await
+            .expect("set active matter setting");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        *state.msg_tx.write().await = Some(tx);
+
+        let (status, _resp) = chat_send_handler(
+            State(Arc::clone(&state)),
+            Json(SendMessageRequest {
+                content: "draft a memo".to_string(),
+                thread_id: Some("thread-123".to_string()),
+            }),
+        )
+        .await
+        .expect("chat send should succeed");
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let sent = rx.recv().await.expect("message should be forwarded");
+        assert_eq!(sent.thread_id.as_deref(), Some("thread-123"));
+        assert_eq!(
+            sent.metadata.get("thread_id").and_then(|v| v.as_str()),
+            Some("thread-123")
+        );
+        assert_eq!(
+            sent.metadata.get("active_matter").and_then(|v| v.as_str()),
+            Some(expected.as_str())
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn chat_send_sets_active_matter_metadata_to_null_when_missing() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        *state.msg_tx.write().await = Some(tx);
+
+        let (status, _resp) = chat_send_handler(
+            State(Arc::clone(&state)),
+            Json(SendMessageRequest {
+                content: "hello".to_string(),
+                thread_id: None,
+            }),
+        )
+        .await
+        .expect("chat send should succeed");
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let sent = rx.recv().await.expect("message should be forwarded");
+        assert_eq!(
+            sent.metadata.get("active_matter"),
+            Some(&serde_json::Value::Null)
         );
     }
 

@@ -132,8 +132,18 @@ impl ToolRegistry {
 
     /// Whether legal policy forces explicit approval for a tool.
     pub fn is_legal_approval_forced(&self, tool_name: &str) -> bool {
-        self.legal
-            .as_ref()
+        self.is_legal_approval_forced_with_legal(tool_name, None)
+    }
+
+    /// Whether legal policy forces explicit approval for a tool using an
+    /// optional runtime legal override.
+    pub fn is_legal_approval_forced_with_legal(
+        &self,
+        tool_name: &str,
+        legal_override: Option<&crate::config::LegalConfig>,
+    ) -> bool {
+        legal_override
+            .or(self.legal.as_ref())
             .is_some_and(|legal| crate::legal::policy::requires_explicit_approval(legal, tool_name))
     }
 
@@ -144,7 +154,19 @@ impl ToolRegistry {
         requirement: ApprovalRequirement,
         is_auto_approved: bool,
     ) -> ToolApprovalDecision {
-        let legal_forced = self.is_legal_approval_forced(tool_name);
+        self.approval_decision_for_with_legal(tool_name, requirement, is_auto_approved, None)
+    }
+
+    /// Resolve final approval behavior from tool requirement + legal policy
+    /// using an optional runtime legal override.
+    pub fn approval_decision_for_with_legal(
+        &self,
+        tool_name: &str,
+        requirement: ApprovalRequirement,
+        is_auto_approved: bool,
+        legal_override: Option<&crate::config::LegalConfig>,
+    ) -> ToolApprovalDecision {
+        let legal_forced = self.is_legal_approval_forced_with_legal(tool_name, legal_override);
         let needs_approval = if legal_forced {
             true
         } else {
@@ -796,5 +818,30 @@ mod tests {
         assert!(shell.legal_forced && shell.needs_approval);
         assert!(read.legal_forced && read.needs_approval);
         assert!(memory.legal_forced && memory.needs_approval);
+    }
+
+    #[test]
+    fn test_approval_decision_uses_runtime_legal_override() {
+        let mut base = legal_for_test();
+        base.hardening = crate::config::LegalHardeningProfile::Standard;
+        base.active_matter = None;
+        base.privilege_guard = true;
+        let registry = ToolRegistry::new().with_legal_policy(base.clone());
+
+        let default_decision =
+            registry.approval_decision_for("read_file", ApprovalRequirement::Never, true);
+        assert!(!default_decision.legal_forced);
+        assert!(!default_decision.needs_approval);
+
+        let mut runtime = base;
+        runtime.active_matter = Some("demo".to_string());
+        let override_decision = registry.approval_decision_for_with_legal(
+            "read_file",
+            ApprovalRequirement::Never,
+            true,
+            Some(&runtime),
+        );
+        assert!(override_decision.legal_forced);
+        assert!(override_decision.needs_approval);
     }
 }
