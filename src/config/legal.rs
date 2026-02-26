@@ -127,6 +127,60 @@ fn validate_audit_path(raw: &str) -> Result<PathBuf, ConfigError> {
     Ok(normalized)
 }
 
+fn validate_matter_root(raw: &str) -> Result<String, ConfigError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            key: "LEGAL_MATTER_ROOT".to_string(),
+            message: "matter root must not be empty".to_string(),
+        });
+    }
+
+    // Parse BEFORE stripping any leading slash so is_absolute() works correctly.
+    let raw_path = PathBuf::from(trimmed);
+    if raw_path.is_absolute() {
+        return Err(ConfigError::InvalidValue {
+            key: "LEGAL_MATTER_ROOT".to_string(),
+            message: "matter root must be relative to the workspace".to_string(),
+        });
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in raw_path.components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(ConfigError::InvalidValue {
+                    key: "LEGAL_MATTER_ROOT".to_string(),
+                    message: "matter root must not contain '..' components".to_string(),
+                });
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(ConfigError::InvalidValue {
+                    key: "LEGAL_MATTER_ROOT".to_string(),
+                    message: "matter root must be relative to the workspace".to_string(),
+                });
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return Err(ConfigError::InvalidValue {
+            key: "LEGAL_MATTER_ROOT".to_string(),
+            message: "matter root must not be empty".to_string(),
+        });
+    }
+
+    normalized
+        .to_str()
+        .ok_or_else(|| ConfigError::InvalidValue {
+            key: "LEGAL_MATTER_ROOT".to_string(),
+            message: "matter root contains non-UTF-8 characters".to_string(),
+        })
+        .map(|s| s.to_string())
+}
+
 impl LegalConfig {
     pub(crate) fn resolve(settings: &Settings) -> Result<Self, ConfigError> {
         let hardening_raw = parse_string_env("LEGAL_HARDENING", settings.legal.hardening.clone())?;
@@ -158,7 +212,11 @@ impl LegalConfig {
                 "LEGAL_CITATION_REQUIRED",
                 settings.legal.citation_required,
             )?,
-            matter_root: parse_string_env("LEGAL_MATTER_ROOT", settings.legal.matter_root.clone())?,
+            matter_root: {
+                let raw =
+                    parse_string_env("LEGAL_MATTER_ROOT", settings.legal.matter_root.clone())?;
+                validate_matter_root(&raw)?
+            },
             active_matter: optional_env("LEGAL_MATTER")?
                 .or_else(|| optional_env("MATTER_ID").ok().flatten())
                 .or_else(|| settings.legal.active_matter.clone()),
@@ -276,5 +334,78 @@ mod tests {
             message.contains("under 'logs/'"),
             "unexpected message: {message}"
         );
+    }
+
+    #[test]
+    fn validate_matter_root_accepts_simple_relative_path() {
+        assert_eq!(
+            super::validate_matter_root("matters").expect("valid"),
+            "matters"
+        );
+    }
+
+    #[test]
+    fn validate_matter_root_accepts_nested_relative_path() {
+        assert_eq!(
+            super::validate_matter_root("legal/matters").expect("valid"),
+            "legal/matters"
+        );
+    }
+
+    #[test]
+    fn validate_matter_root_normalizes_cur_dir_and_trailing_slashes() {
+        assert_eq!(
+            super::validate_matter_root("./matters/./files/").expect("valid"),
+            "matters/files"
+        );
+    }
+
+    #[test]
+    fn validate_matter_root_rejects_parent_dir_traversal() {
+        let err = super::validate_matter_root("../matters").expect_err("must reject '..'");
+        let ConfigError::InvalidValue { key, message } = err else {
+            panic!("expected InvalidValue");
+        };
+        assert_eq!(key, "LEGAL_MATTER_ROOT");
+        assert!(message.contains(".."), "unexpected message: {message}");
+    }
+
+    #[test]
+    fn validate_matter_root_rejects_embedded_traversal() {
+        let err = super::validate_matter_root("matters/../../etc").expect_err("must reject '..'");
+        let ConfigError::InvalidValue { key, message } = err else {
+            panic!("expected InvalidValue");
+        };
+        assert_eq!(key, "LEGAL_MATTER_ROOT");
+        assert!(message.contains(".."), "unexpected message: {message}");
+    }
+
+    #[test]
+    fn validate_matter_root_rejects_absolute_paths() {
+        let absolute = if cfg!(windows) {
+            r"C:\matters"
+        } else {
+            "/tmp/matters"
+        };
+        let err =
+            super::validate_matter_root(absolute).expect_err("absolute paths must be rejected");
+        let ConfigError::InvalidValue { key, message } = err else {
+            panic!("expected InvalidValue");
+        };
+        assert_eq!(key, "LEGAL_MATTER_ROOT");
+        assert!(
+            message.contains("relative to the workspace"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_matter_root_rejects_empty() {
+        let err = super::validate_matter_root("   ").expect_err("empty must be rejected");
+        let ConfigError::InvalidValue { key, message } = err else {
+            panic!("expected InvalidValue");
+        };
+        assert_eq!(key, "LEGAL_MATTER_ROOT");
+        assert!(message.contains("empty"), "unexpected message: {message}");
     }
 }
