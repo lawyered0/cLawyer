@@ -470,19 +470,6 @@ impl Tool for HttpTool {
     }
 
     fn requires_approval(&self, params: &serde_json::Value) -> ApprovalRequirement {
-        if let Some(ref legal) = self.legal {
-            if legal.privilege_guard
-                && legal
-                    .active_matter
-                    .as_deref()
-                    .is_some_and(|m| !m.trim().is_empty())
-            {
-                return ApprovalRequirement::Always;
-            }
-            if crate::legal::policy::is_max_lockdown(legal) {
-                return ApprovalRequirement::Always;
-            }
-        }
         // 1. Manual auth headers/query params in LLM params
         if crate::safety::params_contain_manual_credentials(params) {
             return ApprovalRequirement::Always;

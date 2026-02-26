@@ -401,7 +401,9 @@ impl Scheduler {
             .into());
         }
 
-        if tool.requires_approval(&params).is_required() {
+        let decision =
+            tools.approval_decision_for(tool_name, tool.requires_approval(&params), false);
+        if decision.needs_approval {
             return Err(crate::error::ToolError::AuthRequired {
                 name: tool_name.to_string(),
             }

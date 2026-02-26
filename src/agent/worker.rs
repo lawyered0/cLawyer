@@ -480,8 +480,11 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     name: tool_name.to_string(),
                 })?;
 
-        // Tools requiring approval are blocked in autonomous jobs
-        if tool.requires_approval(params).is_required() {
+        // Tools requiring approval are blocked in autonomous jobs.
+        let decision =
+            deps.tools
+                .approval_decision_for(tool_name, tool.requires_approval(params), false);
+        if decision.needs_approval {
             return Err(crate::error::ToolError::AuthRequired {
                 name: tool_name.to_string(),
             }

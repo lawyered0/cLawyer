@@ -1,6 +1,6 @@
 use crate::config::{LegalConfig, LegalHardeningProfile};
 
-const SIDE_EFFECT_TOOLS: &[&str] = &[
+const MAX_LOCKDOWN_SIDE_EFFECT_TOOLS: &[&str] = &[
     "http",
     "shell",
     "write_file",
@@ -17,6 +17,17 @@ const SIDE_EFFECT_TOOLS: &[&str] = &[
     "routine_update",
     "routine_delete",
 ];
+const PRIVILEGE_GUARD_EGRESS_TOOLS: &[&str] = &["http", "shell", "create_job"];
+const PRIVILEGE_GUARD_CONFIDENTIAL_TOOLS: &[&str] = &[
+    "read_file",
+    "write_file",
+    "list_dir",
+    "apply_patch",
+    "memory_read",
+    "memory_write",
+    "memory_search",
+    "memory_tree",
+];
 
 /// True when legal hardening is in max-lockdown mode.
 pub fn is_max_lockdown(config: &LegalConfig) -> bool {
@@ -25,7 +36,27 @@ pub fn is_max_lockdown(config: &LegalConfig) -> bool {
 
 /// Whether a tool should always require explicit approval in legal max-lockdown mode.
 pub fn requires_explicit_approval(config: &LegalConfig, tool_name: &str) -> bool {
-    is_max_lockdown(config) && SIDE_EFFECT_TOOLS.contains(&tool_name)
+    if !config.enabled {
+        return false;
+    }
+
+    if is_max_lockdown(config) && MAX_LOCKDOWN_SIDE_EFFECT_TOOLS.contains(&tool_name) {
+        return true;
+    }
+
+    let active_matter_set = config
+        .active_matter
+        .as_deref()
+        .is_some_and(|m| !m.trim().is_empty());
+    if config.privilege_guard
+        && active_matter_set
+        && (PRIVILEGE_GUARD_EGRESS_TOOLS.contains(&tool_name)
+            || PRIVILEGE_GUARD_CONFIDENTIAL_TOOLS.contains(&tool_name))
+    {
+        return true;
+    }
+
+    false
 }
 
 /// Normalize a domain for allowlist comparisons.
@@ -152,6 +183,39 @@ mod tests {
         assert!(is_network_domain_allowed(&cfg, "example.com"));
         assert!(is_network_domain_allowed(&cfg, "api.example.com"));
         assert!(!is_network_domain_allowed(&cfg, "example.org"));
+    }
+
+    #[test]
+    fn max_lockdown_still_forces_side_effect_approval() {
+        let mut cfg = legal_for_test();
+        cfg.privilege_guard = false;
+        cfg.active_matter = None;
+        assert!(requires_explicit_approval(&cfg, "write_file"));
+        assert!(!requires_explicit_approval(&cfg, "memory_read"));
+    }
+
+    #[test]
+    fn privilege_guard_forces_approval_for_sensitive_tools_with_active_matter() {
+        let mut cfg = legal_for_test();
+        cfg.hardening = LegalHardeningProfile::Standard;
+        cfg.active_matter = Some("demo".to_string());
+        cfg.privilege_guard = true;
+
+        assert!(requires_explicit_approval(&cfg, "http"));
+        assert!(requires_explicit_approval(&cfg, "read_file"));
+        assert!(requires_explicit_approval(&cfg, "memory_write"));
+        assert!(!requires_explicit_approval(&cfg, "echo"));
+    }
+
+    #[test]
+    fn privilege_guard_does_not_force_without_active_matter() {
+        let mut cfg = legal_for_test();
+        cfg.hardening = LegalHardeningProfile::Standard;
+        cfg.active_matter = None;
+        cfg.privilege_guard = true;
+
+        assert!(!requires_explicit_approval(&cfg, "shell"));
+        assert!(!requires_explicit_approval(&cfg, "read_file"));
     }
 
     #[test]

@@ -702,10 +702,7 @@ impl Agent {
         if approved {
             // If always, add to auto-approved set
             if always {
-                let legal_forced = crate::legal::policy::requires_explicit_approval(
-                    &self.deps.legal_config,
-                    &pending.tool_name,
-                );
+                let legal_forced = self.tools().is_legal_approval_forced(&pending.tool_name);
                 if !legal_forced {
                     let mut sess = session.lock().await;
                     sess.auto_approve_tool(&pending.tool_name);
@@ -869,31 +866,23 @@ impl Agent {
 
             for (idx, tc) in deferred_tool_calls.iter().enumerate() {
                 if let Some(tool) = self.tools().get(&tc.name).await {
-                    use crate::tools::ApprovalRequirement;
-                    let legal_forced = crate::legal::policy::requires_explicit_approval(
-                        &self.deps.legal_config,
-                        &tc.name,
-                    );
-                    let needs_approval = if legal_forced {
-                        true
-                    } else {
-                        match tool.requires_approval(&tc.arguments) {
-                            ApprovalRequirement::Never => false,
-                            ApprovalRequirement::UnlessAutoApproved => {
-                                let sess = session.lock().await;
-                                !sess.is_tool_auto_approved(&tc.name)
-                            }
-                            ApprovalRequirement::Always => true,
-                        }
+                    let is_auto_approved = {
+                        let sess = session.lock().await;
+                        sess.is_tool_auto_approved(&tc.name)
                     };
+                    let decision = self.tools().approval_decision_for(
+                        &tc.name,
+                        tool.requires_approval(&tc.arguments),
+                        is_auto_approved,
+                    );
 
-                    if needs_approval {
+                    if decision.needs_approval {
                         crate::legal::audit::inc_approval_required();
                         crate::legal::audit::record(
                             "approval_required",
                             serde_json::json!({
                                 "tool_name": tc.name,
-                                "legal_forced": legal_forced,
+                                "legal_forced": decision.legal_forced,
                             }),
                         );
                         approval_needed = Some((idx, tc.clone(), tool));
