@@ -54,6 +54,7 @@ Trusted bundled skills:
 
 - `legal-intake`
 - `legal-chronology`
+- `legal-gmail-inbox-triage`
 - `legal-contract-review`
 - `legal-litigation-support`
 - `legal-research-synthesis`
@@ -79,4 +80,3 @@ Counters tracked in audit state:
 - `blocked_actions`
 - `approval_required`
 - `redaction_events`
-
