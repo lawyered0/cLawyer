@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State, WebSocketUpgrade},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State, WebSocketUpgrade},
     http::{StatusCode, header},
     middleware,
     response::{
@@ -204,6 +204,10 @@ pub async fn start_server(
         .route("/api/memory/read", get(memory_read_handler))
         .route("/api/memory/write", post(memory_write_handler))
         .route("/api/memory/search", post(memory_search_handler))
+        .route(
+            "/api/memory/upload",
+            post(memory_upload_handler).layer(DefaultBodyLimit::max(UPLOAD_FILE_SIZE_LIMIT)),
+        )
         // Matters
         .route("/api/matters", get(matters_list_handler))
         .route(
@@ -1134,6 +1138,94 @@ async fn memory_search_handler(
     Ok(Json(MemorySearchResponse { results: hits }))
 }
 
+/// Maximum size accepted for a single uploaded file (10 MiB).
+const UPLOAD_FILE_SIZE_LIMIT: usize = 10 * 1024 * 1024;
+
+async fn memory_upload_handler(
+    State(state): State<Arc<GatewayState>>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<MemoryUploadResponse>), (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+
+    let mut uploaded: Vec<UploadedFile> = Vec::new();
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Multipart read error: {e}"),
+        )
+    })? {
+        // Derive a safe filename: take the basename only, keep alphanumerics
+        // plus a small allow-set of punctuation, collapse empty result to a
+        // safe default.  This prevents path traversal via the filename header.
+        let raw_name = field.file_name().unwrap_or("document.txt").to_string();
+        let safe_name: String = raw_name
+            .rsplit('/')
+            .next()
+            .unwrap_or("document.txt")
+            .chars()
+            .filter(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' '))
+            .collect();
+        let safe_name = if safe_name.trim().is_empty() {
+            "document.txt".to_string()
+        } else {
+            safe_name.trim().to_string()
+        };
+        let dest_path = format!("uploads/{safe_name}");
+
+        // Read the field body, enforcing the per-file size limit.
+        let data = field.bytes().await.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read upload body: {e}"),
+            )
+        })?;
+
+        if data.len() > UPLOAD_FILE_SIZE_LIMIT {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "File '{}' exceeds the 10 MiB upload limit ({} bytes)",
+                    raw_name,
+                    data.len()
+                ),
+            ));
+        }
+
+        // Workspace stores text; reject binary (non-UTF-8) content with a
+        // helpful error rather than storing garbled data.
+        let content = String::from_utf8(data.to_vec()).map_err(|_| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "File '{}' contains non-UTF-8 bytes. Only plain-text files are supported.",
+                    raw_name
+                ),
+            )
+        })?;
+
+        let byte_count = content.len();
+        workspace
+            .write(&dest_path, &content)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        uploaded.push(UploadedFile {
+            path: dest_path,
+            bytes: byte_count,
+            status: "written",
+        });
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(MemoryUploadResponse { files: uploaded }),
+    ))
+}
+
 // --- Matter handlers ---
 
 /// The workspace path prefix where matter directories live.
@@ -1149,7 +1241,7 @@ async fn matters_list_handler(
         "Workspace not available".to_string(),
     ))?;
 
-    // List top-level entries under the matter root.  Treat a missing
+    // List top-level entries under the matter root. Treat a missing
     // directory as an empty list rather than an error — the matters/ dir
     // is seeded lazily on first use.
     let entries = workspace.list(MATTER_ROOT).await.unwrap_or_default();

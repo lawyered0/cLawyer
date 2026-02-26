@@ -2574,6 +2574,22 @@ mark {
   border-color: var(--accent);
 }
 
+.memory-upload-btn {
+  padding: 3px 10px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.memory-upload-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 .memory-editor {
   flex: 1;
   display: flex;

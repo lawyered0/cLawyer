@@ -92,7 +92,7 @@ rustyline = { version = "17", features = ["custom-bindings", "derive", "with-fil
 termimad = "0.34"
 
 # Channel integrations
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws", "multipart"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "set-header"] }
 

@@ -290,6 +290,22 @@ pub struct SetActiveMatterRequest {
     pub matter_id: Option<String>,
 }
 
+// --- Memory upload ---
+
+/// One successfully uploaded file entry in the upload response.
+#[derive(Debug, Serialize)]
+pub struct UploadedFile {
+    pub path: String,
+    pub bytes: usize,
+    pub status: &'static str,
+}
+
+/// Response body returned by `POST /api/memory/upload`.
+#[derive(Debug, Serialize)]
+pub struct MemoryUploadResponse {
+    pub files: Vec<UploadedFile>,
+}
+
 // --- Jobs ---
 
 #[derive(Debug, Serialize)]

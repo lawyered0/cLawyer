@@ -103,7 +103,11 @@
         <div class="memory-content">
           <div class="memory-breadcrumb" id="memory-breadcrumb">
             <span id="memory-breadcrumb-path">workspace /</span>
-            <button class="memory-edit-btn" id="memory-edit-btn" style="display:none" onclick="startMemoryEdit()">Edit</button>
+            <div style="display:flex;gap:6px;align-items:center;">
+              <button class="memory-edit-btn" id="memory-edit-btn" style="display:none" onclick="startMemoryEdit()">Edit</button>
+              <button class="memory-upload-btn" id="memory-upload-btn" onclick="triggerMemoryUpload()" title="Upload text files to workspace">Upload</button>
+              <input type="file" id="memory-upload-input" multiple accept=".txt,.md,.json,.yaml,.yml,.toml,.csv,.xml,.html,.css,.js,.ts,.rs,.py,.rb,.go,.sh,.env,.conf,.cfg,.ini,.log" style="display:none">
+            </div>
           </div>
           <div class="memory-viewer" id="memory-viewer">
             <div class="empty">Select a file to view its contents</div>
