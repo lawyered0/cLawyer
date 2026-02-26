@@ -1335,12 +1335,37 @@ async fn matters_active_set_handler(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
         Some(id) => {
+            let workspace = state.workspace.as_ref().ok_or((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Workspace not available".to_string(),
+            ))?;
             let sanitized = crate::legal::policy::sanitize_matter_id(id);
             if sanitized.is_empty() {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     "Matter ID is empty after sanitization".to_string(),
                 ));
+            }
+            match crate::legal::matter::read_matter_metadata_for_root(
+                workspace.as_ref(),
+                MATTER_ROOT,
+                &sanitized,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(crate::legal::matter::MatterMetadataValidationError::Missing { path }) => {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        format!("Matter '{}' not found (missing '{}')", sanitized, path),
+                    ));
+                }
+                Err(err @ crate::legal::matter::MatterMetadataValidationError::Invalid { .. }) => {
+                    return Err((StatusCode::UNPROCESSABLE_ENTITY, err.to_string()));
+                }
+                Err(err @ crate::legal::matter::MatterMetadataValidationError::Storage { .. }) => {
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+                }
             }
             store
                 .set_setting(
@@ -3079,5 +3104,126 @@ mod tests {
                 pattern
             );
         }
+    }
+
+    #[cfg(feature = "libsql")]
+    fn test_gateway_state_with_store_and_workspace(
+        store: Arc<dyn crate::db::Database>,
+        workspace: Arc<Workspace>,
+    ) -> Arc<GatewayState> {
+        Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: SseManager::new(),
+            workspace: Some(workspace),
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: Some(store),
+            job_manager: None,
+            prompt_queue: None,
+            user_id: "test-user".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: Some(Arc::new(
+                crate::channels::web::ws::WsConnectionTracker::new(),
+            )),
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            chat_rate_limiter: RateLimiter::new(30, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            startup_time: std::time::Instant::now(),
+        })
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_active_set_rejects_missing_matter() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let result = matters_active_set_handler(
+            State(state),
+            Json(SetActiveMatterRequest {
+                matter_id: Some("does-not-exist".to_string()),
+            }),
+        )
+        .await;
+
+        let err = result.expect_err("missing matter should be rejected");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(err.1.contains("not found"));
+        assert!(err.1.contains("matter.yaml"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_active_set_rejects_invalid_metadata() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        workspace
+            .write(
+                "matters/demo/matter.yaml",
+                "matter_id: demo\nclient: Demo Client\n",
+            )
+            .await
+            .expect("seed invalid matter metadata");
+
+        let result = matters_active_set_handler(
+            State(state),
+            Json(SetActiveMatterRequest {
+                matter_id: Some("demo".to_string()),
+            }),
+        )
+        .await;
+
+        let err = result.expect_err("invalid matter metadata should be rejected");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err.1.contains("matter.yaml"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_active_set_accepts_valid_metadata() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        workspace
+            .write(
+                "matters/demo/matter.yaml",
+                "matter_id: demo\nclient: Demo Client\nteam:\n  - Lead Counsel\nconfidentiality: attorney-client-privileged\nadversaries:\n  - Example Co\nretention: follow-firm-policy\n",
+            )
+            .await
+            .expect("seed valid matter metadata");
+
+        let status = matters_active_set_handler(
+            State(Arc::clone(&state)),
+            Json(SetActiveMatterRequest {
+                matter_id: Some("demo".to_string()),
+            }),
+        )
+        .await
+        .expect("valid metadata should succeed");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let stored = state
+            .store
+            .as_ref()
+            .expect("store")
+            .get_setting("test-user", MATTER_ACTIVE_SETTING)
+            .await
+            .expect("read setting");
+        assert_eq!(
+            stored.and_then(|v| v.as_str().map(|s| s.to_string())),
+            Some("demo".to_string())
+        );
     }
 }

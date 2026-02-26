@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::LegalConfig;
@@ -13,6 +15,27 @@ pub struct MatterMetadata {
     pub confidentiality: String,
     pub adversaries: Vec<String>,
     pub retention: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatterMetadataValidationError {
+    Missing { path: String },
+    Invalid { path: String, reason: String },
+    Storage { path: String, reason: String },
+}
+
+impl fmt::Display for MatterMetadataValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing { path } => {
+                write!(f, "missing required matter metadata at '{}'", path)
+            }
+            Self::Invalid { path, reason } => write!(f, "{} in '{}'", reason, path),
+            Self::Storage { path, reason } => {
+                write!(f, "failed to read matter metadata '{}': {}", path, reason)
+            }
+        }
+    }
 }
 
 impl MatterMetadata {
@@ -43,6 +66,58 @@ pub fn matter_metadata_path(config: &LegalConfig, matter_id: &str) -> String {
     format!("{}/matter.yaml", matter_prefix(config, matter_id))
 }
 
+pub fn matter_metadata_path_for_root(matter_root: &str, matter_id: &str) -> String {
+    let root = matter_root.trim_matches('/');
+    let id = sanitize_matter_id(matter_id);
+    format!("{root}/{id}/matter.yaml")
+}
+
+pub async fn read_matter_metadata_for_root(
+    workspace: &Workspace,
+    matter_root: &str,
+    matter_id: &str,
+) -> Result<MatterMetadata, MatterMetadataValidationError> {
+    let metadata_path = matter_metadata_path_for_root(matter_root, matter_id);
+    let doc = workspace
+        .read(&metadata_path)
+        .await
+        .map_err(|err| match err {
+            WorkspaceError::DocumentNotFound { .. } => MatterMetadataValidationError::Missing {
+                path: metadata_path.clone(),
+            },
+            other => MatterMetadataValidationError::Storage {
+                path: metadata_path.clone(),
+                reason: other.to_string(),
+            },
+        })?;
+
+    let metadata: MatterMetadata =
+        serde_yml::from_str(&doc.content).map_err(|e| MatterMetadataValidationError::Invalid {
+            path: metadata_path.clone(),
+            reason: format!("invalid matter.yaml format: {}", e),
+        })?;
+
+    metadata.validate_required_fields().map_err(|reason| {
+        MatterMetadataValidationError::Invalid {
+            path: metadata_path.clone(),
+            reason,
+        }
+    })?;
+
+    let expected = sanitize_matter_id(matter_id);
+    if metadata.matter_id != expected {
+        return Err(MatterMetadataValidationError::Invalid {
+            path: metadata_path,
+            reason: format!(
+                "matter.yaml mismatch: expected matter_id '{}', got '{}'",
+                expected, metadata.matter_id
+            ),
+        });
+    }
+
+    Ok(metadata)
+}
+
 /// Validate `matter.yaml` for the active matter context.
 pub async fn validate_active_matter_metadata(
     workspace: &Workspace,
@@ -57,26 +132,10 @@ pub async fn validate_active_matter_metadata(
         _ => return Ok(()),
     };
 
-    let metadata_path = matter_metadata_path(config, matter_id);
-    let doc = workspace
-        .read(&metadata_path)
+    read_matter_metadata_for_root(workspace, &config.matter_root, matter_id)
         .await
-        .map_err(|_| format!("missing required matter metadata at '{}'", metadata_path))?;
-
-    let metadata: MatterMetadata = serde_yml::from_str(&doc.content)
-        .map_err(|e| format!("invalid matter.yaml format in '{}': {}", metadata_path, e))?;
-
-    metadata.validate_required_fields()?;
-
-    let expected = sanitize_matter_id(matter_id);
-    if metadata.matter_id != expected {
-        return Err(format!(
-            "matter.yaml mismatch: expected matter_id '{}', got '{}'",
-            expected, metadata.matter_id
-        ));
-    }
-
-    Ok(())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Seed legal workspace scaffolding if legal mode is enabled.
@@ -288,7 +347,7 @@ pub async fn detect_conflict(
 
 #[cfg(test)]
 mod tests {
-    use super::MatterMetadata;
+    use super::{MatterMetadata, matter_metadata_path_for_root};
 
     #[test]
     fn matter_metadata_requires_core_fields() {
@@ -311,5 +370,13 @@ mod tests {
             retention: "follow-firm-policy".to_string(),
         };
         assert!(ok.validate_required_fields().is_ok());
+    }
+
+    #[test]
+    fn matter_metadata_path_for_root_normalizes_id() {
+        assert_eq!(
+            matter_metadata_path_for_root("matters", "Acme v. Foo"),
+            "matters/acme-v--foo/matter.yaml"
+        );
     }
 }
