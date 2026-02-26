@@ -1483,7 +1483,10 @@ async fn list_matter_documents_recursive(
             .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
         for entry in entries {
-            if !include_templates && entry.path.starts_with(&templates_prefix) {
+            if !include_templates
+                && (entry.path == templates_prefix
+                    || entry.path.starts_with(&format!("{templates_prefix}/")))
+            {
                 continue;
             }
 
@@ -1702,15 +1705,40 @@ async fn matters_create_handler(
 async fn matters_active_get_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<ActiveMatterResponse>, (StatusCode, String)> {
-    let matter_id = if let Some(store) = state.store.as_ref() {
+    let mut matter_id = if let Some(store) = state.store.as_ref() {
         store
             .get_setting(&state.user_id, MATTER_ACTIVE_SETTING)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .and_then(|v| v.as_str().map(crate::legal::policy::sanitize_matter_id))
     } else {
         None
     };
+
+    if matter_id.as_deref().is_some_and(|id| id.is_empty()) {
+        matter_id = None;
+    }
+
+    if let Some(ref candidate) = matter_id
+        && let Some(workspace) = state.workspace.as_ref()
+    {
+        match crate::legal::matter::read_matter_metadata_for_root(
+            workspace.as_ref(),
+            MATTER_ROOT,
+            candidate,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(crate::legal::matter::MatterMetadataValidationError::Missing { .. })
+            | Err(crate::legal::matter::MatterMetadataValidationError::Invalid { .. }) => {
+                matter_id = None;
+            }
+            Err(err @ crate::legal::matter::MatterMetadataValidationError::Storage { .. }) => {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+            }
+        }
+    }
 
     Ok(Json(ActiveMatterResponse { matter_id }))
 }
@@ -3818,6 +3846,13 @@ mod tests {
                 pattern
             );
         }
+
+        let refresh_calls = app_js.matches("refreshActiveMatterState();").count();
+        assert!(
+            refresh_calls >= 2,
+            "expected at least two refreshActiveMatterState() call sites, found {}",
+            refresh_calls
+        );
     }
 
     #[cfg(feature = "libsql")]
@@ -3987,6 +4022,85 @@ mod tests {
             stored.and_then(|v| v.as_str().map(|s| s.to_string())),
             Some("demo".to_string())
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_active_get_returns_null_for_malformed_setting() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(Arc::clone(&db), workspace);
+
+        state
+            .store
+            .as_ref()
+            .expect("store")
+            .set_setting(
+                "test-user",
+                MATTER_ACTIVE_SETTING,
+                &serde_json::Value::String("!!!".to_string()),
+            )
+            .await
+            .expect("set malformed active matter setting");
+
+        let Json(resp) = matters_active_get_handler(State(state))
+            .await
+            .expect("active matter get should succeed");
+
+        assert_eq!(resp.matter_id, None);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_active_get_returns_null_for_stale_missing_matter() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(Arc::clone(&db), workspace);
+
+        state
+            .store
+            .as_ref()
+            .expect("store")
+            .set_setting(
+                "test-user",
+                MATTER_ACTIVE_SETTING,
+                &serde_json::Value::String("missing-matter".to_string()),
+            )
+            .await
+            .expect("set stale active matter setting");
+
+        let Json(resp) = matters_active_get_handler(State(state))
+            .await
+            .expect("active matter get should succeed");
+
+        assert_eq!(resp.matter_id, None);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_active_get_returns_valid_matter_when_metadata_is_valid() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state = test_gateway_state_with_store_and_workspace(Arc::clone(&db), workspace);
+
+        state
+            .store
+            .as_ref()
+            .expect("store")
+            .set_setting(
+                "test-user",
+                MATTER_ACTIVE_SETTING,
+                &serde_json::Value::String("DEMO".to_string()),
+            )
+            .await
+            .expect("set active matter setting");
+
+        let Json(resp) = matters_active_get_handler(State(state))
+            .await
+            .expect("active matter get should succeed");
+
+        assert_eq!(resp.matter_id.as_deref(), Some("demo"));
     }
 
     #[cfg(feature = "libsql")]
@@ -4434,6 +4548,10 @@ mod tests {
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
         seed_valid_matter(workspace.as_ref(), "demo").await;
+        workspace
+            .write("matters/demo/templates-archive/note.md", "archive note")
+            .await
+            .expect("seed templates-archive sibling");
         let state = test_gateway_state_with_store_and_workspace(db, workspace);
 
         let Json(resp) = matter_documents_handler(
@@ -4455,6 +4573,11 @@ mod tests {
             resp.documents
                 .iter()
                 .any(|doc| doc.path == "matters/demo/notes.md")
+        );
+        assert!(
+            resp.documents
+                .iter()
+                .any(|doc| doc.path == "matters/demo/templates-archive/note.md")
         );
     }
 
