@@ -1360,6 +1360,16 @@ fn parse_matter_list(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn list_existing_matters_for_create(
+    result: Result<Vec<crate::workspace::WorkspaceEntry>, crate::error::WorkspaceError>,
+) -> Result<Vec<crate::workspace::WorkspaceEntry>, (StatusCode, String)> {
+    match result {
+        Ok(entries) => Ok(entries),
+        Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => Ok(Vec::new()),
+        Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    }
+}
+
 async fn matters_create_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<CreateMatterRequest>,
@@ -1382,7 +1392,7 @@ async fn matters_create_handler(
         ));
     }
 
-    let existing = workspace.list(MATTER_ROOT).await.unwrap_or_default();
+    let existing = list_existing_matters_for_create(workspace.list(MATTER_ROOT).await)?;
     let matter_prefix = format!("{MATTER_ROOT}/{sanitized}");
     if existing
         .iter()
@@ -3581,6 +3591,17 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("empty after sanitization"));
+    }
+
+    #[test]
+    fn list_existing_matters_for_create_returns_500_for_storage_errors() {
+        let err =
+            list_existing_matters_for_create(Err(crate::error::WorkspaceError::SearchFailed {
+                reason: "boom".to_string(),
+            }))
+            .expect_err("search errors should map to 500");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.contains("Search failed"));
     }
 
     #[cfg(feature = "libsql")]
