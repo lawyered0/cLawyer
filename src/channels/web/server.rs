@@ -160,6 +160,8 @@ pub struct GatewayState {
     pub startup_time: std::time::Instant,
 }
 
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
+
 /// Start the gateway HTTP server.
 ///
 /// Returns the actual bound `SocketAddr` (useful when binding to port 0).
@@ -349,6 +351,10 @@ pub async fn start_server(
         .merge(protected)
         .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB max request body
         .layer(cors)
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            header::HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+        ))
         .layer(SetResponseHeaderLayer::if_not_present(
             header::X_CONTENT_TYPE_OPTIONS,
             header::HeaderValue::from_static("nosniff"),
@@ -2941,6 +2947,19 @@ struct GatewayStatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use regex::Regex;
+
+    fn assert_no_inline_event_handlers(asset_name: &str, content: &str) {
+        let patterns = ["onclick=", "onchange=", "oninput="];
+        for pattern in patterns {
+            assert!(
+                !content.contains(pattern),
+                "{} unexpectedly contains inline event handler pattern '{}'",
+                asset_name,
+                pattern
+            );
+        }
+    }
 
     #[test]
     fn test_build_turns_from_db_messages_complete() {
@@ -3016,5 +3035,49 @@ mod tests {
     fn test_build_turns_from_db_messages_empty() {
         let turns = build_turns_from_db_messages(&[]);
         assert!(turns.is_empty());
+    }
+
+    #[test]
+    fn test_index_html_has_no_inline_event_handlers() {
+        let index = include_str!("static/index.html");
+        assert_no_inline_event_handlers("index.html", index);
+    }
+
+    #[test]
+    fn test_app_js_has_no_inline_event_handlers() {
+        let app_js = include_str!("static/app.js");
+        assert_no_inline_event_handlers("app.js", app_js);
+    }
+
+    #[test]
+    fn test_app_js_contains_delegated_action_hooks() {
+        let app_js = include_str!("static/app.js");
+        let required_markers = [
+            "data-job-action",
+            "data-routine-action",
+            "data-memory-nav-path",
+            "data-tee-action=\"copy-report\"",
+        ];
+        for marker in required_markers {
+            assert!(
+                app_js.contains(marker),
+                "app.js missing delegated action marker: {}",
+                marker
+            );
+        }
+
+        let delegate_calls = [
+            r"delegate\(byId\('jobs-tbody'\),\s*'click',\s*'button\[data-job-action\]'",
+            r"delegate\(byId\('routines-tbody'\),\s*'click',\s*'button\[data-routine-action\]'",
+            r"delegate\(\s*byId\('memory-breadcrumb-path'\),\s*'click',\s*'a\[data-memory-nav-root\],a\[data-memory-nav-path\]'",
+        ];
+        for pattern in delegate_calls {
+            let re = Regex::new(pattern).expect("valid delegate regex");
+            assert!(
+                re.is_match(app_js),
+                "missing delegate call matching {}",
+                pattern
+            );
+        }
     }
 }
