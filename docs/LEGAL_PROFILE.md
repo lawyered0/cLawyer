@@ -58,6 +58,11 @@ If metadata is missing or invalid, legal task execution is blocked with guidance
 - Citation enforcement checks for structured citation formats in generated text.
 - This check does not verify the truth, existence, or legal validity of cited sources.
 
+## Deferred Architecture Items
+
+- Self-repair stuck-job handling is still attempt-count based; time-threshold stuck detection is not implemented yet.
+- Conflict checks still use workspace-global `conflicts.json`; a per-matter conflict-graph model is deferred.
+
 ## Bundled Legal Skills
 
 Trusted bundled skills:
