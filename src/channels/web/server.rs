@@ -1235,6 +1235,12 @@ async fn matters_active_set_handler(
         }
         Some(id) => {
             let sanitized = crate::legal::policy::sanitize_matter_id(id);
+            if sanitized.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Matter ID is empty after sanitization".to_string(),
+                ));
+            }
             store
                 .set_setting(
                     &state.user_id,

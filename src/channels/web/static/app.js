@@ -98,7 +98,15 @@ function apiFetch(path, options) {
         throw new Error(body || (res.status + ' ' + res.statusText));
       });
     }
-    return res.json();
+    if (res.status === 204) return null;
+    return res.text().then(function(body) {
+      if (!body) return null;
+      try {
+        return JSON.parse(body);
+      } catch (_) {
+        return body;
+      }
+    });
   });
 }
 
@@ -3186,9 +3194,9 @@ function renderMatters() {
     }
     html += '<div class="matter-card-actions">';
     if (!isActive) {
-      html += '<button class="btn-ext activate" onclick="selectMatter(' + JSON.stringify(m.id) + ')">Select</button>';
+      html += '<button class="btn-ext activate" onclick=\'selectMatter(' + JSON.stringify(m.id) + ')\'>Select</button>';
     }
-    html += '<button class="btn-ext" onclick="viewMatterInMemory(' + JSON.stringify(m.id) + ')">Browse Files</button>';
+    html += '<button class="btn-ext" onclick=\'viewMatterInMemory(' + JSON.stringify(m.id) + ')\'>Browse Files</button>';
     html += '</div>';
     html += '</div>';
   }
