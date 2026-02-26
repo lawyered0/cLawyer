@@ -259,6 +259,37 @@ pub struct SearchHit {
     pub score: f64,
 }
 
+// --- Matters ---
+
+/// Single matter returned by `GET /api/matters`.
+#[derive(Debug, Serialize)]
+pub struct MatterInfo {
+    pub id: String,
+    pub client: Option<String>,
+    pub confidentiality: Option<String>,
+    pub team: Vec<String>,
+    pub adversaries: Vec<String>,
+    pub retention: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MattersListResponse {
+    pub matters: Vec<MatterInfo>,
+}
+
+/// Response for `GET /api/matters/active`.
+#[derive(Debug, Serialize)]
+pub struct ActiveMatterResponse {
+    pub matter_id: Option<String>,
+}
+
+/// Request body for `POST /api/matters/active`.
+#[derive(Debug, Deserialize)]
+pub struct SetActiveMatterRequest {
+    /// Pass `null` or omit to clear the active matter.
+    pub matter_id: Option<String>,
+}
+
 // --- Jobs ---
 
 #[derive(Debug, Serialize)]

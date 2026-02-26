@@ -3009,3 +3009,153 @@ mark {
     width: 100%;
   }
 }
+
+/* ──────────────────────────────────────────────
+   Matter badge (tab bar)
+   ────────────────────────────────────────────── */
+
+.matter-badge {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
+}
+
+.matter-badge:hover {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.matter-badge svg {
+  flex-shrink: 0;
+}
+
+/* ──────────────────────────────────────────────
+   Matters tab panel
+   ────────────────────────────────────────────── */
+
+.matters-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.matters-active-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+}
+
+.matters-active-label {
+  color: var(--text-secondary);
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.matters-active-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.matters-clear-btn {
+  margin-left: auto;
+  padding: 3px 10px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.matters-clear-btn:hover {
+  border-color: var(--error, #e74c3c);
+  color: var(--error, #e74c3c);
+}
+
+.matters-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* ──────────────────────────────────────────────
+   Matter cards
+   ────────────────────────────────────────────── */
+
+.matter-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  background: var(--bg-secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.matter-card--active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-secondary));
+}
+
+.matter-card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.matter-card-id {
+  font-weight: 600;
+  font-size: 14px;
+  font-family: var(--font-mono, monospace);
+  color: var(--text-primary);
+}
+
+.matter-active-chip {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #fff;
+}
+
+.matter-card-row {
+  display: flex;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.matter-card-label {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  min-width: 110px;
+}
+
+.matter-card-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
