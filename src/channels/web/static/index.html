@@ -297,6 +297,38 @@
     <!-- Matters Tab -->
     <div class="tab-panel" id="tab-matters">
       <div class="matters-container">
+        <div class="matters-create-panel">
+          <h3>Create Matter</h3>
+          <form id="matters-create-form" class="matters-create-form" autocomplete="off">
+            <div class="matters-create-grid">
+              <label>
+                Matter ID
+                <input id="matter-create-id" type="text" placeholder="acme-v-foo-2026" required>
+              </label>
+              <label>
+                Client
+                <input id="matter-create-client" type="text" placeholder="Acme Corp" required>
+              </label>
+              <label>
+                Confidentiality
+                <input id="matter-create-confidentiality" type="text" placeholder="attorney-client-privileged" required>
+              </label>
+              <label>
+                Retention
+                <input id="matter-create-retention" type="text" placeholder="follow-firm-policy" required>
+              </label>
+              <label>
+                Team (optional)
+                <input id="matter-create-team" type="text" placeholder="Lead Counsel, Associate">
+              </label>
+              <label>
+                Adversaries (optional)
+                <input id="matter-create-adversaries" type="text" placeholder="Foo LLC, Bar Inc">
+              </label>
+            </div>
+            <button class="btn-ext activate" id="matters-create-btn" type="submit">Create &amp; Activate</button>
+          </form>
+        </div>
         <div class="matters-active-bar" id="matters-active-bar">
           <span class="matters-active-label">Active matter:</span>
           <span id="matters-active-name" class="matters-active-name">None</span>
