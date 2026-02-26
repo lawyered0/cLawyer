@@ -204,7 +204,10 @@ pub async fn start_server(
         .route("/api/memory/read", get(memory_read_handler))
         .route("/api/memory/write", post(memory_write_handler))
         .route("/api/memory/search", post(memory_search_handler))
-        .route("/api/memory/upload", post(memory_upload_handler))
+        .route(
+            "/api/memory/upload",
+            post(memory_upload_handler).layer(DefaultBodyLimit::max(UPLOAD_FILE_SIZE_LIMIT)),
+        )
         // Jobs
         .route("/api/jobs", get(jobs_list_handler))
         .route("/api/jobs/summary", get(jobs_summary_handler))
