@@ -4356,6 +4356,7 @@ mod tests {
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn conflicts_check_returns_hit_for_matching_entry() {
+        crate::legal::matter::reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
         workspace
@@ -4388,6 +4389,7 @@ mod tests {
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn conflicts_check_rejects_empty_text() {
+        crate::legal::matter::reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
         let state = test_gateway_state_with_store_and_workspace(db, workspace);
@@ -4409,6 +4411,7 @@ mod tests {
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn conflicts_check_respects_disabled_config() {
+        crate::legal::matter::reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
         let mut legal = test_legal_config();

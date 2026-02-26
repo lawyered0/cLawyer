@@ -51,6 +51,7 @@ If metadata is missing or invalid, legal task execution is blocked with guidance
 ## Conflict Check Limits
 
 - Conflict detection currently reads the workspace-global `conflicts.json` (not a per-matter conflict graph).
+- The chat-flow conflict gate and `/api/matters/conflicts/check` endpoint use this same global source.
 - Matching is normalized and boundary-aware, but still heuristic; short aliases are intentionally ignored to reduce false positives.
 
 ## Citation Check Limits
