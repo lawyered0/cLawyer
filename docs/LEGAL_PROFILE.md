@@ -48,6 +48,30 @@ Required metadata fields:
 
 If metadata is missing or invalid, legal task execution is blocked with guidance.
 
+## Matter Workflow Scaffold
+
+New matters now include a practical workflow scaffold for day-to-day legal work:
+
+- `workflows/intake_checklist.md`
+- `workflows/review_and_filing_checklist.md`
+- `deadlines/calendar.md`
+- `facts/key_facts.md`
+- `research/authority_table.md`
+- `discovery/request_tracker.md`
+- `communications/contact_log.md`
+- expanded templates under `templates/` (memo, chronology, discovery, contract issues, research synthesis)
+
+## Matter Workflow APIs
+
+For web-first firm workflows, matter detail now includes:
+
+- `GET /api/matters/{id}/dashboard`
+  - scorecard totals for documents, drafts, templates, checklist completion, and deadline risk.
+- `GET /api/matters/{id}/deadlines`
+  - parsed deadline rows from `deadlines/calendar.md` with overdue flags.
+- `POST /api/matters/{id}/filing-package`
+  - writes a matter-local filing package index to `matters/<id>/exports/`.
+
 ## Conflict Check Limits
 
 - Conflict detection currently reads the workspace-global `conflicts.json` (not a per-matter conflict graph).

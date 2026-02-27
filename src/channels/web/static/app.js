@@ -224,6 +224,10 @@ bindClick('auth-connect-btn', authenticate);
     if (action === 'apply-template') {
       var templateName = button.getAttribute('data-template-name');
       if (templateName) applyMatterTemplate(templateName);
+      return;
+    }
+    if (action === 'build-filing-package') {
+      buildMatterFilingPackage();
     }
   });
   delegate(byId('legal-audit-list'), 'click', 'button[data-audit-index]', function(e, button) {
@@ -3815,6 +3819,10 @@ var selectedMatterId = null;
 var currentMatterDocuments = [];
 /** Last loaded matter templates. */
 var currentMatterTemplates = [];
+/** Last loaded dashboard summary for selected matter. */
+var currentMatterDashboard = null;
+/** Last loaded structured deadlines for selected matter. */
+var currentMatterDeadlines = [];
 /** Persisted key for grouped matters rendering preference. */
 var MATTERS_GROUP_KEY = 'clawyer_matters_group_by_client';
 /** Grouping preference in Matters tab. */
@@ -3940,13 +3948,64 @@ function renderMatterDetail() {
   var panel = byId('matter-detail-panel');
   if (!panel) return;
   if (!selectedMatterId) {
-    renderMatterDetailPlaceholder('Select a matter to view documents and templates.');
+    renderMatterDetailPlaceholder('Select a matter to view workflow scorecard, deadlines, documents, and templates.');
     return;
   }
 
   var html = '<div class="matter-detail-header">';
   html += '<h4>' + escapeHtml(selectedMatterId) + '</h4>';
+  html += '<div class="matter-detail-header-actions">';
   html += '<button data-matter-detail-action="open-doc" data-path="' + escapeHtml('matters/' + selectedMatterId + '/matter.yaml') + '">Open matter.yaml</button>';
+  html += '<button data-matter-detail-action="build-filing-package">Build Filing Package</button>';
+  html += '</div>';
+  html += '</div>';
+
+  html += '<div class="matter-detail-section">';
+  html += '<h5>Workflow Scorecard</h5>';
+  if (!currentMatterDashboard) {
+    html += '<div class="empty-state">Scorecard unavailable.</div>';
+  } else {
+    html += '<div class="matter-scorecard-grid">';
+    html += '<div class="matter-scorecard-card"><span class="label">Documents</span><span class="value">' + escapeHtml(String(currentMatterDashboard.document_count || 0)) + '</span></div>';
+    html += '<div class="matter-scorecard-card"><span class="label">Drafts</span><span class="value">' + escapeHtml(String(currentMatterDashboard.draft_count || 0)) + '</span></div>';
+    html += '<div class="matter-scorecard-card"><span class="label">Checklist</span><span class="value">' + escapeHtml(String(currentMatterDashboard.checklist_completed || 0)) + '/' + escapeHtml(String(currentMatterDashboard.checklist_total || 0)) + '</span></div>';
+    html += '<div class="matter-scorecard-card"><span class="label">Deadlines</span><span class="value">' + escapeHtml(String(currentMatterDashboard.upcoming_deadlines_14d || 0)) + ' due / 14d</span></div>';
+    html += '</div>';
+    if (currentMatterDashboard.next_deadline) {
+      var next = currentMatterDashboard.next_deadline;
+      var nextLabel = next.title + ' (' + next.date + ')';
+      html += '<div class="matter-deadline-next">Next deadline: ' + escapeHtml(nextLabel) + '</div>';
+    }
+    if ((currentMatterDashboard.overdue_deadlines || 0) > 0) {
+      html += '<div class="matter-deadline-overdue">Overdue deadlines: ' + escapeHtml(String(currentMatterDashboard.overdue_deadlines)) + '</div>';
+    }
+  }
+  html += '</div>';
+
+  html += '<div class="matter-detail-section">';
+  html += '<h5>Deadlines</h5>';
+  if (!currentMatterDeadlines.length) {
+    html += '<div class="empty-state">No deadlines parsed yet. Update deadlines/calendar.md to power reminders and filing prep.</div>';
+  } else {
+    html += '<div class="matter-item-list">';
+    for (var d = 0; d < currentMatterDeadlines.length; d++) {
+      var deadline = currentMatterDeadlines[d];
+      var owner = deadline.owner ? ('Owner: ' + deadline.owner) : '';
+      var status = deadline.status ? ('Status: ' + deadline.status) : '';
+      var source = deadline.source ? ('Source: ' + deadline.source) : '';
+      var meta = [owner, status, source].filter(function(v) { return !!v; }).join(' • ');
+      html += '<div class="matter-item-row matter-item-row--deadline">';
+      html += '<div class="matter-item-main">';
+      html += '<span class="matter-item-path">' + escapeHtml(deadline.title) + '</span>';
+      html += '<span class="matter-item-meta">' + escapeHtml(deadline.date + (meta ? (' • ' + meta) : '')) + '</span>';
+      html += '</div>';
+      if (deadline.is_overdue) {
+        html += '<span class="matter-overdue-chip">Overdue</span>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
   html += '</div>';
 
   html += '<div class="matter-detail-section">';
@@ -3994,18 +4053,26 @@ function openMatterDetail(id) {
   selectedMatterId = id;
   currentMatterDocuments = [];
   currentMatterTemplates = [];
+  currentMatterDashboard = null;
+  currentMatterDeadlines = [];
   renderMatters();
   renderMatterDetailPlaceholder('Loading detail for ' + id + '…');
 
   var requestVersion = beginRequest('matterDetail');
   Promise.all([
     apiFetch('/api/matters/' + encodeURIComponent(id) + '/documents?include_templates=false'),
+    apiFetch('/api/matters/' + encodeURIComponent(id) + '/dashboard'),
+    apiFetch('/api/matters/' + encodeURIComponent(id) + '/deadlines'),
     apiFetch('/api/matters/' + encodeURIComponent(id) + '/templates'),
   ]).then(function (results) {
     if (!isCurrentRequest('matterDetail', requestVersion)) return;
     var docsData = results[0];
-    var templatesData = results[1];
+    var dashboardData = results[1];
+    var deadlinesData = results[2];
+    var templatesData = results[3];
     currentMatterDocuments = (docsData && docsData.documents) ? docsData.documents : [];
+    currentMatterDashboard = dashboardData || null;
+    currentMatterDeadlines = (deadlinesData && deadlinesData.deadlines) ? deadlinesData.deadlines : [];
     currentMatterTemplates = (templatesData && templatesData.templates) ? templatesData.templates : [];
     renderMatterDetail();
     renderMatters();
@@ -4031,6 +4098,20 @@ function applyMatterTemplate(templateName) {
     openMatterDetail(selectedMatterId);
   }).catch(function (err) {
     showToast('Failed to apply template: ' + err.message, 'error');
+  });
+}
+
+function buildMatterFilingPackage() {
+  if (!selectedMatterId) return;
+  apiFetch('/api/matters/' + encodeURIComponent(selectedMatterId) + '/filing-package', {
+    method: 'POST',
+  }).then(function (data) {
+    if (!data || !data.path) return;
+    showToast('Filing package created: ' + data.path, 'success');
+    openMatterPathInMemory(data.path);
+    openMatterDetail(selectedMatterId);
+  }).catch(function (err) {
+    showToast('Failed to build filing package: ' + err.message, 'error');
   });
 }
 
@@ -4085,13 +4166,15 @@ function loadMatters() {
       selectedMatterId = null;
       currentMatterDocuments = [];
       currentMatterTemplates = [];
+      currentMatterDashboard = null;
+      currentMatterDeadlines = [];
     }
     renderMatters();
     updateMatterBadge();
     if (selectedMatterId) {
       openMatterDetail(selectedMatterId);
     } else {
-      renderMatterDetailPlaceholder('Select a matter to view documents and templates.');
+      renderMatterDetailPlaceholder('Select a matter to view workflow scorecard, deadlines, documents, and templates.');
     }
   }).catch(function (err) {
     if (!isCurrentRequest('matters', requestVersion)) return;

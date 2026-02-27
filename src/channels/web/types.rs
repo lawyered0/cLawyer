@@ -387,6 +387,43 @@ pub struct MatterTemplateApplyResponse {
     pub status: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+pub struct MatterDashboardResponse {
+    pub matter_id: String,
+    pub document_count: usize,
+    pub template_count: usize,
+    pub draft_count: usize,
+    pub checklist_completed: usize,
+    pub checklist_total: usize,
+    pub overdue_deadlines: usize,
+    pub upcoming_deadlines_14d: usize,
+    pub next_deadline: Option<MatterDeadlineInfo>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct MatterDeadlineInfo {
+    pub date: String,
+    pub title: String,
+    pub owner: Option<String>,
+    pub status: Option<String>,
+    pub source: Option<String>,
+    pub is_overdue: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterDeadlinesResponse {
+    pub matter_id: String,
+    pub deadlines: Vec<MatterDeadlineInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterFilingPackageResponse {
+    pub matter_id: String,
+    pub path: String,
+    pub generated_at: String,
+    pub status: &'static str,
+}
+
 // --- Memory upload ---
 
 /// One successfully uploaded file entry in the upload response.
