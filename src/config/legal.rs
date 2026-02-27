@@ -80,6 +80,17 @@ fn parse_domains_csv(raw: &str) -> Vec<String> {
         .collect()
 }
 
+fn sanitize_active_matter(raw: Option<String>) -> Option<String> {
+    raw.and_then(|value| {
+        let sanitized = crate::legal::policy::sanitize_matter_id(&value);
+        if sanitized.is_empty() {
+            None
+        } else {
+            Some(sanitized)
+        }
+    })
+}
+
 fn validate_audit_path(raw: &str) -> Result<PathBuf, ConfigError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -185,6 +196,11 @@ impl LegalConfig {
     pub(crate) fn resolve(settings: &Settings) -> Result<Self, ConfigError> {
         let hardening_raw = parse_string_env("LEGAL_HARDENING", settings.legal.hardening.clone())?;
         let hardening = LegalHardeningProfile::from_str(&hardening_raw)?;
+        let active_matter = sanitize_active_matter(
+            optional_env("LEGAL_MATTER")?
+                .or_else(|| optional_env("MATTER_ID").ok().flatten())
+                .or_else(|| settings.legal.active_matter.clone()),
+        );
 
         let allowed_domains = match optional_env("LEGAL_NETWORK_ALLOWED_DOMAINS")? {
             Some(raw) => parse_domains_csv(&raw),
@@ -217,9 +233,7 @@ impl LegalConfig {
                     parse_string_env("LEGAL_MATTER_ROOT", settings.legal.matter_root.clone())?;
                 validate_matter_root(&raw)?
             },
-            active_matter: optional_env("LEGAL_MATTER")?
-                .or_else(|| optional_env("MATTER_ID").ok().flatten())
-                .or_else(|| settings.legal.active_matter.clone()),
+            active_matter,
             privilege_guard: parse_bool_env(
                 "LEGAL_PRIVILEGE_GUARD",
                 settings.legal.privilege_guard,
@@ -284,6 +298,24 @@ mod tests {
         assert!(config.network.deny_by_default);
         assert!(config.audit.enabled);
         assert!(config.audit.hash_chain);
+    }
+
+    #[test]
+    fn legal_resolve_sanitizes_active_matter_from_settings() {
+        let mut settings = Settings::default();
+        settings.legal.active_matter = Some(" Acme v. Foo/2026 ".to_string());
+
+        let config = super::LegalConfig::resolve(&settings).expect("legal config");
+        assert_eq!(config.active_matter.as_deref(), Some("acme-v--foo-2026"));
+    }
+
+    #[test]
+    fn legal_resolve_drops_empty_active_matter_after_sanitization() {
+        let mut settings = Settings::default();
+        settings.legal.active_matter = Some("   !!!   ".to_string());
+
+        let config = super::LegalConfig::resolve(&settings).expect("legal config");
+        assert_eq!(config.active_matter, None);
     }
 
     #[test]

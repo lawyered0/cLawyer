@@ -572,12 +572,13 @@ fn contains_term_with_boundaries(haystack: &str, term: &str) -> bool {
         return false;
     }
 
+    let bytes = haystack.as_bytes();
     let mut offset = 0usize;
     while let Some(rel_pos) = haystack[offset..].find(term) {
         let start = offset + rel_pos;
         let end = start + term.len();
-        let before_ok = start == 0 || haystack.as_bytes()[start - 1] == b' ';
-        let after_ok = end == haystack.len() || haystack.as_bytes()[end] == b' ';
+        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
         if before_ok && after_ok {
             return true;
         }
@@ -754,6 +755,17 @@ mod tests {
         assert!(!contains_term_with_boundaries(
             &haystack,
             &normalize_conflict_text("ample")
+        ));
+
+        let corporation_haystack = normalize_conflict_text("I became active in the corporation.");
+        assert!(!contains_term_with_boundaries(
+            &corporation_haystack,
+            &normalize_conflict_text("corp")
+        ));
+        let corp_haystack = normalize_conflict_text("This matter references Acme Corp directly.");
+        assert!(contains_term_with_boundaries(
+            &corp_haystack,
+            &normalize_conflict_text("corp")
         ));
     }
 

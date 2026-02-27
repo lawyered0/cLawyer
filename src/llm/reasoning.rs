@@ -34,24 +34,49 @@ pub fn is_silent_reply(text: &str) -> bool {
                 .all(|c| c.is_whitespace() || c.is_ascii_punctuation())
 }
 
+fn compile_regex_or_match_nothing(pattern: &str, label: &str) -> Regex {
+    match Regex::new(pattern) {
+        Ok(regex) => regex,
+        Err(err) => {
+            tracing::error!("Failed to compile {} regex '{}': {}", label, pattern, err);
+            match Regex::new("$^") {
+                Ok(fallback) => fallback,
+                Err(fallback_err) => {
+                    panic!("failed to compile fallback regex: {}", fallback_err);
+                }
+            }
+        }
+    }
+}
+
 /// Quick-check: bail early if no reasoning/final tags are present at all.
 static QUICK_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)<\s*/?\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue|final)\b").expect("QUICK_TAG_RE")
+    compile_regex_or_match_nothing(
+        r"(?i)<\s*/?\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue|final)\b",
+        "QUICK_TAG_RE",
+    )
 });
 
 /// Matches thinking/reasoning open and close tags. Capture group 1 is "/" for close tags.
 /// Whitespace-tolerant, case-insensitive, attribute-aware.
 static THINKING_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)<\s*(/?)\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue)\b[^<>]*>").expect("THINKING_TAG_RE")
+    compile_regex_or_match_nothing(
+        r"(?i)<\s*(/?)\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue)\b[^<>]*>",
+        "THINKING_TAG_RE",
+    )
 });
 
 /// Matches `<final>` / `</final>` tags. Capture group 1 is "/" for close tags.
-static FINAL_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)<\s*(/?)\s*final\b[^<>]*>").expect("FINAL_TAG_RE"));
+static FINAL_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    compile_regex_or_match_nothing(r"(?i)<\s*(/?)\s*final\b[^<>]*>", "FINAL_TAG_RE")
+});
 
 /// Matches pipe-delimited reasoning tags: `<|think|>...<|/think|>` etc.
 static PIPE_REASONING_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)<\|(/?)\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue)\|>").expect("PIPE_REASONING_TAG_RE")
+    compile_regex_or_match_nothing(
+        r"(?i)<\|(/?)\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue)\|>",
+        "PIPE_REASONING_TAG_RE",
+    )
 });
 
 /// Context for reasoning operations.
@@ -750,14 +775,24 @@ Example:
             let team = if team_items.is_empty() {
                 "[\"none\"]".to_string()
             } else {
-                serde_json::to_string(&team_items)
-                    .expect("serializing team context should be infallible")
+                serde_json::Value::Array(
+                    team_items
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                )
+                .to_string()
             };
             let adversaries = if adversary_items.is_empty() {
                 "[\"none\"]".to_string()
             } else {
-                serde_json::to_string(&adversary_items)
-                    .expect("serializing adversary context should be infallible")
+                serde_json::Value::Array(
+                    adversary_items
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                )
+                .to_string()
             };
 
             format!(
@@ -954,7 +989,7 @@ fn sanitize_legal_context_value(value: &str, max_chars: usize) -> String {
 
 fn quote_legal_context_value(value: &str, max_chars: usize) -> String {
     let sanitized = sanitize_legal_context_value(value, max_chars);
-    serde_json::to_string(&sanitized).expect("serializing legal context value should be infallible")
+    serde_json::Value::String(sanitized).to_string()
 }
 
 /// Result of success evaluation.

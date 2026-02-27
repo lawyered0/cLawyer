@@ -742,6 +742,16 @@ impl Agent {
                                         turn.record_tool_error(error_msg.clone());
                                     }
                                 }
+                                crate::legal::audit::inc_blocked_action();
+                                crate::legal::audit::record(
+                                    "hook_rejected",
+                                    serde_json::json!({
+                                        "thread_id": thread_id.to_string(),
+                                        "tool_name": tc.name.clone(),
+                                        "reason": error_msg.clone(),
+                                        "source": "before_tool_call",
+                                    }),
+                                );
                                 context_messages
                                     .push(ChatMessage::tool_result(&tc.id, &tc.name, error_msg));
                             }
@@ -1137,7 +1147,9 @@ mod tests {
     #[cfg(feature = "libsql")]
     use crate::db::libsql::LibSqlBackend;
     use crate::error::Error;
-    use crate::hooks::HookRegistry;
+    use crate::hooks::{
+        Hook, HookContext, HookError, HookEvent, HookOutcome, HookPoint, HookRegistry,
+    };
     use crate::llm::{
         CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ToolCall,
         ToolCompletionRequest, ToolCompletionResponse,
@@ -1328,11 +1340,37 @@ mod tests {
         }
     }
 
-    fn make_test_agent_with_components(
+    struct RejectAllToolHook;
+
+    #[async_trait]
+    impl Hook for RejectAllToolHook {
+        fn name(&self) -> &str {
+            "reject-all-tool-calls-test-hook"
+        }
+
+        fn hook_points(&self) -> &[HookPoint] {
+            static HOOK_POINTS: [HookPoint; 1] = [HookPoint::BeforeToolCall];
+            &HOOK_POINTS
+        }
+
+        async fn execute(
+            &self,
+            event: &HookEvent,
+            _ctx: &HookContext,
+        ) -> Result<HookOutcome, HookError> {
+            if matches!(event, HookEvent::ToolCall { .. }) {
+                return Ok(HookOutcome::reject("blocked by test hook"));
+            }
+            Ok(HookOutcome::ok())
+        }
+    }
+
+    fn make_test_agent_with_components_and_hooks(
         llm: Arc<dyn LlmProvider>,
         tools: Arc<ToolRegistry>,
         workspace: Option<Arc<Workspace>>,
         legal_config: crate::config::LegalConfig,
+        hooks: Arc<HookRegistry>,
     ) -> Agent {
         let deps = AgentDeps {
             store: None,
@@ -1349,7 +1387,7 @@ mod tests {
             skill_catalog: None,
             skills_config: SkillsConfig::default(),
             legal_config,
-            hooks: Arc::new(HookRegistry::new()),
+            hooks,
             cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
         };
 
@@ -1376,6 +1414,21 @@ mod tests {
             None,
             Some(Arc::new(ContextManager::new(1))),
             None,
+        )
+    }
+
+    fn make_test_agent_with_components(
+        llm: Arc<dyn LlmProvider>,
+        tools: Arc<ToolRegistry>,
+        workspace: Option<Arc<Workspace>>,
+        legal_config: crate::config::LegalConfig,
+    ) -> Agent {
+        make_test_agent_with_components_and_hooks(
+            llm,
+            tools,
+            workspace,
+            legal_config,
+            Arc::new(HookRegistry::new()),
         )
     }
 
@@ -1868,6 +1921,66 @@ mod tests {
         assert!(
             tool_completed.details.get("parameters").is_none(),
             "audit metadata should not include raw parameters"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_rejected_event_emitted_for_blocked_tool_call() {
+        crate::legal::audit::clear_test_events();
+
+        let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = false;
+        legal.citation_required = false;
+        legal.hardening = crate::config::LegalHardeningProfile::Standard;
+
+        let registry = ToolRegistry::new().with_legal_policy(legal.clone());
+        registry
+            .register(std::sync::Arc::new(crate::tools::builtin::EchoTool))
+            .await;
+
+        let hooks = Arc::new(HookRegistry::new());
+        hooks.register(Arc::new(RejectAllToolHook)).await;
+
+        let agent = make_test_agent_with_components_and_hooks(
+            Arc::new(ToolThenTextLlmProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(registry),
+            None,
+            legal,
+            hooks,
+        );
+
+        let session = Arc::new(tokio::sync::Mutex::new(Session::new("user-1")));
+        let thread_id = {
+            let mut s = session.lock().await;
+            s.get_or_create_thread().id
+        };
+        let thread_id_str = thread_id.to_string();
+        let message = IncomingMessage::new("gateway", "user-1", "say hello via tool");
+
+        let result = agent
+            .process_user_input(&message, Arc::clone(&session), thread_id, &message.content)
+            .await
+            .expect("process_user_input should succeed");
+        assert!(
+            matches!(result, SubmissionResult::Response { .. }),
+            "expected response even after hook rejection"
+        );
+
+        let events = crate::legal::audit::test_events_snapshot();
+        let hook_rejected = events.iter().find(|event| {
+            event.event_type == "hook_rejected"
+                && event.details.get("thread_id").and_then(|v| v.as_str()) == Some(&thread_id_str)
+                && event.details.get("tool_name").and_then(|v| v.as_str()) == Some("echo")
+        });
+        let hook_rejected = hook_rejected.expect("hook_rejected event should be present");
+        assert_eq!(
+            hook_rejected.details.get("source").and_then(|v| v.as_str()),
+            Some("before_tool_call")
         );
     }
 

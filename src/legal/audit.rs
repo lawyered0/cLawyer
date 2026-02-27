@@ -58,11 +58,15 @@ impl AuditLogger {
     }
 
     fn write(&self, event_type: &str, details: serde_json::Value) {
-        let metrics = self
-            .metrics
-            .lock()
-            .map(|m| m.clone())
-            .unwrap_or_else(|_| SecurityMetrics::default());
+        // Keep metrics + hash-chain state locked through append so the
+        // serialized metrics snapshot is atomic with the written event.
+        let metrics_guard = match self.metrics.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("Legal audit metrics lock poisoned: {}", e);
+                return;
+            }
+        };
 
         let mut state = match self.state.lock() {
             Ok(s) => s,
@@ -71,6 +75,7 @@ impl AuditLogger {
                 return;
             }
         };
+        let metrics = metrics_guard.clone();
 
         let prev_hash = state.clone();
         let mut event = AuditEvent {
@@ -112,11 +117,8 @@ impl AuditLogger {
             return;
         }
 
-        // SECURITY: create the log file with owner-read/write only (0o600).
-        // Without an explicit mode the file inherits the process umask, which
-        // is typically 0o022 — leaving the audit log world-readable.  Legal
-        // audit logs contain matter IDs, client actions, and security events
-        // and must never be readable by other users on the system.
+        // SECURITY: create files as owner-read/write (0o600). For pre-existing
+        // files, fail closed if permissions are broader than 0o600.
         let mut open_opts = OpenOptions::new();
         open_opts.create(true).append(true);
         #[cfg(unix)]
@@ -124,12 +126,26 @@ impl AuditLogger {
         match open_opts.open(&self.path) {
             Ok(mut f) => {
                 #[cfg(unix)]
-                if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-                    tracing::warn!(
-                        "Failed to enforce 0o600 permissions on legal audit log {:?}: {}",
-                        self.path,
-                        e
-                    );
+                {
+                    let mode = match f.metadata() {
+                        Ok(meta) => meta.permissions().mode() & 0o777,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to read permissions for legal audit log {:?}: {}",
+                                self.path,
+                                e
+                            );
+                            return;
+                        }
+                    };
+                    if mode != 0o600 {
+                        tracing::warn!(
+                            "Refusing to write legal audit event; insecure mode {:o} on {:?} (expected 600)",
+                            mode,
+                            self.path
+                        );
+                        return;
+                    }
                 }
                 if let Err(e) = writeln!(f, "{line}") {
                     tracing::warn!("Failed to append legal audit event: {}", e);
@@ -266,7 +282,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn write_enforces_0600_permissions_on_existing_file() {
+    fn write_refuses_existing_file_with_non_0600_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -278,8 +294,10 @@ mod tests {
         let logger = AuditLogger::new(path.clone(), false);
         logger.write("event", serde_json::json!({"kind": "perm_fix"}));
 
+        let raw = fs::read_to_string(&path).expect("read audit log");
+        assert_eq!(raw, "existing\n");
         let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        assert_eq!(mode, 0o644);
     }
 
     #[cfg(unix)]
