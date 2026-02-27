@@ -1834,6 +1834,26 @@ fn parse_optional_matter_field(value: Option<String>) -> Option<String> {
     })
 }
 
+const OPTIONAL_MATTER_FIELD_MAX_CHARS: usize = 256;
+
+fn validate_optional_matter_field_length(
+    field_name: &str,
+    value: &Option<String>,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(text) = value
+        && text.chars().count() > OPTIONAL_MATTER_FIELD_MAX_CHARS
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'{}' must be at most {} characters",
+                field_name, OPTIONAL_MATTER_FIELD_MAX_CHARS
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_opened_at(value: &str) -> Result<(), (StatusCode, String)> {
     match NaiveDate::parse_from_str(value, "%Y-%m-%d") {
         Ok(parsed) if parsed.format("%Y-%m-%d").to_string() == value => Ok(()),
@@ -1902,6 +1922,8 @@ async fn matters_create_handler(
     let jurisdiction = parse_optional_matter_field(req.jurisdiction);
     let practice_area = parse_optional_matter_field(req.practice_area);
     let opened_at = parse_optional_matter_field(req.opened_at);
+    validate_optional_matter_field_length("jurisdiction", &jurisdiction)?;
+    validate_optional_matter_field_length("practice_area", &practice_area)?;
     if let Some(value) = opened_at.as_deref() {
         validate_opened_at(value)?;
     }
@@ -4964,6 +4986,35 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("YYYY-MM-DD"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_create_rejects_overlong_optional_metadata_fields() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let err = matters_create_handler(
+            State(state),
+            Json(CreateMatterRequest {
+                matter_id: "demo".to_string(),
+                client: "Demo".to_string(),
+                confidentiality: "privileged".to_string(),
+                retention: "policy".to_string(),
+                jurisdiction: Some("X".repeat(257)),
+                practice_area: None,
+                opened_at: None,
+                team: vec![],
+                adversaries: vec![],
+            }),
+        )
+        .await
+        .expect_err("overlong jurisdiction should fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("jurisdiction"));
+        assert!(err.1.contains("at most"));
     }
 
     #[cfg(feature = "libsql")]

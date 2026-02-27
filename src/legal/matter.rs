@@ -11,6 +11,8 @@ use crate::legal::policy::sanitize_matter_id;
 use crate::workspace::Workspace;
 
 const CONFLICT_CACHE_REFRESH_WINDOW: Duration = Duration::from_secs(30);
+// Short single-token aliases (for example "corp") produce high false-positive
+// rates in free-form text, so we require at least 4 characters for those terms.
 const MIN_ALIAS_SINGLE_TOKEN_LEN: usize = 4;
 const MATTER_PROMPT_LIST_MAX_ITEMS: usize = 8;
 const MATTER_PROMPT_FIELD_MAX_CHARS: usize = 160;
@@ -44,11 +46,11 @@ pub struct MatterMetadata {
     pub confidentiality: String,
     pub adversaries: Vec<String>,
     pub retention: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jurisdiction: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub practice_area: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened_at: Option<String>,
 }
 
@@ -638,9 +640,16 @@ fn detect_conflict_in_entries(
     None
 }
 
-fn detect_conflict_in_adversaries(adversaries: &[String], message: &str) -> Option<String> {
+fn detect_conflict_in_adversaries(
+    adversaries: &[String],
+    message: &str,
+    active_matter: Option<&str>,
+) -> Option<String> {
     let normalized_message = normalize_conflict_text(message);
-    if normalized_message.is_empty() {
+    let normalized_active_matter = active_matter
+        .map(normalize_conflict_text)
+        .unwrap_or_default();
+    if normalized_message.is_empty() && normalized_active_matter.is_empty() {
         return None;
     }
 
@@ -655,7 +664,9 @@ fn detect_conflict_in_adversaries(adversaries: &[String], message: &str) -> Opti
             continue;
         }
 
-        if contains_term_with_boundaries(&normalized_message, &normalized) {
+        if contains_term_with_boundaries(&normalized_message, &normalized)
+            || contains_term_with_boundaries(&normalized_active_matter, &normalized)
+        {
             return Some(canonical_name.to_string());
         }
     }
@@ -717,32 +728,45 @@ pub async fn detect_conflict(
 
     if let Some((entries, stale)) = cache_snapshot()
         && !stale
-        && let Some(conflict) = detect_conflict_in_entries(&entries, message, active_matter)
     {
-        return Some(conflict);
+        if let Some(conflict) = detect_conflict_in_entries(&entries, message, active_matter) {
+            return Some(conflict);
+        }
+        if let Some(active_matter) = active_matter
+            && let Ok(metadata) =
+                read_matter_metadata_for_root(workspace, &config.matter_root, active_matter).await
+        {
+            return detect_conflict_in_adversaries(
+                &metadata.adversaries,
+                message,
+                Some(active_matter),
+            );
+        }
+        return None;
     }
 
     if let Some(doc) = workspace.read("conflicts.json").await.ok()
         && let Some(parsed) = parse_conflict_entries(&doc.content)
     {
         store_conflict_cache(parsed.clone());
-        if let Some(conflict) = detect_conflict_in_entries(&parsed, message, active_matter) {
+        let global = detect_conflict_in_entries(&parsed, message, active_matter);
+        if global.is_some() {
+            return global;
+        }
+    } else {
+        mark_conflict_cache_refresh_failure();
+        if let Some((entries, _)) = cache_snapshot()
+            && let Some(conflict) = detect_conflict_in_entries(&entries, message, active_matter)
+        {
             return Some(conflict);
         }
-    }
-
-    mark_conflict_cache_refresh_failure();
-    if let Some((entries, _)) = cache_snapshot()
-        && let Some(conflict) = detect_conflict_in_entries(&entries, message, active_matter)
-    {
-        return Some(conflict);
     }
 
     if let Some(active_matter) = active_matter
         && let Ok(metadata) =
             read_matter_metadata_for_root(workspace, &config.matter_root, active_matter).await
     {
-        return detect_conflict_in_adversaries(&metadata.adversaries, message);
+        return detect_conflict_in_adversaries(&metadata.adversaries, message, Some(active_matter));
     }
 
     None
@@ -1027,6 +1051,41 @@ retention: follow-firm-policy
     }
 
     #[tokio::test]
+    async fn detect_conflict_uses_warm_cache_for_no_match_without_refreshing_disk_parse() {
+        reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Alpha Holdings","aliases":["Alpha"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+
+        let first = detect_conflict(workspace.as_ref(), &legal, "No listed parties here").await;
+        assert_eq!(first, None);
+        assert_eq!(
+            conflict_cache_refresh_count_for_tests(),
+            1,
+            "first call should parse conflicts.json once"
+        );
+
+        let second = detect_conflict(workspace.as_ref(), &legal, "Still no listed parties").await;
+        assert_eq!(second, None);
+        assert_eq!(
+            conflict_cache_refresh_count_for_tests(),
+            1,
+            "warm-cache no-match path should not re-read conflicts.json"
+        );
+    }
+
+    #[tokio::test]
     async fn detect_conflict_ignores_short_single_token_adversary_false_positive() {
         reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
@@ -1065,6 +1124,43 @@ retention: follow-firm-policy
         )
         .await;
         assert_eq!(hit, None);
+    }
+
+    #[tokio::test]
+    async fn detect_conflict_matches_active_matter_identifier_against_adversaries() {
+        reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "matters/smith-v-acme-corp/matter.yaml",
+                r#"
+matter_id: smith-v-acme-corp
+client: Demo Client
+team:
+  - Lead Counsel
+confidentiality: attorney-client-privileged
+adversaries:
+  - Acme Corp
+retention: follow-firm-policy
+"#,
+            )
+            .await
+            .expect("seed matter metadata");
+        workspace
+            .write("conflicts.json", "[]")
+            .await
+            .expect("seed conflicts");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.active_matter = Some("smith-v-acme-corp".to_string());
+        legal.conflict_check_enabled = true;
+
+        let hit =
+            detect_conflict(workspace.as_ref(), &legal, "General project planning note").await;
+        assert_eq!(hit.as_deref(), Some("Acme Corp"));
     }
 
     #[tokio::test]

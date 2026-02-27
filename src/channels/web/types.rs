@@ -300,8 +300,11 @@ pub struct CreateMatterRequest {
     pub client: String,
     pub confidentiality: String,
     pub retention: String,
+    #[serde(default)]
     pub jurisdiction: Option<String>,
+    #[serde(default)]
     pub practice_area: Option<String>,
+    #[serde(default)]
     pub opened_at: Option<String>,
     #[serde(default)]
     pub team: Vec<String>,
