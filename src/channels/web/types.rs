@@ -310,6 +310,83 @@ pub struct CreateMatterResponse {
     pub active_matter_id: String,
 }
 
+/// Request body for `POST /api/matters/conflicts/check`.
+#[derive(Debug, Deserialize)]
+pub struct MatterConflictCheckRequest {
+    pub text: String,
+    pub matter_id: Option<String>,
+}
+
+/// Response body for `POST /api/matters/conflicts/check`.
+#[derive(Debug, Serialize)]
+pub struct MatterConflictCheckResponse {
+    pub matched: bool,
+    pub conflict: Option<String>,
+    pub matter_id: Option<String>,
+}
+
+// --- Legal audit ---
+
+#[derive(Debug, Serialize)]
+pub struct LegalAuditEventInfo {
+    pub line_no: usize,
+    pub ts: String,
+    pub event_type: String,
+    pub details: serde_json::Value,
+    pub metrics: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LegalAuditListResponse {
+    pub events: Vec<LegalAuditEventInfo>,
+    pub total: usize,
+    pub next_offset: Option<usize>,
+    pub parse_errors: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterDocumentInfo {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterDocumentsResponse {
+    pub matter_id: String,
+    pub documents: Vec<MatterDocumentInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterTemplateInfo {
+    pub name: String,
+    pub path: String,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterTemplatesResponse {
+    pub matter_id: String,
+    pub templates: Vec<MatterTemplateInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MatterTemplateApplyRequest {
+    pub template_name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterTemplateApplyResponse {
+    pub path: String,
+    pub status: &'static str,
+}
+
 // --- Memory upload ---
 
 /// One successfully uploaded file entry in the upload response.
