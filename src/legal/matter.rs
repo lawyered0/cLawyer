@@ -44,6 +44,12 @@ pub struct MatterMetadata {
     pub confidentiality: String,
     pub adversaries: Vec<String>,
     pub retention: String,
+    #[serde(default)]
+    pub jurisdiction: Option<String>,
+    #[serde(default)]
+    pub practice_area: Option<String>,
+    #[serde(default)]
+    pub opened_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +60,9 @@ pub struct ActiveMatterPromptContext {
     pub retention: String,
     pub team: Vec<String>,
     pub adversaries: Vec<String>,
+    pub jurisdiction: Option<String>,
+    pub practice_area: Option<String>,
+    pub opened_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +257,21 @@ pub async fn load_active_matter_prompt_context(
         retention: sanitize_prompt_field(&metadata.retention, MATTER_PROMPT_FIELD_MAX_CHARS),
         team: sanitize_prompt_list(&metadata.team),
         adversaries: sanitize_prompt_list(&metadata.adversaries),
+        jurisdiction: metadata
+            .jurisdiction
+            .as_deref()
+            .map(|value| sanitize_prompt_field(value, MATTER_PROMPT_FIELD_MAX_CHARS))
+            .filter(|value| !value.is_empty()),
+        practice_area: metadata
+            .practice_area
+            .as_deref()
+            .map(|value| sanitize_prompt_field(value, MATTER_PROMPT_FIELD_MAX_CHARS))
+            .filter(|value| !value.is_empty()),
+        opened_at: metadata
+            .opened_at
+            .as_deref()
+            .map(|value| sanitize_prompt_field(value, MATTER_PROMPT_FIELD_MAX_CHARS))
+            .filter(|value| !value.is_empty()),
     }))
 }
 
@@ -363,6 +387,9 @@ pub async fn seed_legal_workspace(
         confidentiality: "attorney-client-privileged".to_string(),
         adversaries: Vec::new(),
         retention: "follow-firm-policy".to_string(),
+        jurisdiction: None,
+        practice_area: None,
+        opened_at: None,
     };
     let matter_yaml =
         serde_yml::to_string(&metadata).map_err(|e| WorkspaceError::SearchFailed {
@@ -611,6 +638,31 @@ fn detect_conflict_in_entries(
     None
 }
 
+fn detect_conflict_in_adversaries(adversaries: &[String], message: &str) -> Option<String> {
+    let normalized_message = normalize_conflict_text(message);
+    if normalized_message.is_empty() {
+        return None;
+    }
+
+    for adversary in adversaries {
+        let canonical_name = adversary.trim();
+        if canonical_name.is_empty() {
+            continue;
+        }
+
+        let normalized = normalize_conflict_text(canonical_name);
+        if normalized.is_empty() || !alias_is_matchable(&normalized) {
+            continue;
+        }
+
+        if contains_term_with_boundaries(&normalized_message, &normalized) {
+            return Some(canonical_name.to_string());
+        }
+    }
+
+    None
+}
+
 fn cache_snapshot() -> Option<(Vec<ConflictEntry>, bool)> {
     let generation = CONFLICT_CACHE_GENERATION.load(Ordering::Relaxed);
     let cache = CONFLICT_CACHE.lock().ok()?;
@@ -665,20 +717,32 @@ pub async fn detect_conflict(
 
     if let Some((entries, stale)) = cache_snapshot()
         && !stale
+        && let Some(conflict) = detect_conflict_in_entries(&entries, message, active_matter)
     {
-        return detect_conflict_in_entries(&entries, message, active_matter);
+        return Some(conflict);
     }
 
     if let Some(doc) = workspace.read("conflicts.json").await.ok()
         && let Some(parsed) = parse_conflict_entries(&doc.content)
     {
         store_conflict_cache(parsed.clone());
-        return detect_conflict_in_entries(&parsed, message, active_matter);
+        if let Some(conflict) = detect_conflict_in_entries(&parsed, message, active_matter) {
+            return Some(conflict);
+        }
     }
 
     mark_conflict_cache_refresh_failure();
-    if let Some((entries, _)) = cache_snapshot() {
-        return detect_conflict_in_entries(&entries, message, active_matter);
+    if let Some((entries, _)) = cache_snapshot()
+        && let Some(conflict) = detect_conflict_in_entries(&entries, message, active_matter)
+    {
+        return Some(conflict);
+    }
+
+    if let Some(active_matter) = active_matter
+        && let Ok(metadata) =
+            read_matter_metadata_for_root(workspace, &config.matter_root, active_matter).await
+    {
+        return detect_conflict_in_adversaries(&metadata.adversaries, message);
     }
 
     None
@@ -715,6 +779,9 @@ mod tests {
             confidentiality: "".to_string(),
             adversaries: vec![],
             retention: "".to_string(),
+            jurisdiction: None,
+            practice_area: None,
+            opened_at: None,
         };
         assert!(missing.validate_required_fields().is_err());
 
@@ -725,8 +792,38 @@ mod tests {
             confidentiality: "attorney-client-privileged".to_string(),
             adversaries: vec!["Foo Corp".to_string()],
             retention: "follow-firm-policy".to_string(),
+            jurisdiction: None,
+            practice_area: None,
+            opened_at: None,
         };
         assert!(ok.validate_required_fields().is_ok());
+    }
+
+    #[test]
+    fn matter_metadata_parses_optional_context_fields() {
+        let parsed: MatterMetadata = serde_yml::from_str(
+            r#"
+matter_id: acme-v-foo
+client: Acme Corp
+team:
+  - Lead Counsel
+confidentiality: attorney-client-privileged
+adversaries:
+  - Foo Industries
+retention: follow-firm-policy
+jurisdiction: SDNY / Delaware
+practice_area: commercial litigation
+opened_at: 2024-03-15
+"#,
+        )
+        .expect("yaml should parse");
+
+        assert_eq!(parsed.jurisdiction.as_deref(), Some("SDNY / Delaware"));
+        assert_eq!(
+            parsed.practice_area.as_deref(),
+            Some("commercial litigation")
+        );
+        assert_eq!(parsed.opened_at.as_deref(), Some("2024-03-15"));
     }
 
     #[test]
@@ -824,7 +921,7 @@ mod cache_tests {
 
     use super::{
         conflict_cache_refresh_count_for_tests, detect_conflict, invalidate_conflict_cache,
-        reset_conflict_cache_for_tests,
+        load_active_matter_prompt_context, reset_conflict_cache_for_tests,
     };
     use crate::config::LegalConfig;
     use crate::settings::Settings;
@@ -883,5 +980,128 @@ mod cache_tests {
             2,
             "cache invalidation should force a refresh on next lookup"
         );
+    }
+
+    #[tokio::test]
+    async fn detect_conflict_matches_active_matter_adversary_without_conflicts_json_hit() {
+        reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "matters/demo/matter.yaml",
+                r#"
+matter_id: demo
+client: Demo Client
+team:
+  - Lead Counsel
+confidentiality: attorney-client-privileged
+adversaries:
+  - Foo Industries
+retention: follow-firm-policy
+"#,
+            )
+            .await
+            .expect("seed matter metadata");
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Different Party","aliases":["Different"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.active_matter = Some("demo".to_string());
+        legal.conflict_check_enabled = true;
+
+        let hit = detect_conflict(
+            workspace.as_ref(),
+            &legal,
+            "Did Foo Industries contact us about pricing?",
+        )
+        .await;
+        assert_eq!(hit.as_deref(), Some("Foo Industries"));
+    }
+
+    #[tokio::test]
+    async fn detect_conflict_ignores_short_single_token_adversary_false_positive() {
+        reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "matters/demo/matter.yaml",
+                r#"
+matter_id: demo
+client: Demo Client
+team:
+  - Lead Counsel
+confidentiality: attorney-client-privileged
+adversaries:
+  - Corp
+retention: follow-firm-policy
+"#,
+            )
+            .await
+            .expect("seed matter metadata");
+        workspace
+            .write("conflicts.json", "[]")
+            .await
+            .expect("seed conflicts");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.active_matter = Some("demo".to_string());
+        legal.conflict_check_enabled = true;
+
+        let hit = detect_conflict(
+            workspace.as_ref(),
+            &legal,
+            "We became active in the corporation",
+        )
+        .await;
+        assert_eq!(hit, None);
+    }
+
+    #[tokio::test]
+    async fn load_active_matter_prompt_context_includes_optional_fields_when_present() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "matters/demo/matter.yaml",
+                r#"
+matter_id: demo
+client: Demo Client
+team:
+  - Lead Counsel
+confidentiality: attorney-client-privileged
+adversaries:
+  - Foo Industries
+retention: follow-firm-policy
+jurisdiction: SDNY / Delaware
+practice_area: commercial litigation
+opened_at: 2024-03-15
+"#,
+            )
+            .await
+            .expect("seed matter metadata");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.active_matter = Some("demo".to_string());
+
+        let ctx = load_active_matter_prompt_context(workspace.as_ref(), &legal)
+            .await
+            .expect("context load should succeed")
+            .expect("active matter context should be present");
+        assert_eq!(ctx.jurisdiction.as_deref(), Some("SDNY / Delaware"));
+        assert_eq!(ctx.practice_area.as_deref(), Some("commercial litigation"));
+        assert_eq!(ctx.opened_at.as_deref(), Some("2024-03-15"));
     }
 }

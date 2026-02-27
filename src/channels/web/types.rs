@@ -270,6 +270,9 @@ pub struct MatterInfo {
     pub team: Vec<String>,
     pub adversaries: Vec<String>,
     pub retention: Option<String>,
+    pub jurisdiction: Option<String>,
+    pub practice_area: Option<String>,
+    pub opened_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -297,6 +300,9 @@ pub struct CreateMatterRequest {
     pub client: String,
     pub confidentiality: String,
     pub retention: String,
+    pub jurisdiction: Option<String>,
+    pub practice_area: Option<String>,
+    pub opened_at: Option<String>,
     #[serde(default)]
     pub team: Vec<String>,
     #[serde(default)]

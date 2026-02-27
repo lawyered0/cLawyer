@@ -1798,6 +1798,9 @@ async fn matters_list_handler(
                 .map(|m| m.adversaries.clone())
                 .unwrap_or_default(),
             retention: meta.as_ref().map(|m| m.retention.clone()),
+            jurisdiction: meta.as_ref().and_then(|m| m.jurisdiction.clone()),
+            practice_area: meta.as_ref().and_then(|m| m.practice_area.clone()),
+            opened_at: meta.as_ref().and_then(|m| m.opened_at.clone()),
         });
     }
 
@@ -1818,6 +1821,27 @@ fn parse_required_matter_field(
         ));
     }
     Ok(trimmed.to_string())
+}
+
+fn parse_optional_matter_field(value: Option<String>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn validate_opened_at(value: &str) -> Result<(), (StatusCode, String)> {
+    match NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        Ok(parsed) if parsed.format("%Y-%m-%d").to_string() == value => Ok(()),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "'opened_at' must be in YYYY-MM-DD format".to_string(),
+        )),
+    }
 }
 
 fn parse_matter_list(values: Vec<String>) -> Vec<String> {
@@ -1875,6 +1899,12 @@ async fn matters_create_handler(
     let client = parse_required_matter_field("client", &req.client)?;
     let confidentiality = parse_required_matter_field("confidentiality", &req.confidentiality)?;
     let retention = parse_required_matter_field("retention", &req.retention)?;
+    let jurisdiction = parse_optional_matter_field(req.jurisdiction);
+    let practice_area = parse_optional_matter_field(req.practice_area);
+    let opened_at = parse_optional_matter_field(req.opened_at);
+    if let Some(value) = opened_at.as_deref() {
+        validate_opened_at(value)?;
+    }
     let team = parse_matter_list(req.team);
     let adversaries = parse_matter_list(req.adversaries);
 
@@ -1885,6 +1915,9 @@ async fn matters_create_handler(
         confidentiality: confidentiality.clone(),
         adversaries: adversaries.clone(),
         retention: retention.clone(),
+        jurisdiction: jurisdiction.clone(),
+        practice_area: practice_area.clone(),
+        opened_at: opened_at.clone(),
     };
     let matter_yaml = serde_yml::to_string(&metadata)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1981,6 +2014,9 @@ async fn matters_create_handler(
                 team,
                 adversaries,
                 retention: Some(retention),
+                jurisdiction,
+                practice_area,
+                opened_at,
             },
             active_matter_id: sanitized,
         }),
@@ -4752,6 +4788,9 @@ mod tests {
                 client: "Acme Corp".to_string(),
                 confidentiality: "attorney-client-privileged".to_string(),
                 retention: "follow-firm-policy".to_string(),
+                jurisdiction: Some("SDNY / Delaware".to_string()),
+                practice_area: Some("commercial litigation".to_string()),
+                opened_at: Some("2024-03-15".to_string()),
                 team: vec!["Lead Counsel".to_string()],
                 adversaries: vec!["Foo LLC".to_string()],
             }),
@@ -4762,12 +4801,29 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(response.active_matter_id, "acme-v--foo");
         assert_eq!(response.matter.id, "acme-v--foo");
+        assert_eq!(
+            response.matter.jurisdiction.as_deref(),
+            Some("SDNY / Delaware")
+        );
+        assert_eq!(
+            response.matter.practice_area.as_deref(),
+            Some("commercial litigation")
+        );
+        assert_eq!(response.matter.opened_at.as_deref(), Some("2024-03-15"));
 
         let metadata = workspace
             .read("matters/acme-v--foo/matter.yaml")
             .await
             .expect("matter.yaml should exist");
-        assert!(metadata.content.contains("matter_id: acme-v--foo"));
+        let parsed: crate::legal::matter::MatterMetadata =
+            serde_yml::from_str(&metadata.content).expect("matter.yaml should parse");
+        assert_eq!(parsed.matter_id, "acme-v--foo");
+        assert_eq!(parsed.jurisdiction.as_deref(), Some("SDNY / Delaware"));
+        assert_eq!(
+            parsed.practice_area.as_deref(),
+            Some("commercial litigation")
+        );
+        assert_eq!(parsed.opened_at.as_deref(), Some("2024-03-15"));
         let workflow = workspace
             .read("matters/acme-v--foo/workflows/intake_checklist.md")
             .await
@@ -4799,6 +4855,45 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn matters_list_includes_optional_metadata_fields() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let _ = matters_create_handler(
+            State(Arc::clone(&state)),
+            Json(CreateMatterRequest {
+                matter_id: "Acme v. Foo".to_string(),
+                client: "Acme Corp".to_string(),
+                confidentiality: "attorney-client-privileged".to_string(),
+                retention: "follow-firm-policy".to_string(),
+                jurisdiction: Some("SDNY / Delaware".to_string()),
+                practice_area: Some("commercial litigation".to_string()),
+                opened_at: Some("2024-03-15".to_string()),
+                team: vec!["Lead Counsel".to_string()],
+                adversaries: vec!["Foo LLC".to_string()],
+            }),
+        )
+        .await
+        .expect("create matter should succeed");
+
+        let Json(list) = matters_list_handler(State(state))
+            .await
+            .expect("matters list should succeed");
+        assert_eq!(list.matters.len(), 1);
+        let matter = &list.matters[0];
+        assert_eq!(matter.id, "acme-v--foo");
+        assert_eq!(matter.jurisdiction.as_deref(), Some("SDNY / Delaware"));
+        assert_eq!(
+            matter.practice_area.as_deref(),
+            Some("commercial litigation")
+        );
+        assert_eq!(matter.opened_at.as_deref(), Some("2024-03-15"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     async fn matters_create_rejects_duplicate() {
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
@@ -4812,6 +4907,9 @@ mod tests {
                 client: "Demo".to_string(),
                 confidentiality: "privileged".to_string(),
                 retention: "policy".to_string(),
+                jurisdiction: None,
+                practice_area: None,
+                opened_at: None,
                 team: vec![],
                 adversaries: vec![],
             }),
@@ -4826,6 +4924,9 @@ mod tests {
                 client: "Demo".to_string(),
                 confidentiality: "privileged".to_string(),
                 retention: "policy".to_string(),
+                jurisdiction: None,
+                practice_area: None,
+                opened_at: None,
                 team: vec![],
                 adversaries: vec![],
             }),
@@ -4835,6 +4936,34 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert!(err.1.contains("already exists"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_create_rejects_invalid_opened_at() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let err = matters_create_handler(
+            State(state),
+            Json(CreateMatterRequest {
+                matter_id: "demo".to_string(),
+                client: "Demo".to_string(),
+                confidentiality: "privileged".to_string(),
+                retention: "policy".to_string(),
+                jurisdiction: None,
+                practice_area: None,
+                opened_at: Some("03/15/2024".to_string()),
+                team: vec![],
+                adversaries: vec![],
+            }),
+        )
+        .await
+        .expect_err("invalid opened_at should fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("YYYY-MM-DD"));
     }
 
     #[cfg(feature = "libsql")]
@@ -4851,6 +4980,9 @@ mod tests {
                 client: "Demo".to_string(),
                 confidentiality: "privileged".to_string(),
                 retention: "policy".to_string(),
+                jurisdiction: None,
+                practice_area: None,
+                opened_at: None,
                 team: vec![],
                 adversaries: vec![],
             }),

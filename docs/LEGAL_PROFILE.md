@@ -26,7 +26,7 @@
 
 1. Request enters preflight.
 2. cLawyer checks: active matter (for non-trivial legal requests), conflict list, tool approval policy, and domain allowlist.
-3. When active matter is set and metadata is valid, structured `matter.yaml` fields are injected into legal prompt context (`matter_id`, `client`, `confidentiality`, `retention`, `team`, `adversaries`) as untrusted data.
+3. When active matter is set and metadata is valid, structured `matter.yaml` fields are injected into legal prompt context (`matter_id`, `client`, `confidentiality`, `retention`, `team`, `adversaries`, optional `jurisdiction`, optional `practice_area`, optional `opened_at`) as untrusted data.
 4. Sensitive tool calls are approval-gated in `max_lockdown`.
 5. Memory/file writes are scoped to `matters/<matter_id>/...` when matter context is required.
 6. Output is scanned for leakage and structured citation-format markers.
@@ -46,6 +46,12 @@ Required metadata fields:
 - `client`
 - `confidentiality`
 - `retention`
+
+Optional metadata fields:
+
+- `jurisdiction`
+- `practice_area`
+- `opened_at` (`YYYY-MM-DD`)
 
 If metadata is missing or invalid, legal task execution is blocked with guidance.
 
@@ -76,7 +82,7 @@ For web-first firm workflows, matter detail now includes:
 ## Conflict Check Limits
 
 - Conflict detection currently reads the workspace-global `conflicts.json` (not a per-matter conflict graph).
-- The chat-flow conflict gate and `/api/matters/conflicts/check` endpoint use this same global source.
+- The chat-flow conflict gate and `/api/matters/conflicts/check` endpoint use this same global source, and also check active-matter `adversaries` terms when an active matter is set.
 - Matching is normalized and boundary-aware, but still heuristic; short aliases are intentionally ignored to reduce false positives.
 
 ## Citation Check Limits
