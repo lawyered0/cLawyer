@@ -26,10 +26,11 @@
 
 1. Request enters preflight.
 2. cLawyer checks: active matter (for non-trivial legal requests), conflict list, tool approval policy, and domain allowlist.
-3. Sensitive tool calls are approval-gated in `max_lockdown`.
-4. Memory/file writes are scoped to `matters/<matter_id>/...` when matter context is required.
-5. Output is scanned for leakage and structured citation-format markers.
-6. Audit events are appended to JSONL with hash-chain links.
+3. When active matter is set and metadata is valid, structured `matter.yaml` fields are injected into legal prompt context (`matter_id`, `client`, `confidentiality`, `retention`, `team`, `adversaries`) as untrusted data.
+4. Sensitive tool calls are approval-gated in `max_lockdown`.
+5. Memory/file writes are scoped to `matters/<matter_id>/...` when matter context is required.
+6. Output is scanned for leakage and structured citation-format markers.
+7. Audit events are appended to JSONL with hash-chain links.
 
 ## Matter Model
 
@@ -114,6 +115,9 @@ Audit log events include:
 - blocked operations
 - redaction events
 - skill activations
+- LLM lifecycle events (`llm_call_started`, `llm_call_completed`, `llm_call_failed`)
+- tool lifecycle events (`tool_call_started`, `tool_call_completed`)
+- explicit approval decision events (`approval_decision`)
 
 Counters tracked in audit state:
 

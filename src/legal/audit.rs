@@ -143,6 +143,15 @@ impl AuditLogger {
 }
 
 static LOGGER: OnceLock<AuditLogger> = OnceLock::new();
+#[cfg(test)]
+static TEST_EVENTS: OnceLock<Mutex<Vec<TestAuditEvent>>> = OnceLock::new();
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct TestAuditEvent {
+    pub event_type: String,
+    pub details: serde_json::Value,
+}
 
 /// Initialize the legal audit logger.
 pub fn init(config: &LegalAuditConfig) {
@@ -155,6 +164,8 @@ pub fn init(config: &LegalAuditConfig) {
 
 /// Log a legal audit event.
 pub fn record(event_type: &str, details: serde_json::Value) {
+    #[cfg(test)]
+    push_test_event(event_type, &details);
     if let Some(logger) = LOGGER.get() {
         logger.write(event_type, details);
     }
@@ -187,12 +198,40 @@ pub fn enabled() -> bool {
 }
 
 #[cfg(test)]
+fn push_test_event(event_type: &str, details: &serde_json::Value) {
+    let events = TEST_EVENTS.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut lock) = events.lock() {
+        lock.push(TestAuditEvent {
+            event_type: event_type.to_string(),
+            details: details.clone(),
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_events() {
+    if let Some(events) = TEST_EVENTS.get()
+        && let Ok(mut lock) = events.lock()
+    {
+        lock.clear();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_events_snapshot() -> Vec<TestAuditEvent> {
+    TEST_EVENTS
+        .get()
+        .and_then(|events| events.lock().ok().map(|lock| lock.clone()))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
 
     use serde_json::Value;
 
-    use super::AuditLogger;
+    use super::{AuditLogger, clear_test_events, record, test_events_snapshot};
 
     #[test]
     fn hash_chain_links_consecutive_events() {
@@ -256,5 +295,31 @@ mod tests {
 
         let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn audit_hook_events_capture_metadata_only_fields() {
+        clear_test_events();
+        record(
+            "tool_call_completed",
+            serde_json::json!({
+                "thread_id": "thread-1",
+                "tool_name": "echo",
+                "elapsed_ms": 12,
+                "outcome": "ok",
+                "error_kind": serde_json::Value::Null,
+            }),
+        );
+
+        let events = test_events_snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "tool_call_completed");
+        assert_eq!(
+            events[0].details.get("thread_id").and_then(|v| v.as_str()),
+            Some("thread-1")
+        );
+        assert!(events[0].details.get("content").is_none());
+        assert!(events[0].details.get("parameters").is_none());
+        assert!(events[0].details.get("output").is_none());
     }
 }

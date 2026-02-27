@@ -15,6 +15,7 @@ use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::{ChatMessage, Reasoning, ReasoningContext, RespondResult};
+use crate::tools::ApprovalRequirement;
 
 /// Result of the agentic loop execution.
 pub(super) enum AgenticLoopResult {
@@ -39,6 +40,58 @@ fn is_group_chat_from_trusted_metadata(message: &IncomingMessage) -> bool {
         .get("chat_type")
         .and_then(|v| v.as_str())
         .is_some_and(|t| t == "group" || t == "channel" || t == "supergroup")
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ToolAuditContext {
+    pub thread_id: String,
+}
+
+fn approval_requirement_label(requirement: ApprovalRequirement) -> &'static str {
+    match requirement {
+        ApprovalRequirement::Never => "never",
+        ApprovalRequirement::UnlessAutoApproved => "unless_auto_approved",
+        ApprovalRequirement::Always => "always",
+    }
+}
+
+fn llm_error_kind(err: &crate::error::LlmError) -> &'static str {
+    match err {
+        crate::error::LlmError::RequestFailed { .. } => "request_failed",
+        crate::error::LlmError::RateLimited { .. } => "rate_limited",
+        crate::error::LlmError::InvalidResponse { .. } => "invalid_response",
+        crate::error::LlmError::ContextLengthExceeded { .. } => "context_length_exceeded",
+        crate::error::LlmError::ModelNotAvailable { .. } => "model_not_available",
+        crate::error::LlmError::AuthFailed { .. } => "auth_failed",
+        crate::error::LlmError::SessionExpired { .. } => "session_expired",
+        crate::error::LlmError::SessionRenewalFailed { .. } => "session_renewal_failed",
+        crate::error::LlmError::Http(_) => "http_error",
+        crate::error::LlmError::Json(_) => "json_error",
+        crate::error::LlmError::Io(_) => "io_error",
+    }
+}
+
+fn record_approval_decision(
+    thread_id: &str,
+    tool_name: &str,
+    needs_approval: bool,
+    legal_forced: bool,
+    is_auto_approved: bool,
+    requirement: ApprovalRequirement,
+    source: &'static str,
+) {
+    crate::legal::audit::record(
+        "approval_decision",
+        serde_json::json!({
+            "thread_id": thread_id,
+            "tool_name": tool_name,
+            "needs_approval": needs_approval,
+            "legal_forced": legal_forced,
+            "auto_approved": is_auto_approved,
+            "requirement": approval_requirement_label(requirement),
+            "source": source,
+        }),
+    );
 }
 
 impl Agent {
@@ -76,6 +129,41 @@ impl Agent {
         // Select and prepare active skills (if skills system is enabled)
         let active_skills = self.select_active_skills(&message.content);
         let effective_legal_config = self.effective_legal_config_for(message);
+        let thread_id_str = thread_id.to_string();
+        let active_matter_context =
+            if effective_legal_config.enabled && effective_legal_config.active_matter.is_some() {
+                if let Some(workspace) = self.workspace() {
+                    match crate::legal::matter::load_active_matter_prompt_context(
+                        workspace.as_ref(),
+                        &effective_legal_config,
+                    )
+                    .await
+                    {
+                        Ok(context) => context,
+                        Err(err) => {
+                            crate::legal::audit::record(
+                                "matter_context_metadata_unavailable",
+                                serde_json::json!({
+                                    "thread_id": thread_id_str.clone(),
+                                    "reason": err.to_string(),
+                                }),
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    crate::legal::audit::record(
+                        "matter_context_metadata_unavailable",
+                        serde_json::json!({
+                            "thread_id": thread_id_str.clone(),
+                            "reason": "workspace_unavailable",
+                        }),
+                    );
+                    None
+                }
+            } else {
+                None
+            };
 
         // Build skill context block
         let skill_context = if !active_skills.is_empty() {
@@ -127,6 +215,9 @@ impl Agent {
             .with_model_name(self.llm().active_model_name())
             .with_legal_config(effective_legal_config.clone())
             .with_group_chat(is_group_chat);
+        if let Some(context) = active_matter_context {
+            reasoning = reasoning.with_active_matter_context(context);
+        }
         if let Some(prompt) = system_prompt {
             reasoning = reasoning.with_system_prompt(prompt);
         }
@@ -242,6 +333,16 @@ impl Agent {
                 )
                 .await;
 
+            let model_name = self.llm().active_model_name();
+            crate::legal::audit::record(
+                "llm_call_started",
+                serde_json::json!({
+                    "thread_id": thread_id.to_string(),
+                    "iteration": iteration,
+                    "model": model_name.clone(),
+                    "force_text": force_text,
+                }),
+            );
             let output = match reasoning.respond_with_tools(&context).await {
                 Ok(output) => output,
                 Err(crate::error::LlmError::ContextLengthExceeded { used, limit }) => {
@@ -270,6 +371,15 @@ impl Agent {
                         .respond_with_tools(&retry_context)
                         .await
                         .map_err(|retry_err| {
+                            crate::legal::audit::record(
+                                "llm_call_failed",
+                                serde_json::json!({
+                                    "thread_id": thread_id.to_string(),
+                                    "iteration": iteration,
+                                    "model": model_name.clone(),
+                                    "error_kind": llm_error_kind(&retry_err),
+                                }),
+                            );
                             tracing::error!(
                                 original_used = used,
                                 original_limit = limit,
@@ -280,11 +390,21 @@ impl Agent {
                             crate::error::Error::from(retry_err)
                         })?
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    crate::legal::audit::record(
+                        "llm_call_failed",
+                        serde_json::json!({
+                            "thread_id": thread_id.to_string(),
+                            "iteration": iteration,
+                            "model": model_name.clone(),
+                            "error_kind": llm_error_kind(&e),
+                        }),
+                    );
+                    return Err(e.into());
+                }
             };
 
             // Record cost and track token usage
-            let model_name = self.llm().active_model_name();
             let call_cost = self
                 .cost_guard()
                 .record_llm_call(
@@ -299,6 +419,23 @@ impl Agent {
                 output.usage.input_tokens,
                 output.usage.output_tokens,
                 call_cost,
+            );
+            let result_kind = match &output.result {
+                RespondResult::Text(_) => "text",
+                RespondResult::ToolCalls { .. } => "tool_calls",
+            };
+            crate::legal::audit::record(
+                "llm_call_completed",
+                serde_json::json!({
+                    "thread_id": thread_id.to_string(),
+                    "iteration": iteration,
+                    "model": model_name,
+                    "result_kind": result_kind,
+                    "input_tokens": output.usage.input_tokens,
+                    "output_tokens": output.usage.output_tokens,
+                    "total_tokens": output.usage.total(),
+                    "cost_usd": call_cost.to_string(),
+                }),
             );
 
             match output.result {
@@ -418,11 +555,21 @@ impl Agent {
                                 let sess = session.lock().await;
                                 sess.is_tool_auto_approved(&tc.name)
                             };
+                            let requirement = tool.requires_approval(&tc.arguments);
                             let decision = self.tools().approval_decision_for_with_legal(
                                 &tc.name,
-                                tool.requires_approval(&tc.arguments),
+                                requirement,
                                 is_auto_approved,
                                 Some(&effective_legal_config),
+                            );
+                            record_approval_decision(
+                                &thread_id.to_string(),
+                                &tc.name,
+                                decision.needs_approval,
+                                decision.legal_forced,
+                                is_auto_approved,
+                                requirement,
+                                "preflight",
                             );
 
                             if decision.needs_approval {
@@ -449,6 +596,9 @@ impl Agent {
                     // index so Phase 3 can iterate in original order.
                     let mut exec_results: Vec<Option<Result<String, Error>>> =
                         (0..preflight.len()).map(|_| None).collect();
+                    let tool_audit_ctx = ToolAuditContext {
+                        thread_id: thread_id.to_string(),
+                    };
 
                     if runnable.len() <= 1 {
                         // Single tool (or none): execute inline
@@ -465,7 +615,12 @@ impl Agent {
                                 .await;
 
                             let result = self
-                                .execute_chat_tool(&tc.name, &tc.arguments, &job_ctx)
+                                .execute_chat_tool(
+                                    &tc.name,
+                                    &tc.arguments,
+                                    &job_ctx,
+                                    Some(tool_audit_ctx.clone()),
+                                )
                                 .await;
 
                             let _ = self
@@ -495,6 +650,7 @@ impl Agent {
                             let tc = tc.clone();
                             let channel = message.channel.clone();
                             let metadata = message.metadata.clone();
+                            let audit_ctx = tool_audit_ctx.clone();
 
                             join_set.spawn(async move {
                                 let _ = channels
@@ -513,6 +669,7 @@ impl Agent {
                                     &tc.name,
                                     &tc.arguments,
                                     &job_ctx,
+                                    Some(audit_ctx),
                                 )
                                 .await;
 
@@ -715,8 +872,17 @@ impl Agent {
         tool_name: &str,
         params: &serde_json::Value,
         job_ctx: &JobContext,
+        audit_ctx: Option<ToolAuditContext>,
     ) -> Result<String, Error> {
-        execute_chat_tool_standalone(self.tools(), self.safety(), tool_name, params, job_ctx).await
+        execute_chat_tool_standalone(
+            self.tools(),
+            self.safety(),
+            tool_name,
+            params,
+            job_ctx,
+            audit_ctx,
+        )
+        .await
     }
 }
 
@@ -731,6 +897,7 @@ pub(super) async fn execute_chat_tool_standalone(
     tool_name: &str,
     params: &serde_json::Value,
     job_ctx: &crate::context::JobContext,
+    audit_ctx: Option<ToolAuditContext>,
 ) -> Result<String, Error> {
     let tool = tools
         .get(tool_name)
@@ -763,6 +930,16 @@ pub(super) async fn execute_chat_tool_standalone(
 
     // Execute with per-tool timeout
     let timeout = tool.execution_timeout();
+    if let Some(ctx) = audit_ctx.as_ref() {
+        crate::legal::audit::record(
+            "tool_call_started",
+            serde_json::json!({
+                "thread_id": ctx.thread_id,
+                "tool_name": tool_name,
+                "timeout_ms": timeout.as_millis() as u64,
+            }),
+        );
+    }
     let start = std::time::Instant::now();
     let result = tokio::time::timeout(timeout, async {
         tool.execute(params.clone(), job_ctx).await
@@ -797,6 +974,24 @@ pub(super) async fn execute_chat_tool_standalone(
                 "Tool call timed out"
             );
         }
+    }
+
+    if let Some(ctx) = audit_ctx.as_ref() {
+        let (outcome, error_kind) = match &result {
+            Ok(Ok(_)) => ("ok", None),
+            Ok(Err(_)) => ("error", Some("execution_failed")),
+            Err(_) => ("timeout", Some("timeout")),
+        };
+        crate::legal::audit::record(
+            "tool_call_completed",
+            serde_json::json!({
+                "thread_id": ctx.thread_id,
+                "tool_name": tool_name,
+                "elapsed_ms": elapsed.as_millis() as u64,
+                "outcome": outcome,
+                "error_kind": error_kind,
+            }),
+        );
     }
 
     let result = result
@@ -924,6 +1119,7 @@ fn compact_messages_for_retry(messages: &[ChatMessage]) -> Vec<ChatMessage> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -1031,6 +1227,104 @@ mod tests {
                 output_tokens: 0,
                 finish_reason: FinishReason::Stop,
             })
+        }
+    }
+
+    /// LLM provider that records invocation count and returns a static text response.
+    struct CountingStaticLlmProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CountingStaticLlmProvider {
+        fn model_name(&self) -> &str {
+            "counting-static"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::LlmError> {
+            Ok(CompletionResponse {
+                content: "ok".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolCompletionResponse {
+                content: Some("ok".to_string()),
+                tool_calls: vec![],
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+            })
+        }
+    }
+
+    /// LLM provider that first emits an echo tool call, then a final text.
+    struct ToolThenTextLlmProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ToolThenTextLlmProvider {
+        fn model_name(&self) -> &str {
+            "tool-then-text"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::LlmError> {
+            Ok(CompletionResponse {
+                content: "ok".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+            let call_no = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_no == 0 {
+                Ok(ToolCompletionResponse {
+                    content: Some("using echo".to_string()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_echo_1".to_string(),
+                        name: "echo".to_string(),
+                        arguments: serde_json::json!({ "message": "hello from tool" }),
+                    }],
+                    input_tokens: 12,
+                    output_tokens: 7,
+                    finish_reason: FinishReason::Stop,
+                })
+            } else {
+                Ok(ToolCompletionResponse {
+                    content: Some("Final response.".to_string()),
+                    tool_calls: vec![],
+                    input_tokens: 9,
+                    output_tokens: 6,
+                    finish_reason: FinishReason::Stop,
+                })
+            }
         }
     }
 
@@ -1372,8 +1666,9 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
-    async fn chat_flow_still_blocks_on_conflict_after_ui_additions() {
+    async fn conflict_gate_blocks_before_llm_call() {
         crate::legal::matter::reset_conflict_cache_for_tests();
+        crate::legal::audit::clear_test_events();
         let workspace = make_test_workspace("user-1").await;
         workspace
             .write(
@@ -1389,8 +1684,11 @@ mod tests {
         legal.require_matter_context = false;
         legal.conflict_check_enabled = true;
 
+        let llm_calls = Arc::new(AtomicUsize::new(0));
         let agent = make_test_agent_with_components(
-            Arc::new(StaticLlmProvider),
+            Arc::new(CountingStaticLlmProvider {
+                calls: Arc::clone(&llm_calls),
+            }),
             Arc::new(ToolRegistry::new()),
             Some(workspace),
             legal,
@@ -1421,6 +1719,156 @@ mod tests {
             }
             other => panic!("expected conflict block error, got {other:?}"),
         }
+        assert_eq!(
+            llm_calls.load(Ordering::SeqCst),
+            0,
+            "conflict checks should block before the first LLM call"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_decision_event_emitted_in_preflight() {
+        crate::legal::audit::clear_test_events();
+
+        let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = false;
+        legal.hardening = crate::config::LegalHardeningProfile::MaxLockdown;
+
+        let registry = ToolRegistry::new().with_legal_policy(legal.clone());
+        registry.register_builtin_tools();
+        registry.register_dev_tools();
+
+        let agent = make_test_agent_with_components(
+            Arc::new(ShellToolCallLlmProvider),
+            Arc::new(registry),
+            None,
+            legal,
+        );
+
+        let session = Arc::new(tokio::sync::Mutex::new(Session::new("user-1")));
+        let thread_id = {
+            let mut s = session.lock().await;
+            s.get_or_create_thread().id
+        };
+        let thread_id_str = thread_id.to_string();
+        let message = IncomingMessage::new("gateway", "user-1", "run a quick command");
+
+        let result = agent
+            .process_user_input(&message, Arc::clone(&session), thread_id, &message.content)
+            .await
+            .expect("process_user_input should succeed");
+        assert!(
+            matches!(result, SubmissionResult::NeedApproval { .. }),
+            "expected approval requirement for shell call"
+        );
+
+        let events = crate::legal::audit::test_events_snapshot();
+        let decision = events.iter().find(|event| {
+            event.event_type == "approval_decision"
+                && event.details.get("thread_id").and_then(|v| v.as_str()) == Some(&thread_id_str)
+                && event.details.get("source").and_then(|v| v.as_str()) == Some("preflight")
+                && event.details.get("tool_name").and_then(|v| v.as_str()) == Some("shell")
+        });
+        let decision = decision.expect("approval_decision event should be present");
+        assert_eq!(
+            decision
+                .details
+                .get("needs_approval")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_and_llm_audit_events_emitted_for_chat_turn() {
+        crate::legal::audit::clear_test_events();
+
+        let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = false;
+        legal.citation_required = false;
+        legal.hardening = crate::config::LegalHardeningProfile::Standard;
+
+        let registry = ToolRegistry::new().with_legal_policy(legal.clone());
+        registry
+            .register(std::sync::Arc::new(crate::tools::builtin::EchoTool))
+            .await;
+
+        let llm_calls = Arc::new(AtomicUsize::new(0));
+        let agent = make_test_agent_with_components(
+            Arc::new(ToolThenTextLlmProvider {
+                calls: Arc::clone(&llm_calls),
+            }),
+            Arc::new(registry),
+            None,
+            legal,
+        );
+
+        let session = Arc::new(tokio::sync::Mutex::new(Session::new("user-1")));
+        let thread_id = {
+            let mut s = session.lock().await;
+            s.get_or_create_thread().id
+        };
+        let thread_id_str = thread_id.to_string();
+        let message = IncomingMessage::new("gateway", "user-1", "say hello via tool");
+
+        let result = agent
+            .process_user_input(&message, Arc::clone(&session), thread_id, &message.content)
+            .await
+            .expect("process_user_input should succeed");
+        assert!(
+            matches!(result, SubmissionResult::Response { .. }),
+            "expected normal response after tool execution"
+        );
+        assert!(
+            llm_calls.load(Ordering::SeqCst) >= 2,
+            "provider should be called for tool step and final response"
+        );
+
+        let events: Vec<_> = crate::legal::audit::test_events_snapshot()
+            .into_iter()
+            .filter(|event| {
+                event.details.get("thread_id").and_then(|v| v.as_str()) == Some(&thread_id_str)
+            })
+            .collect();
+
+        let has_llm_started = events
+            .iter()
+            .any(|event| event.event_type == "llm_call_started");
+        let has_llm_completed = events
+            .iter()
+            .any(|event| event.event_type == "llm_call_completed");
+        let has_tool_started = events
+            .iter()
+            .any(|event| event.event_type == "tool_call_started");
+        let has_tool_completed = events
+            .iter()
+            .any(|event| event.event_type == "tool_call_completed");
+        assert!(has_llm_started, "missing llm_call_started event");
+        assert!(has_llm_completed, "missing llm_call_completed event");
+        assert!(has_tool_started, "missing tool_call_started event");
+        assert!(has_tool_completed, "missing tool_call_completed event");
+
+        let tool_completed = events
+            .iter()
+            .find(|event| event.event_type == "tool_call_completed")
+            .expect("tool_call_completed should be present");
+        assert_eq!(
+            tool_completed
+                .details
+                .get("outcome")
+                .and_then(|v| v.as_str()),
+            Some("ok")
+        );
+        assert!(
+            tool_completed.details.get("parameters").is_none(),
+            "audit metadata should not include raw parameters"
+        );
     }
 
     #[tokio::test]
@@ -1542,6 +1990,7 @@ mod tests {
             "echo",
             &serde_json::json!({"message": "hello"}),
             &job_ctx,
+            None,
         )
         .await;
 
@@ -1570,6 +2019,7 @@ mod tests {
             "nonexistent",
             &serde_json::json!({}),
             &job_ctx,
+            None,
         )
         .await;
 

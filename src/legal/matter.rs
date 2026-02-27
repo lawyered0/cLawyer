@@ -12,6 +12,9 @@ use crate::workspace::Workspace;
 
 const CONFLICT_CACHE_REFRESH_WINDOW: Duration = Duration::from_secs(30);
 const MIN_ALIAS_SINGLE_TOKEN_LEN: usize = 4;
+const MATTER_PROMPT_LIST_MAX_ITEMS: usize = 8;
+const MATTER_PROMPT_FIELD_MAX_CHARS: usize = 160;
+const MATTER_PROMPT_LIST_ITEM_MAX_CHARS: usize = 96;
 
 #[derive(Debug, Clone)]
 struct ConflictEntry {
@@ -41,6 +44,16 @@ pub struct MatterMetadata {
     pub confidentiality: String,
     pub adversaries: Vec<String>,
     pub retention: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveMatterPromptContext {
+    pub matter_id: String,
+    pub client: String,
+    pub confidentiality: String,
+    pub retention: String,
+    pub team: Vec<String>,
+    pub adversaries: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +155,100 @@ pub async fn read_matter_metadata_for_root(
     }
 
     Ok(metadata)
+}
+
+fn sanitize_prompt_field(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let mut seen_non_ws = false;
+    let mut pending_space = false;
+    let mut count = 0usize;
+
+    for ch in value.chars() {
+        let normalized = if ch.is_control() {
+            if matches!(ch, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                continue;
+            }
+        } else {
+            ch
+        };
+
+        if normalized.is_whitespace() {
+            if seen_non_ws {
+                pending_space = true;
+            }
+            continue;
+        }
+
+        if pending_space {
+            if count >= max_chars {
+                break;
+            }
+            out.push(' ');
+            count += 1;
+            pending_space = false;
+        }
+
+        if count >= max_chars {
+            break;
+        }
+        out.push(normalized);
+        count += 1;
+        seen_non_ws = true;
+    }
+
+    out
+}
+
+fn sanitize_prompt_list(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| sanitize_prompt_field(value, MATTER_PROMPT_LIST_ITEM_MAX_CHARS))
+        .filter(|value| !value.is_empty())
+        .take(MATTER_PROMPT_LIST_MAX_ITEMS)
+        .collect()
+}
+
+/// Build active matter context fields suitable for inclusion in the legal
+/// system prompt as untrusted data.
+pub async fn load_active_matter_prompt_context(
+    workspace: &Workspace,
+    config: &LegalConfig,
+) -> Result<Option<ActiveMatterPromptContext>, MatterMetadataValidationError> {
+    if !config.enabled {
+        return Ok(None);
+    }
+
+    let active_matter = match config.active_matter.as_deref() {
+        Some(m) if !m.trim().is_empty() => m,
+        _ => return Ok(None),
+    };
+
+    let metadata =
+        read_matter_metadata_for_root(workspace, &config.matter_root, active_matter).await?;
+    let sanitized_matter_id = sanitize_matter_id(&metadata.matter_id);
+    let matter_id = if sanitized_matter_id.is_empty() {
+        sanitize_prompt_field(active_matter, MATTER_PROMPT_FIELD_MAX_CHARS)
+    } else {
+        sanitize_prompt_field(&sanitized_matter_id, MATTER_PROMPT_FIELD_MAX_CHARS)
+    };
+
+    Ok(Some(ActiveMatterPromptContext {
+        matter_id,
+        client: sanitize_prompt_field(&metadata.client, MATTER_PROMPT_FIELD_MAX_CHARS),
+        confidentiality: sanitize_prompt_field(
+            &metadata.confidentiality,
+            MATTER_PROMPT_FIELD_MAX_CHARS,
+        ),
+        retention: sanitize_prompt_field(&metadata.retention, MATTER_PROMPT_FIELD_MAX_CHARS),
+        team: sanitize_prompt_list(&metadata.team),
+        adversaries: sanitize_prompt_list(&metadata.adversaries),
+    }))
 }
 
 /// Validate `matter.yaml` for the active matter context.
@@ -595,7 +702,7 @@ mod tests {
     use super::{
         MatterMetadata, alias_is_matchable, contains_term_with_boundaries,
         is_workspace_conflicts_path, matter_metadata_path_for_root, normalize_conflict_text,
-        parse_conflict_entries,
+        parse_conflict_entries, sanitize_prompt_field, sanitize_prompt_list,
     };
 
     #[test]
@@ -670,6 +777,32 @@ mod tests {
         assert!(terms.iter().any(|t| t == "example adverse party"));
         assert!(terms.iter().any(|t| t == "example co"));
         assert!(!terms.iter().any(|t| t == "ea"));
+    }
+
+    #[test]
+    fn prompt_field_sanitization_normalizes_whitespace_and_controls() {
+        let raw = "  Acme\tCorp\n\x07Litigation   Team  ";
+        let cleaned = sanitize_prompt_field(raw, 120);
+        assert_eq!(cleaned, "Acme Corp Litigation Team");
+    }
+
+    #[test]
+    fn prompt_list_sanitization_applies_limits_and_drops_empty() {
+        let values = vec![
+            " Lead Counsel ".to_string(),
+            "\n\n".to_string(),
+            "Associate\tOne".to_string(),
+            "Paralegal".to_string(),
+            "Investigator".to_string(),
+            "Expert".to_string(),
+            "Analyst".to_string(),
+            "Clerk".to_string(),
+            "Runner".to_string(),
+        ];
+        let cleaned = sanitize_prompt_list(&values);
+        assert_eq!(cleaned.len(), 8);
+        assert_eq!(cleaned[0], "Lead Counsel");
+        assert!(cleaned.iter().all(|item| !item.is_empty()));
     }
 }
 
