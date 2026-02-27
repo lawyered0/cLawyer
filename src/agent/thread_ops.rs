@@ -12,7 +12,8 @@ use uuid::Uuid;
 use crate::agent::Agent;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::dispatcher::{
-    AgenticLoopResult, check_auth_required, execute_chat_tool_standalone, parse_auth_result,
+    AgenticLoopResult, ToolAuditContext, check_auth_required, execute_chat_tool_standalone,
+    parse_auth_result,
 };
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::agent::submission::SubmissionResult;
@@ -20,6 +21,15 @@ use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::ChatMessage;
+use crate::tools::ApprovalRequirement;
+
+fn approval_requirement_label(requirement: ApprovalRequirement) -> &'static str {
+    match requirement {
+        ApprovalRequirement::Never => "never",
+        ApprovalRequirement::UnlessAutoApproved => "unless_auto_approved",
+        ApprovalRequirement::Always => "always",
+    }
+}
 
 impl Agent {
     /// Hydrate a historical thread from DB into memory if not already present.
@@ -754,7 +764,14 @@ impl Agent {
                 .await;
 
             let tool_result = self
-                .execute_chat_tool(&pending.tool_name, &pending.parameters, &job_ctx)
+                .execute_chat_tool(
+                    &pending.tool_name,
+                    &pending.parameters,
+                    &job_ctx,
+                    Some(ToolAuditContext {
+                        thread_id: thread_id.to_string(),
+                    }),
+                )
                 .await;
 
             let _ = self
@@ -870,6 +887,9 @@ impl Agent {
                 crate::llm::ToolCall,
                 Arc<dyn crate::tools::Tool>,
             )> = None;
+            let tool_audit_ctx = ToolAuditContext {
+                thread_id: thread_id.to_string(),
+            };
 
             for (idx, tc) in deferred_tool_calls.iter().enumerate() {
                 if let Some(tool) = self.tools().get(&tc.name).await {
@@ -877,11 +897,24 @@ impl Agent {
                         let sess = session.lock().await;
                         sess.is_tool_auto_approved(&tc.name)
                     };
+                    let requirement = tool.requires_approval(&tc.arguments);
                     let decision = self.tools().approval_decision_for_with_legal(
                         &tc.name,
-                        tool.requires_approval(&tc.arguments),
+                        requirement,
                         is_auto_approved,
                         Some(&effective_legal_config),
+                    );
+                    crate::legal::audit::record(
+                        "approval_decision",
+                        serde_json::json!({
+                            "thread_id": thread_id.to_string(),
+                            "tool_name": tc.name,
+                            "needs_approval": decision.needs_approval,
+                            "legal_forced": decision.legal_forced,
+                            "auto_approved": is_auto_approved,
+                            "requirement": approval_requirement_label(requirement),
+                            "source": "deferred_preflight",
+                        }),
                     );
 
                     if decision.needs_approval {
@@ -920,7 +953,12 @@ impl Agent {
                         .await;
 
                     let result = self
-                        .execute_chat_tool(&tc.name, &tc.arguments, &job_ctx)
+                        .execute_chat_tool(
+                            &tc.name,
+                            &tc.arguments,
+                            &job_ctx,
+                            Some(tool_audit_ctx.clone()),
+                        )
                         .await;
 
                     let _ = self
@@ -951,6 +989,7 @@ impl Agent {
                     let tc = tc.clone();
                     let channel = message.channel.clone();
                     let metadata = message.metadata.clone();
+                    let audit_ctx = tool_audit_ctx.clone();
 
                     join_set.spawn(async move {
                         let _ = channels
@@ -969,6 +1008,7 @@ impl Agent {
                             &tc.name,
                             &tc.arguments,
                             &job_ctx,
+                            Some(audit_ctx),
                         )
                         .await;
 
