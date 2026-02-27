@@ -951,8 +951,13 @@ mod cache_tests {
     use crate::settings::Settings;
     use crate::workspace::Workspace;
 
+    // All cache tests share a process-wide global; run them serially so they
+    // don't stomp each other's `CONFLICT_CACHE_REFRESH_COUNT` state.
+    static CACHE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn detect_conflict_uses_cache_until_invalidated() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
         reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
@@ -1008,6 +1013,7 @@ mod cache_tests {
 
     #[tokio::test]
     async fn detect_conflict_matches_active_matter_adversary_without_conflicts_json_hit() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
         reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
@@ -1052,6 +1058,7 @@ retention: follow-firm-policy
 
     #[tokio::test]
     async fn detect_conflict_uses_warm_cache_for_no_match_without_refreshing_disk_parse() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
         reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
@@ -1087,6 +1094,7 @@ retention: follow-firm-policy
 
     #[tokio::test]
     async fn detect_conflict_ignores_short_single_token_adversary_false_positive() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
         reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
@@ -1128,6 +1136,7 @@ retention: follow-firm-policy
 
     #[tokio::test]
     async fn detect_conflict_matches_active_matter_identifier_against_adversaries() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
         reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
