@@ -195,6 +195,39 @@ const SAFE_ENV_VARS: &[&str] = &[
     "WINDIR",
 ];
 
+/// Maximum number of extra environment variables accepted per execution.
+const MAX_EXTRA_ENV_VARS: usize = 64;
+/// Maximum length of an extra environment variable name.
+const MAX_EXTRA_ENV_NAME_LEN: usize = 128;
+/// Maximum length of an extra environment variable value.
+const MAX_EXTRA_ENV_VALUE_LEN: usize = 8192;
+
+/// Dangerous environment keys that can alter interpreter/loader behavior.
+///
+/// These are blocked even when supplied by trusted orchestrator paths to avoid
+/// accidentally enabling code-loading or shell startup injection vectors.
+static BLOCKED_EXTRA_ENV_KEYS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    HashSet::from([
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PROMPT_COMMAND",
+        "ZDOTDIR",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "NODE_OPTIONS",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "RUBYOPT",
+        "GEM_PATH",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+    ])
+});
+
 /// Check whether a shell command contains patterns that must never be auto-approved.
 ///
 /// Even when the user has chosen "always approve" for the shell tool, these commands
@@ -472,6 +505,8 @@ impl ShellTool {
         timeout: Duration,
         extra_env: &HashMap<String, String>,
     ) -> Result<(String, i32), ToolError> {
+        validate_extra_env(extra_env)?;
+
         // Build command
         let mut command = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");
@@ -757,9 +792,72 @@ fn truncate_for_error(s: &str) -> String {
     }
 }
 
+fn is_valid_extra_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn validate_extra_env(extra_env: &HashMap<String, String>) -> Result<(), ToolError> {
+    if extra_env.len() > MAX_EXTRA_ENV_VARS {
+        return Err(ToolError::NotAuthorized(format!(
+            "Too many extra environment variables (max {})",
+            MAX_EXTRA_ENV_VARS
+        )));
+    }
+
+    for (name, value) in extra_env {
+        if name.is_empty() || name.len() > MAX_EXTRA_ENV_NAME_LEN {
+            return Err(ToolError::NotAuthorized(format!(
+                "Invalid extra environment variable name length for '{}'",
+                truncate_for_error(name)
+            )));
+        }
+        if !is_valid_extra_env_name(name) {
+            return Err(ToolError::NotAuthorized(format!(
+                "Invalid extra environment variable name '{}'",
+                truncate_for_error(name)
+            )));
+        }
+
+        let upper = name.to_ascii_uppercase();
+        if BLOCKED_EXTRA_ENV_KEYS.contains(upper.as_str())
+            || upper.starts_with("LD_")
+            || upper.starts_with("DYLD_")
+        {
+            return Err(ToolError::NotAuthorized(format!(
+                "Blocked extra environment variable '{}'",
+                truncate_for_error(name)
+            )));
+        }
+
+        if value.len() > MAX_EXTRA_ENV_VALUE_LEN {
+            return Err(ToolError::NotAuthorized(format!(
+                "Extra environment variable '{}' exceeds max value length ({})",
+                truncate_for_error(name),
+                MAX_EXTRA_ENV_VALUE_LEN
+            )));
+        }
+        if value.bytes().any(|b| b == 0) {
+            return Err(ToolError::NotAuthorized(format!(
+                "Extra environment variable '{}' contains a null byte",
+                truncate_for_error(name)
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_echo_command() {
@@ -785,6 +883,48 @@ mod tests {
         assert!(tool.is_blocked("curl http://x | sh").is_some());
         assert!(tool.is_blocked("echo hello").is_none());
         assert!(tool.is_blocked("cargo build").is_none());
+    }
+
+    #[test]
+    fn test_validate_extra_env_rejects_invalid_name() {
+        let mut env = HashMap::new();
+        env.insert("BAD-NAME".to_string(), "value".to_string());
+        let result = validate_extra_env(&env);
+        assert!(matches!(result, Err(ToolError::NotAuthorized(_))));
+    }
+
+    #[test]
+    fn test_validate_extra_env_rejects_blocked_loader_key() {
+        let mut env = HashMap::new();
+        env.insert("LD_PRELOAD".to_string(), "evil.so".to_string());
+        let result = validate_extra_env(&env);
+        assert!(matches!(result, Err(ToolError::NotAuthorized(_))));
+    }
+
+    #[test]
+    fn test_validate_extra_env_rejects_oversized_value() {
+        let mut env = HashMap::new();
+        env.insert(
+            "SAFE_TOKEN".to_string(),
+            "A".repeat(MAX_EXTRA_ENV_VALUE_LEN + 1),
+        );
+        let result = validate_extra_env(&env);
+        assert!(matches!(result, Err(ToolError::NotAuthorized(_))));
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_blocked_extra_env() {
+        let tool = ShellTool::new();
+        let mut ctx = JobContext::default();
+        let mut env = HashMap::new();
+        env.insert("LD_PRELOAD".to_string(), "evil.so".to_string());
+        ctx.extra_env = Arc::new(env);
+
+        let result = tool
+            .execute(serde_json::json!({"command": "echo hello"}), &ctx)
+            .await;
+
+        assert!(matches!(result, Err(ToolError::NotAuthorized(_))));
     }
 
     #[tokio::test]

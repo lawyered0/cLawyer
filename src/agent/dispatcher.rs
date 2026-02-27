@@ -27,6 +27,20 @@ pub(super) enum AgenticLoopResult {
     },
 }
 
+fn is_group_chat_from_trusted_metadata(message: &IncomingMessage) -> bool {
+    // Treat channel metadata as untrusted by default. Only built-in channels
+    // with known metadata contracts can influence system-context decisions.
+    if message.channel != "signal" {
+        return false;
+    }
+
+    message
+        .metadata
+        .get("chat_type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t == "group" || t == "channel" || t == "supergroup")
+}
+
 impl Agent {
     /// Run the agentic loop: call LLM, execute tools, repeat until text response.
     ///
@@ -40,12 +54,9 @@ impl Agent {
         thread_id: Uuid,
         initial_messages: Vec<ChatMessage>,
     ) -> Result<AgenticLoopResult, Error> {
-        // Detect group chat from channel metadata (needed before loading system prompt)
-        let is_group_chat = message
-            .metadata
-            .get("chat_type")
-            .and_then(|v| v.as_str())
-            .is_some_and(|t| t == "group" || t == "channel" || t == "supergroup");
+        // Detect group chat from trusted channel metadata (needed before
+        // loading system prompt). Untrusted channels cannot influence this.
+        let is_group_chat = is_group_chat_from_trusted_metadata(message);
 
         // Load workspace system prompt (identity files: AGENTS.md, SOUL.md, etc.)
         // In group chats, MEMORY.md is excluded to prevent leaking personal context.
@@ -1246,6 +1257,37 @@ mod tests {
 
         let effective = agent.effective_legal_config_for(&message);
         assert_eq!(effective.active_matter, None);
+    }
+
+    #[test]
+    fn test_effective_legal_config_ignores_untrusted_active_matter_override() {
+        let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        legal.active_matter = Some("demo".to_string());
+        let agent = make_test_agent_with_legal(legal);
+
+        let message = crate::channels::IncomingMessage::new("signal", "user-1", "hello")
+            .with_metadata(serde_json::json!({
+                "active_matter": "Acme v. Foo!!!"
+            }));
+
+        let effective = agent.effective_legal_config_for(&message);
+        assert_eq!(effective.active_matter.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn test_group_chat_metadata_requires_trusted_channel() {
+        let trusted = crate::channels::IncomingMessage::new("signal", "user-1", "hello")
+            .with_metadata(serde_json::json!({
+                "chat_type": "group"
+            }));
+        assert!(super::is_group_chat_from_trusted_metadata(&trusted));
+
+        let untrusted = crate::channels::IncomingMessage::new("custom-wasm", "user-1", "hello")
+            .with_metadata(serde_json::json!({
+                "chat_type": "group"
+            }));
+        assert!(!super::is_group_chat_from_trusted_metadata(&untrusted));
     }
 
     #[tokio::test]

@@ -92,6 +92,10 @@ pub struct Agent {
 }
 
 impl Agent {
+    fn is_trusted_active_matter_source(channel: &str) -> bool {
+        matches!(channel, "gateway" | "http")
+    }
+
     /// Create a new agent.
     ///
     /// Optionally accepts pre-created `ContextManager` and `SessionManager` for sharing
@@ -167,7 +171,9 @@ impl Agent {
         message: &IncomingMessage,
     ) -> crate::config::LegalConfig {
         let mut legal = self.deps.legal_config.clone();
-        if let Some(active_matter) = message.metadata.get("active_matter") {
+        if let Some(active_matter) = message.metadata.get("active_matter")
+            && Self::is_trusted_active_matter_source(&message.channel)
+        {
             match active_matter {
                 serde_json::Value::Null => {
                     legal.active_matter = None;
@@ -184,6 +190,11 @@ impl Agent {
                     tracing::warn!("Ignoring non-string 'active_matter' metadata override");
                 }
             }
+        } else if message.metadata.get("active_matter").is_some() {
+            tracing::warn!(
+                channel = %message.channel,
+                "Ignoring 'active_matter' metadata override from untrusted channel"
+            );
         }
         legal
     }
