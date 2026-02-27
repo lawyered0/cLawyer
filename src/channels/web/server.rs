@@ -1592,14 +1592,21 @@ fn parse_deadlines_from_calendar(markdown: &str, today: NaiveDate) -> Vec<Matter
 
         // Parse table rows first: | Date | Deadline / Event | Owner | Status | Source |
         if line.starts_with('|') {
-            let columns: Vec<&str> = line
-                .split('|')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .collect();
-            if columns.is_empty()
+            let normalized = line.trim_matches('|').trim();
+            if normalized.is_empty() {
+                continue;
+            }
+            let columns: Vec<&str> = line.split('|').map(str::trim).collect();
+            // split('|') on a pipe-delimited row includes leading/trailing empty tokens.
+            // We trim those by slicing, but keep interior empties to preserve column positions.
+            let columns = if columns.len() >= 2 {
+                &columns[1..columns.len() - 1]
+            } else {
+                &columns[..]
+            };
+            if columns.len() < 2
                 || columns[0].eq_ignore_ascii_case("date")
-                || columns[0].eq_ignore_ascii_case("deadline / event")
+                || columns[1].eq_ignore_ascii_case("deadline / event")
             {
                 continue;
             }
@@ -5211,12 +5218,13 @@ mod tests {
         let today = Utc::now().date_naive();
         let past = (today - chrono::TimeDelta::days(1)).to_string();
         let upcoming = (today + chrono::TimeDelta::days(5)).to_string();
+        let followup = (today + chrono::TimeDelta::days(8)).to_string();
 
         workspace
             .write(
                 "matters/demo/deadlines/calendar.md",
                 &format!(
-                    "# Deadlines\n\n| Date | Deadline / Event | Owner | Status | Source |\n|---|---|---|---|---|\n| {past} | Initial disclosure due | Lead Counsel | open | FRCP 26 |\n| {upcoming} | File reply brief | Associate | drafting | court order |\n"
+                    "# Deadlines\n\n| Date | Deadline / Event | Owner | Status | Source |\n|---|---|---|---|---|\n| {past} | Initial disclosure due | Lead Counsel | open | FRCP 26 |\n| {upcoming} | File reply brief | Associate | drafting | court order |\n| {followup} | Submit witness list |  | open | scheduling order |\n"
                 ),
             )
             .await
@@ -5229,10 +5237,17 @@ mod tests {
             .expect("deadlines handler should succeed");
 
         assert_eq!(resp.matter_id, "demo");
-        assert_eq!(resp.deadlines.len(), 2);
+        assert_eq!(resp.deadlines.len(), 3);
         assert!(resp.deadlines[0].is_overdue);
         assert!(!resp.deadlines[1].is_overdue);
         assert_eq!(resp.deadlines[1].title, "File reply brief");
+        assert_eq!(resp.deadlines[2].title, "Submit witness list");
+        assert_eq!(resp.deadlines[2].owner, None);
+        assert_eq!(resp.deadlines[2].status.as_deref(), Some("open"));
+        assert_eq!(
+            resp.deadlines[2].source.as_deref(),
+            Some("scheduling order")
+        );
     }
 
     #[cfg(feature = "libsql")]
