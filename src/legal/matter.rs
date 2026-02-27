@@ -267,7 +267,13 @@ pub async fn seed_legal_workspace(
             format!("{prefix}/README.md"),
             format!(
                 "# Matter {}\n\nThis matter workspace is scoped for confidential legal work.\n\n\
-                 Files in this tree are treated as privileged by default.\n",
+                 Files in this tree are treated as privileged by default.\n\n\
+                 ## Suggested Workflow\n\n\
+                 1. Intake and conflicts\n\
+                 2. Facts and chronology\n\
+                 3. Research and authority synthesis\n\
+                 4. Drafting and review\n\
+                 5. Filing and follow-up\n",
                 sanitize_matter_id(matter_id)
             ),
         ),
@@ -277,6 +283,34 @@ pub async fn seed_legal_workspace(
                 "# Matter metadata schema\n# Required: matter_id, client, confidentiality, retention\n{}",
                 matter_yaml
             ),
+        ),
+        (
+            format!("{prefix}/workflows/intake_checklist.md"),
+            "# Intake Checklist\n\n- [ ] Confirm engagement and scope\n- [ ] Confirm client contact and billing details\n- [ ] Run conflict check and document result\n- [ ] Capture key deadlines and court dates\n- [ ] Identify required initial filings or responses\n".to_string(),
+        ),
+        (
+            format!("{prefix}/workflows/review_and_filing_checklist.md"),
+            "# Review and Filing Checklist\n\n- [ ] Separate facts from analysis in final draft\n- [ ] Verify citation format coverage for factual/legal assertions\n- [ ] Confirm privilege/confidentiality review complete\n- [ ] Final QA pass and attorney approval recorded\n- [ ] Filing/service steps completed and logged\n".to_string(),
+        ),
+        (
+            format!("{prefix}/deadlines/calendar.md"),
+            "# Deadlines and Hearings\n\n| Date | Deadline / Event | Owner | Status | Source |\n|---|---|---|---|---|\n".to_string(),
+        ),
+        (
+            format!("{prefix}/facts/key_facts.md"),
+            "# Key Facts Log\n\n| Fact | Source | Confidence | Notes |\n|---|---|---|---|\n".to_string(),
+        ),
+        (
+            format!("{prefix}/research/authority_table.md"),
+            "# Authority Table\n\n| Authority | Holding / Principle | Relevance | Risk / Limit | Citation |\n|---|---|---|---|---|\n".to_string(),
+        ),
+        (
+            format!("{prefix}/discovery/request_tracker.md"),
+            "# Discovery Request Tracker\n\n| Request / Topic | Served / Received | Response Due | Status | Notes |\n|---|---|---|---|---|\n".to_string(),
+        ),
+        (
+            format!("{prefix}/communications/contact_log.md"),
+            "# Communications Log\n\n| Date | With | Channel | Summary | Follow-up |\n|---|---|---|---|---|\n".to_string(),
         ),
         (
             format!("{prefix}/templates/research_memo.md"),

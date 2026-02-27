@@ -20,7 +20,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
@@ -225,10 +225,16 @@ pub async fn start_server(
             get(matters_active_get_handler).post(matters_active_set_handler),
         )
         .route("/api/matters/{id}/documents", get(matter_documents_handler))
+        .route("/api/matters/{id}/dashboard", get(matter_dashboard_handler))
+        .route("/api/matters/{id}/deadlines", get(matter_deadlines_handler))
         .route("/api/matters/{id}/templates", get(matter_templates_handler))
         .route(
             "/api/matters/{id}/templates/apply",
             post(matter_template_apply_handler),
+        )
+        .route(
+            "/api/matters/{id}/filing-package",
+            post(matter_filing_package_handler),
         )
         .route(
             "/api/matters/conflicts/check",
@@ -1512,6 +1518,241 @@ async fn list_matter_documents_recursive(
     Ok(documents)
 }
 
+fn checklist_completion_from_markdown(markdown: &str) -> (usize, usize) {
+    let mut completed = 0usize;
+    let mut total = 0usize;
+
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        let marker = if let Some(rest) = trimmed.strip_prefix("- [") {
+            rest
+        } else {
+            continue;
+        };
+        let mut chars = marker.chars();
+        let state = chars.next().unwrap_or(' ');
+        let bracket = chars.next().unwrap_or(' ');
+        if bracket != ']' {
+            continue;
+        }
+        total += 1;
+        if matches!(state, 'x' | 'X' | '✓') {
+            completed += 1;
+        }
+    }
+
+    (completed, total)
+}
+
+fn parse_iso_date_token(input: &str) -> Option<(NaiveDate, usize, usize)> {
+    let bytes = input.as_bytes();
+    if bytes.len() < 10 {
+        return None;
+    }
+
+    for start in 0..=bytes.len() - 10 {
+        let token = &bytes[start..start + 10];
+        let is_iso = token[0].is_ascii_digit()
+            && token[1].is_ascii_digit()
+            && token[2].is_ascii_digit()
+            && token[3].is_ascii_digit()
+            && token[4] == b'-'
+            && token[5].is_ascii_digit()
+            && token[6].is_ascii_digit()
+            && token[7] == b'-'
+            && token[8].is_ascii_digit()
+            && token[9].is_ascii_digit();
+        if !is_iso {
+            continue;
+        }
+
+        let Ok(token_str) = std::str::from_utf8(token) else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(token_str, "%Y-%m-%d") else {
+            continue;
+        };
+        return Some((date, start, start + 10));
+    }
+
+    None
+}
+
+fn parse_deadlines_from_calendar(markdown: &str, today: NaiveDate) -> Vec<MatterDeadlineInfo> {
+    let mut deadlines: Vec<(NaiveDate, MatterDeadlineInfo)> = Vec::new();
+
+    for raw_line in markdown.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with("|---") {
+            continue;
+        }
+
+        // Parse table rows first: | Date | Deadline / Event | Owner | Status | Source |
+        if line.starts_with('|') {
+            let normalized = line.trim_matches('|').trim();
+            if normalized.is_empty() {
+                continue;
+            }
+            let columns: Vec<&str> = line.split('|').map(str::trim).collect();
+            // split('|') on a pipe-delimited row includes leading/trailing empty tokens.
+            // We trim those by slicing, but keep interior empties to preserve column positions.
+            let columns = if columns.len() >= 2 {
+                &columns[1..columns.len() - 1]
+            } else {
+                &columns[..]
+            };
+            if columns.len() < 2
+                || columns[0].eq_ignore_ascii_case("date")
+                || columns[1].eq_ignore_ascii_case("deadline / event")
+            {
+                continue;
+            }
+            if let Some((date, _, _)) = parse_iso_date_token(columns[0]) {
+                let title = columns.get(1).copied().unwrap_or("").trim().to_string();
+                if title.is_empty() {
+                    continue;
+                }
+                let owner = columns
+                    .get(2)
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string());
+                let status = columns
+                    .get(3)
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string());
+                let source = columns
+                    .get(4)
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string());
+
+                deadlines.push((
+                    date,
+                    MatterDeadlineInfo {
+                        date: date.to_string(),
+                        title,
+                        owner,
+                        status,
+                        source,
+                        is_overdue: date < today,
+                    },
+                ));
+                continue;
+            }
+        }
+
+        // Fallback parser for checklist-style lines with embedded YYYY-MM-DD.
+        if let Some((date, start, end)) = parse_iso_date_token(line) {
+            let left = line[..start].trim();
+            let right = line[end..].trim();
+            let joined = if left.is_empty() {
+                right.to_string()
+            } else if right.is_empty() {
+                left.to_string()
+            } else {
+                format!("{left} {right}")
+            };
+            let mut title = joined
+                .trim()
+                .trim_matches('|')
+                .trim_matches('-')
+                .trim()
+                .to_string();
+            if title.is_empty() {
+                title = "Untitled deadline".to_string();
+            }
+
+            deadlines.push((
+                date,
+                MatterDeadlineInfo {
+                    date: date.to_string(),
+                    title,
+                    owner: None,
+                    status: None,
+                    source: None,
+                    is_overdue: date < today,
+                },
+            ));
+        }
+    }
+
+    deadlines.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.title.cmp(&b.1.title)));
+    deadlines.into_iter().map(|(_, info)| info).collect()
+}
+
+async fn read_matter_deadlines(
+    workspace: &Workspace,
+    matter_prefix: &str,
+    today: NaiveDate,
+) -> Result<Vec<MatterDeadlineInfo>, (StatusCode, String)> {
+    let path = format!("{matter_prefix}/deadlines/calendar.md");
+    match workspace.read(&path).await {
+        Ok(doc) => Ok(parse_deadlines_from_calendar(&doc.content, today)),
+        Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => Ok(Vec::new()),
+        Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    }
+}
+
+async fn list_matter_templates(
+    workspace: &Workspace,
+    matter_id: &str,
+) -> Result<Vec<MatterTemplateInfo>, (StatusCode, String)> {
+    let templates_path = format!("{MATTER_ROOT}/{matter_id}/templates");
+    let entries = match workspace.list(&templates_path).await {
+        Ok(entries) => entries,
+        Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => Vec::new(),
+        Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    };
+
+    let mut templates: Vec<MatterTemplateInfo> = entries
+        .into_iter()
+        .filter(|entry| !entry.is_directory)
+        .filter_map(|entry| {
+            let name = entry.path.rsplit('/').next()?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            Some(MatterTemplateInfo {
+                name,
+                path: entry.path,
+                updated_at: entry.updated_at.map(|dt| dt.to_rfc3339()),
+            })
+        })
+        .collect();
+    templates.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(templates)
+}
+
+async fn choose_filing_package_destination(
+    workspace: &Workspace,
+    matter_prefix: &str,
+    timestamp: &str,
+) -> Result<String, (StatusCode, String)> {
+    for counter in 1usize..=999 {
+        let suffix = if counter == 1 {
+            String::new()
+        } else {
+            format!("-{}", counter)
+        };
+        let candidate = format!("{matter_prefix}/exports/filing-package-{timestamp}{suffix}.md");
+        match workspace.read(&candidate).await {
+            Ok(_) => continue,
+            Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => return Ok(candidate),
+            Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+        }
+    }
+
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Failed to choose a unique filing package destination".to_string(),
+    ))
+}
+
 async fn matters_list_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<MattersListResponse>, (StatusCode, String)> {
@@ -1659,9 +1900,37 @@ async fn matters_create_handler(
         (
             format!("{matter_prefix}/README.md"),
             format!(
-                "# Matter {}\n\nClient: {}\n\nThis workspace stores privileged legal work product.\n",
+                "# Matter {}\n\nClient: {}\n\nThis workspace stores privileged legal work product.\n\n## Suggested Workflow\n\n1. Intake and conflicts\n2. Facts and chronology\n3. Research and authority synthesis\n4. Drafting and review\n5. Filing and follow-up\n",
                 sanitized, client
             ),
+        ),
+        (
+            format!("{matter_prefix}/workflows/intake_checklist.md"),
+            "# Intake Checklist\n\n- [ ] Confirm engagement and scope\n- [ ] Confirm client contact and billing details\n- [ ] Run conflict check and document result\n- [ ] Capture key deadlines and court dates\n- [ ] Identify required initial filings or responses\n".to_string(),
+        ),
+        (
+            format!("{matter_prefix}/workflows/review_and_filing_checklist.md"),
+            "# Review and Filing Checklist\n\n- [ ] Separate facts from analysis in final draft\n- [ ] Verify citation format coverage for factual/legal assertions\n- [ ] Confirm privilege/confidentiality review complete\n- [ ] Final QA pass and attorney approval recorded\n- [ ] Filing/service steps completed and logged\n".to_string(),
+        ),
+        (
+            format!("{matter_prefix}/deadlines/calendar.md"),
+            "# Deadlines and Hearings\n\n| Date | Deadline / Event | Owner | Status | Source |\n|---|---|---|---|---|\n".to_string(),
+        ),
+        (
+            format!("{matter_prefix}/facts/key_facts.md"),
+            "# Key Facts Log\n\n| Fact | Source | Confidence | Notes |\n|---|---|---|---|\n".to_string(),
+        ),
+        (
+            format!("{matter_prefix}/research/authority_table.md"),
+            "# Authority Table\n\n| Authority | Holding / Principle | Relevance | Risk / Limit | Citation |\n|---|---|---|---|---|\n".to_string(),
+        ),
+        (
+            format!("{matter_prefix}/discovery/request_tracker.md"),
+            "# Discovery Request Tracker\n\n| Request / Topic | Served / Received | Response Due | Status | Notes |\n|---|---|---|---|---|\n".to_string(),
+        ),
+        (
+            format!("{matter_prefix}/communications/contact_log.md"),
+            "# Communications Log\n\n| Date | With | Channel | Summary | Follow-up |\n|---|---|---|---|---|\n".to_string(),
         ),
         (
             format!("{matter_prefix}/templates/research_memo.md"),
@@ -1670,6 +1939,22 @@ async fn matters_create_handler(
         (
             format!("{matter_prefix}/templates/chronology.md"),
             "# Chronology\n\n| Date | Event | Source |\n|---|---|---|\n".to_string(),
+        ),
+        (
+            format!("{matter_prefix}/templates/legal_memo.md"),
+            "# Legal Memo Template\n\n## Issue\n\n## Brief Answer\n\n## Facts (Cited)\n\n## Analysis\n\n## Conclusion\n\n## Risk / Uncertainty\n".to_string(),
+        ),
+        (
+            format!("{matter_prefix}/templates/contract_issues.md"),
+            "# Contract Issue List\n\n| Clause / Topic | Risk | Recommendation | Source |\n|---|---|---|---|\n".to_string(),
+        ),
+        (
+            format!("{matter_prefix}/templates/discovery_plan.md"),
+            "# Discovery Plan\n\n## Custodians\n\n## Data Sources\n\n## Requests\n\n## Objections / Risks\n\n## Source Traceability\n".to_string(),
+        ),
+        (
+            format!("{matter_prefix}/templates/research_synthesis.md"),
+            "# Research Synthesis\n\n## Question Presented\n\n## Authorities Reviewed\n\n## Facts (Cited)\n\n## Analysis\n\n## Risk / Uncertainty\n".to_string(),
         ),
     ];
 
@@ -1835,6 +2120,101 @@ async fn matter_documents_handler(
     }))
 }
 
+async fn matter_dashboard_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MatterDashboardResponse>, (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, false).await?;
+    let templates = list_matter_templates(workspace.as_ref(), &matter_id).await?;
+    let today = Utc::now().date_naive();
+    let deadlines = read_matter_deadlines(workspace.as_ref(), &matter_prefix, today).await?;
+
+    let document_count = docs.iter().filter(|doc| !doc.is_dir).count();
+    let draft_prefix = format!("{matter_prefix}/drafts/");
+    let draft_count = docs
+        .iter()
+        .filter(|doc| !doc.is_dir && doc.path.starts_with(&draft_prefix))
+        .count();
+
+    let checklist_files = [
+        format!("{matter_prefix}/workflows/intake_checklist.md"),
+        format!("{matter_prefix}/workflows/review_and_filing_checklist.md"),
+    ];
+    let mut checklist_completed = 0usize;
+    let mut checklist_total = 0usize;
+    for path in checklist_files {
+        match workspace.read(&path).await {
+            Ok(doc) => {
+                let (completed, total) = checklist_completion_from_markdown(&doc.content);
+                checklist_completed += completed;
+                checklist_total += total;
+            }
+            Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => {}
+            Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+        }
+    }
+
+    let mut overdue_deadlines = 0usize;
+    let mut upcoming_deadlines_14d = 0usize;
+    let mut next_deadline: Option<(NaiveDate, MatterDeadlineInfo)> = None;
+    for deadline in deadlines {
+        let Ok(date) = NaiveDate::parse_from_str(&deadline.date, "%Y-%m-%d") else {
+            continue;
+        };
+        if date < today {
+            overdue_deadlines += 1;
+            continue;
+        }
+        let days_until = date.signed_duration_since(today).num_days();
+        if days_until <= 14 {
+            upcoming_deadlines_14d += 1;
+        }
+        if next_deadline
+            .as_ref()
+            .is_none_or(|(existing, _)| date < *existing)
+        {
+            next_deadline = Some((date, deadline));
+        }
+    }
+
+    Ok(Json(MatterDashboardResponse {
+        matter_id,
+        document_count,
+        template_count: templates.len(),
+        draft_count,
+        checklist_completed,
+        checklist_total,
+        overdue_deadlines,
+        upcoming_deadlines_14d,
+        next_deadline: next_deadline.map(|(_, item)| item),
+    }))
+}
+
+async fn matter_deadlines_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MatterDeadlinesResponse>, (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let deadlines =
+        read_matter_deadlines(workspace.as_ref(), &matter_prefix, Utc::now().date_naive()).await?;
+
+    Ok(Json(MatterDeadlinesResponse {
+        matter_id,
+        deadlines,
+    }))
+}
+
 async fn matter_templates_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
@@ -1844,30 +2224,7 @@ async fn matter_templates_handler(
         "Workspace not available".to_string(),
     ))?;
     let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
-    let templates_path = format!("{MATTER_ROOT}/{matter_id}/templates");
-
-    let entries = match workspace.list(&templates_path).await {
-        Ok(entries) => entries,
-        Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => Vec::new(),
-        Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
-    };
-
-    let mut templates: Vec<MatterTemplateInfo> = entries
-        .into_iter()
-        .filter(|entry| !entry.is_directory)
-        .filter_map(|entry| {
-            let name = entry.path.rsplit('/').next()?.to_string();
-            if name.is_empty() {
-                return None;
-            }
-            Some(MatterTemplateInfo {
-                name,
-                path: entry.path,
-                updated_at: entry.updated_at.map(|dt| dt.to_rfc3339()),
-            })
-        })
-        .collect();
-    templates.sort_by(|a, b| a.name.cmp(&b.name));
+    let templates = list_matter_templates(workspace.as_ref(), &matter_id).await?;
 
     Ok(Json(MatterTemplatesResponse {
         matter_id,
@@ -1918,6 +2275,143 @@ async fn matter_template_apply_handler(
         StatusCode::CREATED,
         Json(MatterTemplateApplyResponse {
             path: destination,
+            status: "created",
+        }),
+    ))
+}
+
+async fn matter_filing_package_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<MatterFilingPackageResponse>), (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let generated_at = Utc::now();
+    let timestamp = generated_at.format("%Y%m%d-%H%M%S").to_string();
+    let destination =
+        choose_filing_package_destination(workspace.as_ref(), &matter_prefix, &timestamp).await?;
+
+    let metadata = crate::legal::matter::read_matter_metadata_for_root(
+        workspace.as_ref(),
+        MATTER_ROOT,
+        &matter_id,
+    )
+    .await
+    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, true).await?;
+    let templates = list_matter_templates(workspace.as_ref(), &matter_id).await?;
+    let today = generated_at.date_naive();
+    let deadlines = read_matter_deadlines(workspace.as_ref(), &matter_prefix, today).await?;
+
+    let checklist_files = [
+        format!("{matter_prefix}/workflows/intake_checklist.md"),
+        format!("{matter_prefix}/workflows/review_and_filing_checklist.md"),
+    ];
+    let mut checklist_completed = 0usize;
+    let mut checklist_total = 0usize;
+    for path in checklist_files {
+        match workspace.read(&path).await {
+            Ok(doc) => {
+                let (completed, total) = checklist_completion_from_markdown(&doc.content);
+                checklist_completed += completed;
+                checklist_total += total;
+            }
+            Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => {}
+            Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+        }
+    }
+
+    let mut package = String::new();
+    package.push_str("# Filing Package Index\n\n");
+    package.push_str(&format!("Matter: `{}`\n", matter_id));
+    package.push_str(&format!("Client: {}\n", metadata.client));
+    package.push_str(&format!("Confidentiality: {}\n", metadata.confidentiality));
+    package.push_str(&format!("Generated: {}\n\n", generated_at.to_rfc3339()));
+
+    let file_docs: Vec<&MatterDocumentInfo> = docs.iter().filter(|doc| !doc.is_dir).collect();
+    let draft_prefix = format!("{matter_prefix}/drafts/");
+    let draft_count = file_docs
+        .iter()
+        .filter(|doc| doc.path.starts_with(&draft_prefix))
+        .count();
+    let overdue_deadlines = deadlines.iter().filter(|item| item.is_overdue).count();
+    let upcoming_deadlines_14d = deadlines
+        .iter()
+        .filter_map(|item| {
+            NaiveDate::parse_from_str(&item.date, "%Y-%m-%d")
+                .ok()
+                .map(|date| date.signed_duration_since(today).num_days())
+        })
+        .filter(|days| (0..=14).contains(days))
+        .count();
+
+    package.push_str("## Workflow Scorecard\n\n");
+    package.push_str(&format!("- Documents: {}\n", file_docs.len()));
+    package.push_str(&format!("- Drafts: {}\n", draft_count));
+    package.push_str(&format!("- Templates: {}\n", templates.len()));
+    package.push_str(&format!(
+        "- Checklist completion: {}/{}\n",
+        checklist_completed, checklist_total
+    ));
+    package.push_str(&format!("- Overdue deadlines: {}\n", overdue_deadlines));
+    package.push_str(&format!(
+        "- Upcoming deadlines (14d): {}\n\n",
+        upcoming_deadlines_14d
+    ));
+
+    package.push_str("## Deadlines Snapshot\n\n");
+    if deadlines.is_empty() {
+        package.push_str("- None parsed from `deadlines/calendar.md`.\n\n");
+    } else {
+        package.push_str("| Date | Event | Owner | Status | Source |\n");
+        package.push_str("|---|---|---|---|---|\n");
+        for item in &deadlines {
+            package.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                item.date,
+                item.title.replace('|', "\\|"),
+                item.owner.clone().unwrap_or_default().replace('|', "\\|"),
+                item.status.clone().unwrap_or_default().replace('|', "\\|"),
+                item.source.clone().unwrap_or_default().replace('|', "\\|"),
+            ));
+        }
+        package.push('\n');
+    }
+
+    package.push_str("## Document Inventory\n\n");
+    if file_docs.is_empty() {
+        package.push_str("- No documents found.\n\n");
+    } else {
+        for doc in &file_docs {
+            package.push_str(&format!("- `{}`\n", doc.path));
+        }
+        package.push('\n');
+    }
+
+    package.push_str("## Template Inventory\n\n");
+    if templates.is_empty() {
+        package.push_str("- No templates found.\n");
+    } else {
+        for template in &templates {
+            package.push_str(&format!("- `{}`\n", template.path));
+        }
+    }
+
+    workspace
+        .write(&destination, &package)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(MatterFilingPackageResponse {
+            matter_id,
+            path: destination,
+            generated_at: generated_at.to_rfc3339(),
             status: "created",
         }),
     ))
@@ -4274,6 +4768,21 @@ mod tests {
             .await
             .expect("matter.yaml should exist");
         assert!(metadata.content.contains("matter_id: acme-v--foo"));
+        let workflow = workspace
+            .read("matters/acme-v--foo/workflows/intake_checklist.md")
+            .await
+            .expect("intake checklist should exist");
+        assert!(workflow.content.contains("conflict check"));
+        let deadlines = workspace
+            .read("matters/acme-v--foo/deadlines/calendar.md")
+            .await
+            .expect("deadlines file should exist");
+        assert!(deadlines.content.contains("Deadline / Event"));
+        let legal_memo_template = workspace
+            .read("matters/acme-v--foo/templates/legal_memo.md")
+            .await
+            .expect("legal memo template should exist");
+        assert!(legal_memo_template.content.contains("## Facts (Cited)"));
 
         let stored = state
             .store
@@ -4698,6 +5207,149 @@ mod tests {
             "expected -2 suffix, got {}",
             second
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_deadlines_handler_parses_calendar_rows() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let today = Utc::now().date_naive();
+        let past = (today - chrono::TimeDelta::days(1)).to_string();
+        let upcoming = (today + chrono::TimeDelta::days(5)).to_string();
+        let followup = (today + chrono::TimeDelta::days(8)).to_string();
+
+        workspace
+            .write(
+                "matters/demo/deadlines/calendar.md",
+                &format!(
+                    "# Deadlines\n\n| Date | Deadline / Event | Owner | Status | Source |\n|---|---|---|---|---|\n| {past} | Initial disclosure due | Lead Counsel | open | FRCP 26 |\n| {upcoming} | File reply brief | Associate | drafting | court order |\n| {followup} | Submit witness list |  | open | scheduling order |\n"
+                ),
+            )
+            .await
+            .expect("seed deadlines calendar");
+
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let Json(resp) = matter_deadlines_handler(State(state), Path("demo".to_string()))
+            .await
+            .expect("deadlines handler should succeed");
+
+        assert_eq!(resp.matter_id, "demo");
+        assert_eq!(resp.deadlines.len(), 3);
+        assert!(resp.deadlines[0].is_overdue);
+        assert!(!resp.deadlines[1].is_overdue);
+        assert_eq!(resp.deadlines[1].title, "File reply brief");
+        assert_eq!(resp.deadlines[2].title, "Submit witness list");
+        assert_eq!(resp.deadlines[2].owner, None);
+        assert_eq!(resp.deadlines[2].status.as_deref(), Some("open"));
+        assert_eq!(
+            resp.deadlines[2].source.as_deref(),
+            Some("scheduling order")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_dashboard_reports_workflow_scorecard() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let today = Utc::now().date_naive();
+        let upcoming = (today + chrono::TimeDelta::days(7)).to_string();
+        let overdue = (today - chrono::TimeDelta::days(2)).to_string();
+
+        workspace
+            .write("matters/demo/drafts/first-brief.md", "Draft body")
+            .await
+            .expect("seed draft");
+        workspace
+            .write(
+                "matters/demo/workflows/intake_checklist.md",
+                "- [x] Engagement confirmed\n- [ ] Conflict memo attached\n",
+            )
+            .await
+            .expect("seed intake checklist");
+        workspace
+            .write(
+                "matters/demo/workflows/review_and_filing_checklist.md",
+                "- [x] Citation format pass complete\n- [ ] Partner sign-off recorded\n",
+            )
+            .await
+            .expect("seed review checklist");
+        workspace
+            .write(
+                "matters/demo/deadlines/calendar.md",
+                &format!(
+                    "| Date | Deadline / Event | Owner | Status | Source |\n|---|---|---|---|---|\n| {overdue} | Serve disclosures | Team | open | docket |\n| {upcoming} | File opposition | Team | open | order |\n"
+                ),
+            )
+            .await
+            .expect("seed deadlines");
+
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+        let Json(resp) = matter_dashboard_handler(State(state), Path("demo".to_string()))
+            .await
+            .expect("dashboard handler should succeed");
+
+        assert_eq!(resp.matter_id, "demo");
+        assert_eq!(resp.template_count, 2);
+        assert_eq!(resp.draft_count, 1);
+        assert_eq!(resp.checklist_completed, 2);
+        assert_eq!(resp.checklist_total, 4);
+        assert_eq!(resp.overdue_deadlines, 1);
+        assert_eq!(resp.upcoming_deadlines_14d, 1);
+        assert_eq!(
+            resp.next_deadline.as_ref().map(|item| item.date.as_str()),
+            Some(upcoming.as_str())
+        );
+        assert!(resp.document_count >= 6);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_filing_package_creates_export_index() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        workspace
+            .write(
+                "matters/demo/workflows/intake_checklist.md",
+                "- [x] Intake complete\n",
+            )
+            .await
+            .expect("seed checklist");
+        workspace
+            .write(
+                "matters/demo/deadlines/calendar.md",
+                "| Date | Deadline / Event | Owner | Status | Source |\n|---|---|---|---|---|\n| 2027-01-15 | File status report | Team | open | order |\n",
+            )
+            .await
+            .expect("seed deadlines");
+
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let (status, Json(resp)) =
+            matter_filing_package_handler(State(state), Path("demo".to_string()))
+                .await
+                .expect("filing package should be generated");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.matter_id, "demo");
+        assert!(
+            resp.path
+                .starts_with("matters/demo/exports/filing-package-")
+        );
+
+        let exported = workspace
+            .read(&resp.path)
+            .await
+            .expect("filing package file should exist");
+        assert!(exported.content.contains("# Filing Package Index"));
+        assert!(exported.content.contains("matters/demo/notes.md"));
+        assert!(exported.content.contains("Template Inventory"));
     }
 
     #[test]
