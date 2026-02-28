@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use deadpool_postgres::Pool;
+use deadpool_postgres::{GenericClient, Pool};
 use rust_decimal::Decimal;
 use tokio_postgres::types::ToSql;
 use uuid::Uuid;
@@ -110,10 +110,10 @@ fn parse_opened_at_ts(raw: Option<&str>) -> Result<Option<DateTime<Utc>>, Databa
     )))
 }
 
-async fn upsert_party_pg(
-    conn: &mut deadpool_postgres::Object,
-    name: &str,
-) -> Result<Option<Uuid>, DatabaseError> {
+async fn upsert_party_pg<C>(conn: &C, name: &str) -> Result<Option<Uuid>, DatabaseError>
+where
+    C: GenericClient + Sync,
+{
     let display_name = name.trim();
     if display_name.is_empty() {
         return Ok(None);
@@ -769,8 +769,10 @@ impl LegalConflictStore for PgBackend {
         let opened_at = parse_opened_at_ts(opened_at)?;
         let mut conn = self.store.conn().await?;
 
-        if let Some(client_party_id) = upsert_party_pg(&mut conn, client).await? {
-            conn.execute(
+        let tx = conn.transaction().await?;
+
+        if let Some(client_party_id) = upsert_party_pg(&tx, client).await? {
+            tx.execute(
                 "INSERT INTO matter_parties (id, matter_id, party_id, role, opened_at, closed_at) \
                  VALUES ($1, $2, $3, $4, $5, $6) \
                  ON CONFLICT (matter_id, party_id, role) DO UPDATE \
@@ -789,10 +791,10 @@ impl LegalConflictStore for PgBackend {
         }
 
         for name in adversaries {
-            let Some(adverse_party_id) = upsert_party_pg(&mut conn, name).await? else {
+            let Some(adverse_party_id) = upsert_party_pg(&tx, name).await? else {
                 continue;
             };
-            conn.execute(
+            tx.execute(
                 "INSERT INTO matter_parties (id, matter_id, party_id, role, opened_at, closed_at) \
                  VALUES ($1, $2, $3, $4, $5, $6) \
                  ON CONFLICT (matter_id, party_id, role) DO UPDATE \
@@ -810,15 +812,18 @@ impl LegalConflictStore for PgBackend {
             .await?;
         }
 
+        tx.commit().await?;
         Ok(())
     }
 
     async fn reset_conflict_graph(&self) -> Result<(), DatabaseError> {
-        let conn = self.store.conn().await?;
-        conn.execute("DELETE FROM matter_parties", &[]).await?;
-        conn.execute("DELETE FROM party_aliases", &[]).await?;
-        conn.execute("DELETE FROM party_relationships", &[]).await?;
-        conn.execute("DELETE FROM parties", &[]).await?;
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+        tx.execute("DELETE FROM matter_parties", &[]).await?;
+        tx.execute("DELETE FROM party_aliases", &[]).await?;
+        tx.execute("DELETE FROM party_relationships", &[]).await?;
+        tx.execute("DELETE FROM parties", &[]).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -831,8 +836,8 @@ impl LegalConflictStore for PgBackend {
             return Ok(());
         }
 
-        let mut conn = self.store.conn().await?;
-        let Some(party_id) = upsert_party_pg(&mut conn, canonical_name).await? else {
+        let conn = self.store.conn().await?;
+        let Some(party_id) = upsert_party_pg(&conn, canonical_name).await? else {
             return Ok(());
         };
 
