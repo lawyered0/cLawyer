@@ -265,7 +265,13 @@ pub struct SearchHit {
 #[derive(Debug, Serialize)]
 pub struct MatterInfo {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     pub client: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
     pub confidentiality: Option<String>,
     pub team: Vec<String>,
     pub adversaries: Vec<String>,
@@ -278,6 +284,136 @@ pub struct MatterInfo {
 #[derive(Debug, Serialize)]
 pub struct MattersListResponse {
     pub matters: Vec<MatterInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClientInfo {
+    pub id: String,
+    pub name: String,
+    pub client_type: String,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub notes: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClientsListResponse {
+    pub clients: Vec<ClientInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateClientRequest {
+    pub name: String,
+    pub client_type: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub phone: Option<String>,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateClientRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub client_type: Option<String>,
+    #[serde(default)]
+    pub email: Option<Option<String>>,
+    #[serde(default)]
+    pub phone: Option<Option<String>>,
+    #[serde(default)]
+    pub address: Option<Option<String>>,
+    #[serde(default)]
+    pub notes: Option<Option<String>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterTaskInfo {
+    pub id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub assignee: Option<String>,
+    pub due_at: Option<String>,
+    pub blocked_by: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterTasksListResponse {
+    pub tasks: Vec<MatterTaskInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateMatterTaskRequest {
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub due_at: Option<String>,
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateMatterTaskRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<Option<String>>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub assignee: Option<Option<String>>,
+    #[serde(default)]
+    pub due_at: Option<Option<String>>,
+    #[serde(default)]
+    pub blocked_by: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterNoteInfo {
+    pub id: String,
+    pub author: String,
+    pub body: String,
+    pub pinned: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterNotesListResponse {
+    pub notes: Vec<MatterNoteInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateMatterNoteRequest {
+    pub author: String,
+    pub body: String,
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateMatterNoteRequest {
+    #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub pinned: Option<bool>,
 }
 
 /// Response for `GET /api/matters/active`.
@@ -321,6 +457,28 @@ pub struct CreateMatterRequest {
 pub struct CreateMatterResponse {
     pub matter: MatterInfo,
     pub active_matter_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateMatterRequest {
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub stage: Option<Option<String>>,
+    #[serde(default)]
+    pub practice_area: Option<Option<String>>,
+    #[serde(default)]
+    pub jurisdiction: Option<Option<String>>,
+    #[serde(default)]
+    pub opened_at: Option<Option<String>>,
+    #[serde(default)]
+    pub closed_at: Option<Option<String>>,
+    #[serde(default)]
+    pub assigned_to: Option<Vec<String>>,
+    #[serde(default)]
+    pub custom_fields: Option<serde_json::Value>,
 }
 
 /// Request body for `POST /api/matters/conflicts/check`.

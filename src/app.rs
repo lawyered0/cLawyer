@@ -692,6 +692,42 @@ impl AppBuilder {
             }
 
             if self.config.legal.enabled
+                && let Some(ref db) = self.db
+            {
+                let gateway_user_id = self
+                    .config
+                    .channels
+                    .gateway
+                    .as_ref()
+                    .map(|cfg| cfg.user_id.as_str())
+                    .unwrap_or("default");
+                match crate::legal::matter::reindex_matters_from_workspace(
+                    ws.as_ref(),
+                    db,
+                    &self.config.legal,
+                    gateway_user_id,
+                )
+                .await
+                {
+                    Ok(report) => {
+                        tracing::info!(
+                            scanned_matters = report.scanned_matters,
+                            upserted_matters = report.upserted_matters,
+                            skipped_matters = report.skipped_matters,
+                            warning_count = report.warnings.len(),
+                            "Matter metadata DB backfill completed at startup"
+                        );
+                        for warning in report.warnings.iter().take(10) {
+                            tracing::warn!(warning = %warning, "Matter DB backfill warning");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Matter metadata DB backfill failed at startup: {}", e);
+                    }
+                }
+            }
+
+            if self.config.legal.enabled
                 && self.config.legal.conflict_check_enabled
                 && self.config.legal.conflict_reindex_on_startup
                 && let Some(ref db) = self.db

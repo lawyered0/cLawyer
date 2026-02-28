@@ -17,9 +17,13 @@ use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
-    ConflictClearanceRecord, ConflictHit, ConversationStore, Database, JobStore,
-    LegalConflictStore, PartyRole, RoutineStore, SandboxStore, SettingsStore, ToolFailureStore,
-    WorkspaceStore, conflict_terms_from_text, normalize_party_name,
+    ClientRecord, ClientStore, ClientType, ConflictClearanceRecord, ConflictHit, ConversationStore,
+    CreateClientParams, CreateMatterNoteParams, CreateMatterTaskParams, Database, JobStore,
+    LegalConflictStore, MatterNoteRecord, MatterNoteStore, MatterRecord, MatterStatus, MatterStore,
+    MatterTaskRecord, MatterTaskStatus, MatterTaskStore, PartyRole, RoutineStore, SandboxStore,
+    SettingsStore, ToolFailureStore, UpdateClientParams, UpdateMatterNoteParams,
+    UpdateMatterParams, UpdateMatterTaskParams, UpsertMatterParams, WorkspaceStore,
+    conflict_terms_from_text, normalize_party_name,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -177,6 +181,107 @@ fn dedupe_hits(
         hits.truncate(limit);
     }
     hits
+}
+
+fn parse_json_string_array(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_json_uuid_array(value: &serde_json::Value) -> Vec<Uuid> {
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| entry.as_str())
+                .filter_map(|raw| Uuid::parse_str(raw).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn row_to_client_record(row: &tokio_postgres::Row) -> Result<ClientRecord, DatabaseError> {
+    let client_type_raw: String = row.get("client_type");
+    let client_type = ClientType::from_db_value(&client_type_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid client_type '{}'", client_type_raw))
+    })?;
+    Ok(ClientRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        name: row.get("name"),
+        name_normalized: row.get("name_normalized"),
+        client_type,
+        email: row.get("email"),
+        phone: row.get("phone"),
+        address: row.get("address"),
+        notes: row.get("notes"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_matter_record(row: &tokio_postgres::Row) -> Result<MatterRecord, DatabaseError> {
+    let status_raw: String = row.get("status");
+    let status = MatterStatus::from_db_value(&status_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid matter status '{}'", status_raw))
+    })?;
+    let assigned_to_value: serde_json::Value = row.get("assigned_to");
+    let custom_fields: serde_json::Value = row.get("custom_fields");
+    Ok(MatterRecord {
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        client_id: row.get("client_id"),
+        status,
+        stage: row.get("stage"),
+        practice_area: row.get("practice_area"),
+        jurisdiction: row.get("jurisdiction"),
+        opened_at: row.get("opened_at"),
+        closed_at: row.get("closed_at"),
+        assigned_to: parse_json_string_array(&assigned_to_value),
+        custom_fields,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_matter_task_record(row: &tokio_postgres::Row) -> Result<MatterTaskRecord, DatabaseError> {
+    let status_raw: String = row.get("status");
+    let status = MatterTaskStatus::from_db_value(&status_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid matter task status '{}'", status_raw))
+    })?;
+    let blocked_by_value: serde_json::Value = row.get("blocked_by");
+    Ok(MatterTaskRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        title: row.get("title"),
+        description: row.get("description"),
+        status,
+        assignee: row.get("assignee"),
+        due_at: row.get("due_at"),
+        blocked_by: parse_json_uuid_array(&blocked_by_value),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_matter_note_record(row: &tokio_postgres::Row) -> MatterNoteRecord {
+    MatterNoteRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        author: row.get("author"),
+        body: row.get("body"),
+        pinned: row.get("pinned"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
 }
 
 // ==================== Database (supertrait) ====================
@@ -960,6 +1065,606 @@ impl LegalConflictStore for PgBackend {
         )
         .await?;
         Ok(())
+    }
+}
+
+// ==================== ClientStore ====================
+
+#[async_trait]
+impl ClientStore for PgBackend {
+    async fn create_client(
+        &self,
+        user_id: &str,
+        input: &CreateClientParams,
+    ) -> Result<ClientRecord, DatabaseError> {
+        let normalized_name = normalize_party_name(&input.name);
+        if normalized_name.is_empty() {
+            return Err(DatabaseError::Serialization(
+                "client name cannot be empty".to_string(),
+            ));
+        }
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO clients \
+                 (id, user_id, name, name_normalized, client_type, email, phone, address, notes) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 RETURNING id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &input.name.trim(),
+                    &normalized_name,
+                    &input.client_type.as_str(),
+                    &input.email,
+                    &input.phone,
+                    &input.address,
+                    &input.notes,
+                ],
+            )
+            .await?;
+        row_to_client_record(&row)
+    }
+
+    async fn upsert_client_by_normalized_name(
+        &self,
+        user_id: &str,
+        input: &CreateClientParams,
+    ) -> Result<ClientRecord, DatabaseError> {
+        let normalized_name = normalize_party_name(&input.name);
+        if normalized_name.is_empty() {
+            return Err(DatabaseError::Serialization(
+                "client name cannot be empty".to_string(),
+            ));
+        }
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO clients \
+                 (id, user_id, name, name_normalized, client_type, email, phone, address, notes) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 ON CONFLICT (user_id, name_normalized) DO UPDATE SET \
+                    name = EXCLUDED.name, \
+                    client_type = EXCLUDED.client_type, \
+                    email = COALESCE(EXCLUDED.email, clients.email), \
+                    phone = COALESCE(EXCLUDED.phone, clients.phone), \
+                    address = COALESCE(EXCLUDED.address, clients.address), \
+                    notes = COALESCE(EXCLUDED.notes, clients.notes), \
+                    updated_at = NOW() \
+                 RETURNING id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &input.name.trim(),
+                    &normalized_name,
+                    &input.client_type.as_str(),
+                    &input.email,
+                    &input.phone,
+                    &input.address,
+                    &input.notes,
+                ],
+            )
+            .await?;
+        row_to_client_record(&row)
+    }
+
+    async fn list_clients(
+        &self,
+        user_id: &str,
+        query: Option<&str>,
+    ) -> Result<Vec<ClientRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = if let Some(search_raw) = query {
+            let search = normalize_party_name(search_raw);
+            if search.is_empty() {
+                conn.query(
+                    "SELECT id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at \
+                     FROM clients \
+                     WHERE user_id = $1 \
+                     ORDER BY name ASC",
+                    &[&user_id],
+                )
+                .await?
+            } else {
+                let like = format!("%{search}%");
+                conn.query(
+                    "SELECT id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at \
+                     FROM clients \
+                     WHERE user_id = $1 AND (name_normalized LIKE $2 OR name_normalized % $3) \
+                     ORDER BY similarity(name_normalized, $3) DESC, name ASC",
+                    &[&user_id, &like, &search],
+                )
+                .await?
+            }
+        } else {
+            conn.query(
+                "SELECT id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at \
+                 FROM clients \
+                 WHERE user_id = $1 \
+                 ORDER BY name ASC",
+                &[&user_id],
+            )
+            .await?
+        };
+
+        rows.into_iter()
+            .map(|row| row_to_client_record(&row))
+            .collect()
+    }
+
+    async fn get_client(
+        &self,
+        user_id: &str,
+        client_id: Uuid,
+    ) -> Result<Option<ClientRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at \
+                 FROM clients \
+                 WHERE user_id = $1 AND id = $2",
+                &[&user_id, &client_id],
+            )
+            .await?;
+        row.map(|row| row_to_client_record(&row)).transpose()
+    }
+
+    async fn update_client(
+        &self,
+        user_id: &str,
+        client_id: Uuid,
+        input: &UpdateClientParams,
+    ) -> Result<Option<ClientRecord>, DatabaseError> {
+        let Some(existing) = self.get_client(user_id, client_id).await? else {
+            return Ok(None);
+        };
+
+        let merged_name = input
+            .name
+            .as_deref()
+            .unwrap_or(existing.name.as_str())
+            .trim();
+        let normalized_name = normalize_party_name(merged_name);
+        if normalized_name.is_empty() {
+            return Err(DatabaseError::Serialization(
+                "client name cannot be empty".to_string(),
+            ));
+        }
+        let merged_client_type = input.client_type.unwrap_or(existing.client_type);
+        let merged_email = input.email.clone().unwrap_or(existing.email);
+        let merged_phone = input.phone.clone().unwrap_or(existing.phone);
+        let merged_address = input.address.clone().unwrap_or(existing.address);
+        let merged_notes = input.notes.clone().unwrap_or(existing.notes);
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "UPDATE clients SET \
+                    name = $3, \
+                    name_normalized = $4, \
+                    client_type = $5, \
+                    email = $6, \
+                    phone = $7, \
+                    address = $8, \
+                    notes = $9, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND id = $2 \
+                 RETURNING id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at",
+                &[
+                    &user_id,
+                    &client_id,
+                    &merged_name,
+                    &normalized_name,
+                    &merged_client_type.as_str(),
+                    &merged_email,
+                    &merged_phone,
+                    &merged_address,
+                    &merged_notes,
+                ],
+            )
+            .await?;
+
+        Ok(Some(row_to_client_record(&row)?))
+    }
+
+    async fn delete_client(&self, user_id: &str, client_id: Uuid) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM clients WHERE user_id = $1 AND id = $2",
+                &[&user_id, &client_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+// ==================== MatterStore ====================
+
+#[async_trait]
+impl MatterStore for PgBackend {
+    async fn upsert_matter(
+        &self,
+        user_id: &str,
+        input: &UpsertMatterParams,
+    ) -> Result<MatterRecord, DatabaseError> {
+        let assigned_to = serde_json::to_value(&input.assigned_to)
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let custom_fields = if input.custom_fields.is_object() {
+            input.custom_fields.clone()
+        } else {
+            serde_json::json!({})
+        };
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO matters \
+                 (user_id, matter_id, client_id, status, stage, practice_area, jurisdiction, opened_at, closed_at, assigned_to, custom_fields) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT (user_id, matter_id) DO UPDATE SET \
+                    client_id = EXCLUDED.client_id, \
+                    status = EXCLUDED.status, \
+                    stage = EXCLUDED.stage, \
+                    practice_area = EXCLUDED.practice_area, \
+                    jurisdiction = EXCLUDED.jurisdiction, \
+                    opened_at = EXCLUDED.opened_at, \
+                    closed_at = EXCLUDED.closed_at, \
+                    assigned_to = EXCLUDED.assigned_to, \
+                    custom_fields = EXCLUDED.custom_fields, \
+                    updated_at = NOW() \
+                 RETURNING user_id, matter_id, client_id, status, stage, practice_area, jurisdiction, opened_at, closed_at, assigned_to, custom_fields, created_at, updated_at",
+                &[
+                    &user_id,
+                    &input.matter_id,
+                    &input.client_id,
+                    &input.status.as_str(),
+                    &input.stage,
+                    &input.practice_area,
+                    &input.jurisdiction,
+                    &input.opened_at,
+                    &input.closed_at,
+                    &assigned_to,
+                    &custom_fields,
+                ],
+            )
+            .await?;
+        row_to_matter_record(&row)
+    }
+
+    async fn list_matters_db(&self, user_id: &str) -> Result<Vec<MatterRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT user_id, matter_id, client_id, status, stage, practice_area, jurisdiction, opened_at, closed_at, assigned_to, custom_fields, created_at, updated_at \
+                 FROM matters \
+                 WHERE user_id = $1 \
+                 ORDER BY matter_id ASC",
+                &[&user_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_matter_record(&row))
+            .collect()
+    }
+
+    async fn get_matter_db(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Option<MatterRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT user_id, matter_id, client_id, status, stage, practice_area, jurisdiction, opened_at, closed_at, assigned_to, custom_fields, created_at, updated_at \
+                 FROM matters \
+                 WHERE user_id = $1 AND matter_id = $2",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        row.map(|row| row_to_matter_record(&row)).transpose()
+    }
+
+    async fn update_matter(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &UpdateMatterParams,
+    ) -> Result<Option<MatterRecord>, DatabaseError> {
+        let Some(existing) = self.get_matter_db(user_id, matter_id).await? else {
+            return Ok(None);
+        };
+
+        let merged = UpsertMatterParams {
+            matter_id: existing.matter_id.clone(),
+            client_id: input.client_id.unwrap_or(existing.client_id),
+            status: input.status.unwrap_or(existing.status),
+            stage: input.stage.clone().unwrap_or(existing.stage),
+            practice_area: input
+                .practice_area
+                .clone()
+                .unwrap_or(existing.practice_area),
+            jurisdiction: input.jurisdiction.clone().unwrap_or(existing.jurisdiction),
+            opened_at: input.opened_at.unwrap_or(existing.opened_at),
+            closed_at: input.closed_at.unwrap_or(existing.closed_at),
+            assigned_to: input.assigned_to.clone().unwrap_or(existing.assigned_to),
+            custom_fields: input
+                .custom_fields
+                .clone()
+                .unwrap_or(existing.custom_fields),
+        };
+
+        let updated = self.upsert_matter(user_id, &merged).await?;
+        Ok(Some(updated))
+    }
+
+    async fn delete_matter(&self, user_id: &str, matter_id: &str) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM matters WHERE user_id = $1 AND matter_id = $2",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+// ==================== MatterTaskStore ====================
+
+#[async_trait]
+impl MatterTaskStore for PgBackend {
+    async fn list_matter_tasks(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterTaskRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_id, title, description, status, assignee, due_at, blocked_by, created_at, updated_at \
+                 FROM matter_tasks \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY created_at DESC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_matter_task_record(&row))
+            .collect()
+    }
+
+    async fn create_matter_task(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateMatterTaskParams,
+    ) -> Result<MatterTaskRecord, DatabaseError> {
+        let blocked_by = serde_json::to_value(
+            input
+                .blocked_by
+                .iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO matter_tasks \
+                 (id, user_id, matter_id, title, description, status, assignee, due_at, blocked_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 RETURNING id, user_id, matter_id, title, description, status, assignee, due_at, blocked_by, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.title,
+                    &input.description,
+                    &input.status.as_str(),
+                    &input.assignee,
+                    &input.due_at,
+                    &blocked_by,
+                ],
+            )
+            .await?;
+        row_to_matter_task_record(&row)
+    }
+
+    async fn update_matter_task(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        task_id: Uuid,
+        input: &UpdateMatterTaskParams,
+    ) -> Result<Option<MatterTaskRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let existing = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, title, description, status, assignee, due_at, blocked_by, created_at, updated_at \
+                 FROM matter_tasks \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &task_id],
+            )
+            .await?;
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        let existing = row_to_matter_task_record(&existing)?;
+
+        let blocked_by = input.blocked_by.clone().unwrap_or(existing.blocked_by);
+        let blocked_by = serde_json::to_value(
+            blocked_by
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+
+        let merged_title = input.title.clone().unwrap_or(existing.title);
+        let merged_description = input.description.clone().unwrap_or(existing.description);
+        let merged_status = input.status.unwrap_or(existing.status);
+        let merged_assignee = input.assignee.clone().unwrap_or(existing.assignee);
+        let merged_due_at = input.due_at.unwrap_or(existing.due_at);
+
+        let updated = conn
+            .query_one(
+                "UPDATE matter_tasks SET \
+                    title = $4, \
+                    description = $5, \
+                    status = $6, \
+                    assignee = $7, \
+                    due_at = $8, \
+                    blocked_by = $9, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
+                 RETURNING id, user_id, matter_id, title, description, status, assignee, due_at, blocked_by, created_at, updated_at",
+                &[
+                    &user_id,
+                    &matter_id,
+                    &task_id,
+                    &merged_title,
+                    &merged_description,
+                    &merged_status.as_str(),
+                    &merged_assignee,
+                    &merged_due_at,
+                    &blocked_by,
+                ],
+            )
+            .await?;
+        Ok(Some(row_to_matter_task_record(&updated)?))
+    }
+
+    async fn delete_matter_task(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        task_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM matter_tasks WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &task_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+// ==================== MatterNoteStore ====================
+
+#[async_trait]
+impl MatterNoteStore for PgBackend {
+    async fn list_matter_notes(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterNoteRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_id, author, body, pinned, created_at, updated_at \
+                 FROM matter_notes \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY pinned DESC, created_at DESC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(row_to_matter_note_record)
+            .collect::<Vec<_>>())
+    }
+
+    async fn create_matter_note(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateMatterNoteParams,
+    ) -> Result<MatterNoteRecord, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO matter_notes (id, user_id, matter_id, author, body, pinned) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 RETURNING id, user_id, matter_id, author, body, pinned, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.author,
+                    &input.body,
+                    &input.pinned,
+                ],
+            )
+            .await?;
+        Ok(row_to_matter_note_record(&row))
+    }
+
+    async fn update_matter_note(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        note_id: Uuid,
+        input: &UpdateMatterNoteParams,
+    ) -> Result<Option<MatterNoteRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let existing = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, author, body, pinned, created_at, updated_at \
+                 FROM matter_notes \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &note_id],
+            )
+            .await?;
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        let existing = row_to_matter_note_record(&existing);
+
+        let merged_author = input.author.clone().unwrap_or(existing.author);
+        let merged_body = input.body.clone().unwrap_or(existing.body);
+        let merged_pinned = input.pinned.unwrap_or(existing.pinned);
+
+        let updated = conn
+            .query_one(
+                "UPDATE matter_notes SET \
+                    author = $4, \
+                    body = $5, \
+                    pinned = $6, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
+                 RETURNING id, user_id, matter_id, author, body, pinned, created_at, updated_at",
+                &[
+                    &user_id,
+                    &matter_id,
+                    &note_id,
+                    &merged_author,
+                    &merged_body,
+                    &merged_pinned,
+                ],
+            )
+            .await?;
+        Ok(Some(row_to_matter_note_record(&updated)))
+    }
+
+    async fn delete_matter_note(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        note_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM matter_notes WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &note_id],
+            )
+            .await?;
+        Ok(deleted > 0)
     }
 }
 

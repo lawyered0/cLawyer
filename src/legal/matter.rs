@@ -4,10 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::LegalConfig;
-use crate::db::Database;
+use crate::db::{ClientType, CreateClientParams, Database, MatterStatus, UpsertMatterParams};
 use crate::error::WorkspaceError;
 use crate::legal::policy::sanitize_matter_id;
 use crate::workspace::Workspace;
@@ -96,6 +97,47 @@ pub struct ConflictGraphReindexReport {
     pub global_conflicts_seeded: usize,
     pub global_aliases_seeded: usize,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MatterWorkspaceReindexReport {
+    pub scanned_matters: usize,
+    pub upserted_matters: usize,
+    pub skipped_matters: usize,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReindexMatterData {
+    metadata: MatterMetadata,
+    status: MatterStatus,
+    stage: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyMatterMetadata {
+    #[serde(default)]
+    matter_id: Option<String>,
+    #[serde(default)]
+    client: Option<String>,
+    #[serde(default)]
+    team: Vec<String>,
+    #[serde(default)]
+    confidentiality: Option<String>,
+    #[serde(default)]
+    adversaries: Vec<String>,
+    #[serde(default)]
+    retention: Option<String>,
+    #[serde(default)]
+    jurisdiction: Option<String>,
+    #[serde(default)]
+    practice_area: Option<String>,
+    #[serde(default)]
+    opened_at: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    stage: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,6 +564,273 @@ fn push_reindex_warning(report: &mut ConflictGraphReindexReport, message: String
     if report.warnings.len() < REINDEX_WARNING_LIMIT {
         report.warnings.push(message);
     }
+}
+
+fn push_matter_reindex_warning(report: &mut MatterWorkspaceReindexReport, message: String) {
+    if report.warnings.len() < REINDEX_WARNING_LIMIT {
+        report.warnings.push(message);
+    }
+}
+
+fn parse_optional_opened_at_ts(raw: Option<&str>) -> Result<Option<DateTime<Utc>>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        let dt = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| "invalid opened_at date".to_string())?;
+        return Ok(Some(dt.and_utc()));
+    }
+
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Ok(Some(dt.with_timezone(&Utc)));
+    }
+
+    Err(format!("invalid opened_at timestamp '{}'", raw))
+}
+
+fn parse_matter_status_hint(raw: Option<&str>) -> MatterStatus {
+    match raw
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "intake" => MatterStatus::Intake,
+        "pending" => MatterStatus::Pending,
+        "closed" => MatterStatus::Closed,
+        "archived" => MatterStatus::Archived,
+        _ => MatterStatus::Active,
+    }
+}
+
+fn parse_optional_trimmed(value: Option<String>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+async fn load_reindex_matter_data_for_root(
+    workspace: &Workspace,
+    matter_root: &str,
+    matter_id: &str,
+) -> Result<ReindexMatterData, String> {
+    match read_matter_metadata_for_root(workspace, matter_root, matter_id).await {
+        Ok(metadata) => {
+            return Ok(ReindexMatterData {
+                metadata,
+                status: MatterStatus::Active,
+                stage: None,
+            });
+        }
+        Err(MatterMetadataValidationError::Missing { .. }) => {}
+        Err(err) => return Err(err.to_string()),
+    }
+
+    let metadata_path = format!(
+        "{}/{}/metadata.json",
+        matter_root.trim_matches('/'),
+        matter_id
+    );
+    let legacy_doc = workspace
+        .read(&metadata_path)
+        .await
+        .map_err(|err| match err {
+            WorkspaceError::DocumentNotFound { .. } => {
+                format!(
+                    "missing required matter metadata at '{}' (matter.yaml or metadata.json)",
+                    metadata_path
+                )
+            }
+            other => format!("failed to read '{}': {}", metadata_path, other),
+        })?;
+
+    let legacy: LegacyMatterMetadata =
+        serde_json::from_str(&legacy_doc.content).map_err(|err| {
+            format!(
+                "invalid metadata.json format in '{}': {}",
+                metadata_path, err
+            )
+        })?;
+    let matter_id_raw = legacy.matter_id.unwrap_or_else(|| matter_id.to_string());
+    let normalized_id = sanitize_matter_id(&matter_id_raw);
+    if normalized_id != sanitize_matter_id(matter_id) {
+        return Err(format!(
+            "metadata.json mismatch: expected matter_id '{}', got '{}'",
+            sanitize_matter_id(matter_id),
+            matter_id_raw
+        ));
+    }
+
+    let client = parse_optional_trimmed(legacy.client)
+        .ok_or_else(|| format!("client is required in '{}'", metadata_path))?;
+    let confidentiality = parse_optional_trimmed(legacy.confidentiality)
+        .unwrap_or_else(|| "attorney-client privilege".to_string());
+    let retention = parse_optional_trimmed(legacy.retention)
+        .unwrap_or_else(|| "standard legal hold".to_string());
+
+    let metadata = MatterMetadata {
+        matter_id: sanitize_matter_id(matter_id),
+        client,
+        team: legacy
+            .team
+            .into_iter()
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect(),
+        confidentiality,
+        adversaries: legacy
+            .adversaries
+            .into_iter()
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect(),
+        retention,
+        jurisdiction: parse_optional_trimmed(legacy.jurisdiction),
+        practice_area: parse_optional_trimmed(legacy.practice_area),
+        opened_at: parse_optional_trimmed(legacy.opened_at),
+    };
+
+    metadata
+        .validate_required_fields()
+        .map_err(|err| format!("invalid '{}': {}", metadata_path, err))?;
+
+    Ok(ReindexMatterData {
+        metadata,
+        status: parse_matter_status_hint(legacy.status.as_deref()),
+        stage: parse_optional_trimmed(legacy.stage),
+    })
+}
+
+/// Rebuild DB-backed client/matter rows from workspace metadata.
+///
+/// Reads `matter.yaml` first and falls back to `metadata.json` for older
+/// workspaces that have not been migrated yet.
+pub async fn reindex_matters_from_workspace(
+    workspace: &Workspace,
+    store: &std::sync::Arc<dyn Database>,
+    config: &LegalConfig,
+    user_id: &str,
+) -> Result<MatterWorkspaceReindexReport, String> {
+    let matter_root = config.matter_root.trim_matches('/');
+    if matter_root.is_empty() {
+        return Err("legal matter root is empty after normalization".to_string());
+    }
+
+    let matter_entries = workspace
+        .list(matter_root)
+        .await
+        .map_err(|err| format!("failed to list matter root '{matter_root}': {err}"))?;
+    let mut report = MatterWorkspaceReindexReport::default();
+
+    for entry in matter_entries
+        .into_iter()
+        .filter(|entry| entry.is_directory)
+    {
+        report.scanned_matters += 1;
+        let raw_id = entry.path.rsplit('/').next().unwrap_or_default();
+        let matter_id = sanitize_matter_id(raw_id);
+        if matter_id.is_empty() || matter_id == "_template" {
+            report.skipped_matters += 1;
+            push_matter_reindex_warning(
+                &mut report,
+                format!(
+                    "skipped matter directory '{}' (invalid matter id)",
+                    entry.path
+                ),
+            );
+            continue;
+        }
+
+        let data = match load_reindex_matter_data_for_root(workspace, matter_root, &matter_id).await
+        {
+            Ok(data) => data,
+            Err(err) => {
+                report.skipped_matters += 1;
+                push_matter_reindex_warning(
+                    &mut report,
+                    format!(
+                        "skipped matter '{}' due to invalid metadata: {}",
+                        matter_id, err
+                    ),
+                );
+                continue;
+            }
+        };
+
+        let client_input = CreateClientParams {
+            name: data.metadata.client.clone(),
+            client_type: ClientType::Entity,
+            email: None,
+            phone: None,
+            address: None,
+            notes: None,
+        };
+        let client = match store
+            .upsert_client_by_normalized_name(user_id, &client_input)
+            .await
+        {
+            Ok(client) => client,
+            Err(err) => {
+                report.skipped_matters += 1;
+                push_matter_reindex_warning(
+                    &mut report,
+                    format!(
+                        "failed to upsert client for matter '{}': {}",
+                        matter_id, err
+                    ),
+                );
+                continue;
+            }
+        };
+
+        let opened_at = match parse_optional_opened_at_ts(data.metadata.opened_at.as_deref()) {
+            Ok(value) => value,
+            Err(err) => {
+                report.skipped_matters += 1;
+                push_matter_reindex_warning(
+                    &mut report,
+                    format!(
+                        "failed to parse opened_at for matter '{}': {}",
+                        matter_id, err
+                    ),
+                );
+                continue;
+            }
+        };
+
+        let matter_input = UpsertMatterParams {
+            matter_id: matter_id.clone(),
+            client_id: client.id,
+            status: data.status,
+            stage: data.stage,
+            practice_area: data.metadata.practice_area.clone(),
+            jurisdiction: data.metadata.jurisdiction.clone(),
+            opened_at,
+            closed_at: None,
+            assigned_to: data.metadata.team.clone(),
+            custom_fields: serde_json::json!({}),
+        };
+        if let Err(err) = store.upsert_matter(user_id, &matter_input).await {
+            report.skipped_matters += 1;
+            push_matter_reindex_warning(
+                &mut report,
+                format!("failed to upsert matter '{}': {}", matter_id, err),
+            );
+            continue;
+        }
+
+        report.upserted_matters += 1;
+    }
+
+    Ok(report)
 }
 
 /// Rebuild the DB conflict graph from workspace matter metadata and

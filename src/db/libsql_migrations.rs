@@ -548,6 +548,80 @@ CREATE TABLE IF NOT EXISTS conflict_clearances (
 CREATE INDEX IF NOT EXISTS idx_conflict_clearances_matter_created_at
     ON conflict_clearances(matter_id, created_at DESC);
 
+-- ==================== Matter/client core ====================
+
+CREATE TABLE IF NOT EXISTS clients (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    name_normalized TEXT NOT NULL,
+    client_type TEXT NOT NULL CHECK (client_type IN ('individual', 'entity')),
+    email TEXT,
+    phone TEXT,
+    address TEXT,
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (user_id, name_normalized)
+);
+
+CREATE INDEX IF NOT EXISTS idx_clients_user ON clients(user_id);
+CREATE INDEX IF NOT EXISTS idx_clients_user_name_normalized
+    ON clients(user_id, name_normalized);
+
+CREATE TABLE IF NOT EXISTS matters (
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    client_id TEXT NOT NULL REFERENCES clients(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status IN ('intake', 'active', 'pending', 'closed', 'archived')),
+    stage TEXT,
+    practice_area TEXT,
+    jurisdiction TEXT,
+    opened_at TEXT,
+    closed_at TEXT,
+    assigned_to TEXT NOT NULL DEFAULT '[]',
+    custom_fields TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, matter_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_matters_user_status ON matters(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_matters_client ON matters(client_id);
+
+CREATE TABLE IF NOT EXISTS matter_tasks (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL CHECK (status IN ('todo', 'in_progress', 'done', 'blocked', 'cancelled')),
+    assignee TEXT,
+    due_at TEXT,
+    blocked_by TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_matter_tasks_user_matter ON matter_tasks(user_id, matter_id);
+CREATE INDEX IF NOT EXISTS idx_matter_tasks_user_status ON matter_tasks(user_id, status);
+
+CREATE TABLE IF NOT EXISTS matter_notes (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    author TEXT NOT NULL,
+    body TEXT NOT NULL,
+    pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_matter_notes_user_matter ON matter_notes(user_id, matter_id);
+CREATE INDEX IF NOT EXISTS idx_matter_notes_user_created ON matter_notes(user_id, created_at DESC);
+
 -- ==================== Missing indexes (parity with PostgreSQL) ====================
 
 -- agent_jobs

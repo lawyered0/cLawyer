@@ -170,6 +170,239 @@ pub struct ConflictClearanceRecord {
     pub hit_count: i32,
 }
 
+/// Client entity type for conflict and matter tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientType {
+    Individual,
+    Entity,
+}
+
+impl ClientType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Individual => "individual",
+            Self::Entity => "entity",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "individual" => Some(Self::Individual),
+            "entity" => Some(Self::Entity),
+            _ => None,
+        }
+    }
+}
+
+/// Matter lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatterStatus {
+    Intake,
+    Active,
+    Pending,
+    Closed,
+    Archived,
+}
+
+impl MatterStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Intake => "intake",
+            Self::Active => "active",
+            Self::Pending => "pending",
+            Self::Closed => "closed",
+            Self::Archived => "archived",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "intake" => Some(Self::Intake),
+            "active" => Some(Self::Active),
+            "pending" => Some(Self::Pending),
+            "closed" => Some(Self::Closed),
+            "archived" => Some(Self::Archived),
+            _ => None,
+        }
+    }
+}
+
+/// Matter task state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatterTaskStatus {
+    Todo,
+    InProgress,
+    Done,
+    Blocked,
+    Cancelled,
+}
+
+impl MatterTaskStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Todo => "todo",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "todo" => Some(Self::Todo),
+            "in_progress" => Some(Self::InProgress),
+            "done" => Some(Self::Done),
+            "blocked" => Some(Self::Blocked),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub name: String,
+    pub name_normalized: String,
+    pub client_type: ClientType,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateClientParams {
+    pub name: String,
+    pub client_type: ClientType,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateClientParams {
+    pub name: Option<String>,
+    pub client_type: Option<ClientType>,
+    pub email: Option<Option<String>>,
+    pub phone: Option<Option<String>>,
+    pub address: Option<Option<String>>,
+    pub notes: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterRecord {
+    pub user_id: String,
+    pub matter_id: String,
+    pub client_id: Uuid,
+    pub status: MatterStatus,
+    pub stage: Option<String>,
+    pub practice_area: Option<String>,
+    pub jurisdiction: Option<String>,
+    pub opened_at: Option<DateTime<Utc>>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub assigned_to: Vec<String>,
+    pub custom_fields: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertMatterParams {
+    pub matter_id: String,
+    pub client_id: Uuid,
+    pub status: MatterStatus,
+    pub stage: Option<String>,
+    pub practice_area: Option<String>,
+    pub jurisdiction: Option<String>,
+    pub opened_at: Option<DateTime<Utc>>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub assigned_to: Vec<String>,
+    pub custom_fields: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateMatterParams {
+    pub client_id: Option<Uuid>,
+    pub status: Option<MatterStatus>,
+    pub stage: Option<Option<String>>,
+    pub practice_area: Option<Option<String>>,
+    pub jurisdiction: Option<Option<String>>,
+    pub opened_at: Option<Option<DateTime<Utc>>>,
+    pub closed_at: Option<Option<DateTime<Utc>>>,
+    pub assigned_to: Option<Vec<String>>,
+    pub custom_fields: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterTaskRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: MatterTaskStatus,
+    pub assignee: Option<String>,
+    pub due_at: Option<DateTime<Utc>>,
+    pub blocked_by: Vec<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateMatterTaskParams {
+    pub title: String,
+    pub description: Option<String>,
+    pub status: MatterTaskStatus,
+    pub assignee: Option<String>,
+    pub due_at: Option<DateTime<Utc>>,
+    pub blocked_by: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateMatterTaskParams {
+    pub title: Option<String>,
+    pub description: Option<Option<String>>,
+    pub status: Option<MatterTaskStatus>,
+    pub assignee: Option<Option<String>>,
+    pub due_at: Option<Option<DateTime<Utc>>>,
+    pub blocked_by: Option<Vec<Uuid>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterNoteRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub author: String,
+    pub body: String,
+    pub pinned: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateMatterNoteParams {
+    pub author: String,
+    pub body: String,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateMatterNoteParams {
+    pub author: Option<String>,
+    pub body: Option<String>,
+    pub pinned: Option<bool>,
+}
+
 /// Normalize names/text for conflict matching.
 pub fn normalize_party_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -506,6 +739,115 @@ pub trait LegalConflictStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait ClientStore: Send + Sync {
+    async fn create_client(
+        &self,
+        user_id: &str,
+        input: &CreateClientParams,
+    ) -> Result<ClientRecord, DatabaseError>;
+    async fn upsert_client_by_normalized_name(
+        &self,
+        user_id: &str,
+        input: &CreateClientParams,
+    ) -> Result<ClientRecord, DatabaseError>;
+    async fn list_clients(
+        &self,
+        user_id: &str,
+        query: Option<&str>,
+    ) -> Result<Vec<ClientRecord>, DatabaseError>;
+    async fn get_client(
+        &self,
+        user_id: &str,
+        client_id: Uuid,
+    ) -> Result<Option<ClientRecord>, DatabaseError>;
+    async fn update_client(
+        &self,
+        user_id: &str,
+        client_id: Uuid,
+        input: &UpdateClientParams,
+    ) -> Result<Option<ClientRecord>, DatabaseError>;
+    async fn delete_client(&self, user_id: &str, client_id: Uuid) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
+pub trait MatterStore: Send + Sync {
+    async fn upsert_matter(
+        &self,
+        user_id: &str,
+        input: &UpsertMatterParams,
+    ) -> Result<MatterRecord, DatabaseError>;
+    async fn list_matters_db(&self, user_id: &str) -> Result<Vec<MatterRecord>, DatabaseError>;
+    async fn get_matter_db(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Option<MatterRecord>, DatabaseError>;
+    async fn update_matter(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &UpdateMatterParams,
+    ) -> Result<Option<MatterRecord>, DatabaseError>;
+    async fn delete_matter(&self, user_id: &str, matter_id: &str) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
+pub trait MatterTaskStore: Send + Sync {
+    async fn list_matter_tasks(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterTaskRecord>, DatabaseError>;
+    async fn create_matter_task(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateMatterTaskParams,
+    ) -> Result<MatterTaskRecord, DatabaseError>;
+    async fn update_matter_task(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        task_id: Uuid,
+        input: &UpdateMatterTaskParams,
+    ) -> Result<Option<MatterTaskRecord>, DatabaseError>;
+    async fn delete_matter_task(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        task_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
+pub trait MatterNoteStore: Send + Sync {
+    async fn list_matter_notes(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterNoteRecord>, DatabaseError>;
+    async fn create_matter_note(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateMatterNoteParams,
+    ) -> Result<MatterNoteRecord, DatabaseError>;
+    async fn update_matter_note(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        note_id: Uuid,
+        input: &UpdateMatterNoteParams,
+    ) -> Result<Option<MatterNoteRecord>, DatabaseError>;
+    async fn delete_matter_note(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        note_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
 pub trait SettingsStore: Send + Sync {
     async fn get_setting(
         &self,
@@ -616,6 +958,10 @@ pub trait Database:
     + RoutineStore
     + ToolFailureStore
     + LegalConflictStore
+    + ClientStore
+    + MatterStore
+    + MatterTaskStore
+    + MatterNoteStore
     + SettingsStore
     + WorkspaceStore
     + Send
