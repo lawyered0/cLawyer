@@ -21,6 +21,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
@@ -39,11 +40,12 @@ use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
 use crate::db::{
     ClientType, ConflictClearanceRecord, ConflictDecision, ConflictHit, CreateClientParams,
-    CreateDocumentVersionParams, CreateMatterDeadlineParams, CreateMatterNoteParams,
-    CreateMatterTaskParams, Database, MatterDeadlineType, MatterDocumentCategory, MatterStatus,
-    MatterTaskStatus, UpdateClientParams, UpdateMatterDeadlineParams, UpdateMatterNoteParams,
-    UpdateMatterParams, UpdateMatterTaskParams, UpsertDocumentTemplateParams,
-    UpsertMatterDocumentParams, UpsertMatterParams,
+    CreateDocumentVersionParams, CreateExpenseEntryParams, CreateMatterDeadlineParams,
+    CreateMatterNoteParams, CreateMatterTaskParams, CreateTimeEntryParams, Database,
+    ExpenseCategory, MatterDeadlineType, MatterDocumentCategory, MatterStatus, MatterTaskStatus,
+    UpdateClientParams, UpdateExpenseEntryParams, UpdateMatterDeadlineParams,
+    UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
+    UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams,
 };
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -258,6 +260,27 @@ pub async fn start_server(
         .route(
             "/api/matters/{id}/notes/{note_id}",
             axum::routing::patch(matter_notes_patch_handler).delete(matter_notes_delete_handler),
+        )
+        .route(
+            "/api/matters/{id}/time",
+            get(matter_time_list_handler).post(matter_time_create_handler),
+        )
+        .route(
+            "/api/matters/{id}/time/{entry_id}",
+            axum::routing::patch(matter_time_patch_handler).delete(matter_time_delete_handler),
+        )
+        .route(
+            "/api/matters/{id}/expenses",
+            get(matter_expenses_list_handler).post(matter_expenses_create_handler),
+        )
+        .route(
+            "/api/matters/{id}/expenses/{entry_id}",
+            axum::routing::patch(matter_expenses_patch_handler)
+                .delete(matter_expenses_delete_handler),
+        )
+        .route(
+            "/api/matters/{id}/time-summary",
+            get(matter_time_summary_handler),
         )
         .route(
             "/api/matters/active",
@@ -2726,6 +2749,350 @@ async fn matter_notes_delete_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn matter_time_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MatterTimeEntriesResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entries = store
+        .list_time_entries(&state.user_id, &matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .into_iter()
+        .map(time_entry_record_to_info)
+        .collect();
+    Ok(Json(MatterTimeEntriesResponse { entries }))
+}
+
+async fn matter_time_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateTimeEntryRequest>,
+) -> Result<(StatusCode, Json<TimeEntryInfo>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+
+    let timekeeper = parse_required_matter_field("timekeeper", &req.timekeeper)?;
+    let description = parse_required_matter_field("description", &req.description)?;
+    validate_optional_matter_field_length("timekeeper", &Some(timekeeper.clone()))?;
+    validate_optional_matter_field_length("description", &Some(description.clone()))?;
+    let hours = parse_decimal_field("hours", &req.hours)?;
+    let hourly_rate = parse_optional_decimal_field("hourly_rate", req.hourly_rate)?;
+    let entry_date = parse_date_only("entry_date", &req.entry_date)?;
+    let billable = req.billable.unwrap_or(true);
+
+    let created = store
+        .create_time_entry(
+            &state.user_id,
+            &matter_id,
+            &CreateTimeEntryParams {
+                timekeeper,
+                description,
+                hours,
+                hourly_rate,
+                entry_date,
+                billable,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(time_entry_record_to_info(created)),
+    ))
+}
+
+async fn matter_time_patch_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, entry_id)): Path<(String, String)>,
+    Json(req): Json<UpdateTimeEntryRequest>,
+) -> Result<Json<TimeEntryInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entry_id = parse_uuid(&entry_id, "entry_id")?;
+
+    let timekeeper = req.timekeeper.map(|value| value.trim().to_string());
+    if let Some(ref value) = timekeeper {
+        validate_optional_matter_field_length("timekeeper", &Some(value.clone()))?;
+    }
+    let description = req.description.map(|value| value.trim().to_string());
+    if let Some(ref value) = description {
+        validate_optional_matter_field_length("description", &Some(value.clone()))?;
+    }
+    let hours = req
+        .hours
+        .as_deref()
+        .map(|value| parse_decimal_field("hours", value))
+        .transpose()?;
+    let hourly_rate = match req.hourly_rate {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) => Some(Some(parse_decimal_field("hourly_rate", &raw)?)),
+    };
+    let entry_date = req
+        .entry_date
+        .as_deref()
+        .map(|value| parse_date_only("entry_date", value))
+        .transpose()?;
+
+    let updated = store
+        .update_time_entry(
+            &state.user_id,
+            &matter_id,
+            entry_id,
+            &UpdateTimeEntryParams {
+                timekeeper,
+                description,
+                hours,
+                hourly_rate,
+                entry_date,
+                billable: req.billable,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Time entry not found".to_string()))?;
+
+    Ok(Json(time_entry_record_to_info(updated)))
+}
+
+async fn matter_time_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, entry_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entry_id = parse_uuid(&entry_id, "entry_id")?;
+
+    let existing = store
+        .get_time_entry(&state.user_id, &matter_id, entry_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Time entry not found".to_string()))?;
+    if existing.billed_invoice_id.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "Time entry is billed and cannot be deleted".to_string(),
+        ));
+    }
+
+    let deleted = store
+        .delete_time_entry(&state.user_id, &matter_id, entry_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Time entry not found".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn matter_expenses_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MatterExpenseEntriesResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entries = store
+        .list_expense_entries(&state.user_id, &matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .into_iter()
+        .map(expense_entry_record_to_info)
+        .collect();
+    Ok(Json(MatterExpenseEntriesResponse { entries }))
+}
+
+async fn matter_expenses_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateExpenseEntryRequest>,
+) -> Result<(StatusCode, Json<ExpenseEntryInfo>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+
+    let submitted_by = parse_required_matter_field("submitted_by", &req.submitted_by)?;
+    let description = parse_required_matter_field("description", &req.description)?;
+    validate_optional_matter_field_length("submitted_by", &Some(submitted_by.clone()))?;
+    validate_optional_matter_field_length("description", &Some(description.clone()))?;
+    let amount = parse_decimal_field("amount", &req.amount)?;
+    let category = parse_expense_category(&req.category)?;
+    let entry_date = parse_date_only("entry_date", &req.entry_date)?;
+    let receipt_path = parse_optional_matter_field(req.receipt_path);
+    validate_optional_matter_field_length("receipt_path", &receipt_path)?;
+    let billable = req.billable.unwrap_or(true);
+
+    let created = store
+        .create_expense_entry(
+            &state.user_id,
+            &matter_id,
+            &CreateExpenseEntryParams {
+                submitted_by,
+                description,
+                amount,
+                category,
+                entry_date,
+                receipt_path,
+                billable,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(expense_entry_record_to_info(created)),
+    ))
+}
+
+async fn matter_expenses_patch_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, entry_id)): Path<(String, String)>,
+    Json(req): Json<UpdateExpenseEntryRequest>,
+) -> Result<Json<ExpenseEntryInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entry_id = parse_uuid(&entry_id, "entry_id")?;
+
+    let submitted_by = req.submitted_by.map(|value| value.trim().to_string());
+    if let Some(ref value) = submitted_by {
+        validate_optional_matter_field_length("submitted_by", &Some(value.clone()))?;
+    }
+    let description = req.description.map(|value| value.trim().to_string());
+    if let Some(ref value) = description {
+        validate_optional_matter_field_length("description", &Some(value.clone()))?;
+    }
+    let amount = req
+        .amount
+        .as_deref()
+        .map(|value| parse_decimal_field("amount", value))
+        .transpose()?;
+    let category = req
+        .category
+        .as_deref()
+        .map(parse_expense_category)
+        .transpose()?;
+    let entry_date = req
+        .entry_date
+        .as_deref()
+        .map(|value| parse_date_only("entry_date", value))
+        .transpose()?;
+    let receipt_path = req.receipt_path.map(|value| {
+        value.and_then(|inner| {
+            let trimmed = inner.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    });
+    if let Some(Some(ref value)) = receipt_path {
+        validate_optional_matter_field_length("receipt_path", &Some(value.clone()))?;
+    }
+
+    let updated = store
+        .update_expense_entry(
+            &state.user_id,
+            &matter_id,
+            entry_id,
+            &UpdateExpenseEntryParams {
+                submitted_by,
+                description,
+                amount,
+                category,
+                entry_date,
+                receipt_path,
+                billable: req.billable,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Expense entry not found".to_string()))?;
+
+    Ok(Json(expense_entry_record_to_info(updated)))
+}
+
+async fn matter_expenses_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, entry_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entry_id = parse_uuid(&entry_id, "entry_id")?;
+
+    let existing = store
+        .get_expense_entry(&state.user_id, &matter_id, entry_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Expense entry not found".to_string()))?;
+    if existing.billed_invoice_id.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "Expense entry is billed and cannot be deleted".to_string(),
+        ));
+    }
+
+    let deleted = store
+        .delete_expense_entry(&state.user_id, &matter_id, entry_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Expense entry not found".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn matter_time_summary_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MatterTimeSummaryResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let summary = store
+        .matter_time_summary(&state.user_id, &matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(matter_time_summary_to_response(summary)))
+}
+
 fn parse_required_matter_field(
     field_name: &str,
     value: &str,
@@ -2848,6 +3215,78 @@ fn parse_matter_deadline_type(value: &str) -> Result<MatterDeadlineType, (Status
             StatusCode::BAD_REQUEST,
             "'deadline_type' must be one of: court_date, filing, statute_of_limitations, response_due, discovery_cutoff, internal".to_string(),
         )),
+    }
+}
+
+fn parse_expense_category(value: &str) -> Result<ExpenseCategory, (StatusCode, String)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "filing_fee" => Ok(ExpenseCategory::FilingFee),
+        "travel" => Ok(ExpenseCategory::Travel),
+        "postage" => Ok(ExpenseCategory::Postage),
+        "expert" => Ok(ExpenseCategory::Expert),
+        "copying" => Ok(ExpenseCategory::Copying),
+        "court_reporter" => Ok(ExpenseCategory::CourtReporter),
+        "other" => Ok(ExpenseCategory::Other),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "'category' must be one of: filing_fee, travel, postage, expert, copying, court_reporter, other".to_string(),
+        )),
+    }
+}
+
+fn parse_date_only(field_name: &str, raw: &str) -> Result<NaiveDate, (StatusCode, String)> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' is required", field_name),
+        ));
+    }
+    let parsed = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("'{}' must be in YYYY-MM-DD format", field_name),
+        )
+    })?;
+    if parsed.format("%Y-%m-%d").to_string() != value {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' must be in YYYY-MM-DD format", field_name),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_decimal_field(field_name: &str, raw: &str) -> Result<Decimal, (StatusCode, String)> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' is required", field_name),
+        ));
+    }
+    let decimal = value.parse::<Decimal>().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("'{}' must be a valid decimal number", field_name),
+        )
+    })?;
+    if decimal <= Decimal::ZERO {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' must be greater than 0", field_name),
+        ));
+    }
+    Ok(decimal)
+}
+
+fn parse_optional_decimal_field(
+    field_name: &str,
+    raw: Option<String>,
+) -> Result<Option<Decimal>, (StatusCode, String)> {
+    match parse_optional_matter_field(raw) {
+        Some(value) => parse_decimal_field(field_name, &value).map(Some),
+        None => Ok(None),
     }
 }
 
@@ -3259,6 +3698,50 @@ fn matter_note_record_to_info(note: crate::db::MatterNoteRecord) -> MatterNoteIn
         pinned: note.pinned,
         created_at: note.created_at.to_rfc3339(),
         updated_at: note.updated_at.to_rfc3339(),
+    }
+}
+
+fn time_entry_record_to_info(entry: crate::db::TimeEntryRecord) -> TimeEntryInfo {
+    TimeEntryInfo {
+        id: entry.id.to_string(),
+        timekeeper: entry.timekeeper,
+        description: entry.description,
+        hours: entry.hours.to_string(),
+        hourly_rate: entry.hourly_rate.map(|value| value.to_string()),
+        entry_date: entry.entry_date.to_string(),
+        billable: entry.billable,
+        billed_invoice_id: entry.billed_invoice_id,
+        created_at: entry.created_at.to_rfc3339(),
+        updated_at: entry.updated_at.to_rfc3339(),
+    }
+}
+
+fn expense_entry_record_to_info(entry: crate::db::ExpenseEntryRecord) -> ExpenseEntryInfo {
+    ExpenseEntryInfo {
+        id: entry.id.to_string(),
+        submitted_by: entry.submitted_by,
+        description: entry.description,
+        amount: entry.amount.to_string(),
+        category: entry.category.as_str().to_string(),
+        entry_date: entry.entry_date.to_string(),
+        receipt_path: entry.receipt_path,
+        billable: entry.billable,
+        billed_invoice_id: entry.billed_invoice_id,
+        created_at: entry.created_at.to_rfc3339(),
+        updated_at: entry.updated_at.to_rfc3339(),
+    }
+}
+
+fn matter_time_summary_to_response(
+    summary: crate::db::MatterTimeSummary,
+) -> MatterTimeSummaryResponse {
+    MatterTimeSummaryResponse {
+        total_hours: summary.total_hours.to_string(),
+        billable_hours: summary.billable_hours.to_string(),
+        unbilled_hours: summary.unbilled_hours.to_string(),
+        total_expenses: summary.total_expenses.to_string(),
+        billable_expenses: summary.billable_expenses.to_string(),
+        unbilled_expenses: summary.unbilled_expenses.to_string(),
     }
 }
 
@@ -8520,6 +9003,271 @@ opened_at: 2026-02-28
             }))
             .expect("missing matter root should be treated as empty");
         assert!(entries.is_empty());
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_time_create_rejects_non_positive_hours() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+
+        let result = matter_time_create_handler(
+            State(state),
+            Path("demo".to_string()),
+            Json(CreateTimeEntryRequest {
+                timekeeper: "Paralegal".to_string(),
+                description: "Prepare draft".to_string(),
+                hours: "0".to_string(),
+                hourly_rate: Some("200".to_string()),
+                entry_date: "2026-04-10".to_string(),
+                billable: Some(true),
+            }),
+        )
+        .await;
+
+        let err = result.expect_err("zero-hour time entry should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("'hours' must be greater than 0"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_expense_create_rejects_non_positive_amount() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+
+        let result = matter_expenses_create_handler(
+            State(state),
+            Path("demo".to_string()),
+            Json(CreateExpenseEntryRequest {
+                submitted_by: "Associate".to_string(),
+                description: "Filing fee".to_string(),
+                amount: "0".to_string(),
+                category: "filing_fee".to_string(),
+                entry_date: "2026-04-10".to_string(),
+                receipt_path: None,
+                billable: Some(true),
+            }),
+        )
+        .await;
+
+        let err = result.expect_err("zero-amount expense entry should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("'amount' must be greater than 0"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_time_delete_rejects_billed_entry() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        let billed_entry = store
+            .create_time_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateTimeEntryParams {
+                    timekeeper: "Lead".to_string(),
+                    description: "Billed work".to_string(),
+                    hours: rust_decimal::Decimal::new(150, 2),
+                    hourly_rate: Some(rust_decimal::Decimal::new(30000, 2)),
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 9).expect("valid date"),
+                    billable: true,
+                },
+            )
+            .await
+            .expect("create billed seed entry");
+        let unbilled_entry = store
+            .create_time_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateTimeEntryParams {
+                    timekeeper: "Lead".to_string(),
+                    description: "Unbilled work".to_string(),
+                    hours: rust_decimal::Decimal::new(50, 2),
+                    hourly_rate: Some(rust_decimal::Decimal::new(30000, 2)),
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 10).expect("valid date"),
+                    billable: true,
+                },
+            )
+            .await
+            .expect("create unbilled seed entry");
+
+        let marked = store
+            .mark_time_entries_billed(&state.user_id, &[billed_entry.id], "inv-1001")
+            .await
+            .expect("mark billed entry");
+        assert_eq!(marked, 1);
+
+        let billed_after = store
+            .get_time_entry(&state.user_id, "demo", billed_entry.id)
+            .await
+            .expect("load billed entry")
+            .expect("billed entry should exist");
+        let unbilled_after = store
+            .get_time_entry(&state.user_id, "demo", unbilled_entry.id)
+            .await
+            .expect("load unbilled entry")
+            .expect("unbilled entry should exist");
+        assert_eq!(billed_after.billed_invoice_id.as_deref(), Some("inv-1001"));
+        assert!(unbilled_after.billed_invoice_id.is_none());
+
+        let billed_delete = matter_time_delete_handler(
+            State(Arc::clone(&state)),
+            Path(("demo".to_string(), billed_entry.id.to_string())),
+        )
+        .await;
+        let err = billed_delete.expect_err("billed entry should not be deletable");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("billed"));
+
+        let unbilled_delete = matter_time_delete_handler(
+            State(state),
+            Path(("demo".to_string(), unbilled_entry.id.to_string())),
+        )
+        .await
+        .expect("unbilled entry should be deletable");
+        assert_eq!(unbilled_delete, StatusCode::NO_CONTENT);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_time_summary_aggregates_hours_and_expenses() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        let time_one = store
+            .create_time_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateTimeEntryParams {
+                    timekeeper: "Lead".to_string(),
+                    description: "Billable review".to_string(),
+                    hours: rust_decimal::Decimal::new(150, 2),
+                    hourly_rate: Some(rust_decimal::Decimal::new(35000, 2)),
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 11).expect("valid date"),
+                    billable: true,
+                },
+            )
+            .await
+            .expect("create first time entry");
+        store
+            .create_time_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateTimeEntryParams {
+                    timekeeper: "Paralegal".to_string(),
+                    description: "Internal prep".to_string(),
+                    hours: rust_decimal::Decimal::new(50, 2),
+                    hourly_rate: None,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 11).expect("valid date"),
+                    billable: false,
+                },
+            )
+            .await
+            .expect("create second time entry");
+        let expense_one = store
+            .create_expense_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateExpenseEntryParams {
+                    submitted_by: "Lead".to_string(),
+                    description: "Court filing fee".to_string(),
+                    amount: rust_decimal::Decimal::new(10000, 2),
+                    category: crate::db::ExpenseCategory::FilingFee,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 11).expect("valid date"),
+                    receipt_path: None,
+                    billable: true,
+                },
+            )
+            .await
+            .expect("create first expense entry");
+        store
+            .create_expense_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateExpenseEntryParams {
+                    submitted_by: "Lead".to_string(),
+                    description: "Internal courier".to_string(),
+                    amount: rust_decimal::Decimal::new(4000, 2),
+                    category: crate::db::ExpenseCategory::Other,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 11).expect("valid date"),
+                    receipt_path: None,
+                    billable: false,
+                },
+            )
+            .await
+            .expect("create second expense entry");
+        store
+            .mark_time_entries_billed(&state.user_id, &[time_one.id], "inv-2001")
+            .await
+            .expect("mark one time entry billed");
+        store
+            .mark_expense_entries_billed(&state.user_id, &[expense_one.id], "inv-2001")
+            .await
+            .expect("mark one expense entry billed");
+
+        let Json(summary) = matter_time_summary_handler(State(state), Path("demo".to_string()))
+            .await
+            .expect("summary handler should succeed");
+
+        let total_hours = summary
+            .total_hours
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse total hours");
+        let billable_hours = summary
+            .billable_hours
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse billable hours");
+        let unbilled_hours = summary
+            .unbilled_hours
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse unbilled hours");
+        let total_expenses = summary
+            .total_expenses
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse total expenses");
+        let billable_expenses = summary
+            .billable_expenses
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse billable expenses");
+        let unbilled_expenses = summary
+            .unbilled_expenses
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse unbilled expenses");
+
+        assert_eq!(total_hours, rust_decimal::Decimal::new(200, 2));
+        assert_eq!(billable_hours, rust_decimal::Decimal::new(150, 2));
+        assert_eq!(unbilled_hours, rust_decimal::Decimal::new(50, 2));
+        assert_eq!(total_expenses, rust_decimal::Decimal::new(14000, 2));
+        assert_eq!(billable_expenses, rust_decimal::Decimal::new(10000, 2));
+        assert_eq!(unbilled_expenses, rust_decimal::Decimal::new(4000, 2));
     }
 
     #[cfg(feature = "libsql")]

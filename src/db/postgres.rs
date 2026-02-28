@@ -18,17 +18,19 @@ use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
     ClientRecord, ClientStore, ClientType, ConflictClearanceRecord, ConflictHit, ConversationStore,
-    CreateClientParams, CreateDocumentVersionParams, CreateMatterDeadlineParams,
-    CreateMatterNoteParams, CreateMatterTaskParams, Database, DocumentTemplateRecord,
-    DocumentTemplateStore, DocumentVersionRecord, DocumentVersionStore, JobStore,
+    CreateClientParams, CreateDocumentVersionParams, CreateExpenseEntryParams,
+    CreateMatterDeadlineParams, CreateMatterNoteParams, CreateMatterTaskParams,
+    CreateTimeEntryParams, Database, DocumentTemplateRecord, DocumentTemplateStore,
+    DocumentVersionRecord, DocumentVersionStore, ExpenseCategory, ExpenseEntryRecord, JobStore,
     LegalConflictStore, MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType,
     MatterDocumentCategory, MatterDocumentRecord, MatterDocumentStore, MatterNoteRecord,
     MatterNoteStore, MatterRecord, MatterStatus, MatterStore, MatterTaskRecord, MatterTaskStatus,
-    MatterTaskStore, PartyRole, RoutineStore, SandboxStore, SettingsStore, ToolFailureStore,
-    UpdateClientParams, UpdateDocumentTemplateParams, UpdateMatterDeadlineParams,
+    MatterTaskStore, MatterTimeSummary, PartyRole, RoutineStore, SandboxStore, SettingsStore,
+    TimeEntryRecord, TimeExpenseStore, ToolFailureStore, UpdateClientParams,
+    UpdateDocumentTemplateParams, UpdateExpenseEntryParams, UpdateMatterDeadlineParams,
     UpdateMatterDocumentParams, UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams,
-    UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams, WorkspaceStore,
-    conflict_terms_from_text, normalize_party_name,
+    UpdateTimeEntryParams, UpsertDocumentTemplateParams, UpsertMatterDocumentParams,
+    UpsertMatterParams, WorkspaceStore, conflict_terms_from_text, normalize_party_name,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -375,6 +377,48 @@ fn row_to_document_template_record(
         name: row.get("name"),
         body: row.get("body"),
         variables_json,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_time_entry_record(row: &tokio_postgres::Row) -> Result<TimeEntryRecord, DatabaseError> {
+    Ok(TimeEntryRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        timekeeper: row.get("timekeeper"),
+        description: row.get("description"),
+        hours: row.get("hours"),
+        hourly_rate: row.get("hourly_rate"),
+        entry_date: row.get("entry_date"),
+        billable: row.get("billable"),
+        billed_invoice_id: row.get("billed_invoice_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_expense_entry_record(
+    row: &tokio_postgres::Row,
+) -> Result<ExpenseEntryRecord, DatabaseError> {
+    let category_raw: String = row.get("category");
+    let category = ExpenseCategory::from_db_value(&category_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid expense category '{}'", category_raw))
+    })?;
+
+    Ok(ExpenseEntryRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        submitted_by: row.get("submitted_by"),
+        description: row.get("description"),
+        amount: row.get("amount"),
+        category,
+        entry_date: row.get("entry_date"),
+        receipt_path: row.get("receipt_path"),
+        billable: row.get("billable"),
+        billed_invoice_id: row.get("billed_invoice_id"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
@@ -2325,6 +2369,354 @@ impl DocumentTemplateStore for PgBackend {
             )
             .await?;
         Ok(deleted > 0)
+    }
+}
+
+// ==================== TimeExpenseStore ====================
+
+#[async_trait]
+impl TimeExpenseStore for PgBackend {
+    async fn list_time_entries(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<TimeEntryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at \
+                 FROM time_entries \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY entry_date DESC, created_at DESC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_time_entry_record(&row))
+            .collect()
+    }
+
+    async fn get_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<Option<TimeEntryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at \
+                 FROM time_entries \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &entry_id],
+            )
+            .await?;
+        row.map(|row| row_to_time_entry_record(&row)).transpose()
+    }
+
+    async fn create_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateTimeEntryParams,
+    ) -> Result<TimeEntryRecord, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO time_entries \
+                 (id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 RETURNING id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.timekeeper,
+                    &input.description,
+                    &input.hours,
+                    &input.hourly_rate,
+                    &input.entry_date,
+                    &input.billable,
+                ],
+            )
+            .await?;
+        row_to_time_entry_record(&row)
+    }
+
+    async fn update_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+        input: &UpdateTimeEntryParams,
+    ) -> Result<Option<TimeEntryRecord>, DatabaseError> {
+        let Some(existing) = self.get_time_entry(user_id, matter_id, entry_id).await? else {
+            return Ok(None);
+        };
+
+        let merged_timekeeper = input.timekeeper.clone().unwrap_or(existing.timekeeper);
+        let merged_description = input.description.clone().unwrap_or(existing.description);
+        let merged_hours = input.hours.unwrap_or(existing.hours);
+        let merged_hourly_rate = input.hourly_rate.unwrap_or(existing.hourly_rate);
+        let merged_entry_date = input.entry_date.unwrap_or(existing.entry_date);
+        let merged_billable = input.billable.unwrap_or(existing.billable);
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "UPDATE time_entries SET \
+                    timekeeper = $4, \
+                    description = $5, \
+                    hours = $6, \
+                    hourly_rate = $7, \
+                    entry_date = $8, \
+                    billable = $9, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
+                 RETURNING id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at",
+                &[
+                    &user_id,
+                    &matter_id,
+                    &entry_id,
+                    &merged_timekeeper,
+                    &merged_description,
+                    &merged_hours,
+                    &merged_hourly_rate,
+                    &merged_entry_date,
+                    &merged_billable,
+                ],
+            )
+            .await?;
+        Ok(Some(row_to_time_entry_record(&row)?))
+    }
+
+    async fn delete_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM time_entries WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &entry_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+
+    async fn list_expense_entries(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<ExpenseEntryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_id, submitted_by, description, amount, category, entry_date, receipt_path, billable, billed_invoice_id, created_at, updated_at \
+                 FROM expense_entries \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY entry_date DESC, created_at DESC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_expense_entry_record(&row))
+            .collect()
+    }
+
+    async fn get_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<Option<ExpenseEntryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, submitted_by, description, amount, category, entry_date, receipt_path, billable, billed_invoice_id, created_at, updated_at \
+                 FROM expense_entries \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &entry_id],
+            )
+            .await?;
+        row.map(|row| row_to_expense_entry_record(&row)).transpose()
+    }
+
+    async fn create_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateExpenseEntryParams,
+    ) -> Result<ExpenseEntryRecord, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO expense_entries \
+                 (id, user_id, matter_id, submitted_by, description, amount, category, entry_date, receipt_path, billable) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                 RETURNING id, user_id, matter_id, submitted_by, description, amount, category, entry_date, receipt_path, billable, billed_invoice_id, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.submitted_by,
+                    &input.description,
+                    &input.amount,
+                    &input.category.as_str(),
+                    &input.entry_date,
+                    &input.receipt_path,
+                    &input.billable,
+                ],
+            )
+            .await?;
+        row_to_expense_entry_record(&row)
+    }
+
+    async fn update_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+        input: &UpdateExpenseEntryParams,
+    ) -> Result<Option<ExpenseEntryRecord>, DatabaseError> {
+        let Some(existing) = self.get_expense_entry(user_id, matter_id, entry_id).await? else {
+            return Ok(None);
+        };
+
+        let merged_submitted_by = input.submitted_by.clone().unwrap_or(existing.submitted_by);
+        let merged_description = input.description.clone().unwrap_or(existing.description);
+        let merged_amount = input.amount.unwrap_or(existing.amount);
+        let merged_category = input.category.unwrap_or(existing.category);
+        let merged_entry_date = input.entry_date.unwrap_or(existing.entry_date);
+        let merged_receipt_path = input.receipt_path.clone().unwrap_or(existing.receipt_path);
+        let merged_billable = input.billable.unwrap_or(existing.billable);
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "UPDATE expense_entries SET \
+                    submitted_by = $4, \
+                    description = $5, \
+                    amount = $6, \
+                    category = $7, \
+                    entry_date = $8, \
+                    receipt_path = $9, \
+                    billable = $10, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
+                 RETURNING id, user_id, matter_id, submitted_by, description, amount, category, entry_date, receipt_path, billable, billed_invoice_id, created_at, updated_at",
+                &[
+                    &user_id,
+                    &matter_id,
+                    &entry_id,
+                    &merged_submitted_by,
+                    &merged_description,
+                    &merged_amount,
+                    &merged_category.as_str(),
+                    &merged_entry_date,
+                    &merged_receipt_path,
+                    &merged_billable,
+                ],
+            )
+            .await?;
+        Ok(Some(row_to_expense_entry_record(&row)?))
+    }
+
+    async fn delete_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM expense_entries WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &entry_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+
+    async fn mark_time_entries_billed(
+        &self,
+        user_id: &str,
+        entry_ids: &[Uuid],
+        invoice_id: &str,
+    ) -> Result<u64, DatabaseError> {
+        if entry_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.store.conn().await?;
+        let updated = conn
+            .execute(
+                "UPDATE time_entries SET billed_invoice_id = $3, updated_at = NOW() \
+             WHERE user_id = $1 AND id = ANY($2) AND billed_invoice_id IS NULL",
+                &[&user_id, &entry_ids, &invoice_id],
+            )
+            .await?;
+        Ok(updated)
+    }
+
+    async fn mark_expense_entries_billed(
+        &self,
+        user_id: &str,
+        entry_ids: &[Uuid],
+        invoice_id: &str,
+    ) -> Result<u64, DatabaseError> {
+        if entry_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.store.conn().await?;
+        let updated = conn
+            .execute(
+                "UPDATE expense_entries SET billed_invoice_id = $3, updated_at = NOW() \
+             WHERE user_id = $1 AND id = ANY($2) AND billed_invoice_id IS NULL",
+                &[&user_id, &entry_ids, &invoice_id],
+            )
+            .await?;
+        Ok(updated)
+    }
+
+    async fn matter_time_summary(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<MatterTimeSummary, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "SELECT \
+                    COALESCE(SUM(hours), 0)::numeric AS total_hours, \
+                    COALESCE(SUM(CASE WHEN billable THEN hours ELSE 0 END), 0)::numeric AS billable_hours, \
+                    COALESCE(SUM(CASE WHEN billed_invoice_id IS NULL THEN hours ELSE 0 END), 0)::numeric AS unbilled_hours \
+                 FROM time_entries \
+                 WHERE user_id = $1 AND matter_id = $2",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        let expenses = conn
+            .query_one(
+                "SELECT \
+                    COALESCE(SUM(amount), 0)::numeric AS total_expenses, \
+                    COALESCE(SUM(CASE WHEN billable THEN amount ELSE 0 END), 0)::numeric AS billable_expenses, \
+                    COALESCE(SUM(CASE WHEN billed_invoice_id IS NULL THEN amount ELSE 0 END), 0)::numeric AS unbilled_expenses \
+                 FROM expense_entries \
+                 WHERE user_id = $1 AND matter_id = $2",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+
+        Ok(MatterTimeSummary {
+            total_hours: row.get("total_hours"),
+            billable_hours: row.get("billable_hours"),
+            unbilled_hours: row.get("unbilled_hours"),
+            total_expenses: expenses.get("total_expenses"),
+            billable_expenses: expenses.get("billable_expenses"),
+            unbilled_expenses: expenses.get("unbilled_expenses"),
+        })
     }
 }
 

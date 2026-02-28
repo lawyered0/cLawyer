@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -591,6 +591,131 @@ pub struct UpdateDocumentTemplateParams {
     pub variables_json: Option<serde_json::Value>,
 }
 
+/// Expense category for matter accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpenseCategory {
+    FilingFee,
+    Travel,
+    Postage,
+    Expert,
+    Copying,
+    CourtReporter,
+    Other,
+}
+
+impl ExpenseCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FilingFee => "filing_fee",
+            Self::Travel => "travel",
+            Self::Postage => "postage",
+            Self::Expert => "expert",
+            Self::Copying => "copying",
+            Self::CourtReporter => "court_reporter",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "filing_fee" => Some(Self::FilingFee),
+            "travel" => Some(Self::Travel),
+            "postage" => Some(Self::Postage),
+            "expert" => Some(Self::Expert),
+            "copying" => Some(Self::Copying),
+            "court_reporter" => Some(Self::CourtReporter),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeEntryRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub timekeeper: String,
+    pub description: String,
+    pub hours: Decimal,
+    pub hourly_rate: Option<Decimal>,
+    pub entry_date: NaiveDate,
+    pub billable: bool,
+    pub billed_invoice_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateTimeEntryParams {
+    pub timekeeper: String,
+    pub description: String,
+    pub hours: Decimal,
+    pub hourly_rate: Option<Decimal>,
+    pub entry_date: NaiveDate,
+    pub billable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateTimeEntryParams {
+    pub timekeeper: Option<String>,
+    pub description: Option<String>,
+    pub hours: Option<Decimal>,
+    pub hourly_rate: Option<Option<Decimal>>,
+    pub entry_date: Option<NaiveDate>,
+    pub billable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpenseEntryRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub submitted_by: String,
+    pub description: String,
+    pub amount: Decimal,
+    pub category: ExpenseCategory,
+    pub entry_date: NaiveDate,
+    pub receipt_path: Option<String>,
+    pub billable: bool,
+    pub billed_invoice_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateExpenseEntryParams {
+    pub submitted_by: String,
+    pub description: String,
+    pub amount: Decimal,
+    pub category: ExpenseCategory,
+    pub entry_date: NaiveDate,
+    pub receipt_path: Option<String>,
+    pub billable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateExpenseEntryParams {
+    pub submitted_by: Option<String>,
+    pub description: Option<String>,
+    pub amount: Option<Decimal>,
+    pub category: Option<ExpenseCategory>,
+    pub entry_date: Option<NaiveDate>,
+    pub receipt_path: Option<Option<String>>,
+    pub billable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterTimeSummary {
+    pub total_hours: Decimal,
+    pub billable_hours: Decimal,
+    pub unbilled_hours: Decimal,
+    pub total_expenses: Decimal,
+    pub billable_expenses: Decimal,
+    pub unbilled_expenses: Decimal,
+}
+
 /// Normalize names/text for conflict matching.
 pub fn normalize_party_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -1154,6 +1279,89 @@ pub trait DocumentTemplateStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait TimeExpenseStore: Send + Sync {
+    async fn list_time_entries(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<TimeEntryRecord>, DatabaseError>;
+    async fn get_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<Option<TimeEntryRecord>, DatabaseError>;
+    async fn create_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateTimeEntryParams,
+    ) -> Result<TimeEntryRecord, DatabaseError>;
+    async fn update_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+        input: &UpdateTimeEntryParams,
+    ) -> Result<Option<TimeEntryRecord>, DatabaseError>;
+    async fn delete_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+
+    async fn list_expense_entries(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<ExpenseEntryRecord>, DatabaseError>;
+    async fn get_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<Option<ExpenseEntryRecord>, DatabaseError>;
+    async fn create_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateExpenseEntryParams,
+    ) -> Result<ExpenseEntryRecord, DatabaseError>;
+    async fn update_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+        input: &UpdateExpenseEntryParams,
+    ) -> Result<Option<ExpenseEntryRecord>, DatabaseError>;
+    async fn delete_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+
+    async fn mark_time_entries_billed(
+        &self,
+        user_id: &str,
+        entry_ids: &[Uuid],
+        invoice_id: &str,
+    ) -> Result<u64, DatabaseError>;
+    async fn mark_expense_entries_billed(
+        &self,
+        user_id: &str,
+        entry_ids: &[Uuid],
+        invoice_id: &str,
+    ) -> Result<u64, DatabaseError>;
+    async fn matter_time_summary(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<MatterTimeSummary, DatabaseError>;
+}
+
+#[async_trait]
 pub trait SettingsStore: Send + Sync {
     async fn get_setting(
         &self,
@@ -1272,6 +1480,7 @@ pub trait Database:
     + MatterDocumentStore
     + DocumentVersionStore
     + DocumentTemplateStore
+    + TimeExpenseStore
     + SettingsStore
     + WorkspaceStore
     + Send

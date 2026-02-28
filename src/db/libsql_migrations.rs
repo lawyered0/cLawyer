@@ -713,6 +713,57 @@ CREATE INDEX IF NOT EXISTS idx_document_templates_user_matter
 CREATE INDEX IF NOT EXISTS idx_document_templates_user_name
     ON document_templates(user_id, name);
 
+CREATE TABLE IF NOT EXISTS time_entries (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    timekeeper TEXT NOT NULL,
+    description TEXT NOT NULL,
+    hours TEXT NOT NULL CHECK (CAST(hours AS REAL) > 0),
+    hourly_rate TEXT,
+    entry_date TEXT NOT NULL,
+    billable INTEGER NOT NULL DEFAULT 1 CHECK (billable IN (0, 1)),
+    billed_invoice_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_time_entries_user_matter_date
+    ON time_entries(user_id, matter_id, entry_date DESC);
+CREATE INDEX IF NOT EXISTS idx_time_entries_user_billed
+    ON time_entries(user_id, billed_invoice_id);
+
+CREATE TABLE IF NOT EXISTS expense_entries (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    submitted_by TEXT NOT NULL,
+    description TEXT NOT NULL,
+    amount TEXT NOT NULL CHECK (CAST(amount AS REAL) > 0),
+    category TEXT NOT NULL CHECK (category IN (
+        'filing_fee',
+        'travel',
+        'postage',
+        'expert',
+        'copying',
+        'court_reporter',
+        'other'
+    )),
+    entry_date TEXT NOT NULL,
+    receipt_path TEXT,
+    billable INTEGER NOT NULL DEFAULT 1 CHECK (billable IN (0, 1)),
+    billed_invoice_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_expense_entries_user_matter_date
+    ON expense_entries(user_id, matter_id, entry_date DESC);
+CREATE INDEX IF NOT EXISTS idx_expense_entries_user_billed
+    ON expense_entries(user_id, billed_invoice_id);
+
 -- ==================== Missing indexes (parity with PostgreSQL) ====================
 
 -- agent_jobs
