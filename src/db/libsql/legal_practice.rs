@@ -181,7 +181,7 @@ impl ClientStore for LibSqlBackend {
             "INSERT INTO clients (id, user_id, name, name_normalized, client_type, email, phone, address, notes) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                id,
+                id.as_str(),
                 user_id,
                 input.name.trim(),
                 normalized_name.as_str(),
@@ -197,8 +197,8 @@ impl ClientStore for LibSqlBackend {
         let row = conn
             .query(
                 "SELECT id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at \
-                 FROM clients WHERE user_id = ?1 AND name_normalized = ?2 LIMIT 1",
-                params![user_id, normalized_name.as_str()],
+                 FROM clients WHERE id = ?1 LIMIT 1",
+                params![id.as_str()],
             )
             .await?
             .next()
