@@ -641,6 +641,14 @@ pub struct LegalSettings {
     #[serde(default = "default_true")]
     pub conflict_check_enabled: bool,
 
+    /// Allow workspace conflicts.json fallback when DB conflict graph returns no hits.
+    #[serde(default = "default_true")]
+    pub conflict_file_fallback_enabled: bool,
+
+    /// Rebuild the DB conflict graph from workspace matter metadata at startup.
+    #[serde(default = "default_true")]
+    pub conflict_reindex_on_startup: bool,
+
     /// Network controls for legal mode.
     #[serde(default)]
     pub network: LegalNetworkSettings,
@@ -678,6 +686,8 @@ impl Default for LegalSettings {
             active_matter: None,
             privilege_guard: true,
             conflict_check_enabled: true,
+            conflict_file_fallback_enabled: true,
+            conflict_reindex_on_startup: true,
             network: LegalNetworkSettings::default(),
             audit: LegalAuditSettings::default(),
             redaction: LegalRedactionSettings::default(),

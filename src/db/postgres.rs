@@ -3,7 +3,7 @@
 //! Delegates to the existing `Store` (history) and `Repository` (workspace)
 //! implementations, avoiding SQL duplication.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -805,6 +805,57 @@ impl LegalConflictStore for PgBackend {
                     &PartyRole::Adverse.as_str(),
                     &opened_at,
                     &Option::<DateTime<Utc>>::None,
+                ],
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn reset_conflict_graph(&self) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute("DELETE FROM matter_parties", &[]).await?;
+        conn.execute("DELETE FROM party_aliases", &[]).await?;
+        conn.execute("DELETE FROM party_relationships", &[]).await?;
+        conn.execute("DELETE FROM parties", &[]).await?;
+        Ok(())
+    }
+
+    async fn upsert_party_aliases(
+        &self,
+        canonical_name: &str,
+        aliases: &[String],
+    ) -> Result<(), DatabaseError> {
+        if aliases.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.store.conn().await?;
+        let Some(party_id) = upsert_party_pg(&mut conn, canonical_name).await? else {
+            return Ok(());
+        };
+
+        let mut seen = HashSet::new();
+        for alias in aliases {
+            let display_alias = alias.trim();
+            if display_alias.is_empty() {
+                continue;
+            }
+            let normalized_alias = normalize_party_name(display_alias);
+            if normalized_alias.is_empty() || !seen.insert(normalized_alias.clone()) {
+                continue;
+            }
+            conn.execute(
+                "INSERT INTO party_aliases (id, party_id, alias, alias_normalized) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (party_id, alias_normalized) DO UPDATE \
+                 SET alias = EXCLUDED.alias, updated_at = NOW()",
+                &[
+                    &Uuid::new_v4(),
+                    &party_id,
+                    &display_alias,
+                    &normalized_alias,
                 ],
             )
             .await?;
