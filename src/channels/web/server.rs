@@ -20,7 +20,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
@@ -39,8 +39,9 @@ use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
 use crate::db::{
     ClientType, ConflictClearanceRecord, ConflictDecision, ConflictHit, CreateClientParams,
-    CreateMatterNoteParams, CreateMatterTaskParams, Database, MatterStatus, MatterTaskStatus,
-    UpdateClientParams, UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams,
+    CreateMatterDeadlineParams, CreateMatterNoteParams, CreateMatterTaskParams, Database,
+    MatterDeadlineType, MatterStatus, MatterTaskStatus, UpdateClientParams,
+    UpdateMatterDeadlineParams, UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams,
     UpsertMatterParams,
 };
 use crate::extensions::ExtensionManager;
@@ -263,7 +264,19 @@ pub async fn start_server(
         )
         .route("/api/matters/{id}/documents", get(matter_documents_handler))
         .route("/api/matters/{id}/dashboard", get(matter_dashboard_handler))
-        .route("/api/matters/{id}/deadlines", get(matter_deadlines_handler))
+        .route(
+            "/api/matters/{id}/deadlines",
+            get(matter_deadlines_handler).post(matter_deadlines_create_handler),
+        )
+        .route(
+            "/api/matters/{id}/deadlines/{deadline_id}",
+            axum::routing::patch(matter_deadlines_patch_handler)
+                .delete(matter_deadlines_delete_handler),
+        )
+        .route(
+            "/api/matters/{id}/deadlines/compute",
+            post(matter_deadlines_compute_handler),
+        )
         .route("/api/matters/{id}/templates", get(matter_templates_handler))
         .route(
             "/api/matters/{id}/templates/apply",
@@ -286,6 +299,7 @@ pub async fn start_server(
             post(matters_conflicts_reindex_handler),
         )
         .route("/api/legal/audit", get(legal_audit_list_handler))
+        .route("/api/legal/court-rules", get(legal_court_rules_handler))
         // Jobs
         .route("/api/jobs", get(jobs_list_handler))
         .route("/api/jobs/summary", get(jobs_summary_handler))
@@ -1371,6 +1385,10 @@ const MAX_INTAKE_CONFLICT_PARTIES: usize = 64;
 const MAX_INTAKE_CONFLICT_PARTY_CHARS: usize = 160;
 /// Maximum preview length recorded for text conflict checks.
 const MAX_CONFLICT_TEXT_PREVIEW_CHARS: usize = 100;
+/// Maximum reminder offsets accepted for a single deadline.
+const MAX_DEADLINE_REMINDERS: usize = 16;
+/// Maximum allowed reminder offset in days.
+const MAX_DEADLINE_REMINDER_DAYS: i32 = 3650;
 
 fn legal_config_for_gateway(state: &GatewayState) -> crate::config::LegalConfig {
     state.legal_config.clone().unwrap_or_else(|| {
@@ -1754,6 +1772,32 @@ async fn read_matter_deadlines(
     }
 }
 
+async fn read_matter_deadlines_for_matter(
+    state: &GatewayState,
+    matter_id: &str,
+    matter_prefix: &str,
+    today: NaiveDate,
+) -> Result<Vec<MatterDeadlineInfo>, (StatusCode, String)> {
+    if let Some(store) = state.store.as_ref() {
+        let records = store
+            .list_matter_deadlines(&state.user_id, matter_id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        if !records.is_empty() {
+            return Ok(records
+                .iter()
+                .map(deadline_record_to_legacy_info)
+                .collect::<Vec<_>>());
+        }
+    }
+
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    read_matter_deadlines(workspace.as_ref(), matter_prefix, today).await
+}
+
 async fn list_matter_templates(
     workspace: &Workspace,
     matter_id: &str,
@@ -1879,6 +1923,84 @@ async fn ensure_existing_matter_db(
     if !exists {
         return Err((StatusCode::NOT_FOUND, "Matter not found".to_string()));
     }
+    Ok(())
+}
+
+async fn ensure_matter_db_row_from_workspace(
+    state: &GatewayState,
+    matter_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    if store
+        .get_matter_db(&state.user_id, matter_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let metadata = crate::legal::matter::read_matter_metadata_for_root(
+        workspace.as_ref(),
+        MATTER_ROOT,
+        matter_id,
+    )
+    .await
+    .map_err(|err| match err {
+        crate::legal::matter::MatterMetadataValidationError::Missing { path } => (
+            StatusCode::NOT_FOUND,
+            format!("Matter '{}' not found (missing '{}')", matter_id, path),
+        ),
+        crate::legal::matter::MatterMetadataValidationError::Invalid { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
+        }
+        crate::legal::matter::MatterMetadataValidationError::Storage { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+        }
+    })?;
+
+    let client = store
+        .upsert_client_by_normalized_name(
+            &state.user_id,
+            &CreateClientParams {
+                name: metadata.client.clone(),
+                client_type: ClientType::Entity,
+                email: None,
+                phone: None,
+                address: None,
+                notes: None,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    let opened_at = parse_optional_datetime("opened_at", metadata.opened_at.clone())?;
+    store
+        .upsert_matter(
+            &state.user_id,
+            &UpsertMatterParams {
+                matter_id: matter_id.to_string(),
+                client_id: client.id,
+                status: MatterStatus::Active,
+                stage: None,
+                practice_area: metadata.practice_area.clone(),
+                jurisdiction: metadata.jurisdiction.clone(),
+                opened_at,
+                closed_at: None,
+                assigned_to: metadata.team.clone(),
+                custom_fields: serde_json::json!({}),
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
     Ok(())
 }
 
@@ -2447,6 +2569,14 @@ fn parse_optional_matter_field(value: Option<String>) -> Option<String> {
     })
 }
 
+fn parse_optional_matter_field_patch(value: Option<Option<String>>) -> Option<Option<String>> {
+    match value {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) => Some(parse_optional_matter_field(Some(raw))),
+    }
+}
+
 const OPTIONAL_MATTER_FIELD_MAX_CHARS: usize = 256;
 
 fn validate_optional_matter_field_length(
@@ -2524,6 +2654,57 @@ fn parse_matter_task_status(value: &str) -> Result<MatterTaskStatus, (StatusCode
     }
 }
 
+fn parse_matter_deadline_type(value: &str) -> Result<MatterDeadlineType, (StatusCode, String)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "court_date" => Ok(MatterDeadlineType::CourtDate),
+        "filing" => Ok(MatterDeadlineType::Filing),
+        "statute_of_limitations" => Ok(MatterDeadlineType::StatuteOfLimitations),
+        "response_due" => Ok(MatterDeadlineType::ResponseDue),
+        "discovery_cutoff" => Ok(MatterDeadlineType::DiscoveryCutoff),
+        "internal" => Ok(MatterDeadlineType::Internal),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "'deadline_type' must be one of: court_date, filing, statute_of_limitations, response_due, discovery_cutoff, internal".to_string(),
+        )),
+    }
+}
+
+fn normalize_reminder_days(values: &[i32]) -> Result<Vec<i32>, (StatusCode, String)> {
+    use std::collections::BTreeSet;
+
+    if values.len() > MAX_DEADLINE_REMINDERS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'reminder_days' supports at most {} values",
+                MAX_DEADLINE_REMINDERS
+            ),
+        ));
+    }
+
+    let mut unique = BTreeSet::new();
+    for day in values {
+        if *day < 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "'reminder_days' values must be >= 0".to_string(),
+            ));
+        }
+        if *day > MAX_DEADLINE_REMINDER_DAYS {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "'reminder_days' values must be <= {}",
+                    MAX_DEADLINE_REMINDER_DAYS
+                ),
+            ));
+        }
+        unique.insert(*day);
+    }
+
+    Ok(unique.into_iter().collect())
+}
+
 fn parse_datetime_value(field: &str, raw: &str) -> Result<DateTime<Utc>, (StatusCode, String)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2582,6 +2763,238 @@ fn parse_uuid(value: &str, field: &str) -> Result<Uuid, (StatusCode, String)> {
             format!("'{}' must be a valid UUID", field),
         )
     })
+}
+
+fn parse_optional_uuid_field(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<Uuid>, (StatusCode, String)> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    parse_uuid(trimmed, field).map(Some)
+}
+
+fn parse_optional_uuid_patch_field(
+    value: Option<Option<String>>,
+    field: &str,
+) -> Result<Option<Option<Uuid>>, (StatusCode, String)> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let Some(raw) = raw else {
+        return Ok(Some(None));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(None));
+    }
+    parse_uuid(trimmed, field).map(|uuid| Some(Some(uuid)))
+}
+
+fn deadline_record_to_info(record: crate::db::MatterDeadlineRecord) -> MatterDeadlineRecordInfo {
+    let today = Utc::now().date_naive();
+    let due_date = record.due_at.date_naive();
+    MatterDeadlineRecordInfo {
+        id: record.id.to_string(),
+        title: record.title,
+        deadline_type: record.deadline_type.as_str().to_string(),
+        due_at: record.due_at.to_rfc3339(),
+        completed_at: record.completed_at.map(|value| value.to_rfc3339()),
+        reminder_days: record.reminder_days,
+        rule_ref: record.rule_ref,
+        computed_from: record.computed_from.map(|value| value.to_string()),
+        task_id: record.task_id.map(|value| value.to_string()),
+        is_overdue: record.completed_at.is_none() && due_date < today,
+        days_until_due: due_date.signed_duration_since(today).num_days(),
+        created_at: record.created_at.to_rfc3339(),
+        updated_at: record.updated_at.to_rfc3339(),
+    }
+}
+
+fn deadline_record_to_legacy_info(record: &crate::db::MatterDeadlineRecord) -> MatterDeadlineInfo {
+    let today = Utc::now().date_naive();
+    let due_date = record.due_at.date_naive();
+    let status = if record.completed_at.is_some() {
+        Some("completed".to_string())
+    } else {
+        Some("open".to_string())
+    };
+    MatterDeadlineInfo {
+        date: due_date.to_string(),
+        title: record.title.clone(),
+        owner: None,
+        status,
+        source: record.rule_ref.clone(),
+        is_overdue: record.completed_at.is_none() && due_date < today,
+    }
+}
+
+fn deadline_compute_preview_from_params(
+    params: &CreateMatterDeadlineParams,
+) -> MatterDeadlineComputePreview {
+    let today = Utc::now().date_naive();
+    let due_date = params.due_at.date_naive();
+    MatterDeadlineComputePreview {
+        title: params.title.clone(),
+        deadline_type: params.deadline_type.as_str().to_string(),
+        due_at: params.due_at.to_rfc3339(),
+        reminder_days: params.reminder_days.clone(),
+        rule_ref: params.rule_ref.clone(),
+        computed_from: params.computed_from.map(|value| value.to_string()),
+        task_id: params.task_id.map(|value| value.to_string()),
+        is_overdue: due_date < today,
+        days_until_due: due_date.signed_duration_since(today).num_days(),
+    }
+}
+
+fn deadline_reminder_prefix(matter_id: &str, deadline_id: Uuid) -> String {
+    format!("deadline-reminder-{matter_id}-{deadline_id}-")
+}
+
+fn deadline_reminder_name(matter_id: &str, deadline_id: Uuid, reminder_days: i32) -> String {
+    format!(
+        "{}{}",
+        deadline_reminder_prefix(matter_id, deadline_id),
+        reminder_days
+    )
+}
+
+fn deadline_reminder_schedule(run_at: DateTime<Utc>) -> String {
+    format!(
+        "{} {} {} {} {} *",
+        run_at.second(),
+        run_at.minute(),
+        run_at.hour(),
+        run_at.day(),
+        run_at.month()
+    )
+}
+
+async fn disable_deadline_reminder_routines(
+    state: &GatewayState,
+    matter_id: &str,
+    deadline_id: Uuid,
+) -> Result<(), (StatusCode, String)> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(());
+    };
+    let prefix = deadline_reminder_prefix(matter_id, deadline_id);
+    let routines = store
+        .list_routines(&state.user_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    for mut routine in routines {
+        if !routine.name.starts_with(&prefix) || !routine.enabled {
+            continue;
+        }
+        routine.enabled = false;
+        routine.next_fire_at = None;
+        store
+            .update_routine(&routine)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    }
+
+    Ok(())
+}
+
+async fn sync_deadline_reminder_routines_for_record(
+    state: &GatewayState,
+    record: &crate::db::MatterDeadlineRecord,
+) -> Result<(), (StatusCode, String)> {
+    disable_deadline_reminder_routines(state, &record.matter_id, record.id).await?;
+    let Some(store) = state.store.as_ref() else {
+        return Ok(());
+    };
+
+    if record.completed_at.is_some() || record.reminder_days.is_empty() {
+        return Ok(());
+    }
+
+    let now = Utc::now();
+    for reminder_days in &record.reminder_days {
+        let run_at = record.due_at - chrono::Duration::days(i64::from(*reminder_days));
+        if run_at <= now {
+            continue;
+        }
+
+        let name = deadline_reminder_name(&record.matter_id, record.id, *reminder_days);
+        let schedule = deadline_reminder_schedule(run_at);
+        let next_fire = crate::agent::routine::next_cron_fire(&schedule)
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        let prompt = format!(
+            "Matter `{}` deadline reminder: \"{}\" is due on {} ({} days remaining). Provide a concise reminder and immediate next action.",
+            record.matter_id,
+            record.title,
+            record.due_at.date_naive(),
+            reminder_days
+        );
+        let state_json = serde_json::json!({
+            "one_shot": true,
+            "deadline_id": record.id,
+            "matter_id": record.matter_id,
+            "reminder_days": reminder_days,
+        });
+
+        if let Some(mut existing) = store
+            .get_routine_by_name(&state.user_id, &name)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        {
+            existing.enabled = true;
+            existing.trigger = crate::agent::routine::Trigger::Cron { schedule };
+            existing.action = crate::agent::routine::RoutineAction::Lightweight {
+                prompt: prompt.clone(),
+                context_paths: vec![format!("{MATTER_ROOT}/{}/matter.yaml", record.matter_id)],
+                max_tokens: 300,
+            };
+            existing.next_fire_at = next_fire;
+            existing.state = state_json.clone();
+            store
+                .update_routine(&existing)
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+            continue;
+        }
+
+        let routine = crate::agent::routine::Routine {
+            id: Uuid::new_v4(),
+            name,
+            description: format!(
+                "One-shot reminder {} day(s) before deadline '{}'",
+                reminder_days, record.title
+            ),
+            user_id: state.user_id.clone(),
+            enabled: true,
+            trigger: crate::agent::routine::Trigger::Cron { schedule },
+            action: crate::agent::routine::RoutineAction::Lightweight {
+                prompt,
+                context_paths: vec![format!("{MATTER_ROOT}/{}/matter.yaml", record.matter_id)],
+                max_tokens: 300,
+            },
+            guardrails: crate::agent::routine::RoutineGuardrails::default(),
+            notify: crate::agent::routine::NotifyConfig::default(),
+            last_run_at: None,
+            next_fire_at: next_fire,
+            run_count: 0,
+            consecutive_failures: 0,
+            state: state_json,
+            created_at: now,
+            updated_at: now,
+        };
+        store
+            .create_routine(&routine)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    }
+
+    Ok(())
 }
 
 fn parse_uuid_list(values: &[String], field: &str) -> Result<Vec<Uuid>, (StatusCode, String)> {
@@ -3178,7 +3591,8 @@ async fn matter_dashboard_handler(
     let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, false).await?;
     let templates = list_matter_templates(workspace.as_ref(), &matter_id).await?;
     let today = Utc::now().date_naive();
-    let deadlines = read_matter_deadlines(workspace.as_ref(), &matter_prefix, today).await?;
+    let deadlines =
+        read_matter_deadlines_for_matter(state.as_ref(), &matter_id, &matter_prefix, today).await?;
 
     let document_count = docs.iter().filter(|doc| !doc.is_dir).count();
     let draft_prefix = format!("{matter_prefix}/drafts/");
@@ -3251,13 +3665,239 @@ async fn matter_deadlines_handler(
     ))?;
     let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
     let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
-    let deadlines =
-        read_matter_deadlines(workspace.as_ref(), &matter_prefix, Utc::now().date_naive()).await?;
+    let deadlines = read_matter_deadlines_for_matter(
+        state.as_ref(),
+        &matter_id,
+        &matter_prefix,
+        Utc::now().date_naive(),
+    )
+    .await?;
 
     Ok(Json(MatterDeadlinesResponse {
         matter_id,
         deadlines,
     }))
+}
+
+fn court_rule_to_info(rule: &crate::legal::calendar::CourtRule) -> CourtRuleInfo {
+    CourtRuleInfo {
+        id: rule.id.clone(),
+        citation: rule.citation.clone(),
+        deadline_type: rule.deadline_type.as_str().to_string(),
+        offset_days: rule.offset_days,
+        court_days: rule.court_days,
+    }
+}
+
+async fn matter_deadlines_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateMatterDeadlineRequest>,
+) -> Result<(StatusCode, Json<MatterDeadlineRecordInfo>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+
+    let title = req.title.trim();
+    if title.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "'title' is required".to_string()));
+    }
+    let deadline_type = parse_matter_deadline_type(&req.deadline_type)?;
+    let due_at = parse_datetime_value("due_at", &req.due_at)?;
+    let completed_at = parse_optional_datetime("completed_at", req.completed_at)?;
+    let reminder_days = normalize_reminder_days(&req.reminder_days)?;
+    let rule_ref = parse_optional_matter_field(req.rule_ref);
+    validate_optional_matter_field_length("rule_ref", &rule_ref)?;
+    let computed_from = parse_optional_uuid_field(req.computed_from, "computed_from")?;
+    let task_id = parse_optional_uuid_field(req.task_id, "task_id")?;
+
+    let created = store
+        .create_matter_deadline(
+            &state.user_id,
+            &matter_id,
+            &CreateMatterDeadlineParams {
+                title: title.to_string(),
+                deadline_type,
+                due_at,
+                completed_at,
+                reminder_days,
+                rule_ref,
+                computed_from,
+                task_id,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    sync_deadline_reminder_routines_for_record(state.as_ref(), &created).await?;
+
+    Ok((StatusCode::CREATED, Json(deadline_record_to_info(created))))
+}
+
+async fn matter_deadlines_patch_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, deadline_id)): Path<(String, String)>,
+    Json(req): Json<UpdateMatterDeadlineRequest>,
+) -> Result<Json<MatterDeadlineRecordInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+    let deadline_id = parse_uuid(deadline_id.trim(), "deadline_id")?;
+
+    let title = req.title.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+    let deadline_type = req
+        .deadline_type
+        .as_deref()
+        .map(parse_matter_deadline_type)
+        .transpose()?;
+    let due_at = req
+        .due_at
+        .as_deref()
+        .map(|value| parse_datetime_value("due_at", value))
+        .transpose()?;
+    let completed_at = parse_optional_datetime_patch("completed_at", req.completed_at)?;
+    let reminder_days = req
+        .reminder_days
+        .as_ref()
+        .map(|values| normalize_reminder_days(values))
+        .transpose()?;
+    let rule_ref = parse_optional_matter_field_patch(req.rule_ref);
+    if let Some(Some(ref value)) = rule_ref {
+        validate_optional_matter_field_length("rule_ref", &Some(value.clone()))?;
+    }
+    let computed_from = parse_optional_uuid_patch_field(req.computed_from, "computed_from")?;
+    let task_id = parse_optional_uuid_patch_field(req.task_id, "task_id")?;
+
+    let updated = store
+        .update_matter_deadline(
+            &state.user_id,
+            &matter_id,
+            deadline_id,
+            &UpdateMatterDeadlineParams {
+                title,
+                deadline_type,
+                due_at,
+                completed_at,
+                reminder_days,
+                rule_ref,
+                computed_from,
+                task_id,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Deadline not found".to_string()))?;
+
+    sync_deadline_reminder_routines_for_record(state.as_ref(), &updated).await?;
+
+    Ok(Json(deadline_record_to_info(updated)))
+}
+
+async fn matter_deadlines_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, deadline_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+    let deadline_id = parse_uuid(deadline_id.trim(), "deadline_id")?;
+
+    let existing = store
+        .get_matter_deadline(&state.user_id, &matter_id, deadline_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Deadline not found".to_string()))?;
+
+    let deleted = store
+        .delete_matter_deadline(&state.user_id, &matter_id, deadline_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Deadline not found".to_string()));
+    }
+
+    disable_deadline_reminder_routines(state.as_ref(), &existing.matter_id, existing.id).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn matter_deadlines_compute_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<MatterDeadlineComputeRequest>,
+) -> Result<Json<MatterDeadlineComputeResponse>, (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let rule_id = req.rule_id.trim();
+    if rule_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "'rule_id' is required".to_string()));
+    }
+
+    let rule = crate::legal::calendar::get_court_rule(rule_id)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            format!("Unknown rule_id '{}'", rule_id),
+        ))?;
+    let trigger = parse_datetime_value("trigger_date", &req.trigger_date)?;
+    let reminder_days = normalize_reminder_days(&req.reminder_days)?;
+    let computed_from = parse_optional_uuid_field(req.computed_from, "computed_from")?;
+    let task_id = parse_optional_uuid_field(req.task_id, "task_id")?;
+    let title = parse_optional_matter_field(req.title)
+        .unwrap_or_else(|| format!("{} deadline", rule.citation));
+
+    let computed = crate::legal::calendar::deadline_from_rule(
+        &title,
+        &rule,
+        trigger,
+        reminder_days,
+        computed_from,
+        task_id,
+    );
+
+    Ok(Json(MatterDeadlineComputeResponse {
+        matter_id,
+        rule: court_rule_to_info(&rule),
+        deadline: deadline_compute_preview_from_params(&computed),
+    }))
+}
+
+async fn legal_court_rules_handler() -> Result<Json<CourtRulesResponse>, (StatusCode, String)> {
+    let rules = crate::legal::calendar::all_court_rules()
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let payload = rules.iter().map(court_rule_to_info).collect::<Vec<_>>();
+    Ok(Json(CourtRulesResponse { rules: payload }))
 }
 
 async fn matter_templates_handler(
@@ -3350,7 +3990,8 @@ async fn matter_filing_package_handler(
     let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, true).await?;
     let templates = list_matter_templates(workspace.as_ref(), &matter_id).await?;
     let today = generated_at.date_naive();
-    let deadlines = read_matter_deadlines(workspace.as_ref(), &matter_prefix, today).await?;
+    let deadlines =
+        read_matter_deadlines_for_matter(state.as_ref(), &matter_id, &matter_prefix, today).await?;
 
     let checklist_files = [
         format!("{matter_prefix}/workflows/intake_checklist.md"),
@@ -7097,6 +7738,146 @@ opened_at: 2026-02-28
             resp.deadlines[2].source.as_deref(),
             Some("scheduling order")
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_deadlines_db_entries_prefer_over_workspace_calendar() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        workspace
+            .write(
+                "matters/demo/deadlines/calendar.md",
+                "| Date | Deadline / Event | Owner | Status | Source |\n|---|---|---|---|---|\n| 2030-01-01 | Legacy calendar row | Team | open | file |\n",
+            )
+            .await
+            .expect("seed legacy calendar");
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let due_at = (Utc::now() + chrono::TimeDelta::days(7)).to_rfc3339();
+        let (status, Json(created)) = matter_deadlines_create_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Json(CreateMatterDeadlineRequest {
+                title: "File opposition brief".to_string(),
+                deadline_type: "filing".to_string(),
+                due_at: due_at.clone(),
+                completed_at: None,
+                reminder_days: vec![3],
+                rule_ref: Some("FRCP 56(c)(1)".to_string()),
+                computed_from: None,
+                task_id: None,
+            }),
+        )
+        .await
+        .expect("create deadline should succeed");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.title, "File opposition brief");
+
+        let Json(resp) = matter_deadlines_handler(State(state), Path("demo".to_string()))
+            .await
+            .expect("deadlines handler should succeed");
+        assert_eq!(resp.deadlines.len(), 1);
+        assert_eq!(resp.deadlines[0].title, "File opposition brief");
+        assert_eq!(resp.deadlines[0].source.as_deref(), Some("FRCP 56(c)(1)"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn legal_court_rules_and_compute_deadline() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let Json(rules_resp) = legal_court_rules_handler()
+            .await
+            .expect("rules handler should succeed");
+        assert!(rules_resp.rules.iter().any(|rule| rule.id == "frcp_12_a_1"));
+
+        let Json(computed) = matter_deadlines_compute_handler(
+            State(state),
+            Path("demo".to_string()),
+            Json(MatterDeadlineComputeRequest {
+                rule_id: "frcp_12_a_1".to_string(),
+                trigger_date: "2026-03-02".to_string(),
+                title: Some("Response due".to_string()),
+                reminder_days: vec![7, 3],
+                computed_from: None,
+                task_id: None,
+            }),
+        )
+        .await
+        .expect("compute handler should succeed");
+        assert_eq!(computed.rule.id, "frcp_12_a_1");
+        assert!(
+            computed.deadline.due_at.starts_with("2026-03-23T"),
+            "unexpected due_at {}",
+            computed.deadline.due_at
+        );
+        assert_eq!(computed.deadline.reminder_days, vec![3, 7]);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_deadline_delete_disables_reminder_routines() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let due_at = (Utc::now() + chrono::TimeDelta::days(10)).to_rfc3339();
+        let (_status, Json(created)) = matter_deadlines_create_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Json(CreateMatterDeadlineRequest {
+                title: "Serve discovery requests".to_string(),
+                deadline_type: "discovery_cutoff".to_string(),
+                due_at,
+                completed_at: None,
+                reminder_days: vec![1, 3],
+                rule_ref: None,
+                computed_from: None,
+                task_id: None,
+            }),
+        )
+        .await
+        .expect("create deadline should succeed");
+
+        let deadline_id = Uuid::parse_str(&created.id).expect("deadline uuid");
+        let prefix = deadline_reminder_prefix("demo", deadline_id);
+
+        let before_delete = db
+            .list_routines("test-user")
+            .await
+            .expect("list routines before delete");
+        let active_count = before_delete
+            .iter()
+            .filter(|routine| routine.name.starts_with(&prefix) && routine.enabled)
+            .count();
+        assert_eq!(active_count, 2);
+
+        let status = matter_deadlines_delete_handler(
+            State(state),
+            Path(("demo".to_string(), created.id.clone())),
+        )
+        .await
+        .expect("delete deadline should succeed");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let after_delete = db
+            .list_routines("test-user")
+            .await
+            .expect("list routines after delete");
+        let routines: Vec<_> = after_delete
+            .into_iter()
+            .filter(|routine| routine.name.starts_with(&prefix))
+            .collect();
+        assert_eq!(routines.len(), 2);
+        assert!(routines.iter().all(|routine| !routine.enabled));
     }
 
     #[cfg(feature = "libsql")]

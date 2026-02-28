@@ -18,12 +18,13 @@ use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
     ClientRecord, ClientStore, ClientType, ConflictClearanceRecord, ConflictHit, ConversationStore,
-    CreateClientParams, CreateMatterNoteParams, CreateMatterTaskParams, Database, JobStore,
-    LegalConflictStore, MatterNoteRecord, MatterNoteStore, MatterRecord, MatterStatus, MatterStore,
+    CreateClientParams, CreateMatterDeadlineParams, CreateMatterNoteParams, CreateMatterTaskParams,
+    Database, JobStore, LegalConflictStore, MatterDeadlineRecord, MatterDeadlineStore,
+    MatterDeadlineType, MatterNoteRecord, MatterNoteStore, MatterRecord, MatterStatus, MatterStore,
     MatterTaskRecord, MatterTaskStatus, MatterTaskStore, PartyRole, RoutineStore, SandboxStore,
-    SettingsStore, ToolFailureStore, UpdateClientParams, UpdateMatterNoteParams,
-    UpdateMatterParams, UpdateMatterTaskParams, UpsertMatterParams, WorkspaceStore,
-    conflict_terms_from_text, normalize_party_name,
+    SettingsStore, ToolFailureStore, UpdateClientParams, UpdateMatterDeadlineParams,
+    UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpsertMatterParams,
+    WorkspaceStore, conflict_terms_from_text, normalize_party_name,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -282,6 +283,43 @@ fn row_to_matter_note_record(row: &tokio_postgres::Row) -> MatterNoteRecord {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
+}
+
+fn parse_json_i32_array(value: &serde_json::Value) -> Vec<i32> {
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| entry.as_i64())
+                .filter_map(|raw| i32::try_from(raw).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn row_to_matter_deadline_record(
+    row: &tokio_postgres::Row,
+) -> Result<MatterDeadlineRecord, DatabaseError> {
+    let deadline_type_raw: String = row.get("deadline_type");
+    let deadline_type = MatterDeadlineType::from_db_value(&deadline_type_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid deadline_type '{}'", deadline_type_raw))
+    })?;
+    let reminder_days: serde_json::Value = row.get("reminder_days");
+    Ok(MatterDeadlineRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        title: row.get("title"),
+        deadline_type,
+        due_at: row.get("due_at"),
+        completed_at: row.get("completed_at"),
+        reminder_days: parse_json_i32_array(&reminder_days),
+        rule_ref: row.get("rule_ref"),
+        computed_from: row.get("computed_from"),
+        task_id: row.get("task_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
 }
 
 // ==================== Database (supertrait) ====================
@@ -1662,6 +1700,160 @@ impl MatterNoteStore for PgBackend {
             .execute(
                 "DELETE FROM matter_notes WHERE user_id = $1 AND matter_id = $2 AND id = $3",
                 &[&user_id, &matter_id, &note_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+// ==================== MatterDeadlineStore ====================
+
+#[async_trait]
+impl MatterDeadlineStore for PgBackend {
+    async fn list_matter_deadlines(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterDeadlineRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at \
+                 FROM matter_deadlines \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY due_at ASC, created_at ASC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_matter_deadline_record(&row))
+            .collect()
+    }
+
+    async fn get_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+    ) -> Result<Option<MatterDeadlineRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at \
+                 FROM matter_deadlines \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &deadline_id],
+            )
+            .await?;
+        row.map(|row| row_to_matter_deadline_record(&row))
+            .transpose()
+    }
+
+    async fn create_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateMatterDeadlineParams,
+    ) -> Result<MatterDeadlineRecord, DatabaseError> {
+        let reminder_days = serde_json::to_value(&input.reminder_days)
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO matter_deadlines \
+                 (id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 RETURNING id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.title,
+                    &input.deadline_type.as_str(),
+                    &input.due_at,
+                    &input.completed_at,
+                    &reminder_days,
+                    &input.rule_ref,
+                    &input.computed_from,
+                    &input.task_id,
+                ],
+            )
+            .await?;
+        row_to_matter_deadline_record(&row)
+    }
+
+    async fn update_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+        input: &UpdateMatterDeadlineParams,
+    ) -> Result<Option<MatterDeadlineRecord>, DatabaseError> {
+        let Some(existing) = self
+            .get_matter_deadline(user_id, matter_id, deadline_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let merged_title = input.title.clone().unwrap_or(existing.title);
+        let merged_deadline_type = input.deadline_type.unwrap_or(existing.deadline_type);
+        let merged_due_at = input.due_at.unwrap_or(existing.due_at);
+        let merged_completed_at = input.completed_at.unwrap_or(existing.completed_at);
+        let merged_reminder_days = input
+            .reminder_days
+            .clone()
+            .unwrap_or(existing.reminder_days);
+        let merged_rule_ref = input.rule_ref.clone().unwrap_or(existing.rule_ref);
+        let merged_computed_from = input.computed_from.unwrap_or(existing.computed_from);
+        let merged_task_id = input.task_id.unwrap_or(existing.task_id);
+        let reminder_days = serde_json::to_value(&merged_reminder_days)
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "UPDATE matter_deadlines SET \
+                    title = $4, \
+                    deadline_type = $5, \
+                    due_at = $6, \
+                    completed_at = $7, \
+                    reminder_days = $8, \
+                    rule_ref = $9, \
+                    computed_from = $10, \
+                    task_id = $11, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
+                 RETURNING id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at",
+                &[
+                    &user_id,
+                    &matter_id,
+                    &deadline_id,
+                    &merged_title,
+                    &merged_deadline_type.as_str(),
+                    &merged_due_at,
+                    &merged_completed_at,
+                    &reminder_days,
+                    &merged_rule_ref,
+                    &merged_computed_from,
+                    &merged_task_id,
+                ],
+            )
+            .await?;
+        Ok(Some(row_to_matter_deadline_record(&row)?))
+    }
+
+    async fn delete_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM matter_deadlines WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &deadline_id],
             )
             .await?;
         Ok(deleted > 0)

@@ -614,6 +614,108 @@ pub struct MatterDeadlinesResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct MatterDeadlineRecordInfo {
+    pub id: String,
+    pub title: String,
+    pub deadline_type: String,
+    pub due_at: String,
+    pub completed_at: Option<String>,
+    pub reminder_days: Vec<i32>,
+    pub rule_ref: Option<String>,
+    pub computed_from: Option<String>,
+    pub task_id: Option<String>,
+    pub is_overdue: bool,
+    pub days_until_due: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateMatterDeadlineRequest {
+    pub title: String,
+    pub deadline_type: String,
+    pub due_at: String,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub reminder_days: Vec<i32>,
+    #[serde(default)]
+    pub rule_ref: Option<String>,
+    #[serde(default)]
+    pub computed_from: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateMatterDeadlineRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub deadline_type: Option<String>,
+    #[serde(default)]
+    pub due_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<Option<String>>,
+    #[serde(default)]
+    pub reminder_days: Option<Vec<i32>>,
+    #[serde(default)]
+    pub rule_ref: Option<Option<String>>,
+    #[serde(default)]
+    pub computed_from: Option<Option<String>>,
+    #[serde(default)]
+    pub task_id: Option<Option<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MatterDeadlineComputeRequest {
+    pub rule_id: String,
+    pub trigger_date: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub reminder_days: Vec<i32>,
+    #[serde(default)]
+    pub computed_from: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterDeadlineComputeResponse {
+    pub matter_id: String,
+    pub rule: CourtRuleInfo,
+    pub deadline: MatterDeadlineComputePreview,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterDeadlineComputePreview {
+    pub title: String,
+    pub deadline_type: String,
+    pub due_at: String,
+    pub reminder_days: Vec<i32>,
+    pub rule_ref: Option<String>,
+    pub computed_from: Option<String>,
+    pub task_id: Option<String>,
+    pub is_overdue: bool,
+    pub days_until_due: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CourtRuleInfo {
+    pub id: String,
+    pub citation: String,
+    pub deadline_type: String,
+    pub offset_days: i64,
+    pub court_days: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CourtRulesResponse {
+    pub rules: Vec<CourtRuleInfo>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct MatterFilingPackageResponse {
     pub matter_id: String,
     pub path: String,

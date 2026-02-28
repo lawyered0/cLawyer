@@ -327,6 +327,7 @@ struct EngineContext {
 
 /// Execute a routine run. Handles both lightweight and full_job modes.
 async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) {
+    let mut routine = routine;
     // Increment running count (atomic: survives panics in the execution below)
     ctx.running_count.fetch_add(1, Ordering::Relaxed);
 
@@ -391,6 +392,29 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
         .await
     {
         tracing::error!(routine = %routine.name, "Failed to update runtime state: {}", e);
+    }
+
+    let is_one_shot = routine
+        .state
+        .get("one_shot")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if is_one_shot && matches!(status, RunStatus::Ok | RunStatus::Attention) {
+        routine.enabled = false;
+        routine.next_fire_at = None;
+        if let Some(state_obj) = routine.state.as_object_mut() {
+            state_obj.insert(
+                "one_shot_fired_at".to_string(),
+                serde_json::Value::String(now.to_rfc3339()),
+            );
+        }
+        if let Err(e) = ctx.store.update_routine(&routine).await {
+            tracing::error!(
+                routine = %routine.name,
+                "Failed to disable one-shot routine after completion: {}",
+                e
+            );
+        }
     }
 
     // Send notifications based on config

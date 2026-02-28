@@ -403,6 +403,84 @@ pub struct UpdateMatterNoteParams {
     pub pinned: Option<bool>,
 }
 
+/// Matter deadline category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatterDeadlineType {
+    CourtDate,
+    Filing,
+    StatuteOfLimitations,
+    ResponseDue,
+    DiscoveryCutoff,
+    Internal,
+}
+
+impl MatterDeadlineType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CourtDate => "court_date",
+            Self::Filing => "filing",
+            Self::StatuteOfLimitations => "statute_of_limitations",
+            Self::ResponseDue => "response_due",
+            Self::DiscoveryCutoff => "discovery_cutoff",
+            Self::Internal => "internal",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "court_date" => Some(Self::CourtDate),
+            "filing" => Some(Self::Filing),
+            "statute_of_limitations" => Some(Self::StatuteOfLimitations),
+            "response_due" => Some(Self::ResponseDue),
+            "discovery_cutoff" => Some(Self::DiscoveryCutoff),
+            "internal" => Some(Self::Internal),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterDeadlineRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub title: String,
+    pub deadline_type: MatterDeadlineType,
+    pub due_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub reminder_days: Vec<i32>,
+    pub rule_ref: Option<String>,
+    pub computed_from: Option<Uuid>,
+    pub task_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateMatterDeadlineParams {
+    pub title: String,
+    pub deadline_type: MatterDeadlineType,
+    pub due_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub reminder_days: Vec<i32>,
+    pub rule_ref: Option<String>,
+    pub computed_from: Option<Uuid>,
+    pub task_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateMatterDeadlineParams {
+    pub title: Option<String>,
+    pub deadline_type: Option<MatterDeadlineType>,
+    pub due_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<Option<DateTime<Utc>>>,
+    pub reminder_days: Option<Vec<i32>>,
+    pub rule_ref: Option<Option<String>>,
+    pub computed_from: Option<Option<Uuid>>,
+    pub task_id: Option<Option<Uuid>>,
+}
+
 /// Normalize names/text for conflict matching.
 pub fn normalize_party_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -848,6 +926,40 @@ pub trait MatterNoteStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait MatterDeadlineStore: Send + Sync {
+    async fn list_matter_deadlines(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterDeadlineRecord>, DatabaseError>;
+    async fn get_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+    ) -> Result<Option<MatterDeadlineRecord>, DatabaseError>;
+    async fn create_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateMatterDeadlineParams,
+    ) -> Result<MatterDeadlineRecord, DatabaseError>;
+    async fn update_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+        input: &UpdateMatterDeadlineParams,
+    ) -> Result<Option<MatterDeadlineRecord>, DatabaseError>;
+    async fn delete_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
 pub trait SettingsStore: Send + Sync {
     async fn get_setting(
         &self,
@@ -962,6 +1074,7 @@ pub trait Database:
     + MatterStore
     + MatterTaskStore
     + MatterNoteStore
+    + MatterDeadlineStore
     + SettingsStore
     + WorkspaceStore
     + Send

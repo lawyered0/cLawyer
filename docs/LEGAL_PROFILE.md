@@ -77,7 +77,17 @@ For web-first firm workflows, matter detail now includes:
 - `GET /api/matters/{id}/dashboard`
   - scorecard totals for documents, drafts, templates, checklist completion, and deadline risk.
 - `GET /api/matters/{id}/deadlines`
-  - parsed deadline rows from `deadlines/calendar.md` with overdue flags.
+  - DB-backed deadline list (falls back to `deadlines/calendar.md` when DB rows are absent).
+- `POST /api/matters/{id}/deadlines`
+  - create deadline records with type, due date, optional completion/rule/task linkage, and reminder offsets.
+- `PATCH /api/matters/{id}/deadlines/{deadline_id}`
+  - update deadline fields and reminder settings.
+- `DELETE /api/matters/{id}/deadlines/{deadline_id}`
+  - delete a deadline and disable any scheduled reminder routines for it.
+- `POST /api/matters/{id}/deadlines/compute`
+  - computes deadline previews from bundled court rules without persisting.
+- `GET /api/legal/court-rules`
+  - lists bundled rule metadata (citation, deadline type, offset, court-day behavior).
 - `POST /api/matters/{id}/filing-package`
   - writes a matter-local filing package index to `matters/<id>/exports/`.
 - `POST /api/matters/conflict-check`
@@ -94,6 +104,12 @@ For web-first firm workflows, matter detail now includes:
 - Startup can auto-reindex DB conflict graph from workspace (`legal.conflict_reindex_on_startup = true`).
 - Existing `POST /api/matters/conflicts/check` remains for compatibility and now uses the same DB-first path plus fallback.
 - Matching remains normalized/boundary-aware and heuristic; short aliases are intentionally ignored to reduce false positives.
+
+## Deadline Reminder Notes
+
+- Deadline reminders are stored as one-shot routines named `deadline-reminder-{matter_id}-{deadline_id}-{days}`.
+- Reminder routines are auto-disabled after a successful/attention run.
+- Updating, completing, or deleting a deadline disables obsolete reminder routines and re-syncs current ones.
 
 ## Citation Check Limits
 
