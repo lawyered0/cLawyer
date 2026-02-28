@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::{DateTime, NaiveDate, Utc};
 use libsql::params;
 use uuid::Uuid;
@@ -352,6 +354,58 @@ impl LegalConflictStore for LibSqlBackend {
         Ok(())
     }
 
+    async fn reset_conflict_graph(&self) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        conn.execute("DELETE FROM matter_parties", ()).await?;
+        conn.execute("DELETE FROM party_aliases", ()).await?;
+        conn.execute("DELETE FROM party_relationships", ()).await?;
+        conn.execute("DELETE FROM parties", ()).await?;
+        Ok(())
+    }
+
+    async fn upsert_party_aliases(
+        &self,
+        canonical_name: &str,
+        aliases: &[String],
+    ) -> Result<(), DatabaseError> {
+        if aliases.is_empty() {
+            return Ok(());
+        }
+
+        let Some(party_id) = upsert_party_libsql(self, canonical_name).await? else {
+            return Ok(());
+        };
+
+        let conn = self.connect().await?;
+        let mut seen: HashSet<String> = HashSet::new();
+        for alias in aliases {
+            let display_alias = alias.trim();
+            if display_alias.is_empty() {
+                continue;
+            }
+            let normalized_alias = normalize_party_name(display_alias);
+            if normalized_alias.is_empty() || !seen.insert(normalized_alias.clone()) {
+                continue;
+            }
+            conn.execute(
+                "INSERT INTO party_aliases \
+                 (id, party_id, alias, alias_normalized, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now')) \
+                 ON CONFLICT(party_id, alias_normalized) DO UPDATE SET \
+                    alias = excluded.alias, \
+                    updated_at = datetime('now')",
+                params![
+                    Uuid::new_v4().to_string(),
+                    party_id.as_str(),
+                    display_alias,
+                    normalized_alias,
+                ],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn record_conflict_clearance(
         &self,
         row: &ConflictClearanceRecord,
@@ -610,5 +664,80 @@ mod tests {
             .get::<i64>(0)
             .expect("count int");
         assert_eq!(matter_parties_count, 2);
+    }
+
+    #[tokio::test]
+    async fn upsert_party_aliases_is_idempotent() {
+        let fixture = setup_backend().await;
+        fixture
+            .backend
+            .upsert_party_aliases(
+                "Acme Corp",
+                &["Acme".to_string(), "Acme Corporation".to_string()],
+            )
+            .await
+            .expect("initial alias upsert");
+        fixture
+            .backend
+            .upsert_party_aliases(
+                "Acme Corp",
+                &["Acme".to_string(), "Acme Corporation".to_string()],
+            )
+            .await
+            .expect("repeated alias upsert");
+
+        let conn = fixture.backend.connect().await.expect("connect");
+        let alias_count = conn
+            .query("SELECT COUNT(*) FROM party_aliases", ())
+            .await
+            .expect("count aliases")
+            .next()
+            .await
+            .expect("row read")
+            .expect("row exists")
+            .get::<i64>(0)
+            .expect("count int");
+        assert_eq!(alias_count, 2);
+    }
+
+    #[tokio::test]
+    async fn reset_conflict_graph_clears_party_graph_tables() {
+        let fixture = setup_backend().await;
+        fixture
+            .backend
+            .seed_matter_parties("matter-a", "Acme Corp", &["Foo LLC".to_string()], None)
+            .await
+            .expect("seed parties");
+        fixture
+            .backend
+            .upsert_party_aliases("Acme Corp", &["Acme".to_string()])
+            .await
+            .expect("seed aliases");
+
+        fixture
+            .backend
+            .reset_conflict_graph()
+            .await
+            .expect("reset graph");
+
+        let conn = fixture.backend.connect().await.expect("connect");
+        for (table, expected) in [
+            ("matter_parties", 0i64),
+            ("party_aliases", 0i64),
+            ("party_relationships", 0i64),
+            ("parties", 0i64),
+        ] {
+            let count = conn
+                .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+                .await
+                .expect("count query")
+                .next()
+                .await
+                .expect("row read")
+                .expect("row exists")
+                .get::<i64>(0)
+                .expect("count int");
+            assert_eq!(count, expected, "unexpected row count for {table}");
+        }
     }
 }

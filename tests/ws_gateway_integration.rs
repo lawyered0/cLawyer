@@ -43,6 +43,8 @@ fn legal_config_for_tests() -> clawyer::config::LegalConfig {
         active_matter: None,
         privilege_guard: true,
         conflict_check_enabled: true,
+        conflict_file_fallback_enabled: true,
+        conflict_reindex_on_startup: false,
         network: clawyer::config::LegalNetworkConfig {
             deny_by_default: true,
             allowed_domains: Vec::new(),

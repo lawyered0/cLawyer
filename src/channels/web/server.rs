@@ -244,6 +244,10 @@ pub async fn start_server(
             "/api/matters/conflicts/check",
             post(matters_conflicts_check_handler),
         )
+        .route(
+            "/api/matters/conflicts/reindex",
+            post(matters_conflicts_reindex_handler),
+        )
         .route("/api/legal/audit", get(legal_audit_list_handler))
         // Jobs
         .route("/api/jobs", get(jobs_list_handler))
@@ -2790,6 +2794,7 @@ async fn matters_conflicts_check_handler(
     }
 
     legal.active_matter = effective_matter_id.clone();
+    let db_available = state.store.is_some();
     let db_hits = if let Some(store) = state.store.as_ref() {
         match store
             .find_conflict_hits_for_text(text, legal.active_matter.as_deref(), 50)
@@ -2808,6 +2813,8 @@ async fn matters_conflicts_check_handler(
     };
     let conflict = if let Some(first_hit) = db_hits.first() {
         Some(first_hit.party.clone())
+    } else if db_available && !legal.conflict_file_fallback_enabled {
+        None
     } else {
         let workspace = state.workspace.as_ref().ok_or((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2835,6 +2842,49 @@ async fn matters_conflicts_check_handler(
         conflict,
         matter_id: effective_matter_id,
         hits: db_hits,
+    }))
+}
+
+async fn matters_conflicts_reindex_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<MatterConflictGraphReindexResponse>, (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let legal = legal_config_for_gateway(state.as_ref());
+    if !legal.enabled || !legal.conflict_check_enabled {
+        return Err((
+            StatusCode::CONFLICT,
+            "Conflict reindex is disabled by legal policy".to_string(),
+        ));
+    }
+
+    let report = crate::legal::matter::reindex_conflict_graph(workspace.as_ref(), store, &legal)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+
+    crate::legal::audit::record(
+        "conflict_graph_reindex",
+        serde_json::json!({
+            "triggered_by": state.user_id.clone(),
+            "scanned_matters": report.scanned_matters,
+            "seeded_matters": report.seeded_matters,
+            "skipped_matters": report.skipped_matters,
+            "global_conflicts_seeded": report.global_conflicts_seeded,
+            "global_aliases_seeded": report.global_aliases_seeded,
+            "warning_count": report.warnings.len(),
+        }),
+    );
+
+    Ok(Json(MatterConflictGraphReindexResponse {
+        status: "ok",
+        report,
     }))
 }
 
@@ -5481,6 +5531,91 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn conflicts_reindex_backfills_graph_and_emits_audit_event() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "matters/demo/matter.yaml",
+                r#"
+matter_id: demo
+client: Demo Client
+team:
+  - Lead Counsel
+confidentiality: attorney-client-privileged
+adversaries:
+  - Foo Industries
+retention: follow-firm-policy
+opened_at: 2026-02-28
+"#,
+            )
+            .await
+            .expect("seed matter metadata");
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Example Adverse Party","aliases":["Example Co"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+        let state = test_gateway_state_with_store_workspace_and_legal(
+            Arc::clone(&db),
+            Arc::clone(&workspace),
+            legal,
+        );
+
+        let Json(resp) = matters_conflicts_reindex_handler(State(state))
+            .await
+            .expect("reindex should succeed");
+
+        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.report.seeded_matters, 1);
+        assert_eq!(resp.report.global_conflicts_seeded, 1);
+        assert_eq!(resp.report.global_aliases_seeded, 1);
+
+        let alias_hits = db
+            .find_conflict_hits_for_names(&["Example Co".to_string()], 20)
+            .await
+            .expect("query seeded alias");
+        assert!(
+            alias_hits.iter().any(|hit| {
+                hit.matter_id == crate::legal::matter::GLOBAL_CONFLICT_GRAPH_MATTER_ID
+            })
+        );
+
+        let events = crate::legal::audit::test_events_snapshot();
+        assert!(events.iter().any(|event| {
+            event.event_type == "conflict_graph_reindex"
+                && event.details["seeded_matters"] == 1
+                && event.details["global_conflicts_seeded"] == 1
+        }));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conflicts_reindex_respects_disabled_policy() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.conflict_check_enabled = false;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let err = matters_conflicts_reindex_handler(State(state))
+            .await
+            .expect_err("disabled policy should reject reindex");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("disabled"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     async fn matters_create_requires_conflict_decision_when_hits_exist() {
         let (db, _tmp) = crate::testing::test_db().await;
         db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
@@ -5748,6 +5883,42 @@ mod tests {
                 .iter()
                 .any(|hit| hit.matter_id == "existing-matter")
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conflicts_check_skips_file_fallback_when_db_authoritative_mode_enabled() {
+        crate::legal::matter::reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Fallback Party","aliases":["Fallback Co"]}]"#,
+            )
+            .await
+            .expect("seed fallback conflicts");
+
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = false;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let Json(resp) = matters_conflicts_check_handler(
+            State(state),
+            Json(MatterConflictCheckRequest {
+                text: "Review communications with Fallback Party".to_string(),
+                matter_id: None,
+            }),
+        )
+        .await
+        .expect("manual conflict check should succeed");
+
+        assert!(!resp.matched);
+        assert!(resp.conflict.is_none());
+        assert!(resp.hits.is_empty());
     }
 
     #[cfg(feature = "libsql")]

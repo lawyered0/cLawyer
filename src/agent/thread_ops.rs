@@ -265,7 +265,7 @@ impl Agent {
                 }),
             );
             return Ok(SubmissionResult::error(
-                "Potential conflict detected. Review conflicts.json and acknowledge before continuing.",
+                "Potential conflict detected. Review conflict records and acknowledge before continuing.",
             ));
         }
 
