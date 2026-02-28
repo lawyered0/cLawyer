@@ -78,12 +78,17 @@ For web-first firm workflows, matter detail now includes:
   - parsed deadline rows from `deadlines/calendar.md` with overdue flags.
 - `POST /api/matters/{id}/filing-package`
   - writes a matter-local filing package index to `matters/<id>/exports/`.
+- `POST /api/matters/conflict-check`
+  - runs intake-time conflict review against the DB-backed party graph and returns structured `ConflictHit` rows.
+- `POST /api/matters`
+  - server-hard-gated on conflict hits: `clear`/`waived` can proceed, `declined` blocks creation and records clearance.
 
 ## Conflict Check Limits
 
-- Conflict detection currently reads the workspace-global `conflicts.json` (not a per-matter conflict graph).
-- The chat-flow conflict gate and `/api/matters/conflicts/check` endpoint use this same global source, and also check active-matter `adversaries` terms when an active matter is set.
-- Matching is normalized and boundary-aware, but still heuristic; short aliases are intentionally ignored to reduce false positives.
+- Intake conflict checks use a DB-backed party graph (`parties`, `party_aliases`, `matter_parties`) with exact+alias+fuzzy matching.
+- Chat conflict checks are DB-first and fall back to workspace-global `conflicts.json` during transition.
+- Existing `POST /api/matters/conflicts/check` remains for compatibility and now uses the same DB-first path plus fallback.
+- Matching remains normalized/boundary-aware and heuristic; short aliases are intentionally ignored to reduce false positives.
 
 ## Citation Check Limits
 
@@ -93,7 +98,7 @@ For web-first firm workflows, matter detail now includes:
 ## Deferred Architecture Items
 
 - Self-repair stuck-job handling is still attempt-count based; time-threshold stuck detection is not implemented yet.
-- Conflict checks still use workspace-global `conflicts.json`; a per-matter conflict-graph model is deferred.
+- Conflict checks do not yet traverse `party_relationships` recursively for affiliate/corporate-family logic.
 
 ## Bundled Legal Skills
 
