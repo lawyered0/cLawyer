@@ -477,6 +477,77 @@ CREATE TABLE IF NOT EXISTS settings (
 
 CREATE INDEX IF NOT EXISTS idx_settings_user ON settings(user_id);
 
+-- ==================== Legal conflict graph ====================
+
+CREATE TABLE IF NOT EXISTS parties (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    name_normalized TEXT NOT NULL UNIQUE,
+    party_type TEXT NOT NULL CHECK (party_type IN ('individual', 'entity')),
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_parties_name_normalized ON parties(name_normalized);
+
+CREATE TABLE IF NOT EXISTS party_aliases (
+    id TEXT PRIMARY KEY,
+    party_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+    alias TEXT NOT NULL,
+    alias_normalized TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (party_id, alias_normalized)
+);
+
+CREATE INDEX IF NOT EXISTS idx_party_aliases_party_id ON party_aliases(party_id);
+CREATE INDEX IF NOT EXISTS idx_party_aliases_alias_normalized ON party_aliases(alias_normalized);
+
+CREATE TABLE IF NOT EXISTS party_relationships (
+    id TEXT PRIMARY KEY,
+    parent_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+    child_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (parent_id, child_id, kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_party_relationships_parent_id ON party_relationships(parent_id);
+CREATE INDEX IF NOT EXISTS idx_party_relationships_child_id ON party_relationships(child_id);
+
+CREATE TABLE IF NOT EXISTS matter_parties (
+    id TEXT PRIMARY KEY,
+    matter_id TEXT NOT NULL,
+    party_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('client', 'adverse', 'related', 'witness')),
+    opened_at TEXT,
+    closed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (matter_id, party_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_matter_parties_party_id ON matter_parties(party_id);
+CREATE INDEX IF NOT EXISTS idx_matter_parties_matter_id ON matter_parties(matter_id);
+CREATE INDEX IF NOT EXISTS idx_matter_parties_role_closed_at ON matter_parties(role, closed_at);
+
+CREATE TABLE IF NOT EXISTS conflict_clearances (
+    id TEXT PRIMARY KEY,
+    matter_id TEXT NOT NULL,
+    checked_by TEXT NOT NULL,
+    cleared_by TEXT,
+    decision TEXT NOT NULL CHECK (decision IN ('clear', 'waived', 'declined')),
+    note TEXT,
+    hits_json TEXT NOT NULL,
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_conflict_clearances_matter_created_at
+    ON conflict_clearances(matter_id, created_at DESC);
+
 -- ==================== Missing indexes (parity with PostgreSQL) ====================
 
 -- agent_jobs

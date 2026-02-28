@@ -8,6 +8,7 @@
 
 mod conversations;
 mod jobs;
+mod legal_conflicts;
 mod routines;
 mod sandbox;
 mod settings;

@@ -18,12 +18,13 @@ pub mod libsql;
 #[cfg(feature = "libsql")]
 pub mod libsql_migrations;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent::BrokenTool;
@@ -86,6 +87,178 @@ pub async fn connect_from_config(
             "No database backend available. Enable 'postgres' or 'libsql' feature.".to_string(),
         )),
     }
+}
+
+/// Role a party plays in a matter for conflict screening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PartyRole {
+    Client,
+    Adverse,
+    Related,
+    Witness,
+}
+
+impl PartyRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Adverse => "adverse",
+            Self::Related => "related",
+            Self::Witness => "witness",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "client" => Some(Self::Client),
+            "adverse" => Some(Self::Adverse),
+            "related" => Some(Self::Related),
+            "witness" => Some(Self::Witness),
+            _ => None,
+        }
+    }
+}
+
+/// Structured conflict match for legal intake and attorney review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictHit {
+    pub party: String,
+    pub role: PartyRole,
+    pub matter_id: String,
+    pub matter_status: String,
+    pub matched_via: String,
+}
+
+/// Attorney decision after reviewing potential conflict hits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictDecision {
+    Clear,
+    Waived,
+    Declined,
+}
+
+impl ConflictDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Waived => "waived",
+            Self::Declined => "declined",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "clear" => Some(Self::Clear),
+            "waived" => Some(Self::Waived),
+            "declined" => Some(Self::Declined),
+            _ => None,
+        }
+    }
+}
+
+/// Row persisted for legal conflict clearance history.
+#[derive(Debug, Clone)]
+pub struct ConflictClearanceRecord {
+    pub matter_id: String,
+    pub checked_by: String,
+    pub cleared_by: Option<String>,
+    pub decision: ConflictDecision,
+    pub note: Option<String>,
+    pub hits_json: serde_json::Value,
+    pub hit_count: i32,
+}
+
+/// Normalize names/text for conflict matching.
+pub fn normalize_party_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_sep = true;
+
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        } else if !prev_sep {
+            out.push(' ');
+            prev_sep = true;
+        }
+    }
+
+    out.trim().to_string()
+}
+
+fn trigrams(text: &str) -> HashSet<String> {
+    let normalized = normalize_party_name(text);
+    if normalized.is_empty() {
+        return HashSet::new();
+    }
+    let padded = format!("  {normalized}  ");
+    let chars: Vec<char> = padded.chars().collect();
+    let mut set = HashSet::new();
+    if chars.len() < 3 {
+        set.insert(padded);
+        return set;
+    }
+    for i in 0..=(chars.len() - 3) {
+        let tri = [chars[i], chars[i + 1], chars[i + 2]];
+        set.insert(tri.iter().collect::<String>());
+    }
+    set
+}
+
+/// Jaccard-style trigram similarity in [0, 1].
+pub fn trigram_similarity(a: &str, b: &str) -> f64 {
+    let a_set = trigrams(a);
+    let b_set = trigrams(b);
+    if a_set.is_empty() || b_set.is_empty() {
+        return 0.0;
+    }
+    let intersection = a_set.intersection(&b_set).count() as f64;
+    let union = a_set.union(&b_set).count() as f64;
+    if union == 0.0 {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+/// Build normalized candidate terms from free text for conflict matching.
+pub fn conflict_terms_from_text(text: &str, active_matter: Option<&str>) -> Vec<String> {
+    const MAX_TOKENS: usize = 32;
+    const MAX_NGRAM: usize = 4;
+
+    let normalized = normalize_party_name(text);
+    let mut terms: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let tokens: Vec<&str> = normalized
+        .split_whitespace()
+        .filter(|token| token.len() >= 2)
+        .take(MAX_TOKENS)
+        .collect();
+
+    for width in 1..=MAX_NGRAM {
+        if width > tokens.len() {
+            break;
+        }
+        for i in 0..=(tokens.len() - width) {
+            let candidate = tokens[i..(i + width)].join(" ");
+            if candidate.len() < 3 || !seen.insert(candidate.clone()) {
+                continue;
+            }
+            terms.push(candidate);
+        }
+    }
+
+    if let Some(matter) = active_matter {
+        let normalized_matter = normalize_party_name(matter);
+        if !normalized_matter.is_empty() && seen.insert(normalized_matter.clone()) {
+            terms.push(normalized_matter);
+        }
+    }
+
+    terms
 }
 
 // ==================== Sub-traits ====================
@@ -294,6 +467,32 @@ pub trait ToolFailureStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait LegalConflictStore: Send + Sync {
+    async fn find_conflict_hits_for_names(
+        &self,
+        input_names: &[String],
+        limit: usize,
+    ) -> Result<Vec<ConflictHit>, DatabaseError>;
+    async fn find_conflict_hits_for_text(
+        &self,
+        text: &str,
+        active_matter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConflictHit>, DatabaseError>;
+    async fn seed_matter_parties(
+        &self,
+        matter_id: &str,
+        client: &str,
+        adversaries: &[String],
+        opened_at: Option<&str>,
+    ) -> Result<(), DatabaseError>;
+    async fn record_conflict_clearance(
+        &self,
+        row: &ConflictClearanceRecord,
+    ) -> Result<(), DatabaseError>;
+}
+
+#[async_trait]
 pub trait SettingsStore: Send + Sync {
     async fn get_setting(
         &self,
@@ -403,6 +602,7 @@ pub trait Database:
     + SandboxStore
     + RoutineStore
     + ToolFailureStore
+    + LegalConflictStore
     + SettingsStore
     + WorkspaceStore
     + Send

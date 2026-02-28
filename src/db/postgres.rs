@@ -6,9 +6,10 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use deadpool_postgres::Pool;
 use rust_decimal::Decimal;
+use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
 use crate::agent::BrokenTool;
@@ -16,8 +17,9 @@ use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
-    ConversationStore, Database, JobStore, RoutineStore, SandboxStore, SettingsStore,
-    ToolFailureStore, WorkspaceStore,
+    ConflictClearanceRecord, ConflictHit, ConversationStore, Database, JobStore,
+    LegalConflictStore, PartyRole, RoutineStore, SandboxStore, SettingsStore, ToolFailureStore,
+    WorkspaceStore, conflict_terms_from_text, normalize_party_name,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -52,6 +54,129 @@ impl PgBackend {
     pub fn pool(&self) -> Pool {
         self.store.pool()
     }
+}
+
+fn normalize_input_terms(input_names: &[String]) -> Vec<String> {
+    input_names
+        .iter()
+        .map(|name| normalize_party_name(name))
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn sql_or_eq(column: &str, start_idx: usize, count: usize) -> String {
+    (0..count)
+        .map(|i| format!("{column} = ${}", start_idx + i))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn sql_values_terms(start_idx: usize, count: usize) -> String {
+    (0..count)
+        .map(|i| format!("(${})", start_idx + i))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn match_priority(matched_via: &str) -> u8 {
+    if matched_via == "direct" {
+        3
+    } else if matched_via.starts_with("alias:") {
+        2
+    } else {
+        1
+    }
+}
+
+fn parse_opened_at_ts(raw: Option<&str>) -> Result<Option<DateTime<Utc>>, DatabaseError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        let dt = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| DatabaseError::Serialization("invalid opened_at date".to_string()))?;
+        return Ok(Some(dt.and_utc()));
+    }
+
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Ok(Some(dt.with_timezone(&Utc)));
+    }
+
+    Err(DatabaseError::Serialization(format!(
+        "invalid opened_at timestamp '{}'",
+        raw
+    )))
+}
+
+async fn upsert_party_pg(
+    conn: &mut deadpool_postgres::Object,
+    name: &str,
+) -> Result<Option<Uuid>, DatabaseError> {
+    let display_name = name.trim();
+    if display_name.is_empty() {
+        return Ok(None);
+    }
+    let normalized = normalize_party_name(display_name);
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    let row = conn
+        .query_one(
+            "INSERT INTO parties (id, name, name_normalized, party_type) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (name_normalized) DO UPDATE \
+             SET name = EXCLUDED.name, updated_at = NOW() \
+             RETURNING id",
+            &[&Uuid::new_v4(), &display_name, &normalized, &"entity"],
+        )
+        .await?;
+    Ok(Some(row.get::<_, Uuid>(0)))
+}
+
+fn dedupe_hits(
+    rows: Vec<(String, String, String, String, String, f64)>,
+    limit: usize,
+) -> Vec<ConflictHit> {
+    let mut best: std::collections::HashMap<(String, String, String), (u8, f64, ConflictHit)> =
+        std::collections::HashMap::new();
+
+    for (party, role_raw, matter_id, matter_status, matched_via, score) in rows {
+        let Some(role) = PartyRole::from_db_value(&role_raw) else {
+            continue;
+        };
+        let key = (party.clone(), role_raw, matter_id.clone());
+        let hit = ConflictHit {
+            party,
+            role,
+            matter_id,
+            matter_status,
+            matched_via: matched_via.clone(),
+        };
+        let priority = match_priority(&matched_via);
+
+        match best.get(&key) {
+            Some((existing_priority, existing_score, _))
+                if *existing_priority > priority
+                    || (*existing_priority == priority && *existing_score >= score) => {}
+            _ => {
+                best.insert(key, (priority, score, hit));
+            }
+        }
+    }
+
+    let mut hits: Vec<ConflictHit> = best.into_values().map(|(_, _, hit)| hit).collect();
+    hits.sort_by(|a, b| {
+        a.party
+            .cmp(&b.party)
+            .then_with(|| a.matter_id.cmp(&b.matter_id))
+            .then_with(|| a.matched_via.cmp(&b.matched_via))
+    });
+    if hits.len() > limit {
+        hits.truncate(limit);
+    }
+    hits
 }
 
 // ==================== Database (supertrait) ====================
@@ -471,6 +596,245 @@ impl ToolFailureStore for PgBackend {
 
     async fn increment_repair_attempts(&self, tool_name: &str) -> Result<(), DatabaseError> {
         self.store.increment_repair_attempts(tool_name).await
+    }
+}
+
+// ==================== LegalConflictStore ====================
+
+#[async_trait]
+impl LegalConflictStore for PgBackend {
+    async fn find_conflict_hits_for_names(
+        &self,
+        input_names: &[String],
+        limit: usize,
+    ) -> Result<Vec<ConflictHit>, DatabaseError> {
+        let terms = normalize_input_terms(input_names);
+        if terms.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let limit = limit.min(200);
+        let conn = self.store.conn().await?;
+        let mut rows: Vec<(String, String, String, String, String, f64)> = Vec::new();
+
+        let direct_clause = sql_or_eq("p.name_normalized", 1, terms.len());
+        let direct_query = format!(
+            "SELECT p.name, mp.role, mp.matter_id, \
+                    CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
+                    'direct' AS matched_via, \
+                    1.0::double precision AS score \
+             FROM parties p \
+             JOIN matter_parties mp ON mp.party_id = p.id \
+             WHERE {direct_clause} \
+             LIMIT ${}",
+            terms.len() + 1
+        );
+        let direct_limit = limit as i64;
+        let mut direct_params: Vec<&(dyn ToSql + Sync)> = terms
+            .iter()
+            .map(|term| term as &(dyn ToSql + Sync))
+            .collect();
+        direct_params.push(&direct_limit);
+        for row in conn.query(&direct_query, &direct_params).await? {
+            rows.push((
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+            ));
+        }
+
+        let alias_clause = sql_or_eq("pa.alias_normalized", 1, terms.len());
+        let alias_query = format!(
+            "SELECT p.name, mp.role, mp.matter_id, \
+                    CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
+                    ('alias:' || pa.alias) AS matched_via, \
+                    0.9::double precision AS score \
+             FROM party_aliases pa \
+             JOIN parties p ON p.id = pa.party_id \
+             JOIN matter_parties mp ON mp.party_id = p.id \
+             WHERE {alias_clause} \
+             LIMIT ${}",
+            terms.len() + 1
+        );
+        let alias_limit = limit as i64;
+        let mut alias_params: Vec<&(dyn ToSql + Sync)> = terms
+            .iter()
+            .map(|term| term as &(dyn ToSql + Sync))
+            .collect();
+        alias_params.push(&alias_limit);
+        for row in conn.query(&alias_query, &alias_params).await? {
+            rows.push((
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+            ));
+        }
+
+        // Fuzzy fallback via pg_trgm similarity.
+        let values = sql_values_terms(1, terms.len());
+        let fuzzy_names_query = format!(
+            "WITH input_terms(term) AS (VALUES {values}) \
+             SELECT p.name, mp.role, mp.matter_id, \
+                    CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
+                    ('fuzzy:' || input_terms.term) AS matched_via, \
+                    similarity(p.name_normalized, input_terms.term) AS score \
+             FROM input_terms \
+             JOIN parties p ON p.name_normalized % input_terms.term \
+             JOIN matter_parties mp ON mp.party_id = p.id \
+             WHERE similarity(p.name_normalized, input_terms.term) >= 0.45 \
+             LIMIT ${}",
+            terms.len() + 1
+        );
+        let fuzzy_names_limit = limit as i64;
+        let mut fuzzy_name_params: Vec<&(dyn ToSql + Sync)> = terms
+            .iter()
+            .map(|term| term as &(dyn ToSql + Sync))
+            .collect();
+        fuzzy_name_params.push(&fuzzy_names_limit);
+        for row in conn.query(&fuzzy_names_query, &fuzzy_name_params).await? {
+            rows.push((
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+            ));
+        }
+
+        let fuzzy_alias_query = format!(
+            "WITH input_terms(term) AS (VALUES {values}) \
+             SELECT p.name, mp.role, mp.matter_id, \
+                    CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
+                    ('fuzzy:' || input_terms.term) AS matched_via, \
+                    similarity(pa.alias_normalized, input_terms.term) AS score \
+             FROM input_terms \
+             JOIN party_aliases pa ON pa.alias_normalized % input_terms.term \
+             JOIN parties p ON p.id = pa.party_id \
+             JOIN matter_parties mp ON mp.party_id = p.id \
+             WHERE similarity(pa.alias_normalized, input_terms.term) >= 0.45 \
+             LIMIT ${}",
+            terms.len() + 1
+        );
+        let fuzzy_alias_limit = limit as i64;
+        let mut fuzzy_alias_params: Vec<&(dyn ToSql + Sync)> = terms
+            .iter()
+            .map(|term| term as &(dyn ToSql + Sync))
+            .collect();
+        fuzzy_alias_params.push(&fuzzy_alias_limit);
+        for row in conn.query(&fuzzy_alias_query, &fuzzy_alias_params).await? {
+            rows.push((
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+            ));
+        }
+
+        Ok(dedupe_hits(rows, limit))
+    }
+
+    async fn find_conflict_hits_for_text(
+        &self,
+        text: &str,
+        active_matter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConflictHit>, DatabaseError> {
+        let terms = conflict_terms_from_text(text, active_matter);
+        self.find_conflict_hits_for_names(&terms, limit).await
+    }
+
+    async fn seed_matter_parties(
+        &self,
+        matter_id: &str,
+        client: &str,
+        adversaries: &[String],
+        opened_at: Option<&str>,
+    ) -> Result<(), DatabaseError> {
+        let matter_id = matter_id.trim();
+        if matter_id.is_empty() {
+            return Err(DatabaseError::Serialization(
+                "matter_id cannot be empty".to_string(),
+            ));
+        }
+
+        let opened_at = parse_opened_at_ts(opened_at)?;
+        let mut conn = self.store.conn().await?;
+
+        if let Some(client_party_id) = upsert_party_pg(&mut conn, client).await? {
+            conn.execute(
+                "INSERT INTO matter_parties (id, matter_id, party_id, role, opened_at, closed_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (matter_id, party_id, role) DO UPDATE \
+                 SET opened_at = COALESCE(matter_parties.opened_at, EXCLUDED.opened_at), \
+                     updated_at = NOW()",
+                &[
+                    &Uuid::new_v4(),
+                    &matter_id,
+                    &client_party_id,
+                    &PartyRole::Client.as_str(),
+                    &opened_at,
+                    &Option::<DateTime<Utc>>::None,
+                ],
+            )
+            .await?;
+        }
+
+        for name in adversaries {
+            let Some(adverse_party_id) = upsert_party_pg(&mut conn, name).await? else {
+                continue;
+            };
+            conn.execute(
+                "INSERT INTO matter_parties (id, matter_id, party_id, role, opened_at, closed_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (matter_id, party_id, role) DO UPDATE \
+                 SET opened_at = COALESCE(matter_parties.opened_at, EXCLUDED.opened_at), \
+                     updated_at = NOW()",
+                &[
+                    &Uuid::new_v4(),
+                    &matter_id,
+                    &adverse_party_id,
+                    &PartyRole::Adverse.as_str(),
+                    &opened_at,
+                    &Option::<DateTime<Utc>>::None,
+                ],
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn record_conflict_clearance(
+        &self,
+        row: &ConflictClearanceRecord,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO conflict_clearances \
+             (id, matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                &Uuid::new_v4(),
+                &row.matter_id,
+                &row.checked_by,
+                &row.cleared_by,
+                &row.decision.as_str(),
+                &row.note,
+                &row.hits_json,
+                &row.hit_count,
+            ],
+        )
+        .await?;
+        Ok(())
     }
 }
 
