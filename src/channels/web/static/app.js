@@ -182,6 +182,21 @@ bindClick('auth-connect-btn', authenticate);
       e.preventDefault();
       createMatterFromForm();
     });
+    mattersCreateForm.addEventListener('input', handleMatterCreateFormMutation);
+    mattersCreateForm.addEventListener('change', handleMatterCreateFormMutation);
+  }
+  bindClick('matters-review-btn', function(e) {
+    e.preventDefault();
+    reviewMatterCreateConflicts();
+  });
+  bindChange('matter-create-conflict-decision', function() {
+    syncMatterCreateActionState();
+  });
+  var conflictNote = byId('matter-create-conflict-note');
+  if (conflictNote) {
+    conflictNote.addEventListener('input', function() {
+      syncMatterCreateActionState();
+    });
   }
   var mattersConflictForm = byId('matters-conflict-form');
   if (mattersConflictForm) {
@@ -3833,6 +3848,17 @@ var mattersGroupByClient = (function() {
     return false;
   }
 })();
+/** Conflict-review state for create-matter intake flow. */
+var matterCreateReviewState = {
+  status: 'unreviewed',
+  signature: null,
+  matched: false,
+  hits: [],
+  checkedParties: [],
+};
+/** Busy flags for create/review actions. */
+var matterCreateBusy = false;
+var matterCreateReviewBusy = false;
 
 function parseCsvList(raw) {
   if (!raw) return [];
@@ -3842,18 +3868,221 @@ function parseCsvList(raw) {
     .filter(function(v) { return !!v; });
 }
 
-function setCreateMatterBusy(isBusy) {
-  var form = document.getElementById('matters-create-form');
-  var button = document.getElementById('matters-create-btn');
+function readMatterCreateFormValues() {
+  return {
+    matter_id: byId('matter-create-id') ? byId('matter-create-id').value.trim() : '',
+    client: byId('matter-create-client') ? byId('matter-create-client').value.trim() : '',
+    confidentiality: byId('matter-create-confidentiality') ? byId('matter-create-confidentiality').value.trim() : '',
+    retention: byId('matter-create-retention') ? byId('matter-create-retention').value.trim() : '',
+    jurisdiction: byId('matter-create-jurisdiction') ? byId('matter-create-jurisdiction').value.trim() : '',
+    practice_area: byId('matter-create-practice-area') ? byId('matter-create-practice-area').value.trim() : '',
+    opened_at: byId('matter-create-opened-at') ? byId('matter-create-opened-at').value.trim() : '',
+    team: parseCsvList(byId('matter-create-team') ? byId('matter-create-team').value : ''),
+    adversaries: parseCsvList(byId('matter-create-adversaries') ? byId('matter-create-adversaries').value : ''),
+  };
+}
+
+function validateMatterCreateForm(formData) {
+  if (!formData.matter_id || !formData.client || !formData.confidentiality || !formData.retention) {
+    return 'Matter ID, client, confidentiality, and retention are required.';
+  }
+  if (formData.opened_at && !/^\d{4}-\d{2}-\d{2}$/.test(formData.opened_at)) {
+    return 'Opened date must use YYYY-MM-DD.';
+  }
+  return null;
+}
+
+function matterCreateFormSignature(formData) {
+  return JSON.stringify({
+    matter_id: formData.matter_id,
+    client: formData.client,
+    confidentiality: formData.confidentiality,
+    retention: formData.retention,
+    jurisdiction: formData.jurisdiction,
+    practice_area: formData.practice_area,
+    opened_at: formData.opened_at,
+    team: formData.team,
+    adversaries: formData.adversaries,
+  });
+}
+
+function parseErrorPayload(err) {
+  if (!err || !err.message) return null;
+  try {
+    return JSON.parse(err.message);
+  } catch (_) {
+    return null;
+  }
+}
+
+function decisionNeedsNote(decision) {
+  return decision === 'waived' || decision === 'declined';
+}
+
+function setMatterCreateReviewStatus(message, tone) {
+  var status = byId('matters-create-review-status');
+  if (!status) return;
+  status.textContent = message;
+  status.classList.remove('state-success', 'state-warning', 'state-error');
+  if (tone === 'success') status.classList.add('state-success');
+  if (tone === 'warning') status.classList.add('state-warning');
+  if (tone === 'error') status.classList.add('state-error');
+}
+
+function getMatterCreateDecision() {
+  var select = byId('matter-create-conflict-decision');
+  return select ? select.value : 'clear';
+}
+
+function getMatterCreateDecisionNote() {
+  var note = byId('matter-create-conflict-note');
+  return note ? note.value.trim() : '';
+}
+
+function canCreateMatterFromReview(formData) {
+  if (matterCreateReviewState.status !== 'reviewed') return false;
+  if (matterCreateReviewState.signature !== matterCreateFormSignature(formData)) return false;
+  if (!matterCreateReviewState.matched) return true;
+  var decision = getMatterCreateDecision();
+  if (!decision) return false;
+  if (decisionNeedsNote(decision) && !getMatterCreateDecisionNote()) return false;
+  return true;
+}
+
+function renderMatterCreateHits(hits) {
+  var container = byId('matters-create-review-hits');
+  if (!container) return;
+  if (!hits || !hits.length) {
+    container.innerHTML = '';
+    return;
+  }
+
+  var html = '<div class="matter-review-table-wrap"><table class="matter-review-table"><thead><tr>'
+    + '<th>Party</th><th>Role</th><th>Matter</th><th>Status</th><th>Matched Via</th>'
+    + '</tr></thead><tbody>';
+  for (var i = 0; i < hits.length; i++) {
+    var hit = hits[i];
+    html += '<tr>';
+    html += '<td>' + escapeHtml(hit.party || '') + '</td>';
+    html += '<td>' + escapeHtml(hit.role || '') + '</td>';
+    html += '<td>' + escapeHtml(hit.matter_id || '') + '</td>';
+    html += '<td>' + escapeHtml(hit.matter_status || '') + '</td>';
+    html += '<td>' + escapeHtml(hit.matched_via || '') + '</td>';
+    html += '</tr>';
+  }
+  html += '</tbody></table></div>';
+  container.innerHTML = html;
+}
+
+function syncMatterCreateActionState() {
+  var formData = readMatterCreateFormValues();
+  var reviewBtn = byId('matters-review-btn');
+  var createBtn = byId('matters-create-btn');
+  var controls = byId('matters-create-clearance-controls');
+  var noteInput = byId('matter-create-conflict-note');
+  var decision = getMatterCreateDecision();
+
+  if (reviewBtn) {
+    reviewBtn.disabled = matterCreateBusy || matterCreateReviewBusy;
+    reviewBtn.textContent = matterCreateReviewBusy ? 'Reviewing…' : 'Review Conflicts';
+  }
+
+  if (controls) {
+    controls.style.display = (matterCreateReviewState.status === 'reviewed' && matterCreateReviewState.matched)
+      ? 'grid'
+      : 'none';
+  }
+  if (noteInput) {
+    noteInput.required = matterCreateReviewState.matched && decisionNeedsNote(decision);
+  }
+
+  if (createBtn) {
+    createBtn.disabled = matterCreateBusy
+      || matterCreateReviewBusy
+      || !canCreateMatterFromReview(formData);
+    createBtn.textContent = matterCreateBusy ? 'Creating…' : 'Create & Activate';
+  }
+}
+
+function resetMatterCreateReview(message, tone) {
+  matterCreateReviewState.status = 'unreviewed';
+  matterCreateReviewState.signature = null;
+  matterCreateReviewState.matched = false;
+  matterCreateReviewState.hits = [];
+  matterCreateReviewState.checkedParties = [];
+  renderMatterCreateHits([]);
+
+  var decision = byId('matter-create-conflict-decision');
+  if (decision) decision.value = 'clear';
+  var note = byId('matter-create-conflict-note');
+  if (note) note.value = '';
+
+  setMatterCreateReviewStatus(message || 'Run conflict review before creating this matter.', tone || null);
+  syncMatterCreateActionState();
+}
+
+function applyMatterCreateReviewResult(payload, signature) {
+  var hits = (payload && Array.isArray(payload.hits)) ? payload.hits : [];
+  matterCreateReviewState.status = 'reviewed';
+  matterCreateReviewState.signature = signature;
+  matterCreateReviewState.matched = !!(payload && payload.matched);
+  matterCreateReviewState.hits = hits;
+  matterCreateReviewState.checkedParties =
+    (payload && Array.isArray(payload.checked_parties)) ? payload.checked_parties : [];
+
+  if (matterCreateReviewState.matched) {
+    setMatterCreateReviewStatus(
+      hits.length + ' potential conflict' + (hits.length === 1 ? '' : 's')
+      + ' found. Choose a decision to continue.',
+      'warning'
+    );
+  } else {
+    setMatterCreateReviewStatus('No conflicts detected. You can create this matter now.', 'success');
+  }
+
+  var decision = byId('matter-create-conflict-decision');
+  if (decision) decision.value = 'clear';
+  var note = byId('matter-create-conflict-note');
+  if (note) note.value = '';
+  renderMatterCreateHits(hits);
+  syncMatterCreateActionState();
+}
+
+function handleMatterCreateFormMutation() {
+  if (!matterCreateReviewState.signature) {
+    syncMatterCreateActionState();
+    return;
+  }
+  var currentSignature = matterCreateFormSignature(readMatterCreateFormValues());
+  if (currentSignature !== matterCreateReviewState.signature) {
+    resetMatterCreateReview('Matter form changed. Re-run conflict review before creating.', 'warning');
+    return;
+  }
+  syncMatterCreateActionState();
+}
+
+function setMatterCreateReviewBusy(isBusy) {
+  matterCreateReviewBusy = isBusy;
+  var form = byId('matters-create-form');
   if (form) {
-    var fields = form.querySelectorAll('input, button');
+    var fields = form.querySelectorAll('input, textarea, select, button');
     for (var i = 0; i < fields.length; i++) {
-      fields[i].disabled = isBusy;
+      fields[i].disabled = isBusy || matterCreateBusy;
     }
   }
-  if (button) {
-    button.textContent = isBusy ? 'Creating…' : 'Create & Activate';
+  syncMatterCreateActionState();
+}
+
+function setCreateMatterBusy(isBusy) {
+  matterCreateBusy = isBusy;
+  var form = document.getElementById('matters-create-form');
+  if (form) {
+    var fields = form.querySelectorAll('input, textarea, select, button');
+    for (var i = 0; i < fields.length; i++) {
+      fields[i].disabled = isBusy || matterCreateReviewBusy;
+    }
   }
+  syncMatterCreateActionState();
 }
 
 function setMattersGroupToggleFromState() {
@@ -4284,56 +4513,126 @@ function renderMatters() {
   list.innerHTML = html;
 }
 
-function createMatterFromForm() {
-  var matterId = byId('matter-create-id') ? byId('matter-create-id').value.trim() : '';
-  var client = byId('matter-create-client') ? byId('matter-create-client').value.trim() : '';
-  var confidentiality = byId('matter-create-confidentiality') ? byId('matter-create-confidentiality').value.trim() : '';
-  var retention = byId('matter-create-retention') ? byId('matter-create-retention').value.trim() : '';
-  var jurisdiction = byId('matter-create-jurisdiction') ? byId('matter-create-jurisdiction').value.trim() : '';
-  var practiceArea = byId('matter-create-practice-area') ? byId('matter-create-practice-area').value.trim() : '';
-  var openedAt = byId('matter-create-opened-at') ? byId('matter-create-opened-at').value.trim() : '';
-  var team = parseCsvList(byId('matter-create-team') ? byId('matter-create-team').value : '');
-  var adversaries = parseCsvList(byId('matter-create-adversaries') ? byId('matter-create-adversaries').value : '');
-
-  if (!matterId || !client || !confidentiality || !retention) {
-    showToast('Matter ID, client, confidentiality, and retention are required.', 'error');
+function reviewMatterCreateConflicts() {
+  var formData = readMatterCreateFormValues();
+  var validationError = validateMatterCreateForm(formData);
+  if (validationError) {
+    showToast(validationError, 'error');
     return;
   }
-  if (openedAt && !/^\d{4}-\d{2}-\d{2}$/.test(openedAt)) {
-    showToast('Opened date must use YYYY-MM-DD.', 'error');
+
+  var signature = matterCreateFormSignature(formData);
+  setMatterCreateReviewStatus('Running conflict review…', null);
+  setMatterCreateReviewBusy(true);
+
+  apiFetch('/api/matters/conflict-check', {
+    method: 'POST',
+    body: {
+      matter_id: formData.matter_id,
+      client_names: [formData.client],
+      adversary_names: formData.adversaries,
+    },
+  }).then(function(data) {
+    applyMatterCreateReviewResult(data, signature);
+    if (data && data.matched) {
+      showToast('Potential conflicts found. Review required before creation.', 'error');
+    } else {
+      showToast('No conflicts detected for intake parties.', 'success');
+    }
+  }).catch(function(err) {
+    var payload = parseErrorPayload(err);
+    var message = payload && payload.error ? payload.error : err.message;
+    setMatterCreateReviewStatus('Conflict review failed: ' + message, 'error');
+    showToast('Conflict review failed: ' + message, 'error');
+    syncMatterCreateActionState();
+  }).finally(function() {
+    setMatterCreateReviewBusy(false);
+  });
+}
+
+function createMatterFromForm() {
+  var formData = readMatterCreateFormValues();
+  var validationError = validateMatterCreateForm(formData);
+  if (validationError) {
+    showToast(validationError, 'error');
+    return;
+  }
+  if (!canCreateMatterFromReview(formData)) {
+    showToast('Run conflict review for current form values before creating.', 'error');
     return;
   }
 
   var body = {
-    matter_id: matterId,
-    client: client,
-    confidentiality: confidentiality,
-    retention: retention,
-    team: team,
-    adversaries: adversaries,
+    matter_id: formData.matter_id,
+    client: formData.client,
+    confidentiality: formData.confidentiality,
+    retention: formData.retention,
+    team: formData.team,
+    adversaries: formData.adversaries,
   };
-  if (jurisdiction) body.jurisdiction = jurisdiction;
-  if (practiceArea) body.practice_area = practiceArea;
-  if (openedAt) body.opened_at = openedAt;
+  if (formData.jurisdiction) body.jurisdiction = formData.jurisdiction;
+  if (formData.practice_area) body.practice_area = formData.practice_area;
+  if (formData.opened_at) body.opened_at = formData.opened_at;
+  if (matterCreateReviewState.matched) {
+    body.conflict_decision = getMatterCreateDecision();
+    var note = getMatterCreateDecisionNote();
+    if (note) body.conflict_note = note;
+  }
 
   setCreateMatterBusy(true);
   apiFetch('/api/matters', {
     method: 'POST',
     body: body,
   }).then(function(data) {
-    var createdId = data && data.active_matter_id ? data.active_matter_id : matterId;
+    var createdId = data && data.active_matter_id ? data.active_matter_id : formData.matter_id;
     activeMatterId = createdId;
     selectedMatterId = createdId;
     var form = byId('matters-create-form');
     if (form) form.reset();
+    resetMatterCreateReview('Run conflict review before creating this matter.', null);
     showToast('Matter created and activated: ' + createdId, 'success');
     loadMatters();
   }).catch(function(err) {
-    showToast('Failed to create matter: ' + err.message, 'error');
+    var payload = parseErrorPayload(err);
+    if (payload && payload.conflict_required && Array.isArray(payload.hits)) {
+      applyMatterCreateReviewResult(
+        {
+          matched: true,
+          hits: payload.hits,
+          checked_parties: matterCreateReviewState.checkedParties,
+        },
+        matterCreateFormSignature(formData)
+      );
+      setMatterCreateReviewStatus(
+        'Potential conflicts found. Select a decision and re-submit.',
+        'warning'
+      );
+      showToast('Conflict decision required before matter creation.', 'error');
+      return;
+    }
+    if (payload && payload.decision === 'declined') {
+      applyMatterCreateReviewResult(
+        {
+          matched: true,
+          hits: Array.isArray(payload.hits) ? payload.hits : matterCreateReviewState.hits,
+          checked_parties: matterCreateReviewState.checkedParties,
+        },
+        matterCreateFormSignature(formData)
+      );
+      setMatterCreateReviewStatus(
+        'Matter creation declined. You can change decision to clear or waived to proceed.',
+        'error'
+      );
+      showToast('Matter creation declined by conflict decision.', 'error');
+      return;
+    }
+    showToast('Failed to create matter: ' + (payload && payload.error ? payload.error : err.message), 'error');
   }).finally(function() {
     setCreateMatterBusy(false);
   });
 }
+
+resetMatterCreateReview('Run conflict review before creating this matter.', null);
 
 /**
  * Set the active matter to `id`.
