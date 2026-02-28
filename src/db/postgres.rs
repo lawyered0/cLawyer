@@ -2691,19 +2691,11 @@ impl TimeExpenseStore for PgBackend {
                 "SELECT \
                     COALESCE(SUM(hours), 0)::numeric AS total_hours, \
                     COALESCE(SUM(CASE WHEN billable THEN hours ELSE 0 END), 0)::numeric AS billable_hours, \
-                    COALESCE(SUM(CASE WHEN billed_invoice_id IS NULL THEN hours ELSE 0 END), 0)::numeric AS unbilled_hours \
+                    COALESCE(SUM(CASE WHEN billed_invoice_id IS NULL THEN hours ELSE 0 END), 0)::numeric AS unbilled_hours, \
+                    COALESCE((SELECT SUM(amount) FROM expense_entries WHERE user_id = $1 AND matter_id = $2), 0)::numeric AS total_expenses, \
+                    COALESCE((SELECT SUM(CASE WHEN billable THEN amount ELSE 0 END) FROM expense_entries WHERE user_id = $1 AND matter_id = $2), 0)::numeric AS billable_expenses, \
+                    COALESCE((SELECT SUM(CASE WHEN billed_invoice_id IS NULL THEN amount ELSE 0 END) FROM expense_entries WHERE user_id = $1 AND matter_id = $2), 0)::numeric AS unbilled_expenses \
                  FROM time_entries \
-                 WHERE user_id = $1 AND matter_id = $2",
-                &[&user_id, &matter_id],
-            )
-            .await?;
-        let expenses = conn
-            .query_one(
-                "SELECT \
-                    COALESCE(SUM(amount), 0)::numeric AS total_expenses, \
-                    COALESCE(SUM(CASE WHEN billable THEN amount ELSE 0 END), 0)::numeric AS billable_expenses, \
-                    COALESCE(SUM(CASE WHEN billed_invoice_id IS NULL THEN amount ELSE 0 END), 0)::numeric AS unbilled_expenses \
-                 FROM expense_entries \
                  WHERE user_id = $1 AND matter_id = $2",
                 &[&user_id, &matter_id],
             )
@@ -2713,9 +2705,9 @@ impl TimeExpenseStore for PgBackend {
             total_hours: row.get("total_hours"),
             billable_hours: row.get("billable_hours"),
             unbilled_hours: row.get("unbilled_hours"),
-            total_expenses: expenses.get("total_expenses"),
-            billable_expenses: expenses.get("billable_expenses"),
-            unbilled_expenses: expenses.get("unbilled_expenses"),
+            total_expenses: row.get("total_expenses"),
+            billable_expenses: row.get("billable_expenses"),
+            unbilled_expenses: row.get("unbilled_expenses"),
         })
     }
 }
