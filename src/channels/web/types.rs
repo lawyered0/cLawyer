@@ -416,6 +416,114 @@ pub struct UpdateMatterNoteRequest {
     pub pinned: Option<bool>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct TimeEntryInfo {
+    pub id: String,
+    pub timekeeper: String,
+    pub description: String,
+    pub hours: String,
+    pub hourly_rate: Option<String>,
+    pub entry_date: String,
+    pub billable: bool,
+    pub billed_invoice_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterTimeEntriesResponse {
+    pub entries: Vec<TimeEntryInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTimeEntryRequest {
+    pub timekeeper: String,
+    pub description: String,
+    pub hours: String,
+    #[serde(default)]
+    pub hourly_rate: Option<String>,
+    pub entry_date: String,
+    #[serde(default)]
+    pub billable: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateTimeEntryRequest {
+    #[serde(default)]
+    pub timekeeper: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub hours: Option<String>,
+    #[serde(default)]
+    pub hourly_rate: Option<Option<String>>,
+    #[serde(default)]
+    pub entry_date: Option<String>,
+    #[serde(default)]
+    pub billable: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExpenseEntryInfo {
+    pub id: String,
+    pub submitted_by: String,
+    pub description: String,
+    pub amount: String,
+    pub category: String,
+    pub entry_date: String,
+    pub receipt_path: Option<String>,
+    pub billable: bool,
+    pub billed_invoice_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterExpenseEntriesResponse {
+    pub entries: Vec<ExpenseEntryInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateExpenseEntryRequest {
+    pub submitted_by: String,
+    pub description: String,
+    pub amount: String,
+    pub category: String,
+    pub entry_date: String,
+    #[serde(default)]
+    pub receipt_path: Option<String>,
+    #[serde(default)]
+    pub billable: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateExpenseEntryRequest {
+    #[serde(default)]
+    pub submitted_by: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub amount: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub entry_date: Option<String>,
+    #[serde(default)]
+    pub receipt_path: Option<Option<String>>,
+    #[serde(default)]
+    pub billable: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterTimeSummaryResponse {
+    pub total_hours: String,
+    pub billable_hours: String,
+    pub unbilled_hours: String,
+    pub total_expenses: String,
+    pub billable_expenses: String,
+    pub unbilled_expenses: String,
+}
+
 /// Response for `GET /api/matters/active`.
 #[derive(Debug, Serialize)]
 pub struct ActiveMatterResponse {
