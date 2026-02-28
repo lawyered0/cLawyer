@@ -18,13 +18,17 @@ use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
     ClientRecord, ClientStore, ClientType, ConflictClearanceRecord, ConflictHit, ConversationStore,
-    CreateClientParams, CreateMatterDeadlineParams, CreateMatterNoteParams, CreateMatterTaskParams,
-    Database, JobStore, LegalConflictStore, MatterDeadlineRecord, MatterDeadlineStore,
-    MatterDeadlineType, MatterNoteRecord, MatterNoteStore, MatterRecord, MatterStatus, MatterStore,
-    MatterTaskRecord, MatterTaskStatus, MatterTaskStore, PartyRole, RoutineStore, SandboxStore,
-    SettingsStore, ToolFailureStore, UpdateClientParams, UpdateMatterDeadlineParams,
-    UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpsertMatterParams,
-    WorkspaceStore, conflict_terms_from_text, normalize_party_name,
+    CreateClientParams, CreateDocumentVersionParams, CreateMatterDeadlineParams,
+    CreateMatterNoteParams, CreateMatterTaskParams, Database, DocumentTemplateRecord,
+    DocumentTemplateStore, DocumentVersionRecord, DocumentVersionStore, JobStore,
+    LegalConflictStore, MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType,
+    MatterDocumentCategory, MatterDocumentRecord, MatterDocumentStore, MatterNoteRecord,
+    MatterNoteStore, MatterRecord, MatterStatus, MatterStore, MatterTaskRecord, MatterTaskStatus,
+    MatterTaskStore, PartyRole, RoutineStore, SandboxStore, SettingsStore, ToolFailureStore,
+    UpdateClientParams, UpdateDocumentTemplateParams, UpdateMatterDeadlineParams,
+    UpdateMatterDocumentParams, UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams,
+    UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams, WorkspaceStore,
+    conflict_terms_from_text, normalize_party_name,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -317,6 +321,60 @@ fn row_to_matter_deadline_record(
         rule_ref: row.get("rule_ref"),
         computed_from: row.get("computed_from"),
         task_id: row.get("task_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_matter_document_record(
+    row: &tokio_postgres::Row,
+) -> Result<MatterDocumentRecord, DatabaseError> {
+    let category_raw: String = row.get("category");
+    let category = MatterDocumentCategory::from_db_value(&category_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!(
+            "invalid matter document category '{}'",
+            category_raw
+        ))
+    })?;
+    Ok(MatterDocumentRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        memory_document_id: row.get("memory_document_id"),
+        path: row.get("path"),
+        display_name: row.get("display_name"),
+        category,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_document_version_record(
+    row: &tokio_postgres::Row,
+) -> Result<DocumentVersionRecord, DatabaseError> {
+    Ok(DocumentVersionRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_document_id: row.get("matter_document_id"),
+        version_number: row.get("version_number"),
+        label: row.get("label"),
+        memory_document_id: row.get("memory_document_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_document_template_record(
+    row: &tokio_postgres::Row,
+) -> Result<DocumentTemplateRecord, DatabaseError> {
+    let variables_json: serde_json::Value = row.get("variables_json");
+    Ok(DocumentTemplateRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        name: row.get("name"),
+        body: row.get("body"),
+        variables_json,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
@@ -1854,6 +1912,416 @@ impl MatterDeadlineStore for PgBackend {
             .execute(
                 "DELETE FROM matter_deadlines WHERE user_id = $1 AND matter_id = $2 AND id = $3",
                 &[&user_id, &matter_id, &deadline_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+// ==================== MatterDocumentStore ====================
+
+#[async_trait]
+impl MatterDocumentStore for PgBackend {
+    async fn list_matter_documents_db(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterDocumentRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at \
+                 FROM matter_documents md \
+                 JOIN memory_documents d ON d.id = md.memory_document_id \
+                 WHERE md.user_id = $1 AND md.matter_id = $2 \
+                 ORDER BY d.path ASC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_matter_document_record(&row))
+            .collect()
+    }
+
+    async fn get_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at \
+                 FROM matter_documents md \
+                 JOIN memory_documents d ON d.id = md.memory_document_id \
+                 WHERE md.user_id = $1 AND md.matter_id = $2 AND md.id = $3",
+                &[&user_id, &matter_id, &matter_document_id],
+            )
+            .await?;
+        row.map(|row| row_to_matter_document_record(&row))
+            .transpose()
+    }
+
+    async fn upsert_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &UpsertMatterDocumentParams,
+    ) -> Result<MatterDocumentRecord, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO matter_documents \
+                 (id, user_id, matter_id, memory_document_id, display_name, category) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (user_id, matter_id, memory_document_id) DO UPDATE SET \
+                    display_name = EXCLUDED.display_name, \
+                    category = EXCLUDED.category, \
+                    updated_at = NOW() \
+                 RETURNING id",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.memory_document_id,
+                    &input.display_name,
+                    &input.category.as_str(),
+                ],
+            )
+            .await?;
+        let id: Uuid = row.get("id");
+        self.get_matter_document(user_id, matter_id, id)
+            .await?
+            .ok_or_else(|| {
+                DatabaseError::Query("failed to load upserted matter document".to_string())
+            })
+    }
+
+    async fn update_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+        input: &UpdateMatterDocumentParams,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError> {
+        let Some(existing) = self
+            .get_matter_document(user_id, matter_id, matter_document_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let merged_display_name = input
+            .display_name
+            .clone()
+            .unwrap_or(existing.display_name.clone());
+        let merged_category = input.category.unwrap_or(existing.category);
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "UPDATE matter_documents SET \
+                display_name = $4, \
+                category = $5, \
+                updated_at = NOW() \
+             WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+            &[
+                &user_id,
+                &matter_id,
+                &matter_document_id,
+                &merged_display_name,
+                &merged_category.as_str(),
+            ],
+        )
+        .await?;
+
+        self.get_matter_document(user_id, matter_id, matter_document_id)
+            .await
+    }
+
+    async fn delete_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM matter_documents WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &matter_document_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+// ==================== DocumentVersionStore ====================
+
+#[async_trait]
+impl DocumentVersionStore for PgBackend {
+    async fn list_document_versions(
+        &self,
+        user_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Vec<DocumentVersionRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_document_id, version_number, label, memory_document_id, created_at, updated_at \
+                 FROM document_versions \
+                 WHERE user_id = $1 AND matter_document_id = $2 \
+                 ORDER BY version_number DESC",
+                &[&user_id, &matter_document_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_document_version_record(&row))
+            .collect()
+    }
+
+    async fn create_document_version(
+        &self,
+        user_id: &str,
+        input: &CreateDocumentVersionParams,
+    ) -> Result<DocumentVersionRecord, DatabaseError> {
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+        let next_row = tx
+            .query_one(
+                "SELECT COALESCE(MAX(version_number), 0) + 1 \
+                 FROM document_versions \
+                 WHERE user_id = $1 AND matter_document_id = $2",
+                &[&user_id, &input.matter_document_id],
+            )
+            .await?;
+        let next_version: i32 = next_row.get(0);
+        let inserted = tx
+            .query_one(
+                "INSERT INTO document_versions \
+                 (id, user_id, matter_document_id, version_number, label, memory_document_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 RETURNING id, user_id, matter_document_id, version_number, label, memory_document_id, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &input.matter_document_id,
+                    &next_version,
+                    &input.label,
+                    &input.memory_document_id,
+                ],
+            )
+            .await?;
+        tx.commit().await?;
+        row_to_document_version_record(&inserted)
+    }
+}
+
+// ==================== DocumentTemplateStore ====================
+
+#[async_trait]
+impl DocumentTemplateStore for PgBackend {
+    async fn list_document_templates(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+    ) -> Result<Vec<DocumentTemplateRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = if let Some(matter_id) = matter_id {
+            conn.query(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = $1 AND (matter_id = $2 OR matter_id IS NULL) \
+                 ORDER BY CASE WHEN matter_id = $2 THEN 0 ELSE 1 END, name ASC",
+                &[&user_id, &matter_id],
+            )
+            .await?
+        } else {
+            conn.query(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = $1 \
+                 ORDER BY name ASC",
+                &[&user_id],
+            )
+            .await?
+        };
+        rows.into_iter()
+            .map(|row| row_to_document_template_record(&row))
+            .collect()
+    }
+
+    async fn get_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = $1 AND id = $2",
+                &[&user_id, &template_id],
+            )
+            .await?;
+        row.map(|row| row_to_document_template_record(&row))
+            .transpose()
+    }
+
+    async fn get_document_template_by_name(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = if let Some(matter_id) = matter_id {
+            conn.query_opt(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = $1 AND name = $2 AND (matter_id = $3 OR matter_id IS NULL) \
+                 ORDER BY CASE WHEN matter_id = $3 THEN 0 ELSE 1 END \
+                 LIMIT 1",
+                &[&user_id, &name, &matter_id],
+            )
+            .await?
+        } else {
+            conn.query_opt(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = $1 AND name = $2 AND matter_id IS NULL \
+                 LIMIT 1",
+                &[&user_id, &name],
+            )
+            .await?
+        };
+
+        row.map(|row| row_to_document_template_record(&row))
+            .transpose()
+    }
+
+    async fn upsert_document_template(
+        &self,
+        user_id: &str,
+        input: &UpsertDocumentTemplateParams,
+    ) -> Result<DocumentTemplateRecord, DatabaseError> {
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+        let variables_json = if input.variables_json.is_array() || input.variables_json.is_object()
+        {
+            input.variables_json.clone()
+        } else {
+            serde_json::json!([])
+        };
+
+        let row = if let Some(ref matter_id) = input.matter_id {
+            tx.query_one(
+                "INSERT INTO document_templates \
+                 (id, user_id, matter_id, name, body, variables_json) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (user_id, matter_id, name) DO UPDATE SET \
+                    body = EXCLUDED.body, \
+                    variables_json = EXCLUDED.variables_json, \
+                    updated_at = NOW() \
+                 RETURNING id, user_id, matter_id, name, body, variables_json, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.name,
+                    &input.body,
+                    &variables_json,
+                ],
+            )
+            .await?
+        } else if let Some(existing) = tx
+            .query_opt(
+                "SELECT id FROM document_templates \
+                 WHERE user_id = $1 AND matter_id IS NULL AND name = $2 \
+                 LIMIT 1",
+                &[&user_id, &input.name],
+            )
+            .await?
+        {
+            let existing_id: Uuid = existing.get("id");
+            tx.query_one(
+                "UPDATE document_templates SET \
+                    body = $3, \
+                    variables_json = $4, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND id = $2 \
+                 RETURNING id, user_id, matter_id, name, body, variables_json, created_at, updated_at",
+                &[&user_id, &existing_id, &input.body, &variables_json],
+            )
+            .await?
+        } else {
+            tx.query_one(
+                "INSERT INTO document_templates \
+                 (id, user_id, matter_id, name, body, variables_json) \
+                 VALUES ($1, $2, NULL, $3, $4, $5) \
+                 RETURNING id, user_id, matter_id, name, body, variables_json, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &input.name,
+                    &input.body,
+                    &variables_json,
+                ],
+            )
+            .await?
+        };
+        tx.commit().await?;
+        row_to_document_template_record(&row)
+    }
+
+    async fn update_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+        input: &UpdateDocumentTemplateParams,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError> {
+        let Some(existing) = self.get_document_template(user_id, template_id).await? else {
+            return Ok(None);
+        };
+
+        let merged_name = input.name.clone().unwrap_or(existing.name);
+        let merged_body = input.body.clone().unwrap_or(existing.body);
+        let merged_vars = input
+            .variables_json
+            .clone()
+            .unwrap_or(existing.variables_json);
+        let merged_vars = if merged_vars.is_array() || merged_vars.is_object() {
+            merged_vars
+        } else {
+            serde_json::json!([])
+        };
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "UPDATE document_templates SET \
+                    name = $3, \
+                    body = $4, \
+                    variables_json = $5, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND id = $2 \
+                 RETURNING id, user_id, matter_id, name, body, variables_json, created_at, updated_at",
+                &[&user_id, &template_id, &merged_name, &merged_body, &merged_vars],
+            )
+            .await?;
+        Ok(Some(row_to_document_template_record(&row)?))
+    }
+
+    async fn delete_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM document_templates WHERE user_id = $1 AND id = $2",
+                &[&user_id, &template_id],
             )
             .await?;
         Ok(deleted > 0)

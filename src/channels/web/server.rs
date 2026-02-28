@@ -39,10 +39,11 @@ use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
 use crate::db::{
     ClientType, ConflictClearanceRecord, ConflictDecision, ConflictHit, CreateClientParams,
-    CreateMatterDeadlineParams, CreateMatterNoteParams, CreateMatterTaskParams, Database,
-    MatterDeadlineType, MatterStatus, MatterTaskStatus, UpdateClientParams,
-    UpdateMatterDeadlineParams, UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams,
-    UpsertMatterParams,
+    CreateDocumentVersionParams, CreateMatterDeadlineParams, CreateMatterNoteParams,
+    CreateMatterTaskParams, Database, MatterDeadlineType, MatterDocumentCategory, MatterStatus,
+    MatterTaskStatus, UpdateClientParams, UpdateMatterDeadlineParams, UpdateMatterNoteParams,
+    UpdateMatterParams, UpdateMatterTaskParams, UpsertDocumentTemplateParams,
+    UpsertMatterDocumentParams, UpsertMatterParams,
 };
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -282,6 +283,7 @@ pub async fn start_server(
             "/api/matters/{id}/templates/apply",
             post(matter_template_apply_handler),
         )
+        .route("/api/documents/generate", post(documents_generate_handler))
         .route(
             "/api/matters/{id}/filing-package",
             post(matter_filing_package_handler),
@@ -1547,6 +1549,44 @@ async fn choose_template_apply_destination(
     ))
 }
 
+async fn choose_generated_document_destination(
+    workspace: &Workspace,
+    matter_prefix: &str,
+    template_name: &str,
+    timestamp: &str,
+) -> Result<String, (StatusCode, String)> {
+    let parsed = FsPath::new(template_name);
+    let stem = parsed
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("generated-document");
+    let ext = parsed
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("md");
+
+    for counter in 1usize..=999 {
+        let suffix = if counter == 1 {
+            String::new()
+        } else {
+            format!("-{}", counter)
+        };
+        let candidate = format!("{matter_prefix}/drafts/{stem}-{timestamp}{suffix}.{ext}");
+        match workspace.read(&candidate).await {
+            Ok(_) => continue,
+            Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => return Ok(candidate),
+            Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+        }
+    }
+
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Failed to pick a unique destination for generated document".to_string(),
+    ))
+}
+
 async fn list_matter_documents_recursive(
     workspace: &Workspace,
     matter_prefix: &str,
@@ -1576,9 +1616,13 @@ async fn list_matter_documents_recursive(
             }
 
             documents.push(MatterDocumentInfo {
+                id: None,
+                memory_document_id: None,
                 name,
+                display_name: None,
                 path: entry.path.clone(),
                 is_dir: entry.is_directory,
+                category: None,
                 updated_at: entry.updated_at.map(|dt| dt.to_rfc3339()),
             });
 
@@ -1818,14 +1862,152 @@ async fn list_matter_templates(
                 return None;
             }
             Some(MatterTemplateInfo {
+                id: None,
+                matter_id: Some(matter_id.to_string()),
                 name,
                 path: entry.path,
+                variables_json: None,
                 updated_at: entry.updated_at.map(|dt| dt.to_rfc3339()),
             })
         })
         .collect();
     templates.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(templates)
+}
+
+fn document_template_record_to_info(
+    record: crate::db::DocumentTemplateRecord,
+) -> MatterTemplateInfo {
+    let path = match record.matter_id.as_ref() {
+        Some(matter_id) => format!("{MATTER_ROOT}/{matter_id}/templates/{}", record.name),
+        None => format!("templates/shared/{}", record.name),
+    };
+    MatterTemplateInfo {
+        id: Some(record.id.to_string()),
+        matter_id: record.matter_id,
+        name: record.name,
+        path,
+        variables_json: Some(record.variables_json),
+        updated_at: Some(record.updated_at.to_rfc3339()),
+    }
+}
+
+fn matter_document_record_to_info(record: crate::db::MatterDocumentRecord) -> MatterDocumentInfo {
+    let fallback_name = record.path.rsplit('/').next().unwrap_or("").to_string();
+    MatterDocumentInfo {
+        id: Some(record.id.to_string()),
+        memory_document_id: Some(record.memory_document_id.to_string()),
+        name: fallback_name,
+        display_name: Some(record.display_name),
+        path: record.path,
+        is_dir: false,
+        category: Some(record.category.as_str().to_string()),
+        updated_at: Some(record.updated_at.to_rfc3339()),
+    }
+}
+
+async fn backfill_matter_templates_from_workspace(
+    state: &GatewayState,
+    matter_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(());
+    };
+    let Some(workspace) = state.workspace.as_ref() else {
+        return Ok(());
+    };
+    let existing = store
+        .list_document_templates(&state.user_id, Some(matter_id))
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if existing
+        .iter()
+        .any(|template| template.matter_id.as_deref() == Some(matter_id))
+    {
+        return Ok(());
+    }
+
+    let templates = list_matter_templates(workspace.as_ref(), matter_id).await?;
+    for template in templates {
+        let doc = workspace
+            .read(&template.path)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        store
+            .upsert_document_template(
+                &state.user_id,
+                &UpsertDocumentTemplateParams {
+                    matter_id: Some(matter_id.to_string()),
+                    name: template.name,
+                    body: doc.content,
+                    variables_json: serde_json::json!([]),
+                },
+            )
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn backfill_matter_documents_from_workspace(
+    state: &GatewayState,
+    matter_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(());
+    };
+    let Some(workspace) = state.workspace.as_ref() else {
+        return Ok(());
+    };
+
+    let existing = store
+        .list_matter_documents_db(&state.user_id, matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if !existing.is_empty() {
+        return Ok(());
+    }
+
+    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, false).await?;
+    for entry in docs.into_iter().filter(|item| !item.is_dir) {
+        let doc = workspace
+            .read(&entry.path)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        let linked = store
+            .upsert_matter_document(
+                &state.user_id,
+                matter_id,
+                &UpsertMatterDocumentParams {
+                    memory_document_id: doc.id,
+                    path: doc.path.clone(),
+                    display_name: entry.name.clone(),
+                    category: infer_matter_document_category(&entry.path),
+                },
+            )
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        let versions = store
+            .list_document_versions(&state.user_id, linked.id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        if versions.is_empty() {
+            store
+                .create_document_version(
+                    &state.user_id,
+                    &CreateDocumentVersionParams {
+                        matter_document_id: linked.id,
+                        label: "initial".to_string(),
+                        memory_document_id: doc.id,
+                    },
+                )
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn choose_filing_package_destination(
@@ -2666,6 +2848,39 @@ fn parse_matter_deadline_type(value: &str) -> Result<MatterDeadlineType, (Status
             StatusCode::BAD_REQUEST,
             "'deadline_type' must be one of: court_date, filing, statute_of_limitations, response_due, discovery_cutoff, internal".to_string(),
         )),
+    }
+}
+
+fn parse_matter_document_category(
+    value: Option<&str>,
+) -> Result<MatterDocumentCategory, (StatusCode, String)> {
+    let raw = value.unwrap_or("internal").trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "pleading" => Ok(MatterDocumentCategory::Pleading),
+        "correspondence" => Ok(MatterDocumentCategory::Correspondence),
+        "contract" => Ok(MatterDocumentCategory::Contract),
+        "filing" => Ok(MatterDocumentCategory::Filing),
+        "evidence" => Ok(MatterDocumentCategory::Evidence),
+        "internal" | "" => Ok(MatterDocumentCategory::Internal),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "'category' must be one of: pleading, correspondence, contract, filing, evidence, internal".to_string(),
+        )),
+    }
+}
+
+fn infer_matter_document_category(path: &str) -> MatterDocumentCategory {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("/filing") || lower.contains("/pleading") {
+        MatterDocumentCategory::Filing
+    } else if lower.contains("/evidence") {
+        MatterDocumentCategory::Evidence
+    } else if lower.contains("/contract") || lower.contains("/agreement") {
+        MatterDocumentCategory::Contract
+    } else if lower.contains("/correspondence") || lower.contains("/communication") {
+        MatterDocumentCategory::Correspondence
+    } else {
+        MatterDocumentCategory::Internal
     }
 }
 
@@ -3567,10 +3782,50 @@ async fn matter_documents_handler(
     ))?;
     let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
     let include_templates = query.include_templates.unwrap_or(false);
-    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
-    let documents =
+
+    let documents = if state.store.is_some() {
+        ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+        backfill_matter_documents_from_workspace(state.as_ref(), &matter_id).await?;
+        let store = state.store.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Database not available".to_string(),
+        ))?;
+        let mut docs = store
+            .list_matter_documents_db(&state.user_id, &matter_id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+            .into_iter()
+            .map(matter_document_record_to_info)
+            .collect::<Vec<_>>();
+        if include_templates {
+            backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
+            let templates = store
+                .list_document_templates(&state.user_id, Some(&matter_id))
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+            docs.extend(
+                templates
+                    .into_iter()
+                    .map(document_template_record_to_info)
+                    .map(|template| MatterDocumentInfo {
+                        id: template.id,
+                        memory_document_id: None,
+                        name: template.name.clone(),
+                        display_name: Some(template.name),
+                        path: template.path,
+                        is_dir: false,
+                        category: Some("template".to_string()),
+                        updated_at: template.updated_at,
+                    }),
+            );
+            docs.sort_by(|a, b| a.path.cmp(&b.path));
+        }
+        docs
+    } else {
+        let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
         list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, include_templates)
-            .await?;
+            .await?
+    };
 
     Ok(Json(MatterDocumentsResponse {
         matter_id,
@@ -3909,7 +4164,19 @@ async fn matter_templates_handler(
         "Workspace not available".to_string(),
     ))?;
     let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
-    let templates = list_matter_templates(workspace.as_ref(), &matter_id).await?;
+    let templates = if let Some(store) = state.store.as_ref() {
+        ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+        backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
+        store
+            .list_document_templates(&state.user_id, Some(&matter_id))
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+            .into_iter()
+            .map(document_template_record_to_info)
+            .collect::<Vec<_>>()
+    } else {
+        list_matter_templates(workspace.as_ref(), &matter_id).await?
+    };
 
     Ok(Json(MatterTemplatesResponse {
         matter_id,
@@ -3929,18 +4196,33 @@ async fn matter_template_apply_handler(
     let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
     let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
     let template_name = parse_template_name(&req.template_name)?;
-    let template_path = format!("{matter_prefix}/templates/{template_name}");
 
-    let template_doc = workspace
-        .read(&template_path)
-        .await
-        .map_err(|err| match err {
-            crate::error::WorkspaceError::DocumentNotFound { .. } => (
+    let template_body = if let Some(store) = state.store.as_ref() {
+        ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+        backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
+        let template = store
+            .get_document_template_by_name(&state.user_id, Some(&matter_id), &template_name)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+            .ok_or((
                 StatusCode::NOT_FOUND,
                 format!("Template '{}' not found", template_name),
-            ),
-            other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
+            ))?;
+        template.body
+    } else {
+        let template_path = format!("{matter_prefix}/templates/{template_name}");
+        workspace
+            .read(&template_path)
+            .await
+            .map_err(|err| match err {
+                crate::error::WorkspaceError::DocumentNotFound { .. } => (
+                    StatusCode::NOT_FOUND,
+                    format!("Template '{}' not found", template_name),
+                ),
+                other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            })?
+            .content
+    };
 
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let destination = choose_template_apply_destination(
@@ -3951,16 +4233,184 @@ async fn matter_template_apply_handler(
     )
     .await?;
 
-    workspace
-        .write(&destination, &template_doc.content)
+    let written = workspace
+        .write(&destination, &template_body)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if let Some(store) = state.store.as_ref() {
+        let linked = store
+            .upsert_matter_document(
+                &state.user_id,
+                &matter_id,
+                &UpsertMatterDocumentParams {
+                    memory_document_id: written.id,
+                    path: written.path.clone(),
+                    display_name: template_name.clone(),
+                    category: MatterDocumentCategory::Internal,
+                },
+            )
+            .await;
+        let linked = match linked {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = workspace.delete(&destination).await;
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+            }
+        };
+        if let Err(err) = store
+            .create_document_version(
+                &state.user_id,
+                &CreateDocumentVersionParams {
+                    matter_document_id: linked.id,
+                    label: "draft".to_string(),
+                    memory_document_id: written.id,
+                },
+            )
+            .await
+        {
+            let _ = store
+                .delete_matter_document(&state.user_id, &matter_id, linked.id)
+                .await;
+            let _ = workspace.delete(&destination).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+        }
+    }
 
     Ok((
         StatusCode::CREATED,
         Json(MatterTemplateApplyResponse {
             path: destination,
             status: "created",
+        }),
+    ))
+}
+
+async fn documents_generate_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<GenerateDocumentRequest>,
+) -> Result<(StatusCode, Json<GenerateDocumentResponse>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &req.matter_id).await?;
+    ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+    backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
+
+    let template_id = parse_uuid(req.template_id.trim(), "template_id")?;
+    let template = store
+        .get_document_template(&state.user_id, template_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Template not found".to_string()))?;
+    if let Some(ref template_matter) = template.matter_id
+        && template_matter != &matter_id
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Template not available for this matter".to_string(),
+        ));
+    }
+
+    let matter = store
+        .get_matter_db(&state.user_id, &matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Matter not found".to_string()))?;
+    let client = store
+        .get_client(&state.user_id, matter.client_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Matter is missing an associated client record".to_string(),
+        ))?;
+
+    let extra = if req.extra.is_object() {
+        req.extra
+    } else {
+        serde_json::json!({})
+    };
+    let context = crate::legal::docgen::build_context(&matter, &client, Some(&extra));
+    let rendered = crate::legal::docgen::render_template(&template.body, &context)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+
+    let category = parse_matter_document_category(req.category.as_deref())?;
+    let display_name =
+        parse_optional_matter_field(req.display_name).unwrap_or_else(|| template.name.clone());
+    let label = parse_optional_matter_field(req.label).unwrap_or_else(|| "draft".to_string());
+    validate_optional_matter_field_length("display_name", &Some(display_name.clone()))?;
+    validate_optional_matter_field_length("label", &Some(label.clone()))?;
+
+    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let destination = choose_generated_document_destination(
+        workspace.as_ref(),
+        &matter_prefix,
+        &template.name,
+        &timestamp,
+    )
+    .await?;
+
+    let written = workspace
+        .write(&destination, &rendered)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let linked = match store
+        .upsert_matter_document(
+            &state.user_id,
+            &matter_id,
+            &UpsertMatterDocumentParams {
+                memory_document_id: written.id,
+                path: written.path.clone(),
+                display_name: display_name.clone(),
+                category,
+            },
+        )
+        .await
+    {
+        Ok(linked) => linked,
+        Err(err) => {
+            let _ = workspace.delete(&destination).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+        }
+    };
+
+    let version = match store
+        .create_document_version(
+            &state.user_id,
+            &CreateDocumentVersionParams {
+                matter_document_id: linked.id,
+                label: label.clone(),
+                memory_document_id: written.id,
+            },
+        )
+        .await
+    {
+        Ok(version) => version,
+        Err(err) => {
+            let _ = store
+                .delete_matter_document(&state.user_id, &matter_id, linked.id)
+                .await;
+            let _ = workspace.delete(&destination).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+        }
+    };
+
+    Ok((
+        StatusCode::CREATED,
+        Json(GenerateDocumentResponse {
+            matter_document_id: linked.id.to_string(),
+            memory_document_id: linked.memory_document_id.to_string(),
+            path: linked.path,
+            display_name: linked.display_name,
+            category: linked.category.as_str().to_string(),
+            version_number: version.version_number,
+            label: version.label,
         }),
     ))
 }
@@ -7697,6 +8147,75 @@ opened_at: 2026-02-28
             "expected -2 suffix, got {}",
             second
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn documents_generate_creates_matter_link_and_version() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        // Ensure matter + client rows exist for docgen context.
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+
+        let Json(templates_resp) =
+            matter_templates_handler(State(Arc::clone(&state)), Path("demo".to_string()))
+                .await
+                .expect("templates request should succeed");
+        let template_id = templates_resp
+            .templates
+            .iter()
+            .find(|template| template.name == "chronology.md")
+            .and_then(|template| template.id.clone())
+            .expect("template id should exist");
+
+        let (status, Json(resp)) = documents_generate_handler(
+            State(Arc::clone(&state)),
+            Json(GenerateDocumentRequest {
+                template_id,
+                matter_id: "demo".to_string(),
+                extra: serde_json::json!({ "event": "hearing" }),
+                display_name: Some("Chronology Draft".to_string()),
+                category: Some("internal".to_string()),
+                label: Some("draft".to_string()),
+            }),
+        )
+        .await
+        .expect("generate request should succeed");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(resp.path.starts_with("matters/demo/drafts/chronology-"));
+
+        let generated = workspace
+            .read(&resp.path)
+            .await
+            .expect("generated doc exists");
+        assert!(
+            generated.content.contains("# Chronology Template"),
+            "rendered content should contain template body"
+        );
+
+        let matter_docs = db
+            .list_matter_documents_db("test-user", "demo")
+            .await
+            .expect("matter documents query");
+        let linked = matter_docs
+            .iter()
+            .find(|doc| doc.id.to_string() == resp.matter_document_id)
+            .expect("generated link should exist");
+        assert_eq!(linked.display_name, "Chronology Draft");
+
+        let versions = db
+            .list_document_versions("test-user", linked.id)
+            .await
+            .expect("document versions query");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].label, "draft");
     }
 
     #[cfg(feature = "libsql")]

@@ -3,12 +3,16 @@ use libsql::params;
 use uuid::Uuid;
 
 use crate::db::{
-    ClientRecord, ClientStore, ClientType, CreateClientParams, CreateMatterDeadlineParams,
-    CreateMatterNoteParams, CreateMatterTaskParams, MatterDeadlineRecord, MatterDeadlineStore,
-    MatterDeadlineType, MatterNoteRecord, MatterNoteStore, MatterRecord, MatterStatus, MatterStore,
-    MatterTaskRecord, MatterTaskStatus, MatterTaskStore, UpdateClientParams,
-    UpdateMatterDeadlineParams, UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams,
-    UpsertMatterParams, normalize_party_name,
+    ClientRecord, ClientStore, ClientType, CreateClientParams, CreateDocumentVersionParams,
+    CreateMatterDeadlineParams, CreateMatterNoteParams, CreateMatterTaskParams,
+    DocumentTemplateRecord, DocumentTemplateStore, DocumentVersionRecord, DocumentVersionStore,
+    MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType, MatterDocumentCategory,
+    MatterDocumentRecord, MatterDocumentStore, MatterNoteRecord, MatterNoteStore, MatterRecord,
+    MatterStatus, MatterStore, MatterTaskRecord, MatterTaskStatus, MatterTaskStore,
+    UpdateClientParams, UpdateDocumentTemplateParams, UpdateMatterDeadlineParams,
+    UpdateMatterDocumentParams, UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams,
+    UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams,
+    normalize_party_name,
 };
 use crate::error::DatabaseError;
 
@@ -211,6 +215,78 @@ fn row_to_matter_deadline_record(row: &libsql::Row) -> Result<MatterDeadlineReco
         updated_at: parse_timestamp(&get_text(row, 12))
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
     })
+}
+
+fn parse_matter_document_category(raw: &str) -> Result<MatterDocumentCategory, DatabaseError> {
+    MatterDocumentCategory::from_db_value(raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid matter document category '{}'", raw))
+    })
+}
+
+fn row_to_matter_document_record(row: &libsql::Row) -> Result<MatterDocumentRecord, DatabaseError> {
+    let category_raw = get_text(row, 6);
+    Ok(MatterDocumentRecord {
+        id: parse_uuid(&get_text(row, 0), "matter_documents.id")?,
+        user_id: get_text(row, 1),
+        matter_id: get_text(row, 2),
+        memory_document_id: parse_uuid(&get_text(row, 3), "matter_documents.memory_document_id")?,
+        path: get_text(row, 4),
+        display_name: get_text(row, 5),
+        category: parse_matter_document_category(&category_raw)?,
+        created_at: parse_timestamp(&get_text(row, 7))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+        updated_at: parse_timestamp(&get_text(row, 8))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+    })
+}
+
+fn row_to_document_version_record(
+    row: &libsql::Row,
+) -> Result<DocumentVersionRecord, DatabaseError> {
+    Ok(DocumentVersionRecord {
+        id: parse_uuid(&get_text(row, 0), "document_versions.id")?,
+        user_id: get_text(row, 1),
+        matter_document_id: parse_uuid(&get_text(row, 2), "document_versions.matter_document_id")?,
+        version_number: i32::try_from(get_i64(row, 3))
+            .map_err(|_| DatabaseError::Serialization("invalid version_number".to_string()))?,
+        label: get_text(row, 4),
+        memory_document_id: parse_uuid(&get_text(row, 5), "document_versions.memory_document_id")?,
+        created_at: parse_timestamp(&get_text(row, 6))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+        updated_at: parse_timestamp(&get_text(row, 7))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+    })
+}
+
+fn row_to_document_template_record(
+    row: &libsql::Row,
+) -> Result<DocumentTemplateRecord, DatabaseError> {
+    let variables_json = parse_json_object_or_array(&get_text(row, 5))?;
+    Ok(DocumentTemplateRecord {
+        id: parse_uuid(&get_text(row, 0), "document_templates.id")?,
+        user_id: get_text(row, 1),
+        matter_id: get_opt_text(row, 2),
+        name: get_text(row, 3),
+        body: get_text(row, 4),
+        variables_json,
+        created_at: parse_timestamp(&get_text(row, 6))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+        updated_at: parse_timestamp(&get_text(row, 7))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+    })
+}
+
+fn parse_json_object_or_array(raw: &str) -> Result<serde_json::Value, DatabaseError> {
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!([]));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+    if value.is_object() || value.is_array() {
+        Ok(value)
+    } else {
+        Ok(serde_json::json!([]))
+    }
 }
 
 #[async_trait::async_trait]
@@ -1025,6 +1101,523 @@ impl MatterDeadlineStore for LibSqlBackend {
             .execute(
                 "DELETE FROM matter_deadlines WHERE user_id = ?1 AND matter_id = ?2 AND id = ?3",
                 params![user_id, matter_id, deadline_id.to_string()],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+#[async_trait::async_trait]
+impl MatterDocumentStore for LibSqlBackend {
+    async fn list_matter_documents_db(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterDocumentRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at \
+                 FROM matter_documents md \
+                 JOIN memory_documents d ON d.id = md.memory_document_id \
+                 WHERE md.user_id = ?1 AND md.matter_id = ?2 \
+                 ORDER BY d.path ASC",
+                params![user_id, matter_id],
+            )
+            .await?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row_to_matter_document_record(&row)?);
+        }
+        Ok(out)
+    }
+
+    async fn get_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let row = conn
+            .query(
+                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at \
+                 FROM matter_documents md \
+                 JOIN memory_documents d ON d.id = md.memory_document_id \
+                 WHERE md.user_id = ?1 AND md.matter_id = ?2 AND md.id = ?3 LIMIT 1",
+                params![user_id, matter_id, matter_document_id.to_string()],
+            )
+            .await?
+            .next()
+            .await?;
+
+        row.map(|row| row_to_matter_document_record(&row))
+            .transpose()
+    }
+
+    async fn upsert_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &UpsertMatterDocumentParams,
+    ) -> Result<MatterDocumentRecord, DatabaseError> {
+        let conn = self.connect().await?;
+        let id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO matter_documents \
+             (id, user_id, matter_id, memory_document_id, display_name, category, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now')) \
+             ON CONFLICT (user_id, matter_id, memory_document_id) DO UPDATE SET \
+                display_name = excluded.display_name, \
+                category = excluded.category, \
+                updated_at = datetime('now')",
+            params![
+                id.as_str(),
+                user_id,
+                matter_id,
+                input.memory_document_id.to_string(),
+                input.display_name.as_str(),
+                input.category.as_str(),
+            ],
+        )
+        .await?;
+
+        // Prefer fetching by unique memory_document binding to cover both insert/update paths.
+        let row = conn
+            .query(
+                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at \
+                 FROM matter_documents md \
+                 JOIN memory_documents d ON d.id = md.memory_document_id \
+                 WHERE md.user_id = ?1 AND md.matter_id = ?2 AND md.memory_document_id = ?3 LIMIT 1",
+                params![user_id, matter_id, input.memory_document_id.to_string()],
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| {
+                DatabaseError::Query("failed to resolve upserted matter document".to_string())
+            })?;
+
+        row_to_matter_document_record(&row)
+    }
+
+    async fn update_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+        input: &UpdateMatterDocumentParams,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError> {
+        let Some(existing) = self
+            .get_matter_document(user_id, matter_id, matter_document_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let merged_display_name = input.display_name.clone().unwrap_or(existing.display_name);
+        let merged_category = input.category.unwrap_or(existing.category);
+
+        let conn = self.connect().await?;
+        conn.execute(
+            "UPDATE matter_documents SET \
+                display_name = ?4, \
+                category = ?5, \
+                updated_at = datetime('now') \
+             WHERE user_id = ?1 AND matter_id = ?2 AND id = ?3",
+            params![
+                user_id,
+                matter_id,
+                matter_document_id.to_string(),
+                merged_display_name,
+                merged_category.as_str(),
+            ],
+        )
+        .await?;
+
+        self.get_matter_document(user_id, matter_id, matter_document_id)
+            .await
+    }
+
+    async fn delete_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.connect().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM matter_documents WHERE user_id = ?1 AND matter_id = ?2 AND id = ?3",
+                params![user_id, matter_id, matter_document_id.to_string()],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+#[async_trait::async_trait]
+impl DocumentVersionStore for LibSqlBackend {
+    async fn list_document_versions(
+        &self,
+        user_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Vec<DocumentVersionRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id, user_id, matter_document_id, version_number, label, memory_document_id, created_at, updated_at \
+                 FROM document_versions \
+                 WHERE user_id = ?1 AND matter_document_id = ?2 \
+                 ORDER BY version_number DESC",
+                params![user_id, matter_document_id.to_string()],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row_to_document_version_record(&row)?);
+        }
+        Ok(out)
+    }
+
+    async fn create_document_version(
+        &self,
+        user_id: &str,
+        input: &CreateDocumentVersionParams,
+    ) -> Result<DocumentVersionRecord, DatabaseError> {
+        let conn = self.connect().await?;
+        conn.execute("BEGIN", ()).await?;
+        let version_result = async {
+            let next_row = conn
+                .query(
+                    "SELECT COALESCE(MAX(version_number), 0) + 1 \
+                     FROM document_versions \
+                     WHERE user_id = ?1 AND matter_document_id = ?2",
+                    params![user_id, input.matter_document_id.to_string()],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_else(|| {
+                    DatabaseError::Query("failed to compute next document version".to_string())
+                })?;
+            let next_version = i32::try_from(get_i64(&next_row, 0))
+                .map_err(|_| DatabaseError::Serialization("invalid version number".to_string()))?;
+
+            let id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO document_versions \
+                 (id, user_id, matter_document_id, version_number, label, memory_document_id, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))",
+                params![
+                    id.as_str(),
+                    user_id,
+                    input.matter_document_id.to_string(),
+                    i64::from(next_version),
+                    input.label.as_str(),
+                    input.memory_document_id.to_string(),
+                ],
+            )
+            .await?;
+            let row = conn
+                .query(
+                    "SELECT id, user_id, matter_document_id, version_number, label, memory_document_id, created_at, updated_at \
+                     FROM document_versions \
+                     WHERE id = ?1 LIMIT 1",
+                    params![id.as_str()],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_else(|| {
+                    DatabaseError::Query("failed to load created document version".to_string())
+                })?;
+            row_to_document_version_record(&row)
+        }
+        .await;
+
+        match version_result {
+            Ok(record) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(record)
+            }
+            Err(err) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(err)
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl DocumentTemplateStore for LibSqlBackend {
+    async fn list_document_templates(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+    ) -> Result<Vec<DocumentTemplateRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = if let Some(matter_id) = matter_id {
+            conn.query(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = ?1 AND (matter_id = ?2 OR matter_id IS NULL) \
+                 ORDER BY CASE WHEN matter_id = ?2 THEN 0 ELSE 1 END, name ASC",
+                params![user_id, matter_id],
+            )
+            .await?
+        } else {
+            conn.query(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = ?1 ORDER BY name ASC",
+                params![user_id],
+            )
+            .await?
+        };
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row_to_document_template_record(&row)?);
+        }
+        Ok(out)
+    }
+
+    async fn get_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let row = conn
+            .query(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = ?1 AND id = ?2 LIMIT 1",
+                params![user_id, template_id.to_string()],
+            )
+            .await?
+            .next()
+            .await?;
+
+        row.map(|row| row_to_document_template_record(&row))
+            .transpose()
+    }
+
+    async fn get_document_template_by_name(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let row = if let Some(matter_id) = matter_id {
+            conn.query(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = ?1 AND name = ?2 AND (matter_id = ?3 OR matter_id IS NULL) \
+                 ORDER BY CASE WHEN matter_id = ?3 THEN 0 ELSE 1 END \
+                 LIMIT 1",
+                params![user_id, name, matter_id],
+            )
+            .await?
+            .next()
+            .await?
+        } else {
+            conn.query(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = ?1 AND name = ?2 AND matter_id IS NULL \
+                 LIMIT 1",
+                params![user_id, name],
+            )
+            .await?
+            .next()
+            .await?
+        };
+
+        row.map(|row| row_to_document_template_record(&row))
+            .transpose()
+    }
+
+    async fn upsert_document_template(
+        &self,
+        user_id: &str,
+        input: &UpsertDocumentTemplateParams,
+    ) -> Result<DocumentTemplateRecord, DatabaseError> {
+        let conn = self.connect().await?;
+        let variables_json = if input.variables_json.is_object() || input.variables_json.is_array()
+        {
+            serde_json::to_string(&input.variables_json)
+                .map_err(|e| DatabaseError::Serialization(e.to_string()))?
+        } else {
+            "[]".to_string()
+        };
+
+        conn.execute("BEGIN", ()).await?;
+        let upsert_result = async {
+            let row = if let Some(matter_id) = input.matter_id.as_deref() {
+                let id = Uuid::new_v4().to_string();
+                conn.execute(
+                    "INSERT INTO document_templates \
+                     (id, user_id, matter_id, name, body, variables_json, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now')) \
+                     ON CONFLICT (user_id, matter_id, name) DO UPDATE SET \
+                        body = excluded.body, \
+                        variables_json = excluded.variables_json, \
+                        updated_at = datetime('now')",
+                    params![
+                        id.as_str(),
+                        user_id,
+                        matter_id,
+                        input.name.as_str(),
+                        input.body.as_str(),
+                        variables_json.as_str(),
+                    ],
+                )
+                .await?;
+                conn.query(
+                    "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                     FROM document_templates \
+                     WHERE user_id = ?1 AND matter_id = ?2 AND name = ?3 LIMIT 1",
+                    params![user_id, matter_id, input.name.as_str()],
+                )
+                .await?
+                .next()
+                .await?
+            } else if let Some(existing) = conn
+                .query(
+                    "SELECT id FROM document_templates \
+                     WHERE user_id = ?1 AND matter_id IS NULL AND name = ?2 LIMIT 1",
+                    params![user_id, input.name.as_str()],
+                )
+                .await?
+                .next()
+                .await?
+            {
+                let existing_id = get_text(&existing, 0);
+                conn.execute(
+                    "UPDATE document_templates SET \
+                        body = ?3, \
+                        variables_json = ?4, \
+                        updated_at = datetime('now') \
+                     WHERE user_id = ?1 AND id = ?2",
+                    params![
+                        user_id,
+                        existing_id.as_str(),
+                        input.body.as_str(),
+                        variables_json.as_str(),
+                    ],
+                )
+                .await?;
+                conn.query(
+                    "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                     FROM document_templates \
+                     WHERE user_id = ?1 AND id = ?2 LIMIT 1",
+                    params![user_id, existing_id.as_str()],
+                )
+                .await?
+                .next()
+                .await?
+            } else {
+                let id = Uuid::new_v4().to_string();
+                conn.execute(
+                    "INSERT INTO document_templates \
+                     (id, user_id, matter_id, name, body, variables_json, created_at, updated_at) \
+                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, datetime('now'), datetime('now'))",
+                    params![
+                        id.as_str(),
+                        user_id,
+                        input.name.as_str(),
+                        input.body.as_str(),
+                        variables_json.as_str(),
+                    ],
+                )
+                .await?;
+                conn.query(
+                    "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                     FROM document_templates \
+                     WHERE user_id = ?1 AND id = ?2 LIMIT 1",
+                    params![user_id, id.as_str()],
+                )
+                .await?
+                .next()
+                .await?
+            };
+
+            let row =
+                row.ok_or_else(|| DatabaseError::Query("failed to load upserted template".to_string()))?;
+            row_to_document_template_record(&row)
+        }
+        .await;
+
+        match upsert_result {
+            Ok(record) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(record)
+            }
+            Err(err) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn update_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+        input: &UpdateDocumentTemplateParams,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError> {
+        let Some(existing) = self.get_document_template(user_id, template_id).await? else {
+            return Ok(None);
+        };
+
+        let merged_name = input.name.clone().unwrap_or(existing.name);
+        let merged_body = input.body.clone().unwrap_or(existing.body);
+        let merged_vars = input
+            .variables_json
+            .clone()
+            .unwrap_or(existing.variables_json);
+        let merged_vars = if merged_vars.is_object() || merged_vars.is_array() {
+            serde_json::to_string(&merged_vars)
+                .map_err(|e| DatabaseError::Serialization(e.to_string()))?
+        } else {
+            "[]".to_string()
+        };
+
+        let conn = self.connect().await?;
+        conn.execute(
+            "UPDATE document_templates SET \
+                name = ?3, \
+                body = ?4, \
+                variables_json = ?5, \
+                updated_at = datetime('now') \
+             WHERE user_id = ?1 AND id = ?2",
+            params![
+                user_id,
+                template_id.to_string(),
+                merged_name,
+                merged_body,
+                merged_vars,
+            ],
+        )
+        .await?;
+
+        self.get_document_template(user_id, template_id).await
+    }
+
+    async fn delete_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.connect().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM document_templates WHERE user_id = ?1 AND id = ?2",
+                params![user_id, template_id.to_string()],
             )
             .await?;
         Ok(deleted > 0)

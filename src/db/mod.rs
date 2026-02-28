@@ -481,6 +481,116 @@ pub struct UpdateMatterDeadlineParams {
     pub task_id: Option<Option<Uuid>>,
 }
 
+/// Matter document category for attorney workflows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatterDocumentCategory {
+    Pleading,
+    Correspondence,
+    Contract,
+    Filing,
+    Evidence,
+    Internal,
+}
+
+impl MatterDocumentCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pleading => "pleading",
+            Self::Correspondence => "correspondence",
+            Self::Contract => "contract",
+            Self::Filing => "filing",
+            Self::Evidence => "evidence",
+            Self::Internal => "internal",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "pleading" => Some(Self::Pleading),
+            "correspondence" => Some(Self::Correspondence),
+            "contract" => Some(Self::Contract),
+            "filing" => Some(Self::Filing),
+            "evidence" => Some(Self::Evidence),
+            "internal" => Some(Self::Internal),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterDocumentRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub memory_document_id: Uuid,
+    pub path: String,
+    pub display_name: String,
+    pub category: MatterDocumentCategory,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertMatterDocumentParams {
+    pub memory_document_id: Uuid,
+    pub path: String,
+    pub display_name: String,
+    pub category: MatterDocumentCategory,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateMatterDocumentParams {
+    pub display_name: Option<String>,
+    pub category: Option<MatterDocumentCategory>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentVersionRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_document_id: Uuid,
+    pub version_number: i32,
+    pub label: String,
+    pub memory_document_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateDocumentVersionParams {
+    pub matter_document_id: Uuid,
+    pub label: String,
+    pub memory_document_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentTemplateRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: Option<String>,
+    pub name: String,
+    pub body: String,
+    pub variables_json: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertDocumentTemplateParams {
+    pub matter_id: Option<String>,
+    pub name: String,
+    pub body: String,
+    pub variables_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateDocumentTemplateParams {
+    pub name: Option<String>,
+    pub body: Option<String>,
+    pub variables_json: Option<serde_json::Value>,
+}
+
 /// Normalize names/text for conflict matching.
 pub fn normalize_party_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -960,6 +1070,90 @@ pub trait MatterDeadlineStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait MatterDocumentStore: Send + Sync {
+    async fn list_matter_documents_db(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterDocumentRecord>, DatabaseError>;
+    async fn get_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError>;
+    async fn upsert_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &UpsertMatterDocumentParams,
+    ) -> Result<MatterDocumentRecord, DatabaseError>;
+    async fn update_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+        input: &UpdateMatterDocumentParams,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError>;
+    async fn delete_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
+pub trait DocumentVersionStore: Send + Sync {
+    async fn list_document_versions(
+        &self,
+        user_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Vec<DocumentVersionRecord>, DatabaseError>;
+    async fn create_document_version(
+        &self,
+        user_id: &str,
+        input: &CreateDocumentVersionParams,
+    ) -> Result<DocumentVersionRecord, DatabaseError>;
+}
+
+#[async_trait]
+pub trait DocumentTemplateStore: Send + Sync {
+    async fn list_document_templates(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+    ) -> Result<Vec<DocumentTemplateRecord>, DatabaseError>;
+    async fn get_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError>;
+    async fn get_document_template_by_name(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError>;
+    async fn upsert_document_template(
+        &self,
+        user_id: &str,
+        input: &UpsertDocumentTemplateParams,
+    ) -> Result<DocumentTemplateRecord, DatabaseError>;
+    async fn update_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+        input: &UpdateDocumentTemplateParams,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError>;
+    async fn delete_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
 pub trait SettingsStore: Send + Sync {
     async fn get_setting(
         &self,
@@ -1075,6 +1269,9 @@ pub trait Database:
     + MatterTaskStore
     + MatterNoteStore
     + MatterDeadlineStore
+    + MatterDocumentStore
+    + DocumentVersionStore
+    + DocumentTemplateStore
     + SettingsStore
     + WorkspaceStore
     + Send

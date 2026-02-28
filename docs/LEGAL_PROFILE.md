@@ -90,6 +90,12 @@ For web-first firm workflows, matter detail now includes:
   - lists bundled rule metadata (citation, deadline type, offset, court-day behavior).
 - `POST /api/matters/{id}/filing-package`
   - writes a matter-local filing package index to `matters/<id>/exports/`.
+- `GET /api/matters/{id}/documents`
+  - DB-backed matter document index linked to `memory_documents` (workspace backfill for legacy files).
+- `GET /api/matters/{id}/templates`
+  - DB-backed template list (workspace templates are backfilled for compatibility).
+- `POST /api/documents/generate`
+  - renders a DB template with matter/client context, writes a draft document, links it to the matter, and records a version row.
 - `POST /api/matters/conflict-check`
   - runs intake-time conflict review against the DB-backed party graph and returns structured `ConflictHit` rows.
 - `POST /api/matters`

@@ -548,9 +548,13 @@ pub struct LegalAuditListResponse {
 
 #[derive(Debug, Serialize)]
 pub struct MatterDocumentInfo {
+    pub id: Option<String>,
+    pub memory_document_id: Option<String>,
     pub name: String,
+    pub display_name: Option<String>,
     pub path: String,
     pub is_dir: bool,
+    pub category: Option<String>,
     pub updated_at: Option<String>,
 }
 
@@ -562,8 +566,11 @@ pub struct MatterDocumentsResponse {
 
 #[derive(Debug, Serialize)]
 pub struct MatterTemplateInfo {
+    pub id: Option<String>,
+    pub matter_id: Option<String>,
     pub name: String,
     pub path: String,
+    pub variables_json: Option<serde_json::Value>,
     pub updated_at: Option<String>,
 }
 
@@ -582,6 +589,31 @@ pub struct MatterTemplateApplyRequest {
 pub struct MatterTemplateApplyResponse {
     pub path: String,
     pub status: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenerateDocumentRequest {
+    pub template_id: String,
+    pub matter_id: String,
+    #[serde(default)]
+    pub extra: serde_json::Value,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GenerateDocumentResponse {
+    pub matter_document_id: String,
+    pub memory_document_id: String,
+    pub path: String,
+    pub display_name: String,
+    pub category: String,
+    pub version_number: i32,
+    pub label: String,
 }
 
 #[derive(Debug, Serialize)]
