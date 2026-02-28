@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -6,6 +7,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::config::LegalConfig;
+use crate::db::Database;
 use crate::error::WorkspaceError;
 use crate::legal::policy::sanitize_matter_id;
 use crate::workspace::Workspace;
@@ -32,8 +34,22 @@ struct ConflictCacheState {
     ready: bool,
 }
 
+#[derive(Debug, Clone)]
+struct DbConflictCacheEntry {
+    conflict: Option<String>,
+    refreshed_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct DbConflictCacheState {
+    entries: HashMap<String, DbConflictCacheEntry>,
+    generation: u64,
+}
+
 static CONFLICT_CACHE: LazyLock<Mutex<ConflictCacheState>> =
     LazyLock::new(|| Mutex::new(ConflictCacheState::default()));
+static DB_CONFLICT_CACHE: LazyLock<Mutex<DbConflictCacheState>> =
+    LazyLock::new(|| Mutex::new(DbConflictCacheState::default()));
 static CONFLICT_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
 static CONFLICT_CACHE_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -489,7 +505,11 @@ pub async fn seed_legal_workspace(
 
 /// Invalidate the cached conflicts.json parse result.
 pub fn invalidate_conflict_cache() {
-    CONFLICT_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let next_generation = CONFLICT_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Ok(mut db_cache) = DB_CONFLICT_CACHE.lock() {
+        db_cache.entries.clear();
+        db_cache.generation = next_generation;
+    }
 }
 
 /// True when the path resolves to the workspace-global `conflicts.json`.
@@ -714,8 +734,79 @@ fn mark_conflict_cache_refresh_failure() {
     }
 }
 
-/// Check conflicts.json for conflict hits in message or active matter.
-pub async fn detect_conflict(
+fn db_conflict_cache_key(message: &str, active_matter: Option<&str>) -> String {
+    let message = normalize_conflict_text(message);
+    let matter = active_matter
+        .map(normalize_conflict_text)
+        .unwrap_or_default();
+    format!("{message}|{matter}")
+}
+
+fn db_conflict_cache_lookup(key: &str) -> Option<Option<String>> {
+    let generation = CONFLICT_CACHE_GENERATION.load(Ordering::Relaxed);
+    let cache = DB_CONFLICT_CACHE.lock().ok()?;
+    if cache.generation != generation {
+        return None;
+    }
+    let entry = cache.entries.get(key)?;
+    if entry.refreshed_at.elapsed() > CONFLICT_CACHE_REFRESH_WINDOW {
+        return None;
+    }
+    Some(entry.conflict.clone())
+}
+
+fn db_conflict_cache_store(key: String, conflict: Option<String>) {
+    let generation = CONFLICT_CACHE_GENERATION.load(Ordering::Relaxed);
+    if let Ok(mut cache) = DB_CONFLICT_CACHE.lock() {
+        if cache.generation != generation {
+            cache.entries.clear();
+            cache.generation = generation;
+        }
+        cache.entries.insert(
+            key,
+            DbConflictCacheEntry {
+                conflict,
+                refreshed_at: Instant::now(),
+            },
+        );
+        if cache.entries.len() > 512 {
+            cache
+                .entries
+                .retain(|_, value| value.refreshed_at.elapsed() <= CONFLICT_CACHE_REFRESH_WINDOW);
+        }
+    }
+}
+
+async fn detect_conflict_from_db(
+    store: Option<&std::sync::Arc<dyn Database>>,
+    config: &LegalConfig,
+    message: &str,
+) -> Option<String> {
+    if !config.enabled || !config.conflict_check_enabled {
+        return None;
+    }
+    let store = store?;
+    let active_matter = config.active_matter.as_deref();
+    let key = db_conflict_cache_key(message, active_matter);
+    if let Some(cached) = db_conflict_cache_lookup(&key) {
+        return cached;
+    }
+
+    let conflict = match store
+        .find_conflict_hits_for_text(message, active_matter, 25)
+        .await
+    {
+        Ok(hits) => hits.first().map(|hit| hit.party.clone()),
+        Err(err) => {
+            tracing::warn!("DB-backed conflict check failed, falling back to file cache: {err}");
+            None
+        }
+    };
+    db_conflict_cache_store(key, conflict.clone());
+    conflict
+}
+
+async fn detect_conflict_from_workspace_conflicts(
     workspace: &Workspace,
     config: &LegalConfig,
     message: &str,
@@ -772,12 +863,41 @@ pub async fn detect_conflict(
     None
 }
 
+/// Check for conflict hits using DB-backed matching first, then fallback to
+/// workspace `conflicts.json` + active-matter adversaries.
+pub async fn detect_conflict_with_store(
+    store: Option<&std::sync::Arc<dyn Database>>,
+    workspace: &Workspace,
+    config: &LegalConfig,
+    message: &str,
+) -> Option<String> {
+    if !config.enabled || !config.conflict_check_enabled {
+        return None;
+    }
+    if let Some(conflict) = detect_conflict_from_db(store, config, message).await {
+        return Some(conflict);
+    }
+    detect_conflict_from_workspace_conflicts(workspace, config, message).await
+}
+
+/// Backward-compatible detector for call sites that do not have DB access.
+pub async fn detect_conflict(
+    workspace: &Workspace,
+    config: &LegalConfig,
+    message: &str,
+) -> Option<String> {
+    detect_conflict_with_store(None, workspace, config, message).await
+}
+
 #[cfg(test)]
 pub(crate) fn reset_conflict_cache_for_tests() {
     CONFLICT_CACHE_GENERATION.store(1, Ordering::Relaxed);
     CONFLICT_CACHE_REFRESH_COUNT.store(0, Ordering::Relaxed);
     if let Ok(mut cache) = CONFLICT_CACHE.lock() {
         *cache = ConflictCacheState::default();
+    }
+    if let Ok(mut db_cache) = DB_CONFLICT_CACHE.lock() {
+        *db_cache = DbConflictCacheState::default();
     }
 }
 
@@ -939,7 +1059,7 @@ opened_at: 2024-03-15
     }
 }
 
-#[cfg(all(test, feature = "libsql"))]
+#[cfg(test)]
 mod cache_tests {
     use std::sync::Arc;
 
@@ -955,6 +1075,7 @@ mod cache_tests {
     // don't stomp each other's `CONFLICT_CACHE_REFRESH_COUNT` state.
     static CACHE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn detect_conflict_uses_cache_until_invalidated() {
         let _guard = CACHE_TEST_LOCK.lock().await;
@@ -1011,6 +1132,38 @@ mod cache_tests {
         );
     }
 
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn detect_conflict_with_store_respects_disabled_policy() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
+        reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Example Co","aliases":["Example Company"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.conflict_check_enabled = false;
+        legal.active_matter = None;
+
+        let hit = super::detect_conflict_with_store(
+            Some(&db),
+            workspace.as_ref(),
+            &legal,
+            "Representing Example Co",
+        )
+        .await;
+        assert_eq!(hit, None);
+    }
+
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn detect_conflict_matches_active_matter_adversary_without_conflicts_json_hit() {
         let _guard = CACHE_TEST_LOCK.lock().await;
@@ -1056,6 +1209,7 @@ retention: follow-firm-policy
         assert_eq!(hit.as_deref(), Some("Foo Industries"));
     }
 
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn detect_conflict_uses_warm_cache_for_no_match_without_refreshing_disk_parse() {
         let _guard = CACHE_TEST_LOCK.lock().await;
@@ -1092,6 +1246,7 @@ retention: follow-firm-policy
         );
     }
 
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn detect_conflict_ignores_short_single_token_adversary_false_positive() {
         let _guard = CACHE_TEST_LOCK.lock().await;
@@ -1134,6 +1289,7 @@ retention: follow-firm-policy
         assert_eq!(hit, None);
     }
 
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn detect_conflict_matches_active_matter_identifier_against_adversaries() {
         let _guard = CACHE_TEST_LOCK.lock().await;
@@ -1172,6 +1328,7 @@ retention: follow-firm-policy
         assert_eq!(hit.as_deref(), Some("Acme Corp"));
     }
 
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn load_active_matter_prompt_context_includes_optional_fields_when_present() {
         let (db, _tmp) = crate::testing::test_db().await;

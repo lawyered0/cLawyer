@@ -161,6 +161,8 @@ impl AuditLogger {
 static LOGGER: OnceLock<AuditLogger> = OnceLock::new();
 #[cfg(test)]
 static TEST_EVENTS: OnceLock<Mutex<Vec<TestAuditEvent>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_EVENT_SCENARIO_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
@@ -242,12 +244,19 @@ pub(crate) fn test_events_snapshot() -> Vec<TestAuditEvent> {
 }
 
 #[cfg(test)]
+pub(crate) async fn lock_test_event_scenario() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_EVENT_SCENARIO_LOCK.lock().await
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
 
     use serde_json::Value;
 
-    use super::{AuditLogger, clear_test_events, record, test_events_snapshot};
+    use super::{
+        AuditLogger, clear_test_events, lock_test_event_scenario, record, test_events_snapshot,
+    };
 
     #[test]
     fn hash_chain_links_consecutive_events() {
@@ -315,8 +324,9 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
-    #[test]
-    fn audit_hook_events_capture_metadata_only_fields() {
+    #[tokio::test]
+    async fn audit_hook_events_capture_metadata_only_fields() {
+        let _audit_lock = lock_test_event_scenario().await;
         clear_test_events();
         record(
             "tool_call_completed",
