@@ -3909,6 +3909,15 @@ function renderMatterCardHtml(matter, index) {
   if (matter.retention) {
     html += '<div class="matter-card-row"><span class="matter-card-label">Retention</span><span>' + escapeHtml(matter.retention) + '</span></div>';
   }
+  if (matter.jurisdiction) {
+    html += '<div class="matter-card-row"><span class="matter-card-label">Jurisdiction</span><span>' + escapeHtml(matter.jurisdiction) + '</span></div>';
+  }
+  if (matter.practice_area) {
+    html += '<div class="matter-card-row"><span class="matter-card-label">Practice area</span><span>' + escapeHtml(matter.practice_area) + '</span></div>';
+  }
+  if (matter.opened_at) {
+    html += '<div class="matter-card-row"><span class="matter-card-label">Opened</span><span>' + escapeHtml(matter.opened_at) + '</span></div>';
+  }
   html += '<div class="matter-card-actions">';
   if (!isActive) {
     html += '<button class="btn-ext activate" data-matter-action="select" data-matter-index="' + index + '">Select</button>';
@@ -3952,6 +3961,14 @@ function renderMatterDetail() {
     return;
   }
 
+  var selectedMatter = null;
+  for (var m = 0; m < mattersCache.length; m++) {
+    if (mattersCache[m] && mattersCache[m].id === selectedMatterId) {
+      selectedMatter = mattersCache[m];
+      break;
+    }
+  }
+
   var html = '<div class="matter-detail-header">';
   html += '<h4>' + escapeHtml(selectedMatterId) + '</h4>';
   html += '<div class="matter-detail-header-actions">';
@@ -3959,6 +3976,38 @@ function renderMatterDetail() {
   html += '<button data-matter-detail-action="build-filing-package">Build Filing Package</button>';
   html += '</div>';
   html += '</div>';
+
+  if (selectedMatter) {
+    var metadataRows = [];
+    if (selectedMatter.client) metadataRows.push({ label: 'Client', value: selectedMatter.client });
+    if (selectedMatter.confidentiality) metadataRows.push({ label: 'Confidentiality', value: selectedMatter.confidentiality });
+    if (selectedMatter.retention) metadataRows.push({ label: 'Retention', value: selectedMatter.retention });
+    if (selectedMatter.jurisdiction) metadataRows.push({ label: 'Jurisdiction', value: selectedMatter.jurisdiction });
+    if (selectedMatter.practice_area) metadataRows.push({ label: 'Practice area', value: selectedMatter.practice_area });
+    if (selectedMatter.opened_at) metadataRows.push({ label: 'Opened', value: selectedMatter.opened_at });
+    if (selectedMatter.team && selectedMatter.team.length) {
+      metadataRows.push({ label: 'Team', value: selectedMatter.team.join(', ') });
+    }
+    if (selectedMatter.adversaries && selectedMatter.adversaries.length) {
+      metadataRows.push({ label: 'Adversaries', value: selectedMatter.adversaries.join(', ') });
+    }
+
+    html += '<div class="matter-detail-section">';
+    html += '<h5>Matter Metadata</h5>';
+    if (!metadataRows.length) {
+      html += '<div class="empty-state">No matter metadata available.</div>';
+    } else {
+      html += '<div class="matter-meta-grid">';
+      for (var r = 0; r < metadataRows.length; r++) {
+        html += '<div class="matter-meta-item">';
+        html += '<span class="matter-meta-label">' + escapeHtml(metadataRows[r].label) + '</span>';
+        html += '<span class="matter-meta-value">' + escapeHtml(metadataRows[r].value) + '</span>';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
 
   html += '<div class="matter-detail-section">';
   html += '<h5>Workflow Scorecard</h5>';
@@ -4240,6 +4289,9 @@ function createMatterFromForm() {
   var client = byId('matter-create-client') ? byId('matter-create-client').value.trim() : '';
   var confidentiality = byId('matter-create-confidentiality') ? byId('matter-create-confidentiality').value.trim() : '';
   var retention = byId('matter-create-retention') ? byId('matter-create-retention').value.trim() : '';
+  var jurisdiction = byId('matter-create-jurisdiction') ? byId('matter-create-jurisdiction').value.trim() : '';
+  var practiceArea = byId('matter-create-practice-area') ? byId('matter-create-practice-area').value.trim() : '';
+  var openedAt = byId('matter-create-opened-at') ? byId('matter-create-opened-at').value.trim() : '';
   var team = parseCsvList(byId('matter-create-team') ? byId('matter-create-team').value : '');
   var adversaries = parseCsvList(byId('matter-create-adversaries') ? byId('matter-create-adversaries').value : '');
 
@@ -4247,18 +4299,27 @@ function createMatterFromForm() {
     showToast('Matter ID, client, confidentiality, and retention are required.', 'error');
     return;
   }
+  if (openedAt && !/^\d{4}-\d{2}-\d{2}$/.test(openedAt)) {
+    showToast('Opened date must use YYYY-MM-DD.', 'error');
+    return;
+  }
+
+  var body = {
+    matter_id: matterId,
+    client: client,
+    confidentiality: confidentiality,
+    retention: retention,
+    team: team,
+    adversaries: adversaries,
+  };
+  if (jurisdiction) body.jurisdiction = jurisdiction;
+  if (practiceArea) body.practice_area = practiceArea;
+  if (openedAt) body.opened_at = openedAt;
 
   setCreateMatterBusy(true);
   apiFetch('/api/matters', {
     method: 'POST',
-    body: {
-      matter_id: matterId,
-      client: client,
-      confidentiality: confidentiality,
-      retention: retention,
-      team: team,
-      adversaries: adversaries,
-    },
+    body: body,
   }).then(function(data) {
     var createdId = data && data.active_matter_id ? data.active_matter_id : matterId;
     activeMatterId = createdId;

@@ -3465,6 +3465,12 @@ mark {
   border-color: var(--accent);
 }
 
+.matters-create-help {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
 .matters-active-bar {
   display: flex;
   align-items: center;
@@ -3710,6 +3716,35 @@ mark {
   color: var(--text-secondary);
 }
 
+.matter-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.matter-meta-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-primary);
+  padding: 8px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.matter-meta-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.matter-meta-value {
+  font-size: 12px;
+  color: var(--text-primary);
+  word-break: break-word;
+}
+
 .matter-item-list {
   display: flex;
   flex-direction: column;
@@ -3830,6 +3865,10 @@ mark {
   }
 
   .matter-scorecard-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .matter-meta-grid {
     grid-template-columns: 1fr;
   }
 
