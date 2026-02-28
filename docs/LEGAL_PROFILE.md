@@ -10,6 +10,8 @@
 - `legal.require_matter_context = true`
 - `legal.citation_required = true`
 - `legal.matter_root = "matters"`
+- `legal.conflict_file_fallback_enabled = true`
+- `legal.conflict_reindex_on_startup = true`
 - `legal.network.deny_by_default = true`
 - `legal.audit.enabled = true`
 - `legal.audit.path = "logs/legal_audit.jsonl"`
@@ -82,11 +84,14 @@ For web-first firm workflows, matter detail now includes:
   - runs intake-time conflict review against the DB-backed party graph and returns structured `ConflictHit` rows.
 - `POST /api/matters`
   - server-hard-gated on conflict hits: `clear`/`waived` can proceed, `declined` blocks creation and records clearance.
+- `POST /api/matters/conflicts/reindex`
+  - rebuilds DB conflict graph from `matters/*/matter.yaml` plus workspace `conflicts.json`.
 
 ## Conflict Check Limits
 
 - Intake conflict checks use a DB-backed party graph (`parties`, `party_aliases`, `matter_parties`) with exact+alias+fuzzy matching.
-- Chat conflict checks are DB-first and fall back to workspace-global `conflicts.json` during transition.
+- Chat conflict checks are DB-first. Fallback to workspace-global `conflicts.json` is controlled by `legal.conflict_file_fallback_enabled`.
+- Startup can auto-reindex DB conflict graph from workspace (`legal.conflict_reindex_on_startup = true`).
 - Existing `POST /api/matters/conflicts/check` remains for compatibility and now uses the same DB-first path plus fallback.
 - Matching remains normalized/boundary-aware and heuristic; short aliases are intentionally ignored to reduce false positives.
 

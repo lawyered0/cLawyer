@@ -691,6 +691,40 @@ impl AppBuilder {
                 tracing::warn!("Failed to seed legal workspace scaffolding: {}", e);
             }
 
+            if self.config.legal.enabled
+                && self.config.legal.conflict_check_enabled
+                && self.config.legal.conflict_reindex_on_startup
+                && let Some(ref db) = self.db
+            {
+                let startup_legal = self.config.legal.clone();
+                match crate::legal::matter::reindex_conflict_graph(ws.as_ref(), db, &startup_legal)
+                    .await
+                {
+                    Ok(report) => {
+                        tracing::info!(
+                            scanned_matters = report.scanned_matters,
+                            seeded_matters = report.seeded_matters,
+                            skipped_matters = report.skipped_matters,
+                            global_conflicts_seeded = report.global_conflicts_seeded,
+                            global_aliases_seeded = report.global_aliases_seeded,
+                            warning_count = report.warnings.len(),
+                            "Conflict graph reindex completed at startup"
+                        );
+                    }
+                    Err(e) => {
+                        if !startup_legal.conflict_file_fallback_enabled {
+                            tracing::error!(
+                                "Conflict graph startup reindex failed in DB-authoritative mode: {}; enabling file fallback for this process",
+                                e
+                            );
+                            self.config.legal.conflict_file_fallback_enabled = true;
+                        } else {
+                            tracing::warn!("Conflict graph startup reindex failed: {}", e);
+                        }
+                    }
+                }
+            }
+
             if embeddings.is_some() {
                 let ws_bg = Arc::clone(ws);
                 tokio::spawn(async move {

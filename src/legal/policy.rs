@@ -169,6 +169,8 @@ mod tests {
             active_matter: Some("demo-matter".to_string()),
             privilege_guard: true,
             conflict_check_enabled: true,
+            conflict_file_fallback_enabled: true,
+            conflict_reindex_on_startup: false,
             network: LegalNetworkConfig {
                 deny_by_default: true,
                 allowed_domains: vec!["example.com".to_string()],

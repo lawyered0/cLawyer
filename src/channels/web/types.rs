@@ -357,6 +357,13 @@ pub struct MatterIntakeConflictCheckResponse {
     pub checked_parties: Vec<String>,
 }
 
+/// Response body for `POST /api/matters/conflicts/reindex`.
+#[derive(Debug, Serialize)]
+pub struct MatterConflictGraphReindexResponse {
+    pub status: &'static str,
+    pub report: crate::legal::matter::ConflictGraphReindexReport,
+}
+
 // --- Legal audit ---
 
 #[derive(Debug, Serialize)]

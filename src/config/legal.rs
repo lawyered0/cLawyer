@@ -67,6 +67,8 @@ pub struct LegalConfig {
     pub active_matter: Option<String>,
     pub privilege_guard: bool,
     pub conflict_check_enabled: bool,
+    pub conflict_file_fallback_enabled: bool,
+    pub conflict_reindex_on_startup: bool,
     pub network: LegalNetworkConfig,
     pub audit: LegalAuditConfig,
     pub redaction: LegalRedactionConfig,
@@ -242,6 +244,14 @@ impl LegalConfig {
                 "LEGAL_CONFLICT_CHECK_ENABLED",
                 settings.legal.conflict_check_enabled,
             )?,
+            conflict_file_fallback_enabled: parse_bool_env(
+                "LEGAL_CONFLICT_FILE_FALLBACK_ENABLED",
+                settings.legal.conflict_file_fallback_enabled,
+            )?,
+            conflict_reindex_on_startup: parse_bool_env(
+                "LEGAL_CONFLICT_REINDEX_ON_STARTUP",
+                settings.legal.conflict_reindex_on_startup,
+            )?,
             network: LegalNetworkConfig {
                 deny_by_default: parse_bool_env(
                     "LEGAL_NETWORK_DENY_BY_DEFAULT",
@@ -295,6 +305,8 @@ mod tests {
         assert!(config.require_matter_context);
         assert!(config.citation_required);
         assert_eq!(config.matter_root, "matters");
+        assert!(config.conflict_file_fallback_enabled);
+        assert!(config.conflict_reindex_on_startup);
         assert!(config.network.deny_by_default);
         assert!(config.audit.enabled);
         assert!(config.audit.hash_chain);

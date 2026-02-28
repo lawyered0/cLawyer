@@ -19,11 +19,14 @@ const MIN_ALIAS_SINGLE_TOKEN_LEN: usize = 4;
 const MATTER_PROMPT_LIST_MAX_ITEMS: usize = 8;
 const MATTER_PROMPT_FIELD_MAX_CHARS: usize = 160;
 const MATTER_PROMPT_LIST_ITEM_MAX_CHARS: usize = 96;
+pub const GLOBAL_CONFLICT_GRAPH_MATTER_ID: &str = "__global_conflicts__";
+const REINDEX_WARNING_LIMIT: usize = 50;
 
 #[derive(Debug, Clone)]
 struct ConflictEntry {
     canonical_name: String,
     terms: Vec<String>,
+    aliases: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -81,6 +84,16 @@ pub struct ActiveMatterPromptContext {
     pub jurisdiction: Option<String>,
     pub practice_area: Option<String>,
     pub opened_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ConflictGraphReindexReport {
+    pub scanned_matters: usize,
+    pub seeded_matters: usize,
+    pub skipped_matters: usize,
+    pub global_conflicts_seeded: usize,
+    pub global_aliases_seeded: usize,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,6 +516,164 @@ pub async fn seed_legal_workspace(
     Ok(())
 }
 
+fn push_reindex_warning(report: &mut ConflictGraphReindexReport, message: String) {
+    if report.warnings.len() < REINDEX_WARNING_LIMIT {
+        report.warnings.push(message);
+    }
+}
+
+/// Rebuild the DB conflict graph from workspace matter metadata and
+/// workspace-global `conflicts.json`.
+pub async fn reindex_conflict_graph(
+    workspace: &Workspace,
+    store: &std::sync::Arc<dyn Database>,
+    config: &LegalConfig,
+) -> Result<ConflictGraphReindexReport, String> {
+    let matter_root = config.matter_root.trim_matches('/');
+    if matter_root.is_empty() {
+        return Err("legal matter root is empty after normalization".to_string());
+    }
+
+    store
+        .reset_conflict_graph()
+        .await
+        .map_err(|err| format!("failed to reset conflict graph: {err}"))?;
+
+    let mut report = ConflictGraphReindexReport::default();
+    let matter_entries = workspace
+        .list(matter_root)
+        .await
+        .map_err(|err| format!("failed to list matter root '{matter_root}': {err}"))?;
+
+    for entry in matter_entries
+        .into_iter()
+        .filter(|entry| entry.is_directory)
+    {
+        report.scanned_matters += 1;
+
+        let raw_id = entry.path.rsplit('/').next().unwrap_or_default();
+        let matter_id = sanitize_matter_id(raw_id);
+        if matter_id.is_empty() {
+            report.skipped_matters += 1;
+            push_reindex_warning(
+                &mut report,
+                format!(
+                    "skipped matter directory '{}' (empty id after sanitization)",
+                    entry.path
+                ),
+            );
+            continue;
+        }
+
+        let metadata = match read_matter_metadata_for_root(workspace, matter_root, &matter_id).await
+        {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                report.skipped_matters += 1;
+                push_reindex_warning(
+                    &mut report,
+                    format!(
+                        "skipped matter '{}' due to invalid metadata: {}",
+                        matter_id, err
+                    ),
+                );
+                continue;
+            }
+        };
+
+        match store
+            .seed_matter_parties(
+                &matter_id,
+                &metadata.client,
+                &metadata.adversaries,
+                metadata.opened_at.as_deref(),
+            )
+            .await
+        {
+            Ok(_) => {
+                report.seeded_matters += 1;
+            }
+            Err(err) => {
+                report.skipped_matters += 1;
+                push_reindex_warning(
+                    &mut report,
+                    format!(
+                        "failed to seed matter '{}' into conflict graph: {}",
+                        matter_id, err
+                    ),
+                );
+            }
+        }
+    }
+
+    match workspace.read("conflicts.json").await {
+        Ok(doc) => {
+            if let Some(entries) = parse_conflict_entries(&doc.content) {
+                for entry in entries {
+                    let adversaries = vec![entry.canonical_name.clone()];
+                    match store
+                        .seed_matter_parties(
+                            GLOBAL_CONFLICT_GRAPH_MATTER_ID,
+                            "",
+                            &adversaries,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            report.global_conflicts_seeded += 1;
+                        }
+                        Err(err) => {
+                            push_reindex_warning(
+                                &mut report,
+                                format!(
+                                    "failed to seed global conflict '{}': {}",
+                                    entry.canonical_name, err
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+
+                    match store
+                        .upsert_party_aliases(&entry.canonical_name, &entry.aliases)
+                        .await
+                    {
+                        Ok(_) => {
+                            report.global_aliases_seeded += entry.aliases.len();
+                        }
+                        Err(err) => {
+                            push_reindex_warning(
+                                &mut report,
+                                format!(
+                                    "failed to seed aliases for global conflict '{}': {}",
+                                    entry.canonical_name, err
+                                ),
+                            );
+                        }
+                    }
+                }
+            } else {
+                push_reindex_warning(
+                    &mut report,
+                    "conflicts.json exists but could not be parsed; skipped global conflicts import"
+                        .to_string(),
+                );
+            }
+        }
+        Err(WorkspaceError::DocumentNotFound { .. }) => {}
+        Err(err) => {
+            push_reindex_warning(
+                &mut report,
+                format!("failed to read conflicts.json during reindex: {}", err),
+            );
+        }
+    }
+
+    invalidate_conflict_cache();
+    Ok(report)
+}
+
 /// Invalidate the cached conflicts.json parse result.
 pub fn invalidate_conflict_cache() {
     let next_generation = CONFLICT_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
@@ -591,11 +762,16 @@ fn parse_conflict_entries(raw: &str) -> Option<Vec<ConflictEntry>> {
         }
 
         let mut terms = vec![normalized_name.clone()];
+        let mut alias_values = Vec::new();
         let mut seen = std::collections::HashSet::new();
         seen.insert(normalized_name);
 
-        if let Some(aliases) = entry.get("aliases").and_then(|v| v.as_array()) {
-            for alias in aliases.iter().filter_map(|v| v.as_str()) {
+        if let Some(alias_entries) = entry.get("aliases").and_then(|v| v.as_array()) {
+            for alias in alias_entries.iter().filter_map(|v| v.as_str()) {
+                let alias_trimmed = alias.trim();
+                if alias_trimmed.is_empty() {
+                    continue;
+                }
                 let normalized_alias = normalize_conflict_text(alias);
                 if normalized_alias.is_empty()
                     || !alias_is_matchable(&normalized_alias)
@@ -604,12 +780,14 @@ fn parse_conflict_entries(raw: &str) -> Option<Vec<ConflictEntry>> {
                     continue;
                 }
                 terms.push(normalized_alias);
+                alias_values.push(alias_trimmed.to_string());
             }
         }
 
         parsed.push(ConflictEntry {
             canonical_name: canonical_name.to_string(),
             terms,
+            aliases: alias_values,
         });
     }
 
@@ -874,8 +1052,12 @@ pub async fn detect_conflict_with_store(
     if !config.enabled || !config.conflict_check_enabled {
         return None;
     }
+    let db_available = store.is_some();
     if let Some(conflict) = detect_conflict_from_db(store, config, message).await {
         return Some(conflict);
+    }
+    if db_available && !config.conflict_file_fallback_enabled {
+        return None;
     }
     detect_conflict_from_workspace_conflicts(workspace, config, message).await
 }
@@ -1030,6 +1212,8 @@ opened_at: 2024-03-15
         assert!(terms.iter().any(|t| t == "example adverse party"));
         assert!(terms.iter().any(|t| t == "example co"));
         assert!(!terms.iter().any(|t| t == "ea"));
+        assert!(parsed[0].aliases.iter().any(|alias| alias == "Example Co"));
+        assert!(!parsed[0].aliases.iter().any(|alias| alias == "EA"));
     }
 
     #[test]
@@ -1064,8 +1248,9 @@ mod cache_tests {
     use std::sync::Arc;
 
     use super::{
-        conflict_cache_refresh_count_for_tests, detect_conflict, invalidate_conflict_cache,
-        load_active_matter_prompt_context, reset_conflict_cache_for_tests,
+        GLOBAL_CONFLICT_GRAPH_MATTER_ID, conflict_cache_refresh_count_for_tests, detect_conflict,
+        invalidate_conflict_cache, load_active_matter_prompt_context, reindex_conflict_graph,
+        reset_conflict_cache_for_tests,
     };
     use crate::config::LegalConfig;
     use crate::settings::Settings;
@@ -1161,6 +1346,71 @@ mod cache_tests {
         )
         .await;
         assert_eq!(hit, None);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn detect_conflict_with_store_can_disable_file_fallback_when_db_is_available() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
+        reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Fallback Only Party","aliases":["Fallback Co"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = false;
+
+        let hit = super::detect_conflict_with_store(
+            Some(&db),
+            workspace.as_ref(),
+            &legal,
+            "Discussing Fallback Only Party strategy",
+        )
+        .await;
+        assert_eq!(
+            hit, None,
+            "DB-authoritative mode should not use conflicts.json fallback"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn detect_conflict_without_store_still_uses_file_fallback() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
+        reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Fallback Party","aliases":["Fallback Co"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = false;
+
+        let hit = super::detect_conflict_with_store(
+            None,
+            workspace.as_ref(),
+            &legal,
+            "Discussing Fallback Party strategy",
+        )
+        .await;
+        assert_eq!(hit.as_deref(), Some("Fallback Party"));
     }
 
     #[cfg(feature = "libsql")]
@@ -1326,6 +1576,69 @@ retention: follow-firm-policy
         let hit =
             detect_conflict(workspace.as_ref(), &legal, "General project planning note").await;
         assert_eq!(hit.as_deref(), Some("Acme Corp"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn reindex_conflict_graph_backfills_workspace_matters_and_global_conflicts() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
+        reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "matters/demo/matter.yaml",
+                r#"
+matter_id: demo
+client: Demo Client
+team:
+  - Lead Counsel
+confidentiality: attorney-client-privileged
+adversaries:
+  - Foo Industries
+retention: follow-firm-policy
+opened_at: 2026-02-28
+"#,
+            )
+            .await
+            .expect("seed matter metadata");
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Example Adverse Party","aliases":["Example Co"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+
+        let report = reindex_conflict_graph(workspace.as_ref(), &db, &legal)
+            .await
+            .expect("reindex should succeed");
+        assert_eq!(report.scanned_matters, 1);
+        assert_eq!(report.seeded_matters, 1);
+        assert_eq!(report.global_conflicts_seeded, 1);
+        assert_eq!(report.global_aliases_seeded, 1);
+
+        let demo_hit = db
+            .find_conflict_hits_for_names(&["Demo Client".to_string()], 20)
+            .await
+            .expect("query hits");
+        assert!(demo_hit.iter().any(|hit| hit.matter_id == "demo"));
+
+        let global_hit = db
+            .find_conflict_hits_for_names(&["Example Co".to_string()], 20)
+            .await
+            .expect("query global alias hit");
+        assert!(
+            global_hit
+                .iter()
+                .any(|hit| hit.matter_id == GLOBAL_CONFLICT_GRAPH_MATTER_ID),
+            "global conflicts should be queryable from DB graph"
+        );
     }
 
     #[cfg(feature = "libsql")]

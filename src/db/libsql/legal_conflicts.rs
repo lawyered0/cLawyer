@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::{DateTime, NaiveDate, Utc};
 use libsql::params;
 use uuid::Uuid;
@@ -101,8 +103,8 @@ fn dedupe_hits(
     hits
 }
 
-async fn upsert_party_libsql(
-    backend: &LibSqlBackend,
+async fn upsert_party_libsql_with_conn(
+    conn: &libsql::Connection,
     name: &str,
 ) -> Result<Option<String>, DatabaseError> {
     let display_name = name.trim();
@@ -114,7 +116,6 @@ async fn upsert_party_libsql(
         return Ok(None);
     }
 
-    let conn = backend.connect().await?;
     conn.execute(
         "INSERT INTO parties (id, name, name_normalized, party_type, created_at, updated_at) \
          VALUES (?1, ?2, ?3, 'entity', datetime('now'), datetime('now')) \
@@ -140,6 +141,14 @@ async fn upsert_party_libsql(
         .ok_or_else(|| DatabaseError::Query("failed to resolve upserted party".to_string()))?;
 
     Ok(Some(get_text(&row, 0)))
+}
+
+async fn upsert_party_libsql(
+    backend: &LibSqlBackend,
+    name: &str,
+) -> Result<Option<String>, DatabaseError> {
+    let conn = backend.connect().await?;
+    upsert_party_libsql_with_conn(&conn, name).await
 }
 
 #[async_trait::async_trait]
@@ -304,51 +313,129 @@ impl LegalConflictStore for LibSqlBackend {
 
         let opened_at = parse_opened_at_text(opened_at)?;
 
-        if let Some(client_party_id) = upsert_party_libsql(self, client).await? {
-            let conn = self.connect().await?;
-            conn.execute(
-                "INSERT INTO matter_parties \
-                 (id, matter_id, party_id, role, opened_at, closed_at, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now')) \
-                 ON CONFLICT(matter_id, party_id, role) DO UPDATE SET \
-                    opened_at = COALESCE(matter_parties.opened_at, excluded.opened_at), \
-                    updated_at = datetime('now')",
-                params![
-                    Uuid::new_v4().to_string(),
-                    matter_id,
-                    client_party_id,
-                    PartyRole::Client.as_str(),
-                    opt_text(opened_at.as_deref()),
-                    libsql::Value::Null,
-                ],
-            )
-            .await?;
+        let conn = self.connect().await?;
+        conn.execute("BEGIN", ()).await?;
+
+        let op_result: Result<(), DatabaseError> = async {
+            if let Some(client_party_id) = upsert_party_libsql_with_conn(&conn, client).await? {
+                conn.execute(
+                    "INSERT INTO matter_parties \
+                     (id, matter_id, party_id, role, opened_at, closed_at, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now')) \
+                     ON CONFLICT(matter_id, party_id, role) DO UPDATE SET \
+                        opened_at = COALESCE(matter_parties.opened_at, excluded.opened_at), \
+                        updated_at = datetime('now')",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        matter_id,
+                        client_party_id,
+                        PartyRole::Client.as_str(),
+                        opt_text(opened_at.as_deref()),
+                        libsql::Value::Null,
+                    ],
+                )
+                .await?;
+            }
+
+            for name in adversaries {
+                let Some(adverse_party_id) = upsert_party_libsql_with_conn(&conn, name).await?
+                else {
+                    continue;
+                };
+                conn.execute(
+                    "INSERT INTO matter_parties \
+                     (id, matter_id, party_id, role, opened_at, closed_at, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now')) \
+                     ON CONFLICT(matter_id, party_id, role) DO UPDATE SET \
+                        opened_at = COALESCE(matter_parties.opened_at, excluded.opened_at), \
+                        updated_at = datetime('now')",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        matter_id,
+                        adverse_party_id,
+                        PartyRole::Adverse.as_str(),
+                        opt_text(opened_at.as_deref()),
+                        libsql::Value::Null,
+                    ],
+                )
+                .await?;
+            }
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = op_result {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(err);
         }
 
-        for name in adversaries {
-            let Some(adverse_party_id) = upsert_party_libsql(self, name).await? else {
+        conn.execute("COMMIT", ()).await?;
+        Ok(())
+    }
+
+    async fn reset_conflict_graph(&self) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        conn.execute("BEGIN", ()).await?;
+
+        let op_result: Result<(), DatabaseError> = async {
+            conn.execute("DELETE FROM matter_parties", ()).await?;
+            conn.execute("DELETE FROM party_aliases", ()).await?;
+            conn.execute("DELETE FROM party_relationships", ()).await?;
+            conn.execute("DELETE FROM parties", ()).await?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = op_result {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(err);
+        }
+
+        conn.execute("COMMIT", ()).await?;
+        Ok(())
+    }
+
+    async fn upsert_party_aliases(
+        &self,
+        canonical_name: &str,
+        aliases: &[String],
+    ) -> Result<(), DatabaseError> {
+        if aliases.is_empty() {
+            return Ok(());
+        }
+
+        let Some(party_id) = upsert_party_libsql(self, canonical_name).await? else {
+            return Ok(());
+        };
+
+        let conn = self.connect().await?;
+        let mut seen: HashSet<String> = HashSet::new();
+        for alias in aliases {
+            let display_alias = alias.trim();
+            if display_alias.is_empty() {
                 continue;
-            };
-            let conn = self.connect().await?;
+            }
+            let normalized_alias = normalize_party_name(display_alias);
+            if normalized_alias.is_empty() || !seen.insert(normalized_alias.clone()) {
+                continue;
+            }
             conn.execute(
-                "INSERT INTO matter_parties \
-                 (id, matter_id, party_id, role, opened_at, closed_at, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now')) \
-                 ON CONFLICT(matter_id, party_id, role) DO UPDATE SET \
-                    opened_at = COALESCE(matter_parties.opened_at, excluded.opened_at), \
+                "INSERT INTO party_aliases \
+                 (id, party_id, alias, alias_normalized, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now')) \
+                 ON CONFLICT(party_id, alias_normalized) DO UPDATE SET \
+                    alias = excluded.alias, \
                     updated_at = datetime('now')",
                 params![
                     Uuid::new_v4().to_string(),
-                    matter_id,
-                    adverse_party_id,
-                    PartyRole::Adverse.as_str(),
-                    opt_text(opened_at.as_deref()),
-                    libsql::Value::Null,
+                    party_id.as_str(),
+                    display_alias,
+                    normalized_alias,
                 ],
             )
             .await?;
         }
-
         Ok(())
     }
 
@@ -404,6 +491,19 @@ mod tests {
             backend,
             _tmpdir: tmpdir,
         }
+    }
+
+    async fn table_count(backend: &LibSqlBackend, table: &str) -> i64 {
+        let conn = backend.connect().await.expect("connect");
+        conn.query(&format!("SELECT COUNT(*) FROM {table}"), ())
+            .await
+            .expect("count query")
+            .next()
+            .await
+            .expect("row read")
+            .expect("row exists")
+            .get::<i64>(0)
+            .expect("count int")
     }
 
     #[tokio::test]
@@ -610,5 +710,153 @@ mod tests {
             .get::<i64>(0)
             .expect("count int");
         assert_eq!(matter_parties_count, 2);
+    }
+
+    #[tokio::test]
+    async fn seed_matter_parties_rolls_back_on_midstream_failure() {
+        let fixture = setup_backend().await;
+        let conn = fixture.backend.connect().await.expect("connect");
+        conn.execute(
+            "CREATE TRIGGER fail_adverse_insert \
+             BEFORE INSERT ON matter_parties \
+             WHEN NEW.role = 'adverse' \
+             BEGIN \
+               SELECT RAISE(ABORT, 'adverse insert blocked'); \
+             END;",
+            (),
+        )
+        .await
+        .expect("create failure trigger");
+
+        let err = fixture
+            .backend
+            .seed_matter_parties("matter-a", "Acme Corp", &["Foo LLC".to_string()], None)
+            .await
+            .expect_err("seed should fail due to trigger");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("adverse insert blocked"),
+            "unexpected error: {err_msg}"
+        );
+
+        assert_eq!(table_count(&fixture.backend, "matter_parties").await, 0);
+        assert_eq!(table_count(&fixture.backend, "parties").await, 0);
+    }
+
+    #[tokio::test]
+    async fn upsert_party_aliases_is_idempotent() {
+        let fixture = setup_backend().await;
+        fixture
+            .backend
+            .upsert_party_aliases(
+                "Acme Corp",
+                &["Acme".to_string(), "Acme Corporation".to_string()],
+            )
+            .await
+            .expect("initial alias upsert");
+        fixture
+            .backend
+            .upsert_party_aliases(
+                "Acme Corp",
+                &["Acme".to_string(), "Acme Corporation".to_string()],
+            )
+            .await
+            .expect("repeated alias upsert");
+
+        let conn = fixture.backend.connect().await.expect("connect");
+        let alias_count = conn
+            .query("SELECT COUNT(*) FROM party_aliases", ())
+            .await
+            .expect("count aliases")
+            .next()
+            .await
+            .expect("row read")
+            .expect("row exists")
+            .get::<i64>(0)
+            .expect("count int");
+        assert_eq!(alias_count, 2);
+    }
+
+    #[tokio::test]
+    async fn reset_conflict_graph_clears_party_graph_tables() {
+        let fixture = setup_backend().await;
+        fixture
+            .backend
+            .seed_matter_parties("matter-a", "Acme Corp", &["Foo LLC".to_string()], None)
+            .await
+            .expect("seed parties");
+        fixture
+            .backend
+            .upsert_party_aliases("Acme Corp", &["Acme".to_string()])
+            .await
+            .expect("seed aliases");
+
+        fixture
+            .backend
+            .reset_conflict_graph()
+            .await
+            .expect("reset graph");
+
+        let conn = fixture.backend.connect().await.expect("connect");
+        for (table, expected) in [
+            ("matter_parties", 0i64),
+            ("party_aliases", 0i64),
+            ("party_relationships", 0i64),
+            ("parties", 0i64),
+        ] {
+            let count = conn
+                .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+                .await
+                .expect("count query")
+                .next()
+                .await
+                .expect("row read")
+                .expect("row exists")
+                .get::<i64>(0)
+                .expect("count int");
+            assert_eq!(count, expected, "unexpected row count for {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_conflict_graph_rolls_back_when_delete_fails() {
+        let fixture = setup_backend().await;
+        fixture
+            .backend
+            .seed_matter_parties("matter-a", "Acme Corp", &["Foo LLC".to_string()], None)
+            .await
+            .expect("seed parties");
+        fixture
+            .backend
+            .upsert_party_aliases("Acme Corp", &["Acme".to_string()])
+            .await
+            .expect("seed aliases");
+
+        let conn = fixture.backend.connect().await.expect("connect");
+        conn.execute(
+            "CREATE TRIGGER fail_alias_delete \
+             BEFORE DELETE ON party_aliases \
+             BEGIN \
+               SELECT RAISE(ABORT, 'alias delete blocked'); \
+             END;",
+            (),
+        )
+        .await
+        .expect("create delete failure trigger");
+
+        let err = fixture
+            .backend
+            .reset_conflict_graph()
+            .await
+            .expect_err("reset should fail due to trigger");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("alias delete blocked"),
+            "unexpected error: {err_msg}"
+        );
+
+        assert_eq!(table_count(&fixture.backend, "matter_parties").await, 2);
+        assert_eq!(table_count(&fixture.backend, "party_aliases").await, 1);
+        assert_eq!(table_count(&fixture.backend, "parties").await, 2);
     }
 }

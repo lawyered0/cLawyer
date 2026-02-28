@@ -3,11 +3,11 @@
 //! Delegates to the existing `Store` (history) and `Repository` (workspace)
 //! implementations, avoiding SQL duplication.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use deadpool_postgres::Pool;
+use deadpool_postgres::{GenericClient, Pool};
 use rust_decimal::Decimal;
 use tokio_postgres::types::ToSql;
 use uuid::Uuid;
@@ -110,10 +110,10 @@ fn parse_opened_at_ts(raw: Option<&str>) -> Result<Option<DateTime<Utc>>, Databa
     )))
 }
 
-async fn upsert_party_pg(
-    conn: &mut deadpool_postgres::Object,
-    name: &str,
-) -> Result<Option<Uuid>, DatabaseError> {
+async fn upsert_party_pg<C>(conn: &C, name: &str) -> Result<Option<Uuid>, DatabaseError>
+where
+    C: GenericClient + Sync,
+{
     let display_name = name.trim();
     if display_name.is_empty() {
         return Ok(None);
@@ -769,8 +769,10 @@ impl LegalConflictStore for PgBackend {
         let opened_at = parse_opened_at_ts(opened_at)?;
         let mut conn = self.store.conn().await?;
 
-        if let Some(client_party_id) = upsert_party_pg(&mut conn, client).await? {
-            conn.execute(
+        let tx = conn.transaction().await?;
+
+        if let Some(client_party_id) = upsert_party_pg(&tx, client).await? {
+            tx.execute(
                 "INSERT INTO matter_parties (id, matter_id, party_id, role, opened_at, closed_at) \
                  VALUES ($1, $2, $3, $4, $5, $6) \
                  ON CONFLICT (matter_id, party_id, role) DO UPDATE \
@@ -789,10 +791,10 @@ impl LegalConflictStore for PgBackend {
         }
 
         for name in adversaries {
-            let Some(adverse_party_id) = upsert_party_pg(&mut conn, name).await? else {
+            let Some(adverse_party_id) = upsert_party_pg(&tx, name).await? else {
                 continue;
             };
-            conn.execute(
+            tx.execute(
                 "INSERT INTO matter_parties (id, matter_id, party_id, role, opened_at, closed_at) \
                  VALUES ($1, $2, $3, $4, $5, $6) \
                  ON CONFLICT (matter_id, party_id, role) DO UPDATE \
@@ -805,6 +807,60 @@ impl LegalConflictStore for PgBackend {
                     &PartyRole::Adverse.as_str(),
                     &opened_at,
                     &Option::<DateTime<Utc>>::None,
+                ],
+            )
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn reset_conflict_graph(&self) -> Result<(), DatabaseError> {
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+        tx.execute("DELETE FROM matter_parties", &[]).await?;
+        tx.execute("DELETE FROM party_aliases", &[]).await?;
+        tx.execute("DELETE FROM party_relationships", &[]).await?;
+        tx.execute("DELETE FROM parties", &[]).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn upsert_party_aliases(
+        &self,
+        canonical_name: &str,
+        aliases: &[String],
+    ) -> Result<(), DatabaseError> {
+        if aliases.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.store.conn().await?;
+        let Some(party_id) = upsert_party_pg(&conn, canonical_name).await? else {
+            return Ok(());
+        };
+
+        let mut seen = HashSet::new();
+        for alias in aliases {
+            let display_alias = alias.trim();
+            if display_alias.is_empty() {
+                continue;
+            }
+            let normalized_alias = normalize_party_name(display_alias);
+            if normalized_alias.is_empty() || !seen.insert(normalized_alias.clone()) {
+                continue;
+            }
+            conn.execute(
+                "INSERT INTO party_aliases (id, party_id, alias, alias_normalized) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (party_id, alias_normalized) DO UPDATE \
+                 SET alias = EXCLUDED.alias, updated_at = NOW()",
+                &[
+                    &Uuid::new_v4(),
+                    &party_id,
+                    &display_alias,
+                    &normalized_alias,
                 ],
             )
             .await?;
