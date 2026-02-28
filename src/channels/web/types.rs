@@ -310,6 +310,10 @@ pub struct CreateMatterRequest {
     pub team: Vec<String>,
     #[serde(default)]
     pub adversaries: Vec<String>,
+    #[serde(default)]
+    pub conflict_decision: Option<crate::db::ConflictDecision>,
+    #[serde(default)]
+    pub conflict_note: Option<String>,
 }
 
 /// Response body for `POST /api/matters`.
@@ -332,6 +336,24 @@ pub struct MatterConflictCheckResponse {
     pub matched: bool,
     pub conflict: Option<String>,
     pub matter_id: Option<String>,
+}
+
+/// Request body for `POST /api/matters/conflict-check`.
+#[derive(Debug, Deserialize)]
+pub struct MatterIntakeConflictCheckRequest {
+    pub matter_id: String,
+    pub client_names: Vec<String>,
+    #[serde(default)]
+    pub adversary_names: Vec<String>,
+}
+
+/// Response body for `POST /api/matters/conflict-check`.
+#[derive(Debug, Serialize)]
+pub struct MatterIntakeConflictCheckResponse {
+    pub matched: bool,
+    pub hits: Vec<crate::db::ConflictHit>,
+    pub matter_id: String,
+    pub checked_parties: Vec<String>,
 }
 
 // --- Legal audit ---

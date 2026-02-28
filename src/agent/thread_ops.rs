@@ -248,9 +248,13 @@ impl Agent {
         }
 
         if let Some(ws) = self.workspace()
-            && let Some(conflict) =
-                crate::legal::matter::detect_conflict(ws.as_ref(), &effective_legal_config, content)
-                    .await
+            && let Some(conflict) = crate::legal::matter::detect_conflict_with_store(
+                self.store(),
+                ws.as_ref(),
+                &effective_legal_config,
+                content,
+            )
+            .await
         {
             crate::legal::audit::inc_blocked_action();
             crate::legal::audit::record(

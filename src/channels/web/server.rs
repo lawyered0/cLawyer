@@ -37,7 +37,7 @@ use crate::channels::web::handlers::skills::{
 use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
-use crate::db::Database;
+use crate::db::{ConflictClearanceRecord, ConflictDecision, ConflictHit, Database};
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::tools::ToolRegistry;
@@ -235,6 +235,10 @@ pub async fn start_server(
         .route(
             "/api/matters/{id}/filing-package",
             post(matter_filing_package_handler),
+        )
+        .route(
+            "/api/matters/conflict-check",
+            post(matters_conflict_check_handler),
         )
         .route(
             "/api/matters/conflicts/check",
@@ -1872,6 +1876,51 @@ fn parse_matter_list(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn build_checked_parties(client: &str, adversaries: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    if !client.trim().is_empty() {
+        out.push(client.trim().to_string());
+    }
+    for name in adversaries {
+        let trimmed = name.trim();
+        if trimmed.is_empty()
+            || out
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    out
+}
+
+fn json_error_string(value: serde_json::Value) -> String {
+    serde_json::to_string(&value).unwrap_or_else(|_| "{\"error\":\"serialization_error\"}".into())
+}
+
+fn conflict_required_error(hits: &[ConflictHit]) -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        json_error_string(serde_json::json!({
+            "error": "Potential conflicts detected. Review and submit a conflict decision before creating the matter.",
+            "conflict_required": true,
+            "hits": hits,
+        })),
+    )
+}
+
+fn conflict_declined_error(hits: &[ConflictHit]) -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        json_error_string(serde_json::json!({
+            "error": "Matter creation declined due to conflict review decision.",
+            "decision": "declined",
+            "hits": hits,
+        })),
+    )
+}
+
 fn list_matters_root_entries(
     result: Result<Vec<crate::workspace::WorkspaceEntry>, crate::error::WorkspaceError>,
 ) -> Result<Vec<crate::workspace::WorkspaceEntry>, (StatusCode, String)> {
@@ -1929,6 +1978,70 @@ async fn matters_create_handler(
     }
     let team = parse_matter_list(req.team);
     let adversaries = parse_matter_list(req.adversaries);
+    let conflict_decision = req.conflict_decision;
+    let conflict_note = parse_optional_matter_field(req.conflict_note);
+    let checked_parties = build_checked_parties(&client, &adversaries);
+    let conflict_hits = if checked_parties.is_empty() {
+        Vec::new()
+    } else {
+        store
+            .find_conflict_hits_for_names(&checked_parties, 50)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    if !conflict_hits.is_empty() {
+        let decision = match conflict_decision {
+            Some(decision) => decision,
+            None => return Err(conflict_required_error(&conflict_hits)),
+        };
+
+        if matches!(
+            decision,
+            ConflictDecision::Waived | ConflictDecision::Declined
+        ) && conflict_note.as_deref().is_none()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "'conflict_note' is required for waived or declined decisions".to_string(),
+            ));
+        }
+
+        let clearance = ConflictClearanceRecord {
+            matter_id: sanitized.clone(),
+            checked_by: state.user_id.clone(),
+            cleared_by: if matches!(decision, ConflictDecision::Declined) {
+                None
+            } else {
+                Some(state.user_id.clone())
+            },
+            decision,
+            note: conflict_note.clone(),
+            hits_json: serde_json::to_value(&conflict_hits)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            hit_count: conflict_hits.len() as i32,
+        };
+        store
+            .record_conflict_clearance(&clearance)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        crate::legal::audit::record(
+            "conflict_clearance_decision",
+            serde_json::json!({
+                "matter_id": sanitized.clone(),
+                "decision": decision.as_str(),
+                "checked_by": state.user_id.clone(),
+                "cleared_by_present": clearance.cleared_by.is_some(),
+                "hit_count": clearance.hit_count,
+                "source": "create_flow",
+            }),
+        );
+
+        if matches!(decision, ConflictDecision::Declined) {
+            return Err(conflict_declined_error(&conflict_hits));
+        }
+    }
 
     let metadata = crate::legal::matter::MatterMetadata {
         matter_id: sanitized.clone(),
@@ -2019,6 +2132,12 @@ async fn matters_create_handler(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
+
+    store
+        .seed_matter_parties(&sanitized, &client, &adversaries, opened_at.as_deref())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::legal::matter::invalidate_conflict_cache();
 
     let value = serde_json::json!(sanitized);
     store
@@ -2475,6 +2594,64 @@ async fn matter_filing_package_handler(
     ))
 }
 
+async fn matters_conflict_check_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<MatterIntakeConflictCheckRequest>,
+) -> Result<Json<MatterIntakeConflictCheckResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let legal = legal_config_for_gateway(state.as_ref());
+    if !legal.enabled || !legal.conflict_check_enabled {
+        return Err((
+            StatusCode::CONFLICT,
+            "Conflict check is disabled by legal policy".to_string(),
+        ));
+    }
+
+    let matter_id = crate::legal::policy::sanitize_matter_id(req.matter_id.trim());
+    if matter_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'matter_id' is empty after sanitization".to_string(),
+        ));
+    }
+
+    let client_names = parse_matter_list(req.client_names);
+    if client_names.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'client_names' must include at least one non-empty name".to_string(),
+        ));
+    }
+    let adversary_names = parse_matter_list(req.adversary_names);
+
+    let mut checked_parties: Vec<String> = Vec::new();
+    for value in client_names.iter().chain(adversary_names.iter()) {
+        if checked_parties
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(value))
+        {
+            continue;
+        }
+        checked_parties.push(value.clone());
+    }
+
+    let hits = store
+        .find_conflict_hits_for_names(&checked_parties, 100)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(MatterIntakeConflictCheckResponse {
+        matched: !hits.is_empty(),
+        hits,
+        matter_id,
+        checked_parties,
+    }))
+}
+
 async fn matters_conflicts_check_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<MatterConflictCheckRequest>,
@@ -2520,12 +2697,13 @@ async fn matters_conflicts_check_handler(
 
     legal.active_matter = effective_matter_id.clone();
 
-    match workspace.read("conflicts.json").await {
-        Ok(_) | Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => {}
-        Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
-    }
-
-    let conflict = crate::legal::matter::detect_conflict(workspace.as_ref(), &legal, text).await;
+    let conflict = crate::legal::matter::detect_conflict_with_store(
+        state.store.as_ref(),
+        workspace.as_ref(),
+        &legal,
+        text,
+    )
+    .await;
     Ok(Json(MatterConflictCheckResponse {
         matched: conflict.is_some(),
         conflict,
@@ -4815,6 +4993,8 @@ mod tests {
                 opened_at: Some("2024-03-15".to_string()),
                 team: vec!["Lead Counsel".to_string()],
                 adversaries: vec!["Foo LLC".to_string()],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -4895,6 +5075,8 @@ mod tests {
                 opened_at: Some("2024-03-15".to_string()),
                 team: vec!["Lead Counsel".to_string()],
                 adversaries: vec!["Foo LLC".to_string()],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -4934,6 +5116,8 @@ mod tests {
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -4951,6 +5135,8 @@ mod tests {
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -4979,6 +5165,8 @@ mod tests {
                 opened_at: Some("03/15/2024".to_string()),
                 team: vec![],
                 adversaries: vec![],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -5007,6 +5195,8 @@ mod tests {
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -5036,6 +5226,8 @@ mod tests {
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -5043,6 +5235,224 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("empty after sanitization"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn intake_conflict_check_returns_structured_hits() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
+            .await
+            .expect("seed matter parties");
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let Json(resp) = matters_conflict_check_handler(
+            State(state),
+            Json(MatterIntakeConflictCheckRequest {
+                matter_id: "new-matter".to_string(),
+                client_names: vec!["Acme Corp".to_string()],
+                adversary_names: vec!["Other Party".to_string()],
+            }),
+        )
+        .await
+        .expect("intake conflict check should succeed");
+
+        assert!(resp.matched);
+        assert_eq!(resp.matter_id, "new-matter");
+        assert_eq!(resp.checked_parties.len(), 2);
+        assert!(!resp.hits.is_empty());
+        assert!(resp.hits.iter().any(|hit| hit.party == "Acme Corp"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn intake_conflict_check_rejects_empty_client_names() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let err = matters_conflict_check_handler(
+            State(state),
+            Json(MatterIntakeConflictCheckRequest {
+                matter_id: "new-matter".to_string(),
+                client_names: vec!["   ".to_string()],
+                adversary_names: vec![],
+            }),
+        )
+        .await
+        .expect_err("empty client list should fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("client_names"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn intake_conflict_check_respects_disabled_policy() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.conflict_check_enabled = false;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let err = matters_conflict_check_handler(
+            State(state),
+            Json(MatterIntakeConflictCheckRequest {
+                matter_id: "new-matter".to_string(),
+                client_names: vec!["Acme Corp".to_string()],
+                adversary_names: vec![],
+            }),
+        )
+        .await
+        .expect_err("disabled policy should reject");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("disabled"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_create_requires_conflict_decision_when_hits_exist() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
+            .await
+            .expect("seed matter parties");
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let err = matters_create_handler(
+            State(state),
+            Json(CreateMatterRequest {
+                matter_id: "new-matter".to_string(),
+                client: "Acme Corp".to_string(),
+                confidentiality: "privileged".to_string(),
+                retention: "policy".to_string(),
+                jurisdiction: None,
+                practice_area: None,
+                opened_at: None,
+                team: vec![],
+                adversaries: vec![],
+                conflict_decision: None,
+                conflict_note: None,
+            }),
+        )
+        .await
+        .expect_err("missing conflict decision should fail");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_str(&err.1).expect("conflict body should be json");
+        assert_eq!(body["conflict_required"], true);
+        assert!(body["hits"].as_array().is_some_and(|hits| !hits.is_empty()));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_create_declined_records_audit_and_blocks_creation() {
+        crate::legal::audit::clear_test_events();
+        let (db, _tmp) = crate::testing::test_db().await;
+        db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
+            .await
+            .expect("seed matter parties");
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let err = matters_create_handler(
+            State(state),
+            Json(CreateMatterRequest {
+                matter_id: "new-matter".to_string(),
+                client: "Acme Corp".to_string(),
+                confidentiality: "privileged".to_string(),
+                retention: "policy".to_string(),
+                jurisdiction: None,
+                practice_area: None,
+                opened_at: None,
+                team: vec![],
+                adversaries: vec![],
+                conflict_decision: Some(ConflictDecision::Declined),
+                conflict_note: Some("Escalated to conflicts counsel".to_string()),
+            }),
+        )
+        .await
+        .expect_err("declined decision should block creation");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_str(&err.1).expect("declined body should be json");
+        assert_eq!(body["decision"], "declined");
+        let created = workspace.read("matters/new-matter/matter.yaml").await;
+        assert!(matches!(
+            created,
+            Err(crate::error::WorkspaceError::DocumentNotFound { .. })
+        ));
+
+        let events = crate::legal::audit::test_events_snapshot();
+        let decision_event = events
+            .iter()
+            .find(|event| event.event_type == "conflict_clearance_decision")
+            .expect("expected conflict_clearance_decision event");
+        assert_eq!(decision_event.details["decision"], "declined");
+        assert_eq!(decision_event.details["source"], "create_flow");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_create_waived_records_and_proceeds() {
+        crate::legal::audit::clear_test_events();
+        let (db, _tmp) = crate::testing::test_db().await;
+        db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
+            .await
+            .expect("seed matter parties");
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let (status, Json(resp)) = matters_create_handler(
+            State(state),
+            Json(CreateMatterRequest {
+                matter_id: "new-matter".to_string(),
+                client: "Acme Corp".to_string(),
+                confidentiality: "privileged".to_string(),
+                retention: "policy".to_string(),
+                jurisdiction: None,
+                practice_area: None,
+                opened_at: Some("2026-02-28".to_string()),
+                team: vec![],
+                adversaries: vec!["Other Party".to_string()],
+                conflict_decision: Some(ConflictDecision::Waived),
+                conflict_note: Some("Waived after documented informed consent".to_string()),
+            }),
+        )
+        .await
+        .expect("waived decision should allow creation");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.matter.id, "new-matter");
+        workspace
+            .read("matters/new-matter/matter.yaml")
+            .await
+            .expect("matter yaml should exist");
+
+        let hits = db
+            .find_conflict_hits_for_names(&["Acme Corp".to_string()], 20)
+            .await
+            .expect("conflict search should succeed");
+        assert!(
+            hits.iter().any(|hit| hit.matter_id == "new-matter"),
+            "seed_matter_parties should register new matter parties"
+        );
+
+        let events = crate::legal::audit::test_events_snapshot();
+        assert!(events.iter().any(|event| {
+            event.event_type == "conflict_clearance_decision"
+                && event.details["decision"] == "waived"
+        }));
     }
 
     #[cfg(feature = "libsql")]

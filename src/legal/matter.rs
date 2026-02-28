@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -6,6 +7,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::config::LegalConfig;
+use crate::db::Database;
 use crate::error::WorkspaceError;
 use crate::legal::policy::sanitize_matter_id;
 use crate::workspace::Workspace;
@@ -32,8 +34,22 @@ struct ConflictCacheState {
     ready: bool,
 }
 
+#[derive(Debug, Clone)]
+struct DbConflictCacheEntry {
+    conflict: Option<String>,
+    refreshed_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct DbConflictCacheState {
+    entries: HashMap<String, DbConflictCacheEntry>,
+    generation: u64,
+}
+
 static CONFLICT_CACHE: LazyLock<Mutex<ConflictCacheState>> =
     LazyLock::new(|| Mutex::new(ConflictCacheState::default()));
+static DB_CONFLICT_CACHE: LazyLock<Mutex<DbConflictCacheState>> =
+    LazyLock::new(|| Mutex::new(DbConflictCacheState::default()));
 static CONFLICT_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
 static CONFLICT_CACHE_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -489,7 +505,11 @@ pub async fn seed_legal_workspace(
 
 /// Invalidate the cached conflicts.json parse result.
 pub fn invalidate_conflict_cache() {
-    CONFLICT_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let next_generation = CONFLICT_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Ok(mut db_cache) = DB_CONFLICT_CACHE.lock() {
+        db_cache.entries.clear();
+        db_cache.generation = next_generation;
+    }
 }
 
 /// True when the path resolves to the workspace-global `conflicts.json`.
@@ -714,8 +734,76 @@ fn mark_conflict_cache_refresh_failure() {
     }
 }
 
-/// Check conflicts.json for conflict hits in message or active matter.
-pub async fn detect_conflict(
+fn db_conflict_cache_key(message: &str, active_matter: Option<&str>) -> String {
+    let message = normalize_conflict_text(message);
+    let matter = active_matter
+        .map(normalize_conflict_text)
+        .unwrap_or_default();
+    format!("{message}|{matter}")
+}
+
+fn db_conflict_cache_lookup(key: &str) -> Option<Option<String>> {
+    let generation = CONFLICT_CACHE_GENERATION.load(Ordering::Relaxed);
+    let cache = DB_CONFLICT_CACHE.lock().ok()?;
+    if cache.generation != generation {
+        return None;
+    }
+    let entry = cache.entries.get(key)?;
+    if entry.refreshed_at.elapsed() > CONFLICT_CACHE_REFRESH_WINDOW {
+        return None;
+    }
+    Some(entry.conflict.clone())
+}
+
+fn db_conflict_cache_store(key: String, conflict: Option<String>) {
+    let generation = CONFLICT_CACHE_GENERATION.load(Ordering::Relaxed);
+    if let Ok(mut cache) = DB_CONFLICT_CACHE.lock() {
+        if cache.generation != generation {
+            cache.entries.clear();
+            cache.generation = generation;
+        }
+        cache.entries.insert(
+            key,
+            DbConflictCacheEntry {
+                conflict,
+                refreshed_at: Instant::now(),
+            },
+        );
+        if cache.entries.len() > 512 {
+            cache
+                .entries
+                .retain(|_, value| value.refreshed_at.elapsed() <= CONFLICT_CACHE_REFRESH_WINDOW);
+        }
+    }
+}
+
+async fn detect_conflict_from_db(
+    store: Option<&std::sync::Arc<dyn Database>>,
+    config: &LegalConfig,
+    message: &str,
+) -> Option<String> {
+    let store = store?;
+    let active_matter = config.active_matter.as_deref();
+    let key = db_conflict_cache_key(message, active_matter);
+    if let Some(cached) = db_conflict_cache_lookup(&key) {
+        return cached;
+    }
+
+    let conflict = match store
+        .find_conflict_hits_for_text(message, active_matter, 25)
+        .await
+    {
+        Ok(hits) => hits.first().map(|hit| hit.party.clone()),
+        Err(err) => {
+            tracing::warn!("DB-backed conflict check failed, falling back to file cache: {err}");
+            None
+        }
+    };
+    db_conflict_cache_store(key, conflict.clone());
+    conflict
+}
+
+async fn detect_conflict_from_workspace_conflicts(
     workspace: &Workspace,
     config: &LegalConfig,
     message: &str,
@@ -772,12 +860,38 @@ pub async fn detect_conflict(
     None
 }
 
+/// Check for conflict hits using DB-backed matching first, then fallback to
+/// workspace `conflicts.json` + active-matter adversaries.
+pub async fn detect_conflict_with_store(
+    store: Option<&std::sync::Arc<dyn Database>>,
+    workspace: &Workspace,
+    config: &LegalConfig,
+    message: &str,
+) -> Option<String> {
+    if let Some(conflict) = detect_conflict_from_db(store, config, message).await {
+        return Some(conflict);
+    }
+    detect_conflict_from_workspace_conflicts(workspace, config, message).await
+}
+
+/// Backward-compatible detector for call sites that do not have DB access.
+pub async fn detect_conflict(
+    workspace: &Workspace,
+    config: &LegalConfig,
+    message: &str,
+) -> Option<String> {
+    detect_conflict_with_store(None, workspace, config, message).await
+}
+
 #[cfg(test)]
 pub(crate) fn reset_conflict_cache_for_tests() {
     CONFLICT_CACHE_GENERATION.store(1, Ordering::Relaxed);
     CONFLICT_CACHE_REFRESH_COUNT.store(0, Ordering::Relaxed);
     if let Ok(mut cache) = CONFLICT_CACHE.lock() {
         *cache = ConflictCacheState::default();
+    }
+    if let Ok(mut db_cache) = DB_CONFLICT_CACHE.lock() {
+        *db_cache = DbConflictCacheState::default();
     }
 }
 
