@@ -782,6 +782,9 @@ async fn detect_conflict_from_db(
     config: &LegalConfig,
     message: &str,
 ) -> Option<String> {
+    if !config.enabled || !config.conflict_check_enabled {
+        return None;
+    }
     let store = store?;
     let active_matter = config.active_matter.as_deref();
     let key = db_conflict_cache_key(message, active_matter);
@@ -868,6 +871,9 @@ pub async fn detect_conflict_with_store(
     config: &LegalConfig,
     message: &str,
 ) -> Option<String> {
+    if !config.enabled || !config.conflict_check_enabled {
+        return None;
+    }
     if let Some(conflict) = detect_conflict_from_db(store, config, message).await {
         return Some(conflict);
     }
@@ -1053,7 +1059,7 @@ opened_at: 2024-03-15
     }
 }
 
-#[cfg(all(test, feature = "libsql"))]
+#[cfg(test)]
 mod cache_tests {
     use std::sync::Arc;
 
@@ -1069,6 +1075,7 @@ mod cache_tests {
     // don't stomp each other's `CONFLICT_CACHE_REFRESH_COUNT` state.
     static CACHE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn detect_conflict_uses_cache_until_invalidated() {
         let _guard = CACHE_TEST_LOCK.lock().await;
@@ -1125,6 +1132,38 @@ mod cache_tests {
         );
     }
 
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn detect_conflict_with_store_respects_disabled_policy() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
+        reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Example Co","aliases":["Example Company"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.conflict_check_enabled = false;
+        legal.active_matter = None;
+
+        let hit = super::detect_conflict_with_store(
+            Some(&db),
+            workspace.as_ref(),
+            &legal,
+            "Representing Example Co",
+        )
+        .await;
+        assert_eq!(hit, None);
+    }
+
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn detect_conflict_matches_active_matter_adversary_without_conflicts_json_hit() {
         let _guard = CACHE_TEST_LOCK.lock().await;
@@ -1170,6 +1209,7 @@ retention: follow-firm-policy
         assert_eq!(hit.as_deref(), Some("Foo Industries"));
     }
 
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn detect_conflict_uses_warm_cache_for_no_match_without_refreshing_disk_parse() {
         let _guard = CACHE_TEST_LOCK.lock().await;
@@ -1206,6 +1246,7 @@ retention: follow-firm-policy
         );
     }
 
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn detect_conflict_ignores_short_single_token_adversary_false_positive() {
         let _guard = CACHE_TEST_LOCK.lock().await;
@@ -1248,6 +1289,7 @@ retention: follow-firm-policy
         assert_eq!(hit, None);
     }
 
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn detect_conflict_matches_active_matter_identifier_against_adversaries() {
         let _guard = CACHE_TEST_LOCK.lock().await;
@@ -1286,6 +1328,7 @@ retention: follow-firm-policy
         assert_eq!(hit.as_deref(), Some("Acme Corp"));
     }
 
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn load_active_matter_prompt_context_includes_optional_fields_when_present() {
         let (db, _tmp) = crate::testing::test_db().await;

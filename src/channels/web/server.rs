@@ -1324,6 +1324,12 @@ const MATTER_ROOT: &str = "matters";
 const MATTER_ACTIVE_SETTING: &str = "legal.active_matter";
 /// Maximum number of audit log lines scanned per request.
 const MAX_AUDIT_SCAN_LINES: usize = 10_000;
+/// Maximum number of party names accepted by intake conflict endpoints.
+const MAX_INTAKE_CONFLICT_PARTIES: usize = 64;
+/// Maximum length for a single intake party name.
+const MAX_INTAKE_CONFLICT_PARTY_CHARS: usize = 160;
+/// Maximum preview length recorded for text conflict checks.
+const MAX_CONFLICT_TEXT_PREVIEW_CHARS: usize = 100;
 
 fn legal_config_for_gateway(state: &GatewayState) -> crate::config::LegalConfig {
     state.legal_config.clone().unwrap_or_else(|| {
@@ -1876,6 +1882,55 @@ fn parse_matter_list(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn validate_intake_party_name(field_name: &str, value: &str) -> Result<(), (StatusCode, String)> {
+    if value.chars().count() > MAX_INTAKE_CONFLICT_PARTY_CHARS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'{}' entries must be at most {} characters",
+                field_name, MAX_INTAKE_CONFLICT_PARTY_CHARS
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_intake_party_list(
+    field_name: &str,
+    values: &[String],
+) -> Result<(), (StatusCode, String)> {
+    if values.len() > MAX_INTAKE_CONFLICT_PARTIES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'{}' may include at most {} names",
+                field_name, MAX_INTAKE_CONFLICT_PARTIES
+            ),
+        ));
+    }
+    for value in values {
+        validate_intake_party_name(field_name, value)?;
+    }
+    Ok(())
+}
+
+fn conflict_text_preview(text: &str) -> String {
+    let normalized = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let preview: String = collapsed
+        .chars()
+        .take(MAX_CONFLICT_TEXT_PREVIEW_CHARS)
+        .collect();
+    if collapsed.chars().count() > MAX_CONFLICT_TEXT_PREVIEW_CHARS {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
 fn build_checked_parties(client: &str, adversaries: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     if !client.trim().is_empty() {
@@ -1968,6 +2023,7 @@ async fn matters_create_handler(
     let client = parse_required_matter_field("client", &req.client)?;
     let confidentiality = parse_required_matter_field("confidentiality", &req.confidentiality)?;
     let retention = parse_required_matter_field("retention", &req.retention)?;
+    validate_intake_party_name("client", &client)?;
     let jurisdiction = parse_optional_matter_field(req.jurisdiction);
     let practice_area = parse_optional_matter_field(req.practice_area);
     let opened_at = parse_optional_matter_field(req.opened_at);
@@ -1978,9 +2034,19 @@ async fn matters_create_handler(
     }
     let team = parse_matter_list(req.team);
     let adversaries = parse_matter_list(req.adversaries);
+    validate_intake_party_list("adversaries", &adversaries)?;
     let conflict_decision = req.conflict_decision;
     let conflict_note = parse_optional_matter_field(req.conflict_note);
     let checked_parties = build_checked_parties(&client, &adversaries);
+    if checked_parties.len() > MAX_INTAKE_CONFLICT_PARTIES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "combined conflict-check parties may include at most {} names",
+                MAX_INTAKE_CONFLICT_PARTIES
+            ),
+        ));
+    }
     let conflict_hits = if checked_parties.is_empty() {
         Vec::new()
     } else {
@@ -2126,18 +2192,20 @@ async fn matters_create_handler(
         ),
     ];
 
+    // Seed conflict graph rows before filesystem writes so DB failures do not
+    // leave behind an unindexed matter directory that cannot be retried.
+    store
+        .seed_matter_parties(&sanitized, &client, &adversaries, opened_at.as_deref())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::legal::matter::invalidate_conflict_cache();
+
     for (path, content) in scaffold {
         workspace
             .write(&path, &content)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
-
-    store
-        .seed_matter_parties(&sanitized, &client, &adversaries, opened_at.as_deref())
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    crate::legal::matter::invalidate_conflict_cache();
 
     let value = serde_json::json!(sanitized);
     store
@@ -2626,7 +2694,9 @@ async fn matters_conflict_check_handler(
             "'client_names' must include at least one non-empty name".to_string(),
         ));
     }
+    validate_intake_party_list("client_names", &client_names)?;
     let adversary_names = parse_matter_list(req.adversary_names);
+    validate_intake_party_list("adversary_names", &adversary_names)?;
 
     let mut checked_parties: Vec<String> = Vec::new();
     for value in client_names.iter().chain(adversary_names.iter()) {
@@ -2638,14 +2708,37 @@ async fn matters_conflict_check_handler(
         }
         checked_parties.push(value.clone());
     }
+    if checked_parties.len() > MAX_INTAKE_CONFLICT_PARTIES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "combined client/adversary names may include at most {} values",
+                MAX_INTAKE_CONFLICT_PARTIES
+            ),
+        ));
+    }
 
     let hits = store
         .find_conflict_hits_for_names(&checked_parties, 100)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let matched = !hits.is_empty();
+    let top_conflict = hits.first().map(|hit| hit.party.clone());
+
+    crate::legal::audit::record(
+        "matter_intake_conflict_check",
+        serde_json::json!({
+            "matter_id": matter_id.clone(),
+            "matched": matched,
+            "hit_count": hits.len(),
+            "top_conflict": top_conflict,
+            "checked_party_count": checked_parties.len(),
+            "checked_by": state.user_id.clone(),
+        }),
+    );
 
     Ok(Json(MatterIntakeConflictCheckResponse {
-        matched: !hits.is_empty(),
+        matched,
         hits,
         matter_id,
         checked_parties,
@@ -2656,11 +2749,6 @@ async fn matters_conflicts_check_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<MatterConflictCheckRequest>,
 ) -> Result<Json<MatterConflictCheckResponse>, (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-
     let text = req.text.trim();
     if text.is_empty() {
         return Err((
@@ -2694,20 +2782,59 @@ async fn matters_conflicts_check_handler(
     } else {
         load_active_matter_for_chat(state.as_ref()).await
     };
+    if legal.require_matter_context && effective_matter_id.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Active matter is required by legal policy for conflict checks".to_string(),
+        ));
+    }
 
     legal.active_matter = effective_matter_id.clone();
+    let db_hits = if let Some(store) = state.store.as_ref() {
+        match store
+            .find_conflict_hits_for_text(text, legal.active_matter.as_deref(), 50)
+            .await
+        {
+            Ok(hits) => hits,
+            Err(err) => {
+                tracing::warn!(
+                    "DB text conflict check failed, falling back to workspace cache: {err}"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let conflict = if let Some(first_hit) = db_hits.first() {
+        Some(first_hit.party.clone())
+    } else {
+        let workspace = state.workspace.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Workspace not available".to_string(),
+        ))?;
+        crate::legal::matter::detect_conflict_with_store(None, workspace.as_ref(), &legal, text)
+            .await
+    };
+    let matched = conflict.is_some();
 
-    let conflict = crate::legal::matter::detect_conflict_with_store(
-        state.store.as_ref(),
-        workspace.as_ref(),
-        &legal,
-        text,
-    )
-    .await;
+    crate::legal::audit::record(
+        "matter_conflict_check",
+        serde_json::json!({
+            "matter_id": effective_matter_id.clone(),
+            "matched": matched,
+            "conflict": conflict.clone(),
+            "text_preview": conflict_text_preview(text),
+            "checked_by": state.user_id.clone(),
+            "source": "manual_text_check",
+        }),
+    );
+
     Ok(Json(MatterConflictCheckResponse {
-        matched: conflict.is_some(),
+        matched,
         conflict,
         matter_id: effective_matter_id,
+        hits: db_hits,
     }))
 }
 
@@ -5240,6 +5367,7 @@ mod tests {
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn intake_conflict_check_returns_structured_hits() {
+        crate::legal::audit::clear_test_events();
         let (db, _tmp) = crate::testing::test_db().await;
         db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
             .await
@@ -5247,6 +5375,7 @@ mod tests {
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
         let mut legal = test_legal_config();
         legal.enabled = true;
+        legal.require_matter_context = false;
         legal.conflict_check_enabled = true;
         let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
 
@@ -5266,6 +5395,14 @@ mod tests {
         assert_eq!(resp.checked_parties.len(), 2);
         assert!(!resp.hits.is_empty());
         assert!(resp.hits.iter().any(|hit| hit.party == "Acme Corp"));
+
+        let events = crate::legal::audit::test_events_snapshot();
+        let intake_event = events
+            .iter()
+            .find(|event| event.event_type == "matter_intake_conflict_check")
+            .expect("expected intake conflict audit event");
+        assert_eq!(intake_event.details["matched"], true);
+        assert_eq!(intake_event.details["matter_id"], "new-matter");
     }
 
     #[cfg(feature = "libsql")]
@@ -5288,6 +5425,32 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("client_names"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn intake_conflict_check_rejects_excessive_client_names() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+        let client_names: Vec<String> = (0..=MAX_INTAKE_CONFLICT_PARTIES)
+            .map(|idx| format!("Client {idx}"))
+            .collect();
+
+        let err = matters_conflict_check_handler(
+            State(state),
+            Json(MatterIntakeConflictCheckRequest {
+                matter_id: "new-matter".to_string(),
+                client_names,
+                adversary_names: vec![],
+            }),
+        )
+        .await
+        .expect_err("oversized client list should fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("client_names"));
+        assert!(err.1.contains("at most"));
     }
 
     #[cfg(feature = "libsql")]
@@ -5457,7 +5620,42 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn matters_create_rejects_excessive_adversaries() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+        let adversaries: Vec<String> = (0..=MAX_INTAKE_CONFLICT_PARTIES)
+            .map(|idx| format!("Adverse Party {idx}"))
+            .collect();
+
+        let err = matters_create_handler(
+            State(state),
+            Json(CreateMatterRequest {
+                matter_id: "new-matter".to_string(),
+                client: "Acme Corp".to_string(),
+                confidentiality: "privileged".to_string(),
+                retention: "policy".to_string(),
+                jurisdiction: None,
+                practice_area: None,
+                opened_at: None,
+                team: vec![],
+                adversaries,
+                conflict_decision: None,
+                conflict_note: None,
+            }),
+        )
+        .await
+        .expect_err("oversized adversary list should fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("adversaries"));
+        assert!(err.1.contains("at most"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     async fn conflicts_check_returns_hit_for_matching_entry() {
+        crate::legal::audit::clear_test_events();
         crate::legal::matter::reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
@@ -5471,6 +5669,7 @@ mod tests {
 
         let mut legal = test_legal_config();
         legal.enabled = true;
+        legal.require_matter_context = false;
         legal.conflict_check_enabled = true;
         let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
 
@@ -5486,6 +5685,59 @@ mod tests {
 
         assert!(resp.matched);
         assert_eq!(resp.conflict.as_deref(), Some("Alpha Holdings"));
+        assert!(
+            resp.hits.is_empty(),
+            "legacy file fallback should not return db hits"
+        );
+
+        let events = crate::legal::audit::test_events_snapshot();
+        let event = events
+            .iter()
+            .find(|entry| entry.event_type == "matter_conflict_check")
+            .expect("expected manual conflict check audit event");
+        assert_eq!(event.details["matched"], true);
+        assert_eq!(event.details["conflict"], "Alpha Holdings");
+        assert_eq!(event.details["source"], "manual_text_check");
+        assert!(
+            event.details["text_preview"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conflicts_check_returns_db_hits_context() {
+        crate::legal::matter::reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
+            .await
+            .expect("seed matter parties");
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = true;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let Json(resp) = matters_conflicts_check_handler(
+            State(state),
+            Json(MatterConflictCheckRequest {
+                text: "Please analyze exposure for Acme Corp".to_string(),
+                matter_id: None,
+            }),
+        )
+        .await
+        .expect("conflicts check should succeed");
+
+        assert!(resp.matched);
+        assert_eq!(resp.conflict.as_deref(), Some("Acme Corp"));
+        assert!(!resp.hits.is_empty());
+        assert!(
+            resp.hits
+                .iter()
+                .any(|hit| hit.matter_id == "existing-matter")
+        );
     }
 
     #[cfg(feature = "libsql")]
@@ -5532,6 +5784,33 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert!(err.1.contains("disabled"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conflicts_check_requires_active_matter_when_policy_enabled() {
+        crate::legal::matter::reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+        legal.require_matter_context = true;
+        legal.active_matter = None;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let err = matters_conflicts_check_handler(
+            State(state),
+            Json(MatterConflictCheckRequest {
+                text: "Alpha".to_string(),
+                matter_id: None,
+            }),
+        )
+        .await
+        .expect_err("missing matter context should fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("Active matter"));
     }
 
     #[cfg(feature = "libsql")]

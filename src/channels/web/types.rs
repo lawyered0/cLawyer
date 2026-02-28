@@ -336,6 +336,7 @@ pub struct MatterConflictCheckResponse {
     pub matched: bool,
     pub conflict: Option<String>,
     pub matter_id: Option<String>,
+    pub hits: Vec<crate::db::ConflictHit>,
 }
 
 /// Request body for `POST /api/matters/conflict-check`.
