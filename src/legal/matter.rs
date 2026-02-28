@@ -53,6 +53,8 @@ static CONFLICT_CACHE: LazyLock<Mutex<ConflictCacheState>> =
     LazyLock::new(|| Mutex::new(ConflictCacheState::default()));
 static DB_CONFLICT_CACHE: LazyLock<Mutex<DbConflictCacheState>> =
     LazyLock::new(|| Mutex::new(DbConflictCacheState::default()));
+static CONFLICT_REINDEX_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 static CONFLICT_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
 static CONFLICT_CACHE_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -529,6 +531,8 @@ pub async fn reindex_conflict_graph(
     store: &std::sync::Arc<dyn Database>,
     config: &LegalConfig,
 ) -> Result<ConflictGraphReindexReport, String> {
+    let _reindex_guard = CONFLICT_REINDEX_LOCK.lock().await;
+
     let matter_root = config.matter_root.trim_matches('/');
     if matter_root.is_empty() {
         return Err("legal matter root is empty after normalization".to_string());
@@ -610,18 +614,18 @@ pub async fn reindex_conflict_graph(
         Ok(doc) => {
             if let Some(entries) = parse_conflict_entries(&doc.content) {
                 for entry in entries {
-                    let adversaries = vec![entry.canonical_name.clone()];
                     match store
-                        .seed_matter_parties(
+                        .seed_conflict_entry(
                             GLOBAL_CONFLICT_GRAPH_MATTER_ID,
-                            "",
-                            &adversaries,
+                            &entry.canonical_name,
+                            &entry.aliases,
                             None,
                         )
                         .await
                     {
                         Ok(_) => {
                             report.global_conflicts_seeded += 1;
+                            report.global_aliases_seeded += entry.aliases.len();
                         }
                         Err(err) => {
                             push_reindex_warning(
@@ -632,24 +636,6 @@ pub async fn reindex_conflict_graph(
                                 ),
                             );
                             continue;
-                        }
-                    }
-
-                    match store
-                        .upsert_party_aliases(&entry.canonical_name, &entry.aliases)
-                        .await
-                    {
-                        Ok(_) => {
-                            report.global_aliases_seeded += entry.aliases.len();
-                        }
-                        Err(err) => {
-                            push_reindex_warning(
-                                &mut report,
-                                format!(
-                                    "failed to seed aliases for global conflict '{}': {}",
-                                    entry.canonical_name, err
-                                ),
-                            );
                         }
                     }
                 }
@@ -1246,11 +1232,12 @@ opened_at: 2024-03-15
 #[cfg(test)]
 mod cache_tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use super::{
-        GLOBAL_CONFLICT_GRAPH_MATTER_ID, conflict_cache_refresh_count_for_tests, detect_conflict,
-        invalidate_conflict_cache, load_active_matter_prompt_context, reindex_conflict_graph,
-        reset_conflict_cache_for_tests,
+        CONFLICT_REINDEX_LOCK, GLOBAL_CONFLICT_GRAPH_MATTER_ID,
+        conflict_cache_refresh_count_for_tests, detect_conflict, invalidate_conflict_cache,
+        load_active_matter_prompt_context, reindex_conflict_graph, reset_conflict_cache_for_tests,
     };
     use crate::config::LegalConfig;
     use crate::settings::Settings;
@@ -1639,6 +1626,85 @@ opened_at: 2026-02-28
                 .any(|hit| hit.matter_id == GLOBAL_CONFLICT_GRAPH_MATTER_ID),
             "global conflicts should be queryable from DB graph"
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn reindex_conflict_graph_waits_for_global_reindex_lock() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
+        reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "matters/demo/matter.yaml",
+                r#"
+matter_id: demo
+client: Demo Client
+team:
+  - Lead Counsel
+confidentiality: attorney-client-privileged
+adversaries:
+  - Foo Industries
+retention: follow-firm-policy
+"#,
+            )
+            .await
+            .expect("seed matter metadata");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+
+        let reindex_lock_guard = CONFLICT_REINDEX_LOCK.lock().await;
+        let workspace_for_task = Arc::clone(&workspace);
+        let db_for_task = Arc::clone(&db);
+        let legal_for_task = legal.clone();
+
+        let mut reindex_task = tokio::spawn(async move {
+            reindex_conflict_graph(workspace_for_task.as_ref(), &db_for_task, &legal_for_task).await
+        });
+
+        let blocked = tokio::time::timeout(Duration::from_millis(100), &mut reindex_task).await;
+        assert!(blocked.is_err(), "reindex should wait while lock is held");
+
+        drop(reindex_lock_guard);
+        let report = reindex_task
+            .await
+            .expect("reindex task join should succeed")
+            .expect("reindex should succeed");
+        assert_eq!(report.seeded_matters, 1);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn detect_conflict_read_path_not_blocked_by_reindex_lock() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
+        reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Example Co","aliases":["Example Company","ExCo"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+
+        let _reindex_lock_guard = CONFLICT_REINDEX_LOCK.lock().await;
+        let hit = tokio::time::timeout(
+            Duration::from_millis(250),
+            detect_conflict(workspace.as_ref(), &legal, "Representing Example Co"),
+        )
+        .await
+        .expect("conflict read should not block on reindex lock");
+        assert_eq!(hit.as_deref(), Some("Example Co"));
     }
 
     #[cfg(feature = "libsql")]

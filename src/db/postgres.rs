@@ -816,6 +816,75 @@ impl LegalConflictStore for PgBackend {
         Ok(())
     }
 
+    async fn seed_conflict_entry(
+        &self,
+        matter_id: &str,
+        canonical_name: &str,
+        aliases: &[String],
+        opened_at: Option<&str>,
+    ) -> Result<(), DatabaseError> {
+        let matter_id = matter_id.trim();
+        if matter_id.is_empty() {
+            return Err(DatabaseError::Serialization(
+                "matter_id cannot be empty".to_string(),
+            ));
+        }
+
+        let opened_at = parse_opened_at_ts(opened_at)?;
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+
+        let Some(party_id) = upsert_party_pg(&tx, canonical_name).await? else {
+            tx.commit().await?;
+            return Ok(());
+        };
+
+        tx.execute(
+            "INSERT INTO matter_parties (id, matter_id, party_id, role, opened_at, closed_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (matter_id, party_id, role) DO UPDATE \
+             SET opened_at = COALESCE(matter_parties.opened_at, EXCLUDED.opened_at), \
+                 updated_at = NOW()",
+            &[
+                &Uuid::new_v4(),
+                &matter_id,
+                &party_id,
+                &PartyRole::Adverse.as_str(),
+                &opened_at,
+                &Option::<DateTime<Utc>>::None,
+            ],
+        )
+        .await?;
+
+        let mut seen = HashSet::new();
+        for alias in aliases {
+            let display_alias = alias.trim();
+            if display_alias.is_empty() {
+                continue;
+            }
+            let normalized_alias = normalize_party_name(display_alias);
+            if normalized_alias.is_empty() || !seen.insert(normalized_alias.clone()) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO party_aliases (id, party_id, alias, alias_normalized) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (party_id, alias_normalized) DO UPDATE \
+                 SET alias = EXCLUDED.alias, updated_at = NOW()",
+                &[
+                    &Uuid::new_v4(),
+                    &party_id,
+                    &display_alias,
+                    &normalized_alias,
+                ],
+            )
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn reset_conflict_graph(&self) -> Result<(), DatabaseError> {
         let mut conn = self.store.conn().await?;
         let tx = conn.transaction().await?;

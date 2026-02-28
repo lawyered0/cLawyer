@@ -486,6 +486,13 @@ pub trait LegalConflictStore: Send + Sync {
         adversaries: &[String],
         opened_at: Option<&str>,
     ) -> Result<(), DatabaseError>;
+    async fn seed_conflict_entry(
+        &self,
+        matter_id: &str,
+        canonical_name: &str,
+        aliases: &[String],
+        opened_at: Option<&str>,
+    ) -> Result<(), DatabaseError>;
     async fn reset_conflict_graph(&self) -> Result<(), DatabaseError>;
     async fn upsert_party_aliases(
         &self,
