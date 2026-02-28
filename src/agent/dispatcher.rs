@@ -1720,6 +1720,7 @@ mod tests {
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn conflict_gate_blocks_before_llm_call() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
         crate::legal::matter::reset_conflict_cache_for_tests();
         crate::legal::audit::clear_test_events();
         let workspace = make_test_workspace("user-1").await;
@@ -1781,6 +1782,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_decision_event_emitted_in_preflight() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
         crate::legal::audit::clear_test_events();
 
         let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
@@ -1837,6 +1839,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_and_llm_audit_events_emitted_for_chat_turn() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
         crate::legal::audit::clear_test_events();
 
         let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
@@ -1926,6 +1929,7 @@ mod tests {
 
     #[tokio::test]
     async fn hook_rejected_event_emitted_for_blocked_tool_call() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
         crate::legal::audit::clear_test_events();
 
         let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())

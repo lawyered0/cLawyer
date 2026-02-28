@@ -5367,6 +5367,7 @@ mod tests {
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn intake_conflict_check_returns_structured_hits() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
         crate::legal::audit::clear_test_events();
         let (db, _tmp) = crate::testing::test_db().await;
         db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
@@ -5517,6 +5518,7 @@ mod tests {
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn matters_create_declined_records_audit_and_blocks_creation() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
         crate::legal::audit::clear_test_events();
         let (db, _tmp) = crate::testing::test_db().await;
         db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
@@ -5567,6 +5569,7 @@ mod tests {
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn matters_create_waived_records_and_proceeds() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
         crate::legal::audit::clear_test_events();
         let (db, _tmp) = crate::testing::test_db().await;
         db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
@@ -5655,6 +5658,7 @@ mod tests {
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn conflicts_check_returns_hit_for_matching_entry() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
         crate::legal::audit::clear_test_events();
         crate::legal::matter::reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
@@ -5693,7 +5697,13 @@ mod tests {
         let events = crate::legal::audit::test_events_snapshot();
         let event = events
             .iter()
-            .find(|entry| entry.event_type == "matter_conflict_check")
+            .find(|entry| {
+                entry.event_type == "matter_conflict_check"
+                    && entry.details.get("source").and_then(|v| v.as_str())
+                        == Some("manual_text_check")
+                    && entry.details.get("conflict").and_then(|v| v.as_str())
+                        == Some("Alpha Holdings")
+            })
             .expect("expected manual conflict check audit event");
         assert_eq!(event.details["matched"], true);
         assert_eq!(event.details["conflict"], "Alpha Holdings");
