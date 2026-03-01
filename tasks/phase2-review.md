@@ -36,3 +36,34 @@ Reviewed at commit 408b7b4 (codex/phase2f-audit).
 - Table parity between Postgres migrations and libSQL consolidated schema
 - No unwrap/expect in production paths of new code
 - No super:: imports outside test modules
+
+## Follow-up: Extended-Usage Robustness Review
+
+Reviewed at commit `3d9276e` (review/phase2-full, tracking codex/phase2f-audit).
+
+### Additional bugs found and fixed (3d9276e)
+
+**Bug 3 — Audit hash-chain state-before-write race (`audit.rs:103`)**
+`*state = Some(hash)` advanced the in-memory chain head before `writeln!`
+succeeded. A disk-write failure (full disk, permission tightened mid-run)
+would permanently corrupt the chain for the process lifetime: every
+subsequent event would reference a hash that was never persisted.
+Fix: compute `pending_hash`, only advance `*state` after `writeln!` returns `Ok`.
+
+**Bug 4 — Over-payment: `paid_amount` could exceed `total`**
+`apply_invoice_payment` incremented unconditionally. Two sequential partial
+payments (e.g. $600 + $600 on a $1000 invoice) left `paid_amount = $1200`.
+Fix (DB layer, both backends):
+- Postgres: `LEAST(paid_amount + $3, total)`
+- libSQL: `MIN(CAST(paid_amount...) + CAST(?3...), CAST(total...))`
+Fix (application layer, `billing.rs`): remaining-balance guard returns
+descriptive error "Payment of X exceeds outstanding balance of Y" before
+calling the DB, so concurrent callers also get a clean failure.
+
+### Items confirmed NOT a problem
+- `parse_decimal_field` already guards `hours > 0` for time entries
+- `list_invoices` doesn't exist — invoices are always fetched per-matter (bounded)
+- `audit_events` list already has `limit`/`offset` in the trait signature
+- Trust balance atomicity confirmed correct (advisory lock + `FOR UPDATE`)
+
+### Final gate (1691 passed, 0 failed, 1 ignored)
