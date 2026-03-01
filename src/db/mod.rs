@@ -716,6 +716,152 @@ pub struct MatterTimeSummary {
     pub unbilled_expenses: Decimal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvoiceStatus {
+    Draft,
+    Sent,
+    Paid,
+    Void,
+    WriteOff,
+}
+
+impl InvoiceStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Sent => "sent",
+            Self::Paid => "paid",
+            Self::Void => "void",
+            Self::WriteOff => "write_off",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "draft" => Some(Self::Draft),
+            "sent" => Some(Self::Sent),
+            "paid" => Some(Self::Paid),
+            "void" => Some(Self::Void),
+            "write_off" => Some(Self::WriteOff),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvoiceRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub invoice_number: String,
+    pub status: InvoiceStatus,
+    pub issued_date: Option<NaiveDate>,
+    pub due_date: Option<NaiveDate>,
+    pub subtotal: Decimal,
+    pub tax: Decimal,
+    pub total: Decimal,
+    pub paid_amount: Decimal,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateInvoiceParams {
+    pub matter_id: String,
+    pub invoice_number: String,
+    pub status: InvoiceStatus,
+    pub issued_date: Option<NaiveDate>,
+    pub due_date: Option<NaiveDate>,
+    pub subtotal: Decimal,
+    pub tax: Decimal,
+    pub total: Decimal,
+    pub paid_amount: Decimal,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvoiceLineItemRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub invoice_id: Uuid,
+    pub description: String,
+    pub quantity: Decimal,
+    pub unit_price: Decimal,
+    pub amount: Decimal,
+    pub time_entry_id: Option<Uuid>,
+    pub expense_entry_id: Option<Uuid>,
+    pub sort_order: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateInvoiceLineItemParams {
+    pub description: String,
+    pub quantity: Decimal,
+    pub unit_price: Decimal,
+    pub amount: Decimal,
+    pub time_entry_id: Option<Uuid>,
+    pub expense_entry_id: Option<Uuid>,
+    pub sort_order: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustLedgerEntryType {
+    Deposit,
+    Withdrawal,
+    InvoicePayment,
+    Refund,
+}
+
+impl TrustLedgerEntryType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deposit => "deposit",
+            Self::Withdrawal => "withdrawal",
+            Self::InvoicePayment => "invoice_payment",
+            Self::Refund => "refund",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "deposit" => Some(Self::Deposit),
+            "withdrawal" => Some(Self::Withdrawal),
+            "invoice_payment" => Some(Self::InvoicePayment),
+            "refund" => Some(Self::Refund),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustLedgerEntryRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub entry_type: TrustLedgerEntryType,
+    pub amount: Decimal,
+    pub balance_after: Decimal,
+    pub description: String,
+    pub invoice_id: Option<Uuid>,
+    pub recorded_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateTrustLedgerEntryParams {
+    pub entry_type: TrustLedgerEntryType,
+    pub amount: Decimal,
+    pub balance_after: Decimal,
+    pub description: String,
+    pub invoice_id: Option<Uuid>,
+    pub recorded_by: String,
+}
+
 /// Normalize names/text for conflict matching.
 pub fn normalize_party_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -1362,6 +1508,55 @@ pub trait TimeExpenseStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait BillingStore: Send + Sync {
+    async fn save_invoice_draft(
+        &self,
+        user_id: &str,
+        invoice: &CreateInvoiceParams,
+        line_items: &[CreateInvoiceLineItemParams],
+    ) -> Result<(InvoiceRecord, Vec<InvoiceLineItemRecord>), DatabaseError>;
+    async fn get_invoice(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError>;
+    async fn list_invoice_line_items(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+    ) -> Result<Vec<InvoiceLineItemRecord>, DatabaseError>;
+    async fn set_invoice_status(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+        status: InvoiceStatus,
+        issued_date: Option<NaiveDate>,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError>;
+    async fn apply_invoice_payment(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+        amount: Decimal,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError>;
+    async fn append_trust_ledger_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateTrustLedgerEntryParams,
+    ) -> Result<TrustLedgerEntryRecord, DatabaseError>;
+    async fn list_trust_ledger_entries(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<TrustLedgerEntryRecord>, DatabaseError>;
+    async fn current_trust_balance(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Decimal, DatabaseError>;
+}
+
+#[async_trait]
 pub trait SettingsStore: Send + Sync {
     async fn get_setting(
         &self,
@@ -1481,6 +1676,7 @@ pub trait Database:
     + DocumentVersionStore
     + DocumentTemplateStore
     + TimeExpenseStore
+    + BillingStore
     + SettingsStore
     + WorkspaceStore
     + Send
