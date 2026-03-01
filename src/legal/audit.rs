@@ -88,6 +88,7 @@ impl AuditLogger {
             hash: None,
         };
 
+        let mut next_hash: Option<String> = None;
         if self.hash_chain {
             let to_hash = match serde_json::to_string(&event) {
                 Ok(s) => s,
@@ -100,7 +101,7 @@ impl AuditLogger {
             hasher.update(to_hash.as_bytes());
             let hash = format!("{:x}", hasher.finalize());
             event.hash = Some(hash.clone());
-            *state = Some(hash);
+            next_hash = Some(hash);
         }
 
         let line = match serde_json::to_string(&event) {
@@ -150,6 +151,8 @@ impl AuditLogger {
                 }
                 if let Err(e) = writeln!(f, "{line}") {
                     tracing::warn!("Failed to append legal audit event: {}", e);
+                } else if let Some(hash) = next_hash {
+                    *state = Some(hash);
                 }
             }
             Err(e) => {
@@ -385,6 +388,29 @@ mod tests {
             .expect("second prev_hash");
         assert_eq!(second_prev, first_hash);
         assert!(second.get("hash").and_then(|v| v.as_str()).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hash_chain_does_not_advance_when_write_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        fs::write(&path, "existing\n").expect("seed existing file");
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set permissive mode");
+        let logger = AuditLogger::new(path.clone(), true);
+
+        logger.write("event", serde_json::json!({"kind": "blocked"}));
+
+        let raw = fs::read_to_string(&path).expect("read audit log");
+        assert_eq!(raw, "existing\n");
+        let state = logger.state.lock().expect("hash state lock");
+        assert!(
+            state.is_none(),
+            "hash state should not advance on failed write"
+        );
     }
 
     #[cfg(unix)]

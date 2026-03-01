@@ -2397,9 +2397,9 @@ impl BillingStore for LibSqlBackend {
         let conn = self.connect().await?;
         conn.execute(
             "UPDATE invoices SET \
-                paid_amount = printf('%.2f', CAST(paid_amount AS REAL) + CAST(?3 AS REAL)), \
+                paid_amount = printf('%.2f', MIN(CAST(paid_amount AS REAL) + CAST(?3 AS REAL), CAST(total AS REAL))), \
                 status = CASE \
-                    WHEN CAST(paid_amount AS REAL) + CAST(?3 AS REAL) >= CAST(total AS REAL) THEN 'paid' \
+                    WHEN MIN(CAST(paid_amount AS REAL) + CAST(?3 AS REAL), CAST(total AS REAL)) >= CAST(total AS REAL) THEN 'paid' \
                     ELSE status \
                 END, \
                 updated_at = datetime('now') \

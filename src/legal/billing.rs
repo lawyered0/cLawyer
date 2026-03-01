@@ -186,6 +186,17 @@ pub async fn record_payment(
             invoice.status.as_str()
         ));
     }
+    let remaining = (invoice.total - invoice.paid_amount).round_dp(2);
+    if remaining <= Decimal::ZERO {
+        return Err("Invoice has no remaining balance".to_string());
+    }
+    if amount > remaining {
+        return Err(format!(
+            "Payment amount {} exceeds remaining balance {}",
+            amount.round_dp(2),
+            remaining
+        ));
+    }
 
     let trust_entry = if draw_from_trust {
         let entry = db

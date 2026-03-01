@@ -2932,8 +2932,8 @@ impl BillingStore for PgBackend {
         let row = conn
             .query_opt(
                 "UPDATE invoices \
-                 SET paid_amount = paid_amount + $3, \
-                     status = CASE WHEN paid_amount + $3 >= total THEN 'paid' ELSE status END, \
+                 SET paid_amount = LEAST(paid_amount + $3, total), \
+                     status = CASE WHEN LEAST(paid_amount + $3, total) >= total THEN 'paid' ELSE status END, \
                      updated_at = NOW() \
                  WHERE user_id = $1 AND id = $2 \
                  RETURNING id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at",
