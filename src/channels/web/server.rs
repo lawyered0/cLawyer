@@ -3330,6 +3330,21 @@ async fn invoices_void_handler(
         "Database not available".to_string(),
     ))?;
     let invoice_id = parse_uuid(&id, "invoice_id")?;
+    let existing = store
+        .get_invoice(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    if !matches!(existing.status, InvoiceStatus::Draft | InvoiceStatus::Sent) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Cannot void invoice with status '{}'",
+                existing.status.as_str()
+            ),
+        ));
+    }
+
     let invoice = store
         .set_invoice_status(&state.user_id, invoice_id, InvoiceStatus::Void, None)
         .await
@@ -9720,6 +9735,10 @@ opened_at: 2026-02-28
         )
         .await
         .expect("save draft should succeed");
+        let _ =
+            invoices_finalize_handler(State(Arc::clone(&state)), Path(created.invoice.id.clone()))
+                .await
+                .expect("finalize should succeed");
 
         let (_deposit_status, _deposit_body) = matter_trust_deposit_handler(
             State(Arc::clone(&state)),
@@ -9753,6 +9772,152 @@ opened_at: 2026-02-28
                 .iter()
                 .any(|event| event.event_type == "trust_withdrawal_rejected")
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn invoices_payment_rejects_draft_invoice_status() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        store
+            .create_expense_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateExpenseEntryParams {
+                    submitted_by: "Lead".to_string(),
+                    description: "Draft-only charge".to_string(),
+                    amount: rust_decimal::Decimal::new(10000, 2),
+                    category: crate::db::ExpenseCategory::Other,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 6).expect("valid date"),
+                    receipt_path: None,
+                    billable: true,
+                },
+            )
+            .await
+            .expect("seed expense entry");
+
+        let (_status, Json(created)) = invoices_save_handler(
+            State(Arc::clone(&state)),
+            Json(DraftInvoiceRequest {
+                matter_id: "demo".to_string(),
+                invoice_number: "INV-DRAFT-100".to_string(),
+                due_date: Some("2026-06-06".to_string()),
+                notes: None,
+            }),
+        )
+        .await
+        .expect("save draft should succeed");
+
+        let err = invoices_payment_handler(
+            State(Arc::clone(&state)),
+            Path(created.invoice.id.clone()),
+            Json(RecordInvoicePaymentRequest {
+                amount: "25.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                draw_from_trust: false,
+                description: Some("Should fail on draft".to_string()),
+            }),
+        )
+        .await
+        .expect_err("payment on draft invoice should fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("status 'draft'"));
+
+        let invoice_after = store
+            .get_invoice(
+                &state.user_id,
+                Uuid::parse_str(&created.invoice.id).expect("invoice uuid"),
+            )
+            .await
+            .expect("load invoice")
+            .expect("invoice exists");
+        assert_eq!(invoice_after.status, crate::db::InvoiceStatus::Draft);
+        assert_eq!(invoice_after.paid_amount, rust_decimal::Decimal::ZERO);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn invoices_void_rejects_paid_invoice_status() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        store
+            .create_expense_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateExpenseEntryParams {
+                    submitted_by: "Lead".to_string(),
+                    description: "Payable service".to_string(),
+                    amount: rust_decimal::Decimal::new(10000, 2),
+                    category: crate::db::ExpenseCategory::Other,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 7).expect("valid date"),
+                    receipt_path: None,
+                    billable: true,
+                },
+            )
+            .await
+            .expect("seed expense entry");
+
+        let (_status, Json(created)) = invoices_save_handler(
+            State(Arc::clone(&state)),
+            Json(DraftInvoiceRequest {
+                matter_id: "demo".to_string(),
+                invoice_number: "INV-PAID-100".to_string(),
+                due_date: Some("2026-06-07".to_string()),
+                notes: None,
+            }),
+        )
+        .await
+        .expect("save draft should succeed");
+
+        let invoice_id = created.invoice.id.clone();
+        let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
+            .await
+            .expect("finalize should succeed");
+
+        let _ = invoices_payment_handler(
+            State(Arc::clone(&state)),
+            Path(invoice_id.clone()),
+            Json(RecordInvoicePaymentRequest {
+                amount: "100.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                draw_from_trust: false,
+                description: Some("Mark paid".to_string()),
+            }),
+        )
+        .await
+        .expect("payment should succeed");
+
+        let err = invoices_void_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
+            .await
+            .expect_err("void on paid invoice should fail");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("status 'paid'"));
+
+        let invoice_after = store
+            .get_invoice(
+                &state.user_id,
+                Uuid::parse_str(&invoice_id).expect("invoice uuid"),
+            )
+            .await
+            .expect("load invoice")
+            .expect("invoice exists");
+        assert_eq!(invoice_after.status, crate::db::InvoiceStatus::Paid);
     }
 
     #[cfg(feature = "libsql")]

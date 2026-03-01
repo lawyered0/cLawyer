@@ -180,6 +180,12 @@ pub async fn record_payment(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Invoice not found".to_string())?;
+    if !matches!(invoice.status, InvoiceStatus::Sent) {
+        return Err(format!(
+            "Cannot record payment for invoice with status '{}'",
+            invoice.status.as_str()
+        ));
+    }
 
     let trust_entry = if draw_from_trust {
         let entry = db
