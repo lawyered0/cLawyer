@@ -2930,8 +2930,35 @@ impl BillingStore for PgBackend {
         matter_id: &str,
         input: &CreateTrustLedgerEntryParams,
     ) -> Result<TrustLedgerEntryRecord, DatabaseError> {
-        let conn = self.store.conn().await?;
-        let row = conn
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+        tx.query(
+            "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+            &[&user_id, &matter_id],
+        )
+        .await?;
+        let current_row = tx
+            .query_opt(
+                "SELECT balance_after \
+                 FROM trust_ledger \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY created_at DESC, id DESC \
+                 LIMIT 1 \
+                 FOR UPDATE",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        let current_balance = current_row
+            .as_ref()
+            .map(|row| row.get::<_, Decimal>("balance_after"))
+            .unwrap_or(Decimal::ZERO);
+        let balance_after = (current_balance + input.delta).round_dp(2);
+        if balance_after < Decimal::ZERO {
+            return Err(DatabaseError::Constraint(
+                "insufficient trust balance for requested entry".to_string(),
+            ));
+        }
+        let row = tx
             .query_one(
                 "INSERT INTO trust_ledger (id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
@@ -2942,13 +2969,14 @@ impl BillingStore for PgBackend {
                     &matter_id,
                     &input.entry_type.as_str(),
                     &input.amount,
-                    &input.balance_after,
+                    &balance_after,
                     &input.description,
                     &input.invoice_id,
                     &input.recorded_by,
                 ],
             )
             .await?;
+        tx.commit().await?;
         row_to_trust_ledger_entry_record(&row)
     }
 
@@ -2963,7 +2991,7 @@ impl BillingStore for PgBackend {
                 "SELECT id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at \
                  FROM trust_ledger \
                  WHERE user_id = $1 AND matter_id = $2 \
-                 ORDER BY created_at DESC",
+                 ORDER BY created_at DESC, id DESC",
                 &[&user_id, &matter_id],
             )
             .await?;
@@ -2980,7 +3008,7 @@ impl BillingStore for PgBackend {
         let conn = self.store.conn().await?;
         let row = conn
             .query_one(
-                "SELECT COALESCE((SELECT balance_after FROM trust_ledger WHERE user_id = $1 AND matter_id = $2 ORDER BY created_at DESC LIMIT 1), 0)::numeric AS balance",
+                "SELECT COALESCE((SELECT balance_after FROM trust_ledger WHERE user_id = $1 AND matter_id = $2 ORDER BY created_at DESC, id DESC LIMIT 1), 0)::numeric AS balance",
                 &[&user_id, &matter_id],
             )
             .await?;

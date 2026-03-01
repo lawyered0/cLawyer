@@ -182,14 +182,6 @@ pub async fn record_payment(
         .ok_or_else(|| "Invoice not found".to_string())?;
 
     let trust_entry = if draw_from_trust {
-        let balance = db
-            .current_trust_balance(user_id, &invoice.matter_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        if balance < amount {
-            return Err("Trust balance is insufficient for this payment".to_string());
-        }
-        let balance_after = (balance - amount).round_dp(2);
         let entry = db
             .append_trust_ledger_entry(
                 user_id,
@@ -197,7 +189,7 @@ pub async fn record_payment(
                 &CreateTrustLedgerEntryParams {
                     entry_type: TrustLedgerEntryType::InvoicePayment,
                     amount,
-                    balance_after,
+                    delta: -amount,
                     description: description
                         .unwrap_or("Invoice payment from trust")
                         .trim()
@@ -207,7 +199,17 @@ pub async fn record_payment(
                 },
             )
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg
+                    .to_ascii_lowercase()
+                    .contains("insufficient trust balance")
+                {
+                    "Trust balance is insufficient for this payment".to_string()
+                } else {
+                    msg
+                }
+            })?;
         Some(entry)
     } else {
         None
@@ -232,18 +234,13 @@ pub async fn record_trust_deposit(
     if amount <= Decimal::ZERO {
         return Err("Deposit amount must be greater than 0".to_string());
     }
-    let current_balance = db
-        .current_trust_balance(user_id, matter_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    let balance_after = (current_balance + amount).round_dp(2);
     db.append_trust_ledger_entry(
         user_id,
         matter_id,
         &CreateTrustLedgerEntryParams {
             entry_type: TrustLedgerEntryType::Deposit,
             amount,
-            balance_after,
+            delta: amount,
             description: description.trim().to_string(),
             invoice_id: None,
             recorded_by: recorded_by.trim().to_string(),

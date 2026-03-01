@@ -856,7 +856,9 @@ pub struct TrustLedgerEntryRecord {
 pub struct CreateTrustLedgerEntryParams {
     pub entry_type: TrustLedgerEntryType,
     pub amount: Decimal,
-    pub balance_after: Decimal,
+    /// Signed balance delta applied atomically by the backend.
+    /// Positive values credit trust; negative values debit trust.
+    pub delta: Decimal,
     pub description: String,
     pub invoice_id: Option<Uuid>,
     pub recorded_by: String,

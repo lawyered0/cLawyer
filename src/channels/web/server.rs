@@ -9562,6 +9562,80 @@ opened_at: 2026-02-28
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn trust_deposits_concurrently_update_balance_atomically() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist").clone();
+        let user_id = state.user_id.clone();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let barrier_a = Arc::clone(&barrier);
+        let store_a = Arc::clone(&store);
+        let user_a = user_id.clone();
+        let task_a = tokio::spawn(async move {
+            barrier_a.wait().await;
+            crate::legal::billing::record_trust_deposit(
+                store_a.as_ref(),
+                &user_a,
+                "demo",
+                rust_decimal::Decimal::new(5000, 2),
+                "Lead A",
+                "Concurrent deposit A",
+            )
+            .await
+        });
+
+        let barrier_b = Arc::clone(&barrier);
+        let store_b = Arc::clone(&store);
+        let user_b = user_id.clone();
+        let task_b = tokio::spawn(async move {
+            barrier_b.wait().await;
+            crate::legal::billing::record_trust_deposit(
+                store_b.as_ref(),
+                &user_b,
+                "demo",
+                rust_decimal::Decimal::new(5000, 2),
+                "Lead B",
+                "Concurrent deposit B",
+            )
+            .await
+        });
+
+        barrier.wait().await;
+        let entry_a = task_a
+            .await
+            .expect("task A should join")
+            .expect("deposit A should succeed");
+        let entry_b = task_b
+            .await
+            .expect("task B should join")
+            .expect("deposit B should succeed");
+
+        let mut balances = vec![entry_a.balance_after, entry_b.balance_after];
+        balances.sort();
+        assert_eq!(
+            balances,
+            vec![
+                rust_decimal::Decimal::new(5000, 2),
+                rust_decimal::Decimal::new(10000, 2)
+            ]
+        );
+
+        let balance = store
+            .current_trust_balance(&state.user_id, "demo")
+            .await
+            .expect("read balance");
+        assert_eq!(balance, rust_decimal::Decimal::new(10000, 2));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     async fn matter_time_create_rejects_non_positive_hours() {
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));

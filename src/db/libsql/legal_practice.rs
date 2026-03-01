@@ -2393,36 +2393,74 @@ impl BillingStore for LibSqlBackend {
         input: &CreateTrustLedgerEntryParams,
     ) -> Result<TrustLedgerEntryRecord, DatabaseError> {
         let conn = self.connect().await?;
-        let entry_id = Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT INTO trust_ledger (id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-            params![
-                entry_id.as_str(),
-                user_id,
-                matter_id,
-                input.entry_type.as_str(),
-                input.amount.to_string(),
-                input.balance_after.to_string(),
-                input.description.as_str(),
-                opt_text_owned(input.invoice_id.map(|value| value.to_string())),
-                input.recorded_by.as_str(),
-            ],
-        )
-        .await?;
-        let row = conn
-            .query(
-                "SELECT id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at \
-                 FROM trust_ledger WHERE id = ?1 LIMIT 1",
-                params![entry_id.as_str()],
-            )
-            .await?
-            .next()
-            .await?
-            .ok_or_else(|| {
-                DatabaseError::Query("failed to load created trust ledger entry".to_string())
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let result = async {
+            let balance_row = conn
+                .query(
+                    "SELECT COALESCE((SELECT balance_after FROM trust_ledger WHERE user_id = ?1 AND matter_id = ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1), '0') AS balance",
+                    params![user_id, matter_id],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_else(|| DatabaseError::Query("failed to read trust balance".to_string()))?;
+            let current_balance_raw = get_text(&balance_row, 0);
+            let current_balance = current_balance_raw.parse::<Decimal>().map_err(|_| {
+                DatabaseError::Serialization(format!(
+                    "failed to parse trust balance '{}'",
+                    current_balance_raw
+                ))
             })?;
-        row_to_trust_ledger_entry_record(&row)
+            let balance_after = (current_balance + input.delta).round_dp(2);
+            if balance_after < Decimal::ZERO {
+                return Err(DatabaseError::Constraint(
+                    "insufficient trust balance for requested entry".to_string(),
+                ));
+            }
+
+            let entry_id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO trust_ledger (id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                params![
+                    entry_id.as_str(),
+                    user_id,
+                    matter_id,
+                    input.entry_type.as_str(),
+                    input.amount.to_string(),
+                    balance_after.to_string(),
+                    input.description.as_str(),
+                    opt_text_owned(input.invoice_id.map(|value| value.to_string())),
+                    input.recorded_by.as_str(),
+                ],
+            )
+            .await?;
+            let row = conn
+                .query(
+                    "SELECT id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at \
+                     FROM trust_ledger WHERE id = ?1 LIMIT 1",
+                    params![entry_id.as_str()],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_else(|| {
+                    DatabaseError::Query("failed to load created trust ledger entry".to_string())
+                })?;
+            row_to_trust_ledger_entry_record(&row)
+        }
+        .await;
+
+        match result {
+            Ok(record) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(record)
+            }
+            Err(err) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(err)
+            }
+        }
     }
 
     async fn list_trust_ledger_entries(
