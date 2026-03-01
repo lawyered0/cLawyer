@@ -4,7 +4,7 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::Path as FsPath;
+use std::path::{Component as FsComponent, Path as FsPath};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,7 +51,7 @@ use crate::db::{
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::tools::ToolRegistry;
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, paths};
 
 /// Shared prompt queue: maps job IDs to pending follow-up prompts for Claude Code bridges.
 pub type PromptQueue = Arc<
@@ -1284,17 +1284,19 @@ async fn memory_write_handler(
         "Workspace not available".to_string(),
     ))?;
 
+    let resolved_path = resolve_memory_write_path_for_gateway(state.as_ref(), &req.path).await?;
+
     workspace
-        .write(&req.path, &req.content)
+        .write(&resolved_path, &req.content)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    if crate::legal::matter::is_workspace_conflicts_path(&req.path) {
+    if crate::legal::matter::is_workspace_conflicts_path(&resolved_path) {
         crate::legal::matter::invalidate_conflict_cache();
     }
 
     Ok(Json(MemoryWriteResponse {
-        path: req.path,
+        path: resolved_path,
         status: "written",
     }))
 }
@@ -1416,7 +1418,7 @@ async fn memory_upload_handler(
 
 // --- Matter handlers ---
 
-/// The workspace path prefix where matter directories live.
+/// Default workspace path prefix where matter directories live.
 const MATTER_ROOT: &str = "matters";
 /// Settings key used to persist the active matter ID.
 const MATTER_ACTIVE_SETTING: &str = "legal.active_matter";
@@ -1430,12 +1432,141 @@ const MAX_CONFLICT_TEXT_PREVIEW_CHARS: usize = 100;
 const MAX_DEADLINE_REMINDERS: usize = 16;
 /// Maximum allowed reminder offset in days.
 const MAX_DEADLINE_REMINDER_DAYS: i32 = 3650;
+/// Maximum allowed body text length for `/api/matters/conflicts/check`.
+const MAX_CONFLICT_CHECK_TEXT_LEN: usize = 32 * 1024;
+
+/// Identity files that must not be overwritten through web memory-write APIs.
+const PROTECTED_IDENTITY_FILES: &[&str] =
+    &[paths::IDENTITY, paths::SOUL, paths::AGENTS, paths::USER];
 
 fn legal_config_for_gateway(state: &GatewayState) -> crate::config::LegalConfig {
     state.legal_config.clone().unwrap_or_else(|| {
         crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
             .expect("default legal config should resolve")
     })
+}
+
+fn matter_root_for_gateway(state: &GatewayState) -> String {
+    let configured = legal_config_for_gateway(state).matter_root;
+    let normalized = configured.trim_matches('/');
+    if normalized.is_empty() {
+        MATTER_ROOT.to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
+fn matter_prefix_for_gateway(state: &GatewayState, matter_id: &str) -> String {
+    format!("{}/{matter_id}", matter_root_for_gateway(state))
+}
+
+fn matter_metadata_path_for_gateway(state: &GatewayState, matter_id: &str) -> String {
+    format!(
+        "{}/matter.yaml",
+        matter_prefix_for_gateway(state, matter_id)
+    )
+}
+
+/// Normalize user-supplied memory paths for policy checks.
+///
+/// This mirrors workspace normalization semantics that strip leading/trailing
+/// slashes, collapse duplicate separators, and ignore `.` segments.
+/// `..` segments are preserved and rejected separately by traversal guards.
+fn normalize_policy_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for component in FsPath::new(path.trim()).components() {
+        match component {
+            FsComponent::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            FsComponent::ParentDir => parts.push("..".to_string()),
+            FsComponent::CurDir | FsComponent::RootDir | FsComponent::Prefix(_) => {}
+        }
+    }
+    parts.join("/")
+}
+
+fn is_protected_identity_path(path: &str) -> bool {
+    let normalized = normalize_policy_path(path);
+    PROTECTED_IDENTITY_FILES
+        .iter()
+        .any(|protected| normalized.eq_ignore_ascii_case(protected))
+}
+
+async fn resolve_memory_write_path_for_gateway(
+    state: &GatewayState,
+    requested_path: &str,
+) -> Result<String, (StatusCode, String)> {
+    let normalized = normalize_policy_path(requested_path);
+    if normalized.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Path is empty after normalization".to_string(),
+        ));
+    }
+
+    if is_protected_identity_path(&normalized) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "Path '{}' is protected from tool/web writes",
+                requested_path
+            ),
+        ));
+    }
+
+    let legal = legal_config_for_gateway(state);
+    let resolved_path = if legal.enabled && legal.require_matter_context {
+        let matter_id = load_active_matter_for_chat(state)
+            .await
+            .or_else(|| legal.active_matter.clone())
+            .ok_or((
+                StatusCode::FORBIDDEN,
+                "No active matter selected. Set an active matter before writing files.".to_string(),
+            ))?;
+        let matter_root = matter_root_for_gateway(state);
+        let matter_prefix = format!("{matter_root}/{matter_id}");
+        let matter_root_prefix = format!("{matter_root}/");
+
+        if normalized == matter_prefix || normalized.starts_with(&format!("{matter_prefix}/")) {
+            normalized
+        } else if normalized == matter_root || normalized.starts_with(&matter_root_prefix) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "Path '{}' is outside active matter scope '{}'",
+                    requested_path, matter_prefix
+                ),
+            ));
+        } else {
+            format!("{matter_prefix}/{normalized}")
+        }
+    } else {
+        normalized
+    };
+
+    if FsPath::new(&resolved_path)
+        .components()
+        .any(|component| component == FsComponent::ParentDir)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Path '{}' contains directory traversal sequences",
+                requested_path
+            ),
+        ));
+    }
+
+    if is_protected_identity_path(&resolved_path) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "Path '{}' resolves to a protected identity file",
+                requested_path
+            ),
+        ));
+    }
+
+    Ok(resolved_path)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1536,10 +1667,11 @@ fn sanitize_matter_id_for_route(raw: &str) -> Result<String, (StatusCode, String
 
 async fn ensure_existing_matter_for_route(
     workspace: &Workspace,
+    matter_root: &str,
     raw_matter_id: &str,
 ) -> Result<String, (StatusCode, String)> {
     let matter_id = sanitize_matter_id_for_route(raw_matter_id)?;
-    match crate::legal::matter::read_matter_metadata_for_root(workspace, MATTER_ROOT, &matter_id)
+    match crate::legal::matter::read_matter_metadata_for_root(workspace, matter_root, &matter_id)
         .await
     {
         Ok(_) => Ok(matter_id),
@@ -1920,9 +2052,10 @@ async fn read_matter_deadlines_for_matter(
 
 async fn list_matter_templates(
     workspace: &Workspace,
+    matter_root: &str,
     matter_id: &str,
 ) -> Result<Vec<MatterTemplateInfo>, (StatusCode, String)> {
-    let templates_path = format!("{MATTER_ROOT}/{matter_id}/templates");
+    let templates_path = format!("{matter_root}/{matter_id}/templates");
     let entries = match workspace.list(&templates_path).await {
         Ok(entries) => entries,
         Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => Vec::new(),
@@ -1952,10 +2085,11 @@ async fn list_matter_templates(
 }
 
 fn document_template_record_to_info(
+    matter_root: &str,
     record: crate::db::DocumentTemplateRecord,
 ) -> MatterTemplateInfo {
     let path = match record.matter_id.as_ref() {
-        Some(matter_id) => format!("{MATTER_ROOT}/{matter_id}/templates/{}", record.name),
+        Some(matter_id) => format!("{matter_root}/{matter_id}/templates/{}", record.name),
         None => format!("templates/shared/{}", record.name),
     };
     MatterTemplateInfo {
@@ -2003,7 +2137,8 @@ async fn backfill_matter_templates_from_workspace(
         return Ok(());
     }
 
-    let templates = list_matter_templates(workspace.as_ref(), matter_id).await?;
+    let matter_root = matter_root_for_gateway(state);
+    let templates = list_matter_templates(workspace.as_ref(), &matter_root, matter_id).await?;
     for template in templates {
         let doc = workspace
             .read(&template.path)
@@ -2044,7 +2179,7 @@ async fn backfill_matter_documents_from_workspace(
         return Ok(());
     }
 
-    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let matter_prefix = matter_prefix_for_gateway(state, matter_id);
     let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, false).await?;
     for entry in docs.into_iter().filter(|item| !item.is_dir) {
         let doc = workspace
@@ -2113,17 +2248,23 @@ async fn choose_filing_package_destination(
 
 async fn read_workspace_matter_metadata_optional(
     workspace: Option<&Arc<Workspace>>,
+    matter_root: &str,
     matter_id: &str,
 ) -> Option<crate::legal::matter::MatterMetadata> {
     let workspace = workspace?;
-    let path = format!("{MATTER_ROOT}/{matter_id}/matter.yaml");
+    let path = format!("{matter_root}/{matter_id}/matter.yaml");
     let doc = workspace.read(&path).await.ok()?;
     serde_yml::from_str(&doc.content).ok()
 }
 
 async fn db_matter_to_info(state: &GatewayState, matter: crate::db::MatterRecord) -> MatterInfo {
-    let metadata =
-        read_workspace_matter_metadata_optional(state.workspace.as_ref(), &matter.matter_id).await;
+    let matter_root = matter_root_for_gateway(state);
+    let metadata = read_workspace_matter_metadata_optional(
+        state.workspace.as_ref(),
+        &matter_root,
+        &matter.matter_id,
+    )
+    .await;
     let client_name = if let Some(store) = state.store.as_ref() {
         match store.get_client(&state.user_id, matter.client_id).await {
             Ok(Some(client)) => Some(client.name),
@@ -2205,9 +2346,10 @@ async fn ensure_matter_db_row_from_workspace(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
+    let matter_root = matter_root_for_gateway(state);
     let metadata = crate::legal::matter::read_matter_metadata_for_root(
         workspace.as_ref(),
-        MATTER_ROOT,
+        &matter_root,
         matter_id,
     )
     .await
@@ -2265,6 +2407,7 @@ async fn ensure_matter_db_row_from_workspace(
 async fn matters_list_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<MattersListResponse>, (StatusCode, String)> {
+    let matter_root = matter_root_for_gateway(state.as_ref());
     if let Some(store) = state.store.as_ref() {
         let matter_rows = store
             .list_matters_db(&state.user_id)
@@ -2282,14 +2425,15 @@ async fn matters_list_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-    let entries = list_matters_root_entries(workspace.list(MATTER_ROOT).await)?;
+    let entries = list_matters_root_entries(workspace.list(&matter_root).await)?;
     let mut matters: Vec<MatterInfo> = Vec::new();
     for entry in entries.into_iter().filter(|entry| entry.is_directory) {
         let dir_name = entry.path.rsplit('/').next().unwrap_or("").to_string();
         if dir_name.is_empty() || dir_name == "_template" {
             continue;
         }
-        let meta = read_workspace_matter_metadata_optional(Some(workspace), &dir_name).await;
+        let meta =
+            read_workspace_matter_metadata_optional(Some(workspace), &matter_root, &dir_name).await;
         matters.push(MatterInfo {
             id: dir_name,
             client_id: None,
@@ -2513,7 +2657,7 @@ async fn matter_patch_handler(
         .ok_or((StatusCode::NOT_FOUND, "Matter not found".to_string()))?;
 
     if let Some(workspace) = state.workspace.as_ref() {
-        let metadata_path = format!("{MATTER_ROOT}/{matter_id}/matter.yaml");
+        let metadata_path = matter_metadata_path_for_gateway(state.as_ref(), &matter_id);
         if let Ok(doc) = workspace.read(&metadata_path).await
             && let Ok(mut metadata) =
                 serde_yml::from_str::<crate::legal::matter::MatterMetadata>(&doc.content)
@@ -4012,7 +4156,7 @@ async fn sync_deadline_reminder_routines_for_record(
             existing.trigger = crate::agent::routine::Trigger::Cron { schedule };
             existing.action = crate::agent::routine::RoutineAction::Lightweight {
                 prompt: prompt.clone(),
-                context_paths: vec![format!("{MATTER_ROOT}/{}/matter.yaml", record.matter_id)],
+                context_paths: vec![matter_metadata_path_for_gateway(state, &record.matter_id)],
                 max_tokens: 300,
             };
             existing.next_fire_at = next_fire;
@@ -4036,7 +4180,7 @@ async fn sync_deadline_reminder_routines_for_record(
             trigger: crate::agent::routine::Trigger::Cron { schedule },
             action: crate::agent::routine::RoutineAction::Lightweight {
                 prompt,
-                context_paths: vec![format!("{MATTER_ROOT}/{}/matter.yaml", record.matter_id)],
+                context_paths: vec![matter_metadata_path_for_gateway(state, &record.matter_id)],
                 max_tokens: 300,
             },
             guardrails: crate::agent::routine::RoutineGuardrails::default(),
@@ -4353,6 +4497,7 @@ async fn matters_create_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
+    let matter_root = matter_root_for_gateway(state.as_ref());
 
     let raw_matter_id = parse_required_matter_field("matter_id", &req.matter_id)?;
     let sanitized = crate::legal::policy::sanitize_matter_id(&raw_matter_id);
@@ -4363,8 +4508,8 @@ async fn matters_create_handler(
         ));
     }
 
-    let existing = list_matters_root_entries(workspace.list(MATTER_ROOT).await)?;
-    let matter_prefix = format!("{MATTER_ROOT}/{sanitized}");
+    let existing = list_matters_root_entries(workspace.list(&matter_root).await)?;
+    let matter_prefix = format!("{matter_root}/{sanitized}");
     if existing
         .iter()
         .any(|entry| entry.is_directory && entry.path == matter_prefix)
@@ -4657,6 +4802,7 @@ async fn matters_create_handler(
 async fn matters_active_get_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<ActiveMatterResponse>, (StatusCode, String)> {
+    let matter_root = matter_root_for_gateway(state.as_ref());
     let mut matter_id = if let Some(store) = state.store.as_ref() {
         store
             .get_setting(&state.user_id, MATTER_ACTIVE_SETTING)
@@ -4676,7 +4822,7 @@ async fn matters_active_get_handler(
     {
         match crate::legal::matter::read_matter_metadata_for_root(
             workspace.as_ref(),
-            MATTER_ROOT,
+            &matter_root,
             candidate,
         )
         .await
@@ -4703,6 +4849,7 @@ async fn matters_active_set_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
+    let matter_root = matter_root_for_gateway(state.as_ref());
 
     let trimmed = req
         .matter_id
@@ -4732,7 +4879,7 @@ async fn matters_active_set_handler(
             }
             match crate::legal::matter::read_matter_metadata_for_root(
                 workspace.as_ref(),
-                MATTER_ROOT,
+                &matter_root,
                 &sanitized,
             )
             .await
@@ -4774,7 +4921,8 @@ async fn matter_documents_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let matter_root = matter_root_for_gateway(state.as_ref());
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
     let include_templates = query.include_templates.unwrap_or(false);
 
     let documents = if state.store.is_some() {
@@ -4800,7 +4948,7 @@ async fn matter_documents_handler(
             docs.extend(
                 templates
                     .into_iter()
-                    .map(document_template_record_to_info)
+                    .map(|record| document_template_record_to_info(&matter_root, record))
                     .map(|template| MatterDocumentInfo {
                         id: template.id,
                         memory_document_id: None,
@@ -4816,7 +4964,7 @@ async fn matter_documents_handler(
         }
         docs
     } else {
-        let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+        let matter_prefix = format!("{matter_root}/{matter_id}");
         list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, include_templates)
             .await?
     };
@@ -4835,10 +4983,11 @@ async fn matter_dashboard_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
-    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let matter_root = matter_root_for_gateway(state.as_ref());
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
+    let matter_prefix = format!("{matter_root}/{matter_id}");
     let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, false).await?;
-    let templates = list_matter_templates(workspace.as_ref(), &matter_id).await?;
+    let templates = list_matter_templates(workspace.as_ref(), &matter_root, &matter_id).await?;
     let today = Utc::now().date_naive();
     let deadlines =
         read_matter_deadlines_for_matter(state.as_ref(), &matter_id, &matter_prefix, today).await?;
@@ -4912,8 +5061,9 @@ async fn matter_deadlines_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
-    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let matter_root = matter_root_for_gateway(state.as_ref());
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
+    let matter_prefix = format!("{matter_root}/{matter_id}");
     let deadlines = read_matter_deadlines_for_matter(
         state.as_ref(),
         &matter_id,
@@ -4951,7 +5101,8 @@ async fn matter_deadlines_create_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let matter_root = matter_root_for_gateway(state.as_ref());
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
     ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
 
     let title = req.title.trim();
@@ -5003,7 +5154,8 @@ async fn matter_deadlines_patch_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let matter_root = matter_root_for_gateway(state.as_ref());
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
     ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
     let deadline_id = parse_uuid(deadline_id.trim(), "deadline_id")?;
 
@@ -5075,7 +5227,8 @@ async fn matter_deadlines_delete_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let matter_root = matter_root_for_gateway(state.as_ref());
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
     ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
     let deadline_id = parse_uuid(deadline_id.trim(), "deadline_id")?;
 
@@ -5107,7 +5260,8 @@ async fn matter_deadlines_compute_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let matter_root = matter_root_for_gateway(state.as_ref());
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
     let rule_id = req.rule_id.trim();
     if rule_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "'rule_id' is required".to_string()));
@@ -5157,7 +5311,8 @@ async fn matter_templates_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let matter_root = matter_root_for_gateway(state.as_ref());
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
     let templates = if let Some(store) = state.store.as_ref() {
         ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
         backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
@@ -5166,10 +5321,10 @@ async fn matter_templates_handler(
             .await
             .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
             .into_iter()
-            .map(document_template_record_to_info)
+            .map(|record| document_template_record_to_info(&matter_root, record))
             .collect::<Vec<_>>()
     } else {
-        list_matter_templates(workspace.as_ref(), &matter_id).await?
+        list_matter_templates(workspace.as_ref(), &matter_root, &matter_id).await?
     };
 
     Ok(Json(MatterTemplatesResponse {
@@ -5187,8 +5342,9 @@ async fn matter_template_apply_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
-    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let matter_root = matter_root_for_gateway(state.as_ref());
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
+    let matter_prefix = format!("{matter_root}/{matter_id}");
     let template_name = parse_template_name(&req.template_name)?;
 
     let template_body = if let Some(store) = state.store.as_ref() {
@@ -5291,7 +5447,9 @@ async fn documents_generate_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &req.matter_id).await?;
+    let matter_root = matter_root_for_gateway(state.as_ref());
+    let matter_id =
+        ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &req.matter_id).await?;
     ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
     backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
 
@@ -5340,7 +5498,7 @@ async fn documents_generate_handler(
     validate_optional_matter_field_length("display_name", &Some(display_name.clone()))?;
     validate_optional_matter_field_length("label", &Some(label.clone()))?;
 
-    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let matter_prefix = format!("{matter_root}/{matter_id}");
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let destination = choose_generated_document_destination(
         workspace.as_ref(),
@@ -5417,8 +5575,9 @@ async fn matter_filing_package_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
-    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let matter_root = matter_root_for_gateway(state.as_ref());
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
+    let matter_prefix = format!("{matter_root}/{matter_id}");
     let generated_at = Utc::now();
     let timestamp = generated_at.format("%Y%m%d-%H%M%S").to_string();
     let destination =
@@ -5426,13 +5585,13 @@ async fn matter_filing_package_handler(
 
     let metadata = crate::legal::matter::read_matter_metadata_for_root(
         workspace.as_ref(),
-        MATTER_ROOT,
+        &matter_root,
         &matter_id,
     )
     .await
     .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, true).await?;
-    let templates = list_matter_templates(workspace.as_ref(), &matter_id).await?;
+    let templates = list_matter_templates(workspace.as_ref(), &matter_root, &matter_id).await?;
     let today = generated_at.date_naive();
     let deadlines =
         read_matter_deadlines_for_matter(state.as_ref(), &matter_id, &matter_prefix, today).await?;
@@ -5659,6 +5818,15 @@ async fn matters_conflicts_check_handler(
         return Err((
             StatusCode::BAD_REQUEST,
             "'text' must not be empty".to_string(),
+        ));
+    }
+    if text.len() > MAX_CONFLICT_CHECK_TEXT_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'text' must be at most {} bytes",
+                MAX_CONFLICT_CHECK_TEXT_LEN
+            ),
         ));
     }
 
@@ -7881,6 +8049,43 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn matters_active_set_uses_configured_matter_root() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let mut legal = test_legal_config();
+        legal.matter_root = "casefiles".to_string();
+        let state =
+            test_gateway_state_with_store_workspace_and_legal(Arc::clone(&db), workspace, legal);
+
+        state
+            .workspace
+            .as_ref()
+            .expect("workspace")
+            .write(
+                "casefiles/demo/matter.yaml",
+                "matter_id: demo\nclient: Demo Client\nteam:\n  - Lead Counsel\nconfidentiality: attorney-client-privileged\nadversaries:\n  - Example Co\nretention: follow-firm-policy\n",
+            )
+            .await
+            .expect("seed valid custom-root matter metadata");
+
+        let status = matters_active_set_handler(
+            State(Arc::clone(&state)),
+            Json(SetActiveMatterRequest {
+                matter_id: Some("demo".to_string()),
+            }),
+        )
+        .await
+        .expect("valid metadata under configured root should succeed");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let Json(resp) = matters_active_get_handler(State(state))
+            .await
+            .expect("active matter get should succeed");
+        assert_eq!(resp.matter_id.as_deref(), Some("demo"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     async fn chat_send_includes_active_matter_metadata_when_setting_exists() {
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
@@ -8729,6 +8934,32 @@ opened_at: 2026-02-28
             entry.event_type == "conflict_detected"
                 && entry.details.get("source").and_then(|v| v.as_str()) == Some("manual_text_check")
         }));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conflicts_check_rejects_oversized_text_payload() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = true;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let oversized = "A".repeat(MAX_CONFLICT_CHECK_TEXT_LEN + 1);
+        let err = matters_conflicts_check_handler(
+            State(state),
+            Json(MatterConflictCheckRequest {
+                text: oversized,
+                matter_id: None,
+            }),
+        )
+        .await
+        .expect_err("oversized payload should be rejected");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("at most"));
     }
 
     #[cfg(feature = "libsql")]
@@ -10354,8 +10585,13 @@ opened_at: 2026-02-28
         crate::legal::matter::reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
-        let state =
-            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        let mut legal = test_legal_config();
+        legal.require_matter_context = false;
+        let state = test_gateway_state_with_store_workspace_and_legal(
+            Arc::clone(&db),
+            Arc::clone(&workspace),
+            legal,
+        );
 
         workspace
             .write(
