@@ -764,6 +764,73 @@ CREATE INDEX IF NOT EXISTS idx_expense_entries_user_matter_date
 CREATE INDEX IF NOT EXISTS idx_expense_entries_user_billed
     ON expense_entries(user_id, billed_invoice_id);
 
+CREATE TABLE IF NOT EXISTS invoices (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    invoice_number TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('draft', 'sent', 'paid', 'void', 'write_off')),
+    issued_date TEXT,
+    due_date TEXT,
+    subtotal TEXT NOT NULL CHECK (CAST(subtotal AS REAL) >= 0),
+    tax TEXT NOT NULL CHECK (CAST(tax AS REAL) >= 0),
+    total TEXT NOT NULL CHECK (CAST(total AS REAL) >= 0),
+    paid_amount TEXT NOT NULL CHECK (CAST(paid_amount AS REAL) >= 0),
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE,
+    UNIQUE (user_id, invoice_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_invoices_user_matter
+    ON invoices(user_id, matter_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_user_status
+    ON invoices(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_invoices_user_due_date
+    ON invoices(user_id, due_date);
+
+CREATE TABLE IF NOT EXISTS invoice_line_items (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    invoice_id TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+    description TEXT NOT NULL,
+    quantity TEXT NOT NULL CHECK (CAST(quantity AS REAL) > 0),
+    unit_price TEXT NOT NULL CHECK (CAST(unit_price AS REAL) >= 0),
+    amount TEXT NOT NULL CHECK (CAST(amount AS REAL) >= 0),
+    time_entry_id TEXT REFERENCES time_entries(id) ON DELETE SET NULL,
+    expense_entry_id TEXT REFERENCES expense_entries(id) ON DELETE SET NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_invoice_line_items_invoice
+    ON invoice_line_items(invoice_id, sort_order);
+CREATE INDEX IF NOT EXISTS idx_invoice_line_items_time
+    ON invoice_line_items(time_entry_id);
+CREATE INDEX IF NOT EXISTS idx_invoice_line_items_expense
+    ON invoice_line_items(expense_entry_id);
+
+CREATE TABLE IF NOT EXISTS trust_ledger (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    entry_type TEXT NOT NULL CHECK (entry_type IN ('deposit', 'withdrawal', 'invoice_payment', 'refund')),
+    amount TEXT NOT NULL CHECK (CAST(amount AS REAL) > 0),
+    balance_after TEXT NOT NULL CHECK (CAST(balance_after AS REAL) >= 0),
+    description TEXT NOT NULL,
+    invoice_id TEXT REFERENCES invoices(id) ON DELETE SET NULL,
+    recorded_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trust_ledger_user_matter_created
+    ON trust_ledger(user_id, matter_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trust_ledger_user_invoice
+    ON trust_ledger(user_id, invoice_id);
+
 -- ==================== Missing indexes (parity with PostgreSQL) ====================
 
 -- agent_jobs

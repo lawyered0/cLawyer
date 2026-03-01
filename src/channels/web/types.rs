@@ -524,6 +524,114 @@ pub struct MatterTimeSummaryResponse {
     pub unbilled_expenses: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct InvoiceLineItemInfo {
+    pub id: String,
+    pub description: String,
+    pub quantity: String,
+    pub unit_price: String,
+    pub amount: String,
+    pub time_entry_id: Option<String>,
+    pub expense_entry_id: Option<String>,
+    pub sort_order: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvoiceInfo {
+    pub id: String,
+    pub matter_id: String,
+    pub invoice_number: String,
+    pub status: String,
+    pub issued_date: Option<String>,
+    pub due_date: Option<String>,
+    pub subtotal: String,
+    pub tax: String,
+    pub total: String,
+    pub paid_amount: String,
+    pub notes: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvoiceDetailResponse {
+    pub invoice: InvoiceInfo,
+    pub line_items: Vec<InvoiceLineItemInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DraftInvoiceRequest {
+    pub matter_id: String,
+    pub invoice_number: String,
+    #[serde(default)]
+    pub due_date: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvoiceDraftResponse {
+    pub invoice: InvoiceDraftInfo,
+    pub line_items: Vec<InvoiceLineItemInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvoiceDraftInfo {
+    pub matter_id: String,
+    pub invoice_number: String,
+    pub status: String,
+    pub due_date: Option<String>,
+    pub subtotal: String,
+    pub tax: String,
+    pub total: String,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecordInvoicePaymentRequest {
+    pub amount: String,
+    pub recorded_by: String,
+    #[serde(default)]
+    pub draw_from_trust: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecordInvoicePaymentResponse {
+    pub invoice: InvoiceInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_entry: Option<TrustLedgerEntryInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrustDepositRequest {
+    pub amount: String,
+    pub recorded_by: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrustLedgerEntryInfo {
+    pub id: String,
+    pub matter_id: String,
+    pub entry_type: String,
+    pub amount: String,
+    pub balance_after: String,
+    pub description: String,
+    pub invoice_id: Option<String>,
+    pub recorded_by: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrustLedgerResponse {
+    pub matter_id: String,
+    pub balance: String,
+    pub entries: Vec<TrustLedgerEntryInfo>,
+}
+
 /// Response for `GET /api/matters/active`.
 #[derive(Debug, Serialize)]
 pub struct ActiveMatterResponse {

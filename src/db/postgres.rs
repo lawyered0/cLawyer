@@ -17,20 +17,23 @@ use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
-    ClientRecord, ClientStore, ClientType, ConflictClearanceRecord, ConflictHit, ConversationStore,
-    CreateClientParams, CreateDocumentVersionParams, CreateExpenseEntryParams,
-    CreateMatterDeadlineParams, CreateMatterNoteParams, CreateMatterTaskParams,
-    CreateTimeEntryParams, Database, DocumentTemplateRecord, DocumentTemplateStore,
-    DocumentVersionRecord, DocumentVersionStore, ExpenseCategory, ExpenseEntryRecord, JobStore,
-    LegalConflictStore, MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType,
-    MatterDocumentCategory, MatterDocumentRecord, MatterDocumentStore, MatterNoteRecord,
-    MatterNoteStore, MatterRecord, MatterStatus, MatterStore, MatterTaskRecord, MatterTaskStatus,
-    MatterTaskStore, MatterTimeSummary, PartyRole, RoutineStore, SandboxStore, SettingsStore,
-    TimeEntryRecord, TimeExpenseStore, ToolFailureStore, UpdateClientParams,
-    UpdateDocumentTemplateParams, UpdateExpenseEntryParams, UpdateMatterDeadlineParams,
-    UpdateMatterDocumentParams, UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams,
-    UpdateTimeEntryParams, UpsertDocumentTemplateParams, UpsertMatterDocumentParams,
-    UpsertMatterParams, WorkspaceStore, conflict_terms_from_text, normalize_party_name,
+    BillingStore, ClientRecord, ClientStore, ClientType, ConflictClearanceRecord, ConflictHit,
+    ConversationStore, CreateClientParams, CreateDocumentVersionParams, CreateExpenseEntryParams,
+    CreateInvoiceLineItemParams, CreateInvoiceParams, CreateMatterDeadlineParams,
+    CreateMatterNoteParams, CreateMatterTaskParams, CreateTimeEntryParams,
+    CreateTrustLedgerEntryParams, Database, DocumentTemplateRecord, DocumentTemplateStore,
+    DocumentVersionRecord, DocumentVersionStore, ExpenseCategory, ExpenseEntryRecord,
+    InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus, JobStore, LegalConflictStore,
+    MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType, MatterDocumentCategory,
+    MatterDocumentRecord, MatterDocumentStore, MatterNoteRecord, MatterNoteStore, MatterRecord,
+    MatterStatus, MatterStore, MatterTaskRecord, MatterTaskStatus, MatterTaskStore,
+    MatterTimeSummary, PartyRole, RoutineStore, SandboxStore, SettingsStore, TimeEntryRecord,
+    TimeExpenseStore, ToolFailureStore, TrustLedgerEntryRecord, TrustLedgerEntryType,
+    UpdateClientParams, UpdateDocumentTemplateParams, UpdateExpenseEntryParams,
+    UpdateMatterDeadlineParams, UpdateMatterDocumentParams, UpdateMatterNoteParams,
+    UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
+    UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams, WorkspaceStore,
+    conflict_terms_from_text, normalize_party_name,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -421,6 +424,72 @@ fn row_to_expense_entry_record(
         billed_invoice_id: row.get("billed_invoice_id"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_invoice_record(row: &tokio_postgres::Row) -> Result<InvoiceRecord, DatabaseError> {
+    let status_raw: String = row.get("status");
+    let status = InvoiceStatus::from_db_value(&status_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid invoice status '{}'", status_raw))
+    })?;
+    Ok(InvoiceRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        invoice_number: row.get("invoice_number"),
+        status,
+        issued_date: row.get("issued_date"),
+        due_date: row.get("due_date"),
+        subtotal: row.get("subtotal"),
+        tax: row.get("tax"),
+        total: row.get("total"),
+        paid_amount: row.get("paid_amount"),
+        notes: row.get("notes"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_invoice_line_item_record(
+    row: &tokio_postgres::Row,
+) -> Result<InvoiceLineItemRecord, DatabaseError> {
+    Ok(InvoiceLineItemRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        invoice_id: row.get("invoice_id"),
+        description: row.get("description"),
+        quantity: row.get("quantity"),
+        unit_price: row.get("unit_price"),
+        amount: row.get("amount"),
+        time_entry_id: row.get("time_entry_id"),
+        expense_entry_id: row.get("expense_entry_id"),
+        sort_order: row.get("sort_order"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_trust_ledger_entry_record(
+    row: &tokio_postgres::Row,
+) -> Result<TrustLedgerEntryRecord, DatabaseError> {
+    let entry_type_raw: String = row.get("entry_type");
+    let entry_type = TrustLedgerEntryType::from_db_value(&entry_type_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!(
+            "invalid trust ledger entry type '{}'",
+            entry_type_raw
+        ))
+    })?;
+    Ok(TrustLedgerEntryRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        entry_type,
+        amount: row.get("amount"),
+        balance_after: row.get("balance_after"),
+        description: row.get("description"),
+        invoice_id: row.get("invoice_id"),
+        recorded_by: row.get("recorded_by"),
+        created_at: row.get("created_at"),
     })
 }
 
@@ -2709,6 +2778,241 @@ impl TimeExpenseStore for PgBackend {
             billable_expenses: row.get("billable_expenses"),
             unbilled_expenses: row.get("unbilled_expenses"),
         })
+    }
+}
+
+// ==================== BillingStore ====================
+
+#[async_trait]
+impl BillingStore for PgBackend {
+    async fn save_invoice_draft(
+        &self,
+        user_id: &str,
+        invoice: &CreateInvoiceParams,
+        line_items: &[CreateInvoiceLineItemParams],
+    ) -> Result<(InvoiceRecord, Vec<InvoiceLineItemRecord>), DatabaseError> {
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+
+        let invoice_row = tx
+            .query_one(
+                "INSERT INTO invoices (id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                 RETURNING id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &invoice.matter_id,
+                    &invoice.invoice_number,
+                    &invoice.status.as_str(),
+                    &invoice.issued_date,
+                    &invoice.due_date,
+                    &invoice.subtotal,
+                    &invoice.tax,
+                    &invoice.total,
+                    &invoice.paid_amount,
+                    &invoice.notes,
+                ],
+            )
+            .await?;
+        let invoice_record = row_to_invoice_record(&invoice_row)?;
+
+        let mut persisted_items = Vec::with_capacity(line_items.len());
+        for item in line_items {
+            let row = tx
+                .query_one(
+                    "INSERT INTO invoice_line_items (id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                     RETURNING id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at",
+                    &[
+                        &Uuid::new_v4(),
+                        &user_id,
+                        &invoice_record.id,
+                        &item.description,
+                        &item.quantity,
+                        &item.unit_price,
+                        &item.amount,
+                        &item.time_entry_id,
+                        &item.expense_entry_id,
+                        &item.sort_order,
+                    ],
+                )
+                .await?;
+            persisted_items.push(row_to_invoice_line_item_record(&row)?);
+        }
+
+        tx.commit().await?;
+        Ok((invoice_record, persisted_items))
+    }
+
+    async fn get_invoice(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at \
+                 FROM invoices WHERE user_id = $1 AND id = $2",
+                &[&user_id, &invoice_id],
+            )
+            .await?;
+        row.map(|row| row_to_invoice_record(&row)).transpose()
+    }
+
+    async fn list_invoice_line_items(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+    ) -> Result<Vec<InvoiceLineItemRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at \
+                 FROM invoice_line_items \
+                 WHERE user_id = $1 AND invoice_id = $2 \
+                 ORDER BY sort_order ASC, created_at ASC",
+                &[&user_id, &invoice_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_invoice_line_item_record(&row))
+            .collect()
+    }
+
+    async fn set_invoice_status(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+        status: InvoiceStatus,
+        issued_date: Option<NaiveDate>,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "UPDATE invoices \
+                 SET status = $3, \
+                     issued_date = CASE WHEN $4::date IS NULL THEN issued_date ELSE $4 END, \
+                     updated_at = NOW() \
+                 WHERE user_id = $1 AND id = $2 \
+                 RETURNING id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at",
+                &[&user_id, &invoice_id, &status.as_str(), &issued_date],
+            )
+            .await?;
+        row.map(|row| row_to_invoice_record(&row)).transpose()
+    }
+
+    async fn apply_invoice_payment(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+        amount: Decimal,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "UPDATE invoices \
+                 SET paid_amount = paid_amount + $3, \
+                     status = CASE WHEN paid_amount + $3 >= total THEN 'paid' ELSE status END, \
+                     updated_at = NOW() \
+                 WHERE user_id = $1 AND id = $2 \
+                 RETURNING id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at",
+                &[&user_id, &invoice_id, &amount],
+            )
+            .await?;
+        row.map(|row| row_to_invoice_record(&row)).transpose()
+    }
+
+    async fn append_trust_ledger_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateTrustLedgerEntryParams,
+    ) -> Result<TrustLedgerEntryRecord, DatabaseError> {
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+        tx.query(
+            "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+            &[&user_id, &matter_id],
+        )
+        .await?;
+        let current_row = tx
+            .query_opt(
+                "SELECT balance_after \
+                 FROM trust_ledger \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY created_at DESC, id DESC \
+                 LIMIT 1 \
+                 FOR UPDATE",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        let current_balance = current_row
+            .as_ref()
+            .map(|row| row.get::<_, Decimal>("balance_after"))
+            .unwrap_or(Decimal::ZERO);
+        let balance_after = (current_balance + input.delta).round_dp(2);
+        if balance_after < Decimal::ZERO {
+            return Err(DatabaseError::Constraint(
+                "insufficient trust balance for requested entry".to_string(),
+            ));
+        }
+        let row = tx
+            .query_one(
+                "INSERT INTO trust_ledger (id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 RETURNING id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.entry_type.as_str(),
+                    &input.amount,
+                    &balance_after,
+                    &input.description,
+                    &input.invoice_id,
+                    &input.recorded_by,
+                ],
+            )
+            .await?;
+        tx.commit().await?;
+        row_to_trust_ledger_entry_record(&row)
+    }
+
+    async fn list_trust_ledger_entries(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<TrustLedgerEntryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at \
+                 FROM trust_ledger \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY created_at DESC, id DESC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_trust_ledger_entry_record(&row))
+            .collect()
+    }
+
+    async fn current_trust_balance(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Decimal, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "SELECT COALESCE((SELECT balance_after FROM trust_ledger WHERE user_id = $1 AND matter_id = $2 ORDER BY created_at DESC, id DESC LIMIT 1), 0)::numeric AS balance",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        Ok(row.get("balance"))
     }
 }
 

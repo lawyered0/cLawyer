@@ -42,7 +42,8 @@ use crate::db::{
     ClientType, ConflictClearanceRecord, ConflictDecision, ConflictHit, CreateClientParams,
     CreateDocumentVersionParams, CreateExpenseEntryParams, CreateMatterDeadlineParams,
     CreateMatterNoteParams, CreateMatterTaskParams, CreateTimeEntryParams, Database,
-    ExpenseCategory, MatterDeadlineType, MatterDocumentCategory, MatterStatus, MatterTaskStatus,
+    ExpenseCategory, InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus, MatterDeadlineType,
+    MatterDocumentCategory, MatterStatus, MatterTaskStatus, TrustLedgerEntryRecord,
     UpdateClientParams, UpdateExpenseEntryParams, UpdateMatterDeadlineParams,
     UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
     UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams,
@@ -281,6 +282,23 @@ pub async fn start_server(
         .route(
             "/api/matters/{id}/time-summary",
             get(matter_time_summary_handler),
+        )
+        .route("/api/invoices/draft", post(invoices_draft_handler))
+        .route("/api/invoices", post(invoices_save_handler))
+        .route("/api/invoices/{id}", get(invoices_get_handler))
+        .route(
+            "/api/invoices/{id}/finalize",
+            post(invoices_finalize_handler),
+        )
+        .route("/api/invoices/{id}/void", post(invoices_void_handler))
+        .route("/api/invoices/{id}/payment", post(invoices_payment_handler))
+        .route(
+            "/api/matters/{id}/trust/deposit",
+            post(matter_trust_deposit_handler),
+        )
+        .route(
+            "/api/matters/{id}/trust/ledger",
+            get(matter_trust_ledger_handler),
         )
         .route(
             "/api/matters/active",
@@ -3093,6 +3111,268 @@ async fn matter_time_summary_handler(
     Ok(Json(matter_time_summary_to_response(summary)))
 }
 
+async fn invoices_draft_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<DraftInvoiceRequest>,
+) -> Result<Json<InvoiceDraftResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&req.matter_id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let invoice_number = parse_required_matter_field("invoice_number", &req.invoice_number)?;
+    let due_date = req
+        .due_date
+        .as_deref()
+        .map(|raw| parse_date_only("due_date", raw))
+        .transpose()?;
+    let notes = parse_optional_matter_field(req.notes);
+    let draft = crate::legal::billing::draft_invoice(
+        store.as_ref(),
+        &state.user_id,
+        &matter_id,
+        &invoice_number,
+        due_date,
+        notes,
+    )
+    .await
+    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    Ok(Json(InvoiceDraftResponse {
+        invoice: invoice_draft_to_info(&draft.invoice),
+        line_items: draft
+            .line_items
+            .iter()
+            .map(invoice_line_item_params_to_info)
+            .collect(),
+    }))
+}
+
+async fn invoices_save_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<DraftInvoiceRequest>,
+) -> Result<(StatusCode, Json<InvoiceDetailResponse>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&req.matter_id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let invoice_number = parse_required_matter_field("invoice_number", &req.invoice_number)?;
+    let due_date = req
+        .due_date
+        .as_deref()
+        .map(|raw| parse_date_only("due_date", raw))
+        .transpose()?;
+    let notes = parse_optional_matter_field(req.notes);
+    let draft = crate::legal::billing::draft_invoice(
+        store.as_ref(),
+        &state.user_id,
+        &matter_id,
+        &invoice_number,
+        due_date,
+        notes,
+    )
+    .await
+    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let (invoice, line_items) =
+        crate::legal::billing::save_draft(store.as_ref(), &state.user_id, &draft)
+            .await
+            .map_err(|err| {
+                let message = err.to_string();
+                if message.contains("UNIQUE constraint")
+                    || message.contains("duplicate key value")
+                    || message.contains("invoice_number")
+                {
+                    (
+                        StatusCode::CONFLICT,
+                        "Invoice number already exists".to_string(),
+                    )
+                } else {
+                    (StatusCode::INTERNAL_SERVER_ERROR, message)
+                }
+            })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(InvoiceDetailResponse {
+            invoice: invoice_record_to_info(invoice),
+            line_items: line_items
+                .into_iter()
+                .map(invoice_line_item_record_to_info)
+                .collect(),
+        }),
+    ))
+}
+
+async fn invoices_get_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let invoice_id = parse_uuid(&id, "invoice_id")?;
+    let invoice = store
+        .get_invoice(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    let line_items = store
+        .list_invoice_line_items(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(InvoiceDetailResponse {
+        invoice: invoice_record_to_info(invoice),
+        line_items: line_items
+            .into_iter()
+            .map(invoice_line_item_record_to_info)
+            .collect(),
+    }))
+}
+
+async fn invoices_finalize_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let invoice_id = parse_uuid(&id, "invoice_id")?;
+    let invoice =
+        crate::legal::billing::finalize_invoice(store.as_ref(), &state.user_id, invoice_id)
+            .await
+            .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    let line_items = store
+        .list_invoice_line_items(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(InvoiceDetailResponse {
+        invoice: invoice_record_to_info(invoice),
+        line_items: line_items
+            .into_iter()
+            .map(invoice_line_item_record_to_info)
+            .collect(),
+    }))
+}
+
+async fn invoices_void_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let invoice_id = parse_uuid(&id, "invoice_id")?;
+    let invoice = store
+        .set_invoice_status(&state.user_id, invoice_id, InvoiceStatus::Void, None)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    let line_items = store
+        .list_invoice_line_items(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(InvoiceDetailResponse {
+        invoice: invoice_record_to_info(invoice),
+        line_items: line_items
+            .into_iter()
+            .map(invoice_line_item_record_to_info)
+            .collect(),
+    }))
+}
+
+async fn invoices_payment_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<RecordInvoicePaymentRequest>,
+) -> Result<Json<RecordInvoicePaymentResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let invoice_id = parse_uuid(&id, "invoice_id")?;
+    let amount = parse_decimal_field("amount", &req.amount)?;
+    let recorded_by = parse_required_matter_field("recorded_by", &req.recorded_by)?;
+    let (invoice, trust_entry) = crate::legal::billing::record_payment(
+        store.as_ref(),
+        &state.user_id,
+        invoice_id,
+        amount,
+        &recorded_by,
+        req.draw_from_trust,
+        req.description.as_deref(),
+    )
+    .await
+    .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    Ok(Json(RecordInvoicePaymentResponse {
+        invoice: invoice_record_to_info(invoice),
+        trust_entry: trust_entry.map(trust_ledger_entry_record_to_info),
+    }))
+}
+
+async fn matter_trust_deposit_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<TrustDepositRequest>,
+) -> Result<(StatusCode, Json<TrustLedgerEntryInfo>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let amount = parse_decimal_field("amount", &req.amount)?;
+    let recorded_by = parse_required_matter_field("recorded_by", &req.recorded_by)?;
+    let description =
+        parse_optional_matter_field(req.description).unwrap_or_else(|| "Trust deposit".to_string());
+    let entry = crate::legal::billing::record_trust_deposit(
+        store.as_ref(),
+        &state.user_id,
+        &matter_id,
+        amount,
+        &recorded_by,
+        &description,
+    )
+    .await
+    .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(trust_ledger_entry_record_to_info(entry)),
+    ))
+}
+
+async fn matter_trust_ledger_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<TrustLedgerResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entries = store
+        .list_trust_ledger_entries(&state.user_id, &matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let balance = store
+        .current_trust_balance(&state.user_id, &matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(TrustLedgerResponse {
+        matter_id,
+        balance: balance.to_string(),
+        entries: entries
+            .into_iter()
+            .map(trust_ledger_entry_record_to_info)
+            .collect(),
+    }))
+}
+
 fn parse_required_matter_field(
     field_name: &str,
     value: &str,
@@ -3742,6 +4022,79 @@ fn matter_time_summary_to_response(
         total_expenses: summary.total_expenses.to_string(),
         billable_expenses: summary.billable_expenses.to_string(),
         unbilled_expenses: summary.unbilled_expenses.to_string(),
+    }
+}
+
+fn invoice_record_to_info(invoice: InvoiceRecord) -> InvoiceInfo {
+    InvoiceInfo {
+        id: invoice.id.to_string(),
+        matter_id: invoice.matter_id,
+        invoice_number: invoice.invoice_number,
+        status: invoice.status.as_str().to_string(),
+        issued_date: invoice.issued_date.map(|value| value.to_string()),
+        due_date: invoice.due_date.map(|value| value.to_string()),
+        subtotal: invoice.subtotal.to_string(),
+        tax: invoice.tax.to_string(),
+        total: invoice.total.to_string(),
+        paid_amount: invoice.paid_amount.to_string(),
+        notes: invoice.notes,
+        created_at: invoice.created_at.to_rfc3339(),
+        updated_at: invoice.updated_at.to_rfc3339(),
+    }
+}
+
+fn invoice_draft_to_info(invoice: &crate::db::CreateInvoiceParams) -> InvoiceDraftInfo {
+    InvoiceDraftInfo {
+        matter_id: invoice.matter_id.clone(),
+        invoice_number: invoice.invoice_number.clone(),
+        status: invoice.status.as_str().to_string(),
+        due_date: invoice.due_date.map(|value| value.to_string()),
+        subtotal: invoice.subtotal.to_string(),
+        tax: invoice.tax.to_string(),
+        total: invoice.total.to_string(),
+        notes: invoice.notes.clone(),
+    }
+}
+
+fn invoice_line_item_record_to_info(item: InvoiceLineItemRecord) -> InvoiceLineItemInfo {
+    InvoiceLineItemInfo {
+        id: item.id.to_string(),
+        description: item.description,
+        quantity: item.quantity.to_string(),
+        unit_price: item.unit_price.to_string(),
+        amount: item.amount.to_string(),
+        time_entry_id: item.time_entry_id.map(|value| value.to_string()),
+        expense_entry_id: item.expense_entry_id.map(|value| value.to_string()),
+        sort_order: item.sort_order,
+    }
+}
+
+fn invoice_line_item_params_to_info(
+    item: &crate::db::CreateInvoiceLineItemParams,
+) -> InvoiceLineItemInfo {
+    InvoiceLineItemInfo {
+        id: "draft".to_string(),
+        description: item.description.clone(),
+        quantity: item.quantity.to_string(),
+        unit_price: item.unit_price.to_string(),
+        amount: item.amount.to_string(),
+        time_entry_id: item.time_entry_id.map(|value| value.to_string()),
+        expense_entry_id: item.expense_entry_id.map(|value| value.to_string()),
+        sort_order: item.sort_order,
+    }
+}
+
+fn trust_ledger_entry_record_to_info(entry: TrustLedgerEntryRecord) -> TrustLedgerEntryInfo {
+    TrustLedgerEntryInfo {
+        id: entry.id.to_string(),
+        matter_id: entry.matter_id,
+        entry_type: entry.entry_type.as_str().to_string(),
+        amount: entry.amount.to_string(),
+        balance_after: entry.balance_after.to_string(),
+        description: entry.description,
+        invoice_id: entry.invoice_id.map(|value| value.to_string()),
+        recorded_by: entry.recorded_by,
+        created_at: entry.created_at.to_rfc3339(),
     }
 }
 
@@ -9003,6 +9356,282 @@ opened_at: 2026-02-28
             }))
             .expect("missing matter root should be treated as empty");
         assert!(entries.is_empty());
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn invoices_finalize_marks_entries_billed_and_supports_trust_payment() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        let time_entry = store
+            .create_time_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateTimeEntryParams {
+                    timekeeper: "Lead".to_string(),
+                    description: "Motion draft".to_string(),
+                    hours: rust_decimal::Decimal::new(150, 2),
+                    hourly_rate: Some(rust_decimal::Decimal::new(20000, 2)),
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("valid date"),
+                    billable: true,
+                },
+            )
+            .await
+            .expect("seed time entry");
+        let expense_entry = store
+            .create_expense_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateExpenseEntryParams {
+                    submitted_by: "Lead".to_string(),
+                    description: "Filing fee".to_string(),
+                    amount: rust_decimal::Decimal::new(4000, 2),
+                    category: crate::db::ExpenseCategory::FilingFee,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("valid date"),
+                    receipt_path: None,
+                    billable: true,
+                },
+            )
+            .await
+            .expect("seed expense entry");
+
+        let (created_status, Json(created)) = invoices_save_handler(
+            State(Arc::clone(&state)),
+            Json(DraftInvoiceRequest {
+                matter_id: "demo".to_string(),
+                invoice_number: "INV-1001".to_string(),
+                due_date: Some("2026-05-30".to_string()),
+                notes: Some("Initial billing cycle".to_string()),
+            }),
+        )
+        .await
+        .expect("save draft should succeed");
+        assert_eq!(created_status, StatusCode::CREATED);
+        assert_eq!(created.invoice.status, "draft");
+        assert_eq!(created.line_items.len(), 2);
+        let invoice_id = created.invoice.id.clone();
+
+        let Json(finalized) =
+            invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
+                .await
+                .expect("finalize should succeed");
+        assert_eq!(finalized.invoice.status, "sent");
+
+        let invoice_uuid = Uuid::parse_str(&invoice_id).expect("invoice uuid");
+        let time_after = store
+            .get_time_entry(&state.user_id, "demo", time_entry.id)
+            .await
+            .expect("get time entry")
+            .expect("time entry exists");
+        let expense_after = store
+            .get_expense_entry(&state.user_id, "demo", expense_entry.id)
+            .await
+            .expect("get expense entry")
+            .expect("expense entry exists");
+        let invoice_id_str = invoice_uuid.to_string();
+        assert_eq!(
+            time_after.billed_invoice_id.as_deref(),
+            Some(invoice_id_str.as_str())
+        );
+        assert_eq!(
+            expense_after.billed_invoice_id.as_deref(),
+            Some(invoice_id_str.as_str())
+        );
+
+        let (deposit_status, _deposit_body) = matter_trust_deposit_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Json(TrustDepositRequest {
+                amount: "500.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                description: Some("Retainer deposit".to_string()),
+            }),
+        )
+        .await
+        .expect("trust deposit should succeed");
+        assert_eq!(deposit_status, StatusCode::CREATED);
+
+        let Json(payment) = invoices_payment_handler(
+            State(Arc::clone(&state)),
+            Path(invoice_id.clone()),
+            Json(RecordInvoicePaymentRequest {
+                amount: "50.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                draw_from_trust: true,
+                description: Some("Apply trust funds".to_string()),
+            }),
+        )
+        .await
+        .expect("payment should succeed");
+        let paid = payment
+            .invoice
+            .paid_amount
+            .parse::<rust_decimal::Decimal>()
+            .expect("paid amount should parse");
+        assert_eq!(paid, rust_decimal::Decimal::new(5000, 2));
+        assert!(payment.trust_entry.is_some());
+
+        let Json(ledger) = matter_trust_ledger_handler(State(state), Path("demo".to_string()))
+            .await
+            .expect("ledger should load");
+        let balance = ledger
+            .balance
+            .parse::<rust_decimal::Decimal>()
+            .expect("balance should parse");
+        assert_eq!(balance, rust_decimal::Decimal::new(45000, 2));
+        assert_eq!(ledger.entries.len(), 2);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn invoices_payment_rejects_trust_overdraw() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        store
+            .create_expense_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateExpenseEntryParams {
+                    submitted_by: "Lead".to_string(),
+                    description: "Service fee".to_string(),
+                    amount: rust_decimal::Decimal::new(10000, 2),
+                    category: crate::db::ExpenseCategory::Other,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 2).expect("valid date"),
+                    receipt_path: None,
+                    billable: true,
+                },
+            )
+            .await
+            .expect("seed expense entry");
+
+        let (_status, Json(created)) = invoices_save_handler(
+            State(Arc::clone(&state)),
+            Json(DraftInvoiceRequest {
+                matter_id: "demo".to_string(),
+                invoice_number: "INV-2001".to_string(),
+                due_date: Some("2026-06-01".to_string()),
+                notes: None,
+            }),
+        )
+        .await
+        .expect("save draft should succeed");
+
+        let (_deposit_status, _deposit_body) = matter_trust_deposit_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Json(TrustDepositRequest {
+                amount: "10.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                description: Some("Small deposit".to_string()),
+            }),
+        )
+        .await
+        .expect("trust deposit should succeed");
+
+        let result = invoices_payment_handler(
+            State(state),
+            Path(created.invoice.id),
+            Json(RecordInvoicePaymentRequest {
+                amount: "20.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                draw_from_trust: true,
+                description: Some("Attempt overdraw".to_string()),
+            }),
+        )
+        .await;
+        let err = result.expect_err("overdraw payment should fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("insufficient"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn trust_deposits_concurrently_update_balance_atomically() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist").clone();
+        let user_id = state.user_id.clone();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let barrier_a = Arc::clone(&barrier);
+        let store_a = Arc::clone(&store);
+        let user_a = user_id.clone();
+        let task_a = tokio::spawn(async move {
+            barrier_a.wait().await;
+            crate::legal::billing::record_trust_deposit(
+                store_a.as_ref(),
+                &user_a,
+                "demo",
+                rust_decimal::Decimal::new(5000, 2),
+                "Lead A",
+                "Concurrent deposit A",
+            )
+            .await
+        });
+
+        let barrier_b = Arc::clone(&barrier);
+        let store_b = Arc::clone(&store);
+        let user_b = user_id.clone();
+        let task_b = tokio::spawn(async move {
+            barrier_b.wait().await;
+            crate::legal::billing::record_trust_deposit(
+                store_b.as_ref(),
+                &user_b,
+                "demo",
+                rust_decimal::Decimal::new(5000, 2),
+                "Lead B",
+                "Concurrent deposit B",
+            )
+            .await
+        });
+
+        barrier.wait().await;
+        let entry_a = task_a
+            .await
+            .expect("task A should join")
+            .expect("deposit A should succeed");
+        let entry_b = task_b
+            .await
+            .expect("task B should join")
+            .expect("deposit B should succeed");
+
+        let mut balances = vec![entry_a.balance_after, entry_b.balance_after];
+        balances.sort();
+        assert_eq!(
+            balances,
+            vec![
+                rust_decimal::Decimal::new(5000, 2),
+                rust_decimal::Decimal::new(10000, 2)
+            ]
+        );
+
+        let balance = store
+            .current_trust_balance(&state.user_id, "demo")
+            .await
+            .expect("read balance");
+        assert_eq!(balance, rust_decimal::Decimal::new(10000, 2));
     }
 
     #[cfg(feature = "libsql")]
