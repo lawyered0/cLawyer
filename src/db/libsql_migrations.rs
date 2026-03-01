@@ -831,6 +831,26 @@ CREATE INDEX IF NOT EXISTS idx_trust_ledger_user_matter_created
 CREATE INDEX IF NOT EXISTS idx_trust_ledger_user_invoice
     ON trust_ledger(user_id, invoice_id);
 
+CREATE TABLE IF NOT EXISTS audit_events (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    matter_id TEXT,
+    severity TEXT NOT NULL CHECK (severity IN ('info', 'warn', 'critical')),
+    details TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_events_user_created
+    ON audit_events(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_user_event_type
+    ON audit_events(user_id, event_type);
+CREATE INDEX IF NOT EXISTS idx_audit_events_user_matter_id
+    ON audit_events(user_id, matter_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_user_severity
+    ON audit_events(user_id, severity);
+
 -- ==================== Missing indexes (parity with PostgreSQL) ====================
 
 -- agent_jobs

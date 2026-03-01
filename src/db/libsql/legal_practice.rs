@@ -4,6 +4,7 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::{
+    AppendAuditEventParams, AuditEventQuery, AuditEventRecord, AuditEventStore, AuditSeverity,
     BillingStore, ClientRecord, ClientStore, ClientType, CreateClientParams,
     CreateDocumentVersionParams, CreateExpenseEntryParams, CreateInvoiceLineItemParams,
     CreateInvoiceParams, CreateMatterDeadlineParams, CreateMatterNoteParams,
@@ -86,6 +87,11 @@ fn parse_trust_ledger_entry_type(raw: &str) -> Result<TrustLedgerEntryType, Data
     TrustLedgerEntryType::from_db_value(raw).ok_or_else(|| {
         DatabaseError::Serialization(format!("invalid trust ledger entry type '{}'", raw))
     })
+}
+
+fn parse_audit_severity(raw: &str) -> Result<AuditSeverity, DatabaseError> {
+    AuditSeverity::from_db_value(raw)
+        .ok_or_else(|| DatabaseError::Serialization(format!("invalid audit severity '{}'", raw)))
 }
 
 fn parse_json_array_strings(raw: &str) -> Result<Vec<String>, DatabaseError> {
@@ -420,6 +426,24 @@ fn row_to_trust_ledger_entry_record(
             .transpose()?,
         recorded_by: get_text(row, 8),
         created_at: parse_timestamp(&get_text(row, 9))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+    })
+}
+
+fn row_to_audit_event_record(row: &libsql::Row) -> Result<AuditEventRecord, DatabaseError> {
+    let severity_raw = get_text(row, 5);
+    let details_raw = get_text(row, 6);
+    let details = serde_json::from_str::<serde_json::Value>(&details_raw)
+        .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+    Ok(AuditEventRecord {
+        id: parse_uuid(&get_text(row, 0), "audit_events.id")?,
+        user_id: get_text(row, 1),
+        event_type: get_text(row, 2),
+        actor: get_text(row, 3),
+        matter_id: get_opt_text(row, 4),
+        severity: parse_audit_severity(&severity_raw)?,
+        details,
+        created_at: parse_timestamp(&get_text(row, 7))
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
     })
 }
@@ -2502,5 +2526,120 @@ impl BillingStore for LibSqlBackend {
         raw.parse::<Decimal>().map_err(|_| {
             DatabaseError::Serialization(format!("failed to parse trust balance '{}'", raw))
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl AuditEventStore for LibSqlBackend {
+    async fn append_audit_event(
+        &self,
+        user_id: &str,
+        input: &AppendAuditEventParams,
+    ) -> Result<AuditEventRecord, DatabaseError> {
+        let conn = self.connect().await?;
+        let event_id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO audit_events (id, user_id, event_type, actor, matter_id, severity, details, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![
+                event_id.as_str(),
+                user_id,
+                input.event_type.as_str(),
+                input.actor.as_str(),
+                opt_text(input.matter_id.as_deref()),
+                input.severity.as_str(),
+                input.details.to_string(),
+            ],
+        )
+        .await?;
+        let row = conn
+            .query(
+                "SELECT id, user_id, event_type, actor, matter_id, severity, details, created_at \
+                 FROM audit_events WHERE id = ?1 LIMIT 1",
+                params![event_id.as_str()],
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| DatabaseError::Query("failed to load audit event".to_string()))?;
+        row_to_audit_event_record(&row)
+    }
+
+    async fn list_audit_events(
+        &self,
+        user_id: &str,
+        query: &AuditEventQuery,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<AuditEventRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let limit_i64 = i64::try_from(limit)
+            .map_err(|_| DatabaseError::Serialization("limit too large".to_string()))?;
+        let offset_i64 = i64::try_from(offset)
+            .map_err(|_| DatabaseError::Serialization("offset too large".to_string()))?;
+        let mut rows = conn
+            .query(
+                "SELECT id, user_id, event_type, actor, matter_id, severity, details, created_at \
+                 FROM audit_events \
+                 WHERE user_id = ?1 \
+                   AND (?2 IS NULL OR event_type = ?2) \
+                   AND (?3 IS NULL OR matter_id = ?3) \
+                   AND (?4 IS NULL OR severity = ?4) \
+                   AND (?5 IS NULL OR created_at >= ?5) \
+                   AND (?6 IS NULL OR created_at <= ?6) \
+                 ORDER BY created_at DESC, rowid DESC \
+                 LIMIT ?7 OFFSET ?8",
+                params![
+                    user_id,
+                    opt_text(query.event_type.as_deref()),
+                    opt_text(query.matter_id.as_deref()),
+                    opt_text(query.severity.map(|value| value.as_str())),
+                    opt_text_owned(query.since.as_ref().map(fmt_ts)),
+                    opt_text_owned(query.until.as_ref().map(fmt_ts)),
+                    limit_i64,
+                    offset_i64,
+                ],
+            )
+            .await?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row_to_audit_event_record(&row)?);
+        }
+        Ok(out)
+    }
+
+    async fn count_audit_events(
+        &self,
+        user_id: &str,
+        query: &AuditEventQuery,
+    ) -> Result<usize, DatabaseError> {
+        let conn = self.connect().await?;
+        let row = conn
+            .query(
+                "SELECT COUNT(*) \
+                 FROM audit_events \
+                 WHERE user_id = ?1 \
+                   AND (?2 IS NULL OR event_type = ?2) \
+                   AND (?3 IS NULL OR matter_id = ?3) \
+                   AND (?4 IS NULL OR severity = ?4) \
+                   AND (?5 IS NULL OR created_at >= ?5) \
+                   AND (?6 IS NULL OR created_at <= ?6)",
+                params![
+                    user_id,
+                    opt_text(query.event_type.as_deref()),
+                    opt_text(query.matter_id.as_deref()),
+                    opt_text(query.severity.map(|value| value.as_str())),
+                    opt_text_owned(query.since.as_ref().map(fmt_ts)),
+                    opt_text_owned(query.until.as_ref().map(fmt_ts)),
+                ],
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| DatabaseError::Query("failed to count audit events".to_string()))?;
+        let count = get_i64(&row, 0);
+        usize::try_from(count)
+            .map_err(|_| DatabaseError::Serialization("audit count overflow".to_string()))
     }
 }

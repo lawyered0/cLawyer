@@ -864,6 +864,63 @@ pub struct CreateTrustLedgerEntryParams {
     pub recorded_by: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditSeverity {
+    Info,
+    Warn,
+    Critical,
+}
+
+impl AuditSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Critical => "critical",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "info" => Some(Self::Info),
+            "warn" => Some(Self::Warn),
+            "critical" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEventRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub event_type: String,
+    pub actor: String,
+    pub matter_id: Option<String>,
+    pub severity: AuditSeverity,
+    pub details: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppendAuditEventParams {
+    pub event_type: String,
+    pub actor: String,
+    pub matter_id: Option<String>,
+    pub severity: AuditSeverity,
+    pub details: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AuditEventQuery {
+    pub event_type: Option<String>,
+    pub matter_id: Option<String>,
+    pub severity: Option<AuditSeverity>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+}
+
 /// Normalize names/text for conflict matching.
 pub fn normalize_party_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -1559,6 +1616,27 @@ pub trait BillingStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait AuditEventStore: Send + Sync {
+    async fn append_audit_event(
+        &self,
+        user_id: &str,
+        input: &AppendAuditEventParams,
+    ) -> Result<AuditEventRecord, DatabaseError>;
+    async fn list_audit_events(
+        &self,
+        user_id: &str,
+        query: &AuditEventQuery,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<AuditEventRecord>, DatabaseError>;
+    async fn count_audit_events(
+        &self,
+        user_id: &str,
+        query: &AuditEventQuery,
+    ) -> Result<usize, DatabaseError>;
+}
+
+#[async_trait]
 pub trait SettingsStore: Send + Sync {
     async fn get_setting(
         &self,
@@ -1679,6 +1757,7 @@ pub trait Database:
     + DocumentTemplateStore
     + TimeExpenseStore
     + BillingStore
+    + AuditEventStore
     + SettingsStore
     + WorkspaceStore
     + Send

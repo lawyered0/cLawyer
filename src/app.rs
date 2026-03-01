@@ -746,6 +746,31 @@ impl AppBuilder {
                             warning_count = report.warnings.len(),
                             "Conflict graph reindex completed at startup"
                         );
+                        let startup_user_id = self
+                            .config
+                            .channels
+                            .gateway
+                            .as_ref()
+                            .map(|cfg| cfg.user_id.as_str())
+                            .unwrap_or("default")
+                            .to_string();
+                        crate::audit_db!(
+                            self.db.clone(),
+                            startup_user_id,
+                            "conflict_graph_reindexed",
+                            "startup",
+                            None,
+                            crate::db::AuditSeverity::Info,
+                            serde_json::json!({
+                                "triggered_by": "startup",
+                                "scanned_matters": report.scanned_matters,
+                                "seeded_matters": report.seeded_matters,
+                                "skipped_matters": report.skipped_matters,
+                                "global_conflicts_seeded": report.global_conflicts_seeded,
+                                "global_aliases_seeded": report.global_aliases_seeded,
+                                "warning_count": report.warnings.len(),
+                            })
+                        );
                     }
                     Err(e) => {
                         if !startup_legal.conflict_file_fallback_enabled {

@@ -17,6 +17,7 @@ use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
+    AppendAuditEventParams, AuditEventQuery, AuditEventRecord, AuditEventStore, AuditSeverity,
     BillingStore, ClientRecord, ClientStore, ClientType, ConflictClearanceRecord, ConflictHit,
     ConversationStore, CreateClientParams, CreateDocumentVersionParams, CreateExpenseEntryParams,
     CreateInvoiceLineItemParams, CreateInvoiceParams, CreateMatterDeadlineParams,
@@ -489,6 +490,24 @@ fn row_to_trust_ledger_entry_record(
         description: row.get("description"),
         invoice_id: row.get("invoice_id"),
         recorded_by: row.get("recorded_by"),
+        created_at: row.get("created_at"),
+    })
+}
+
+fn row_to_audit_event_record(row: &tokio_postgres::Row) -> Result<AuditEventRecord, DatabaseError> {
+    let severity_raw: String = row.get("severity");
+    let severity = AuditSeverity::from_db_value(&severity_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid audit severity '{}'", severity_raw))
+    })?;
+    let details: serde_json::Value = row.get("details");
+    Ok(AuditEventRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        event_type: row.get("event_type"),
+        actor: row.get("actor"),
+        matter_id: row.get("matter_id"),
+        severity,
+        details,
         created_at: row.get("created_at"),
     })
 }
@@ -3013,6 +3032,112 @@ impl BillingStore for PgBackend {
             )
             .await?;
         Ok(row.get("balance"))
+    }
+}
+
+// ==================== AuditEventStore ====================
+
+#[async_trait]
+impl AuditEventStore for PgBackend {
+    async fn append_audit_event(
+        &self,
+        user_id: &str,
+        input: &AppendAuditEventParams,
+    ) -> Result<AuditEventRecord, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO audit_events (id, user_id, event_type, actor, matter_id, severity, details) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 RETURNING id, user_id, event_type, actor, matter_id, severity, details, created_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &input.event_type,
+                    &input.actor,
+                    &input.matter_id,
+                    &input.severity.as_str(),
+                    &input.details,
+                ],
+            )
+            .await?;
+        row_to_audit_event_record(&row)
+    }
+
+    async fn list_audit_events(
+        &self,
+        user_id: &str,
+        query: &AuditEventQuery,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<AuditEventRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let limit_i64 = i64::try_from(limit)
+            .map_err(|_| DatabaseError::Serialization("limit too large".to_string()))?;
+        let offset_i64 = i64::try_from(offset)
+            .map_err(|_| DatabaseError::Serialization("offset too large".to_string()))?;
+        let severity_filter = query.severity.map(|value| value.as_str().to_string());
+
+        let rows = conn
+            .query(
+                "SELECT id, user_id, event_type, actor, matter_id, severity, details, created_at \
+                 FROM audit_events \
+                 WHERE user_id = $1 \
+                   AND ($2::text IS NULL OR event_type = $2) \
+                   AND ($3::text IS NULL OR matter_id = $3) \
+                   AND ($4::text IS NULL OR severity = $4) \
+                   AND ($5::timestamptz IS NULL OR created_at >= $5) \
+                   AND ($6::timestamptz IS NULL OR created_at <= $6) \
+                 ORDER BY created_at DESC, id DESC \
+                 LIMIT $7 OFFSET $8",
+                &[
+                    &user_id,
+                    &query.event_type,
+                    &query.matter_id,
+                    &severity_filter,
+                    &query.since,
+                    &query.until,
+                    &limit_i64,
+                    &offset_i64,
+                ],
+            )
+            .await?;
+
+        rows.into_iter()
+            .map(|row| row_to_audit_event_record(&row))
+            .collect()
+    }
+
+    async fn count_audit_events(
+        &self,
+        user_id: &str,
+        query: &AuditEventQuery,
+    ) -> Result<usize, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let severity_filter = query.severity.map(|value| value.as_str().to_string());
+        let row = conn
+            .query_one(
+                "SELECT COUNT(*)::bigint AS count \
+                 FROM audit_events \
+                 WHERE user_id = $1 \
+                   AND ($2::text IS NULL OR event_type = $2) \
+                   AND ($3::text IS NULL OR matter_id = $3) \
+                   AND ($4::text IS NULL OR severity = $4) \
+                   AND ($5::timestamptz IS NULL OR created_at >= $5) \
+                   AND ($6::timestamptz IS NULL OR created_at <= $6)",
+                &[
+                    &user_id,
+                    &query.event_type,
+                    &query.matter_id,
+                    &severity_filter,
+                    &query.since,
+                    &query.until,
+                ],
+            )
+            .await?;
+        let count_i64: i64 = row.get("count");
+        usize::try_from(count_i64)
+            .map_err(|_| DatabaseError::Serialization("audit count overflow".to_string()))
     }
 }
 

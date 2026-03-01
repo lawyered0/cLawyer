@@ -3,7 +3,6 @@
 //! Handles all API routes: chat, memory, jobs, health, and static file serving.
 
 use std::convert::Infallible;
-use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::Path as FsPath;
 use std::sync::Arc;
@@ -39,10 +38,11 @@ use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
 use crate::db::{
-    ClientType, ConflictClearanceRecord, ConflictDecision, ConflictHit, CreateClientParams,
-    CreateDocumentVersionParams, CreateExpenseEntryParams, CreateMatterDeadlineParams,
-    CreateMatterNoteParams, CreateMatterTaskParams, CreateTimeEntryParams, Database,
-    ExpenseCategory, InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus, MatterDeadlineType,
+    AuditEventQuery as DbAuditEventQuery, AuditSeverity, ClientType, ConflictClearanceRecord,
+    ConflictDecision, ConflictHit, CreateClientParams, CreateDocumentVersionParams,
+    CreateExpenseEntryParams, CreateMatterDeadlineParams, CreateMatterNoteParams,
+    CreateMatterTaskParams, CreateTimeEntryParams, Database, ExpenseCategory,
+    InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus, MatterDeadlineType,
     MatterDocumentCategory, MatterStatus, MatterTaskStatus, TrustLedgerEntryRecord,
     UpdateClientParams, UpdateExpenseEntryParams, UpdateMatterDeadlineParams,
     UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
@@ -1420,8 +1420,6 @@ async fn memory_upload_handler(
 const MATTER_ROOT: &str = "matters";
 /// Settings key used to persist the active matter ID.
 const MATTER_ACTIVE_SETTING: &str = "legal.active_matter";
-/// Maximum number of audit log lines scanned per request.
-const MAX_AUDIT_SCAN_LINES: usize = 10_000;
 /// Maximum number of party names accepted by intake conflict endpoints.
 const MAX_INTAKE_CONFLICT_PARTIES: usize = 64;
 /// Maximum length for a single intake party name.
@@ -1445,20 +1443,12 @@ struct LegalAuditQuery {
     limit: Option<usize>,
     offset: Option<usize>,
     event_type: Option<String>,
+    matter_id: Option<String>,
+    severity: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
     from: Option<String>,
     to: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegalAuditEventLine {
-    ts: String,
-    event_type: String,
-    details: serde_json::Value,
-    metrics: serde_json::Value,
-    #[serde(default)]
-    prev_hash: Option<String>,
-    #[serde(default)]
-    hash: Option<String>,
 }
 
 fn parse_utc_query_ts(
@@ -1479,6 +1469,51 @@ fn parse_utc_query_ts(
         )
     })?;
     Ok(Some(parsed.with_timezone(&Utc)))
+}
+
+fn parse_audit_severity_query(
+    raw: Option<&str>,
+) -> Result<Option<AuditSeverity>, (StatusCode, String)> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed {
+        "info" => Ok(Some(AuditSeverity::Info)),
+        "warn" => Ok(Some(AuditSeverity::Warn)),
+        "critical" => Ok(Some(AuditSeverity::Critical)),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "'severity' must be one of: info, warn, critical".to_string(),
+        )),
+    }
+}
+
+async fn record_legal_audit_event(
+    state: &GatewayState,
+    event_type: &str,
+    actor: &str,
+    matter_id: Option<&str>,
+    severity: AuditSeverity,
+    details: serde_json::Value,
+) {
+    if let Some(store) = state.store.as_ref() {
+        crate::legal::audit::record_with_db(
+            event_type,
+            actor,
+            matter_id,
+            severity,
+            details,
+            store.as_ref(),
+            &state.user_id,
+        )
+        .await;
+    } else {
+        crate::legal::audit::record(event_type, details);
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2508,6 +2543,21 @@ async fn matter_patch_handler(
         }
     }
 
+    if matches!(status, Some(MatterStatus::Closed)) {
+        record_legal_audit_event(
+            state.as_ref(),
+            "matter_closed",
+            state.user_id.as_str(),
+            Some(matter_id.as_str()),
+            AuditSeverity::Info,
+            serde_json::json!({
+                "matter_id": matter_id,
+                "status": MatterStatus::Closed.as_str(),
+            }),
+        )
+        .await;
+    }
+
     Ok(Json(db_matter_to_info(state.as_ref(), matter).await))
 }
 
@@ -3249,6 +3299,19 @@ async fn invoices_finalize_handler(
         .list_invoice_line_items(&state.user_id, invoice_id)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    record_legal_audit_event(
+        state.as_ref(),
+        "invoice_finalized",
+        state.user_id.as_str(),
+        Some(invoice.matter_id.as_str()),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "invoice_id": invoice.id.to_string(),
+            "invoice_number": invoice.invoice_number.clone(),
+            "matter_id": invoice.matter_id.clone(),
+        }),
+    )
+    .await;
     Ok(Json(InvoiceDetailResponse {
         invoice: invoice_record_to_info(invoice),
         line_items: line_items
@@ -3297,7 +3360,7 @@ async fn invoices_payment_handler(
     let invoice_id = parse_uuid(&id, "invoice_id")?;
     let amount = parse_decimal_field("amount", &req.amount)?;
     let recorded_by = parse_required_matter_field("recorded_by", &req.recorded_by)?;
-    let (invoice, trust_entry) = crate::legal::billing::record_payment(
+    let payment_result = crate::legal::billing::record_payment(
         store.as_ref(),
         &state.user_id,
         invoice_id,
@@ -3306,8 +3369,43 @@ async fn invoices_payment_handler(
         req.draw_from_trust,
         req.description.as_deref(),
     )
-    .await
-    .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    .await;
+    let (invoice, trust_entry) = match payment_result {
+        Ok(result) => result,
+        Err(err) => {
+            if req.draw_from_trust && err.to_ascii_lowercase().contains("insufficient") {
+                record_legal_audit_event(
+                    state.as_ref(),
+                    "trust_withdrawal_rejected",
+                    state.user_id.as_str(),
+                    None,
+                    AuditSeverity::Warn,
+                    serde_json::json!({
+                        "invoice_id": invoice_id.to_string(),
+                        "amount": amount.to_string(),
+                        "reason": "insufficient_balance",
+                    }),
+                )
+                .await;
+            }
+            return Err((StatusCode::BAD_REQUEST, err));
+        }
+    };
+    record_legal_audit_event(
+        state.as_ref(),
+        "payment_recorded",
+        state.user_id.as_str(),
+        Some(invoice.matter_id.as_str()),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "invoice_id": invoice.id.to_string(),
+            "matter_id": invoice.matter_id.clone(),
+            "amount": amount.to_string(),
+            "draw_from_trust": req.draw_from_trust,
+            "trust_entry_created": trust_entry.is_some(),
+        }),
+    )
+    .await;
     Ok(Json(RecordInvoicePaymentResponse {
         invoice: invoice_record_to_info(invoice),
         trust_entry: trust_entry.map(trust_ledger_entry_record_to_info),
@@ -3339,6 +3437,20 @@ async fn matter_trust_deposit_handler(
     )
     .await
     .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    record_legal_audit_event(
+        state.as_ref(),
+        "trust_deposit",
+        state.user_id.as_str(),
+        Some(matter_id.as_str()),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "matter_id": matter_id.clone(),
+            "entry_id": entry.id.to_string(),
+            "amount": entry.amount.to_string(),
+            "recorded_by": recorded_by,
+        }),
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(trust_ledger_entry_record_to_info(entry)),
@@ -4098,6 +4210,18 @@ fn trust_ledger_entry_record_to_info(entry: TrustLedgerEntryRecord) -> TrustLedg
     }
 }
 
+fn audit_event_record_to_info(event: crate::db::AuditEventRecord) -> LegalAuditEventInfo {
+    LegalAuditEventInfo {
+        id: event.id.to_string(),
+        ts: event.created_at.to_rfc3339(),
+        event_type: event.event_type,
+        actor: event.actor,
+        matter_id: event.matter_id,
+        severity: event.severity.as_str().to_string(),
+        details: event.details,
+    }
+}
+
 fn validate_intake_party_name(field_name: &str, value: &str) -> Result<(), (StatusCode, String)> {
     if value.chars().count() > MAX_INTAKE_CONFLICT_PARTY_CHARS {
         return Err((
@@ -4319,8 +4443,12 @@ async fn matters_create_handler(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        crate::legal::audit::record(
+        record_legal_audit_event(
+            state.as_ref(),
             "conflict_clearance_decision",
+            state.user_id.as_str(),
+            Some(sanitized.as_str()),
+            AuditSeverity::Info,
             serde_json::json!({
                 "matter_id": sanitized.clone(),
                 "decision": decision.as_str(),
@@ -4329,7 +4457,8 @@ async fn matters_create_handler(
                 "hit_count": clearance.hit_count,
                 "source": "create_flow",
             }),
-        );
+        )
+        .await;
 
         if matches!(decision, ConflictDecision::Declined) {
             return Err(conflict_declined_error(&conflict_hits));
@@ -4473,6 +4602,20 @@ async fn matters_create_handler(
         .set_setting(&state.user_id, MATTER_ACTIVE_SETTING, &value)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    record_legal_audit_event(
+        state.as_ref(),
+        "matter_created",
+        state.user_id.as_str(),
+        Some(sanitized.as_str()),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "matter_id": sanitized.clone(),
+            "client_id": db_client.id.to_string(),
+            "status": MatterStatus::Active.as_str(),
+        }),
+    )
+    .await;
 
     Ok((
         StatusCode::CREATED,
@@ -5452,8 +5595,12 @@ async fn matters_conflict_check_handler(
     let matched = !hits.is_empty();
     let top_conflict = hits.first().map(|hit| hit.party.clone());
 
-    crate::legal::audit::record(
+    record_legal_audit_event(
+        state.as_ref(),
         "matter_intake_conflict_check",
+        state.user_id.as_str(),
+        Some(matter_id.as_str()),
+        AuditSeverity::Info,
         serde_json::json!({
             "matter_id": matter_id.clone(),
             "matched": matched,
@@ -5462,7 +5609,23 @@ async fn matters_conflict_check_handler(
             "checked_party_count": checked_parties.len(),
             "checked_by": state.user_id.clone(),
         }),
-    );
+    )
+    .await;
+    if matched {
+        record_legal_audit_event(
+            state.as_ref(),
+            "conflict_detected",
+            state.user_id.as_str(),
+            Some(matter_id.as_str()),
+            AuditSeverity::Warn,
+            serde_json::json!({
+                "source": "intake_conflict_check",
+                "hit_count": hits.len(),
+                "top_conflict": hits.first().map(|hit| hit.party.clone()),
+            }),
+        )
+        .await;
+    }
 
     Ok(Json(MatterIntakeConflictCheckResponse {
         matched,
@@ -5548,8 +5711,12 @@ async fn matters_conflicts_check_handler(
     };
     let matched = conflict.is_some();
 
-    crate::legal::audit::record(
+    record_legal_audit_event(
+        state.as_ref(),
         "matter_conflict_check",
+        state.user_id.as_str(),
+        effective_matter_id.as_deref(),
+        AuditSeverity::Info,
         serde_json::json!({
             "matter_id": effective_matter_id.clone(),
             "matched": matched,
@@ -5558,7 +5725,23 @@ async fn matters_conflicts_check_handler(
             "checked_by": state.user_id.clone(),
             "source": "manual_text_check",
         }),
-    );
+    )
+    .await;
+    if matched {
+        record_legal_audit_event(
+            state.as_ref(),
+            "conflict_detected",
+            state.user_id.as_str(),
+            effective_matter_id.as_deref(),
+            AuditSeverity::Warn,
+            serde_json::json!({
+                "source": "manual_text_check",
+                "conflict": conflict.clone(),
+                "hit_count": db_hits.len(),
+            }),
+        )
+        .await;
+    }
 
     Ok(Json(MatterConflictCheckResponse {
         matched,
@@ -5592,8 +5775,12 @@ async fn matters_conflicts_reindex_handler(
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
 
-    crate::legal::audit::record(
-        "conflict_graph_reindex",
+    record_legal_audit_event(
+        state.as_ref(),
+        "conflict_graph_reindexed",
+        state.user_id.as_str(),
+        None,
+        AuditSeverity::Info,
         serde_json::json!({
             "triggered_by": state.user_id.clone(),
             "scanned_matters": report.scanned_matters,
@@ -5603,7 +5790,8 @@ async fn matters_conflicts_reindex_handler(
             "global_aliases_seeded": report.global_aliases_seeded,
             "warning_count": report.warnings.len(),
         }),
-    );
+    )
+    .await;
 
     Ok(Json(MatterConflictGraphReindexResponse {
         status: "ok",
@@ -5622,6 +5810,10 @@ async fn legal_audit_list_handler(
             "Legal audit logging is disabled".to_string(),
         ));
     }
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
 
     let limit = query.limit.unwrap_or(50);
     if limit == 0 || limit > 200 {
@@ -5639,102 +5831,46 @@ async fn legal_audit_list_handler(
             Some(trimmed.to_string())
         }
     });
-    let from_ts = parse_utc_query_ts("from", query.from.as_deref())?;
-    let to_ts = parse_utc_query_ts("to", query.to.as_deref())?;
+    let matter_id_filter = query.matter_id.as_ref().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    let severity_filter = parse_audit_severity_query(query.severity.as_deref())?;
+    // Keep backward compatibility with existing `from`/`to` query names.
+    let since_ts = parse_utc_query_ts("since", query.since.as_deref().or(query.from.as_deref()))?;
+    let until_ts = parse_utc_query_ts("until", query.until.as_deref().or(query.to.as_deref()))?;
 
-    if let (Some(from), Some(to)) = (from_ts, to_ts)
-        && from > to
+    if let (Some(since), Some(until)) = (since_ts, until_ts)
+        && since > until
     {
         return Err((
             StatusCode::BAD_REQUEST,
-            "'from' must be earlier than or equal to 'to'".to_string(),
+            "'since' must be earlier than or equal to 'until'".to_string(),
         ));
     }
 
-    let path = &legal.audit.path;
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Json(LegalAuditListResponse {
-                events: Vec::new(),
-                total: 0,
-                next_offset: None,
-                parse_errors: 0,
-                truncated: false,
-            }));
-        }
-        Err(err) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to open legal audit log {:?}: {}", path, err),
-            ));
-        }
+    let db_query = DbAuditEventQuery {
+        event_type: event_type_filter,
+        matter_id: matter_id_filter,
+        severity: severity_filter,
+        since: since_ts,
+        until: until_ts,
     };
-
-    let mut parse_errors = 0usize;
-    let mut truncated = false;
-    let mut filtered: Vec<LegalAuditEventInfo> = Vec::new();
-
-    for (idx, line_res) in BufReader::new(file).lines().enumerate() {
-        if idx >= MAX_AUDIT_SCAN_LINES {
-            truncated = true;
-            break;
-        }
-        let line_no = idx + 1;
-        let line = line_res.map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to read legal audit log {:?}: {}", path, err),
-            )
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let parsed: LegalAuditEventLine = match serde_json::from_str(&line) {
-            Ok(event) => event,
-            Err(_) => {
-                parse_errors += 1;
-                continue;
-            }
-        };
-        let ts = match DateTime::parse_from_rfc3339(&parsed.ts) {
-            Ok(ts) => ts.with_timezone(&Utc),
-            Err(_) => {
-                parse_errors += 1;
-                continue;
-            }
-        };
-
-        if let Some(ref wanted) = event_type_filter
-            && &parsed.event_type != wanted
-        {
-            continue;
-        }
-        if let Some(from) = from_ts
-            && ts < from
-        {
-            continue;
-        }
-        if let Some(to) = to_ts
-            && ts > to
-        {
-            continue;
-        }
-
-        filtered.push(LegalAuditEventInfo {
-            line_no,
-            ts: parsed.ts,
-            event_type: parsed.event_type,
-            details: parsed.details,
-            metrics: parsed.metrics,
-            prev_hash: parsed.prev_hash,
-            hash: parsed.hash,
-        });
-    }
-
-    let total = filtered.len();
-    let events: Vec<LegalAuditEventInfo> = filtered.into_iter().skip(offset).take(limit).collect();
+    let total = store
+        .count_audit_events(&state.user_id, &db_query)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let events = store
+        .list_audit_events(&state.user_id, &db_query, limit, offset)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .into_iter()
+        .map(audit_event_record_to_info)
+        .collect::<Vec<_>>();
     let next_offset = if offset + events.len() < total {
         Some(offset + events.len())
     } else {
@@ -5745,8 +5881,6 @@ async fn legal_audit_list_handler(
         events,
         total,
         next_offset,
-        parse_errors,
-        truncated,
     }))
 }
 
@@ -7340,9 +7474,6 @@ struct GatewayStatusResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::io::Write;
-
     use super::*;
     use regex::Regex;
 
@@ -7876,6 +8007,8 @@ mod tests {
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn matters_create_creates_scaffold_and_sets_active() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
         let state =
@@ -7952,6 +8085,12 @@ mod tests {
         assert_eq!(
             stored.and_then(|v| v.as_str().map(|s| s.to_string())),
             Some("acme-v--foo".to_string())
+        );
+        let events = crate::legal::audit::test_events_snapshot();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "matter_created")
         );
     }
 
@@ -8314,7 +8453,7 @@ opened_at: 2026-02-28
 
         let events = crate::legal::audit::test_events_snapshot();
         assert!(events.iter().any(|event| {
-            event.event_type == "conflict_graph_reindex"
+            event.event_type == "conflict_graph_reindexed"
                 && event.details["seeded_matters"] == 1
                 && event.details["global_conflicts_seeded"] == 1
         }));
@@ -8571,6 +8710,10 @@ opened_at: 2026-02-28
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
         );
+        assert!(events.iter().any(|entry| {
+            entry.event_type == "conflict_detected"
+                && entry.details.get("source").and_then(|v| v.as_str()) == Some("manual_text_check")
+        }));
     }
 
     #[cfg(feature = "libsql")]
@@ -8722,22 +8865,17 @@ opened_at: 2026-02-28
     async fn legal_audit_list_returns_empty_when_missing() {
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
-        let dir = tempfile::tempdir().expect("tempdir");
-
         let mut legal = test_legal_config();
         legal.audit.enabled = true;
-        legal.audit.path = dir.path().join("missing-audit.jsonl");
         let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
 
         let Json(resp) = legal_audit_list_handler(State(state), Query(LegalAuditQuery::default()))
             .await
-            .expect("missing file should not error");
+            .expect("empty DB list should not error");
 
         assert!(resp.events.is_empty());
         assert_eq!(resp.total, 0);
         assert_eq!(resp.next_offset, None);
-        assert_eq!(resp.parse_errors, 0);
-        assert!(!resp.truncated);
     }
 
     #[cfg(feature = "libsql")]
@@ -8745,44 +8883,45 @@ opened_at: 2026-02-28
     async fn legal_audit_list_supports_filters_and_paging() {
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("audit.jsonl");
-
-        let mut file = fs::File::create(&path).expect("create audit file");
-        writeln!(
-            file,
-            r#"{{"ts":"2026-01-01T00:00:00Z","event_type":"prompt_received","details":{{}},"metrics":{{}}}}"#
-        )
-        .expect("write line");
-        writeln!(
-            file,
-            r#"{{"ts":"2026-01-02T00:00:00Z","event_type":"approval_required","details":{{"id":1}},"metrics":{{"approval_required":1}}}}"#
-        )
-        .expect("write line");
-        writeln!(
-            file,
-            r#"{{"ts":"2026-01-03T00:00:00Z","event_type":"approval_required","details":{{"id":2}},"metrics":{{"approval_required":2}}}}"#
-        )
-        .expect("write line");
-        writeln!(
-            file,
-            r#"{{"ts":"2026-01-04T00:00:00Z","event_type":"approval_required","details":{{"id":3}},"metrics":{{"approval_required":3}}}}"#
-        )
-        .expect("write line");
 
         let mut legal = test_legal_config();
         legal.audit.enabled = true;
-        legal.audit.path = path;
-        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+        let state =
+            test_gateway_state_with_store_workspace_and_legal(Arc::clone(&db), workspace, legal);
+        let store = state.store.as_ref().expect("store should exist");
+        for idx in 1..=4 {
+            let severity = if idx % 2 == 0 {
+                crate::db::AuditSeverity::Warn
+            } else {
+                crate::db::AuditSeverity::Info
+            };
+            store
+                .append_audit_event(
+                    &state.user_id,
+                    &crate::db::AppendAuditEventParams {
+                        event_type: "approval_required".to_string(),
+                        actor: "gateway".to_string(),
+                        matter_id: Some("demo".to_string()),
+                        severity,
+                        details: serde_json::json!({ "id": idx }),
+                    },
+                )
+                .await
+                .expect("append audit event");
+        }
 
         let Json(resp) = legal_audit_list_handler(
-            State(state),
+            State(Arc::clone(&state)),
             Query(LegalAuditQuery {
                 limit: Some(1),
                 offset: Some(0),
                 event_type: Some("approval_required".to_string()),
-                from: Some("2026-01-02T00:00:00Z".to_string()),
-                to: Some("2026-01-03T23:59:59Z".to_string()),
+                matter_id: Some("demo".to_string()),
+                severity: Some("warn".to_string()),
+                since: None,
+                until: None,
+                from: None,
+                to: None,
             }),
         )
         .await
@@ -8791,43 +8930,72 @@ opened_at: 2026-02-28
         assert_eq!(resp.total, 2);
         assert_eq!(resp.events.len(), 1);
         assert_eq!(resp.next_offset, Some(1));
-        assert_eq!(resp.events[0].line_no, 2);
         assert_eq!(resp.events[0].event_type, "approval_required");
+        assert_eq!(resp.events[0].matter_id.as_deref(), Some("demo"));
+        assert_eq!(resp.events[0].severity, "warn");
     }
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
-    async fn legal_audit_list_tracks_parse_errors() {
+    async fn legal_audit_list_filters_since_until() {
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("audit.jsonl");
-
-        let mut file = fs::File::create(&path).expect("create audit file");
-        writeln!(
-            file,
-            r#"{{"ts":"2026-01-01T00:00:00Z","event_type":"prompt_received","details":{{}},"metrics":{{}}}}"#
-        )
-        .expect("write valid line");
-        writeln!(file, "not-json").expect("write invalid json line");
-        writeln!(
-            file,
-            r#"{{"ts":"not-a-timestamp","event_type":"prompt_received","details":{{}},"metrics":{{}}}}"#
-        )
-        .expect("write invalid ts line");
 
         let mut legal = test_legal_config();
         legal.audit.enabled = true;
-        legal.audit.path = path;
-        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
-
-        let Json(resp) = legal_audit_list_handler(State(state), Query(LegalAuditQuery::default()))
+        let state =
+            test_gateway_state_with_store_workspace_and_legal(Arc::clone(&db), workspace, legal);
+        let store = state.store.as_ref().expect("store should exist");
+        store
+            .append_audit_event(
+                &state.user_id,
+                &crate::db::AppendAuditEventParams {
+                    event_type: "matter_created".to_string(),
+                    actor: "gateway".to_string(),
+                    matter_id: Some("demo".to_string()),
+                    severity: crate::db::AuditSeverity::Info,
+                    details: serde_json::json!({ "step": 1 }),
+                },
+            )
             .await
-            .expect("audit list should succeed");
+            .expect("append");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let checkpoint = Utc::now().to_rfc3339();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        store
+            .append_audit_event(
+                &state.user_id,
+                &crate::db::AppendAuditEventParams {
+                    event_type: "matter_closed".to_string(),
+                    actor: "gateway".to_string(),
+                    matter_id: Some("demo".to_string()),
+                    severity: crate::db::AuditSeverity::Critical,
+                    details: serde_json::json!({ "step": 2 }),
+                },
+            )
+            .await
+            .expect("append");
+
+        let Json(resp) = legal_audit_list_handler(
+            State(state),
+            Query(LegalAuditQuery {
+                limit: Some(50),
+                offset: Some(0),
+                event_type: None,
+                matter_id: Some("demo".to_string()),
+                severity: None,
+                since: Some(checkpoint),
+                until: None,
+                from: None,
+                to: None,
+            }),
+        )
+        .await
+        .expect("audit list should succeed");
 
         assert_eq!(resp.total, 1);
         assert_eq!(resp.events.len(), 1);
-        assert_eq!(resp.parse_errors, 2);
+        assert_eq!(resp.events[0].event_type, "matter_closed");
     }
 
     #[cfg(feature = "libsql")]
@@ -9361,6 +9529,8 @@ opened_at: 2026-02-28
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn invoices_finalize_marks_entries_billed_and_supports_trust_payment() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
         seed_valid_matter(workspace.as_ref(), "demo").await;
@@ -9488,11 +9658,30 @@ opened_at: 2026-02-28
             .expect("balance should parse");
         assert_eq!(balance, rust_decimal::Decimal::new(45000, 2));
         assert_eq!(ledger.entries.len(), 2);
+
+        let events = crate::legal::audit::test_events_snapshot();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "invoice_finalized")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "payment_recorded")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "trust_deposit")
+        );
     }
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn invoices_payment_rejects_trust_overdraw() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
         seed_valid_matter(workspace.as_ref(), "demo").await;
@@ -9558,6 +9747,12 @@ opened_at: 2026-02-28
         let err = result.expect_err("overdraw payment should fail");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("insufficient"));
+        let events = crate::legal::audit::test_events_snapshot();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "trust_withdrawal_rejected")
+        );
     }
 
     #[cfg(feature = "libsql")]

@@ -87,6 +87,10 @@ For web-first firm workflows, matter detail now includes:
 - `POST /api/matters/{id}/deadlines/compute`
   - computes deadline previews from bundled court rules without persisting.
 - `GET /api/legal/court-rules`
+- `GET /api/legal/audit`
+  - returns DB-backed, user-scoped legal audit events with filters:
+    - `event_type`, `matter_id`, `severity`, `since`, `until`, `limit`, `offset`
+  - file audit log remains authoritative; DB records are best-effort mirrors.
   - lists bundled rule metadata (citation, deadline type, offset, court-day behavior).
 - `POST /api/matters/{id}/filing-package`
   - writes a matter-local filing package index to `matters/<id>/exports/`.
@@ -156,6 +160,9 @@ Audit log events include:
 - LLM lifecycle events (`llm_call_started`, `llm_call_completed`, `llm_call_failed`)
 - tool lifecycle events (`tool_call_started`, `tool_call_completed`)
 - explicit approval decision events (`approval_decision`)
+- matter lifecycle events (`matter_created`, `matter_closed`)
+- billing/trust events (`invoice_finalized`, `payment_recorded`, `trust_deposit`, `trust_withdrawal_rejected`)
+- conflict system events (`conflict_detected`, `conflict_graph_reindexed`)
 
 Counters tracked in audit state:
 

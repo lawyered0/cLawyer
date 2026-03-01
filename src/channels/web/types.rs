@@ -742,15 +742,13 @@ pub struct MatterConflictGraphReindexResponse {
 
 #[derive(Debug, Serialize)]
 pub struct LegalAuditEventInfo {
-    pub line_no: usize,
+    pub id: String,
     pub ts: String,
     pub event_type: String,
+    pub actor: String,
+    pub matter_id: Option<String>,
+    pub severity: String,
     pub details: serde_json::Value,
-    pub metrics: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prev_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hash: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -758,8 +756,6 @@ pub struct LegalAuditListResponse {
     pub events: Vec<LegalAuditEventInfo>,
     pub total: usize,
     pub next_offset: Option<usize>,
-    pub parse_errors: usize,
-    pub truncated: bool,
 }
 
 #[derive(Debug, Serialize)]

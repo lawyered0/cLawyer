@@ -73,6 +73,19 @@ async fn start_test_server_with_overrides(
     Arc<GatewayState>,
     mpsc::Receiver<IncomingMessage>,
 ) {
+    start_test_server_with_store_overrides(workspace, None, legal_config).await
+}
+
+/// Start a gateway server with optional DB store and legal/workspace overrides.
+async fn start_test_server_with_store_overrides(
+    workspace: Option<Arc<Workspace>>,
+    store: Option<Arc<dyn Database>>,
+    legal_config: Option<clawyer::config::LegalConfig>,
+) -> (
+    SocketAddr,
+    Arc<GatewayState>,
+    mpsc::Receiver<IncomingMessage>,
+) {
     let (agent_tx, agent_rx) = mpsc::channel(64);
 
     let state = Arc::new(GatewayState {
@@ -84,7 +97,7 @@ async fn start_test_server_with_overrides(
         log_level_handle: None,
         extension_manager: None,
         tool_registry: None,
-        store: None,
+        store,
         job_manager: None,
         prompt_queue: None,
         user_id: "test-user".to_string(),
@@ -119,6 +132,12 @@ async fn start_test_server() -> (
 
 #[cfg(feature = "libsql")]
 async fn make_test_workspace(user_id: &str) -> Arc<Workspace> {
+    let (workspace, _db) = make_test_workspace_with_db(user_id).await;
+    workspace
+}
+
+#[cfg(feature = "libsql")]
+async fn make_test_workspace_with_db(user_id: &str) -> (Arc<Workspace>, Arc<dyn Database>) {
     let db_path = std::env::temp_dir().join(format!("clawyer-ws-test-{}.db", uuid::Uuid::new_v4()));
     let db: Arc<dyn Database> = Arc::new(
         LibSqlBackend::new_local(&db_path)
@@ -128,7 +147,10 @@ async fn make_test_workspace(user_id: &str) -> Arc<Workspace> {
     db.run_migrations()
         .await
         .expect("libsql migrations should run");
-    Arc::new(Workspace::new_with_db(user_id, db))
+    (
+        Arc::new(Workspace::new_with_db(user_id, Arc::clone(&db))),
+        db,
+    )
 }
 
 /// Connect a WebSocket client with auth token in query parameter.
@@ -382,27 +404,42 @@ async fn test_root_response_has_csp_header() {
 #[cfg(feature = "libsql")]
 #[tokio::test]
 async fn gateway_legal_audit_endpoint_requires_auth_and_returns_data() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let logs_dir = dir.path().join("logs");
-    std::fs::create_dir_all(&logs_dir).expect("create logs dir");
-    let audit_path = logs_dir.join("legal_audit.jsonl");
-    std::fs::write(
-        &audit_path,
-        r#"{"ts":"2026-02-25T12:00:00Z","event_type":"prompt_received","details":{"thread_id":"t1"},"metrics":{"blocked_actions":0,"approval_required":0,"redaction_events":0}}"#,
-    )
-    .expect("write audit fixture");
+    let (workspace, store) = make_test_workspace_with_db("test-user").await;
+    workspace
+        .write(
+            "conflicts.json",
+            r#"[{"name":"Acme Corp","aliases":["Acme"]}]"#,
+        )
+        .await
+        .expect("seed conflicts");
 
     let mut legal = legal_config_for_tests();
     legal.enabled = true;
     legal.audit.enabled = true;
-    legal.audit.path = audit_path;
+    legal.require_matter_context = false;
+    legal.conflict_check_enabled = true;
 
-    let (addr, _state, _agent_rx) = start_test_server_with_overrides(None, Some(legal)).await;
+    let (addr, _state, _agent_rx) =
+        start_test_server_with_store_overrides(Some(workspace), Some(store), Some(legal)).await;
     let client = reqwest::Client::new();
     let url = format!("http://{}/api/legal/audit?limit=10", addr);
 
     let unauth = client.get(&url).send().await.expect("unauth request");
     assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Trigger a real audit event persisted to DB.
+    let conflict_url = format!("http://{}/api/matters/conflicts/check", addr);
+    let check = client
+        .post(&conflict_url)
+        .header("Authorization", format!("Bearer {}", AUTH_TOKEN))
+        .json(&serde_json::json!({
+            "text": "Review communications with Acme Corp",
+            "matter_id": null
+        }))
+        .send()
+        .await
+        .expect("conflict check request");
+    assert_eq!(check.status(), reqwest::StatusCode::OK);
 
     let resp = client
         .get(&url)
@@ -414,9 +451,13 @@ async fn gateway_legal_audit_endpoint_requires_auth_and_returns_data() {
 
     let body: serde_json::Value = resp.json().await.expect("audit response json");
     let events = body["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["event_type"], "prompt_received");
-    assert_eq!(body["total"], 1);
+    assert!(!events.is_empty());
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "matter_conflict_check")
+    );
+    assert!(body["total"].as_u64().unwrap_or(0) >= 1);
 }
 
 #[cfg(feature = "libsql")]
