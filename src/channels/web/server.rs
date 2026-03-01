@@ -3,7 +3,6 @@
 //! Handles all API routes: chat, memory, jobs, health, and static file serving.
 
 use std::convert::Infallible;
-use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::Path as FsPath;
 use std::sync::Arc;
@@ -20,7 +19,8 @@ use axum::{
     },
     routing::{get, post},
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
@@ -37,7 +37,17 @@ use crate::channels::web::handlers::skills::{
 use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
-use crate::db::Database;
+use crate::db::{
+    AuditEventQuery as DbAuditEventQuery, AuditSeverity, ClientType, ConflictClearanceRecord,
+    ConflictDecision, ConflictHit, CreateClientParams, CreateDocumentVersionParams,
+    CreateExpenseEntryParams, CreateMatterDeadlineParams, CreateMatterNoteParams,
+    CreateMatterTaskParams, CreateTimeEntryParams, Database, ExpenseCategory,
+    InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus, MatterDeadlineType,
+    MatterDocumentCategory, MatterStatus, MatterTaskStatus, TrustLedgerEntryRecord,
+    UpdateClientParams, UpdateExpenseEntryParams, UpdateMatterDeadlineParams,
+    UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
+    UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams,
+};
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::tools::ToolRegistry;
@@ -221,26 +231,118 @@ pub async fn start_server(
             get(matters_list_handler).post(matters_create_handler),
         )
         .route(
+            "/api/clients",
+            get(clients_list_handler).post(clients_create_handler),
+        )
+        .route(
+            "/api/clients/{id}",
+            get(clients_get_handler)
+                .patch(clients_patch_handler)
+                .delete(clients_delete_handler),
+        )
+        .route(
+            "/api/matters/{id}",
+            get(matter_get_handler)
+                .patch(matter_patch_handler)
+                .delete(matter_delete_handler),
+        )
+        .route(
+            "/api/matters/{id}/tasks",
+            get(matter_tasks_list_handler).post(matter_tasks_create_handler),
+        )
+        .route(
+            "/api/matters/{id}/tasks/{task_id}",
+            axum::routing::patch(matter_tasks_patch_handler).delete(matter_tasks_delete_handler),
+        )
+        .route(
+            "/api/matters/{id}/notes",
+            get(matter_notes_list_handler).post(matter_notes_create_handler),
+        )
+        .route(
+            "/api/matters/{id}/notes/{note_id}",
+            axum::routing::patch(matter_notes_patch_handler).delete(matter_notes_delete_handler),
+        )
+        .route(
+            "/api/matters/{id}/time",
+            get(matter_time_list_handler).post(matter_time_create_handler),
+        )
+        .route(
+            "/api/matters/{id}/time/{entry_id}",
+            axum::routing::patch(matter_time_patch_handler).delete(matter_time_delete_handler),
+        )
+        .route(
+            "/api/matters/{id}/expenses",
+            get(matter_expenses_list_handler).post(matter_expenses_create_handler),
+        )
+        .route(
+            "/api/matters/{id}/expenses/{entry_id}",
+            axum::routing::patch(matter_expenses_patch_handler)
+                .delete(matter_expenses_delete_handler),
+        )
+        .route(
+            "/api/matters/{id}/time-summary",
+            get(matter_time_summary_handler),
+        )
+        .route("/api/invoices/draft", post(invoices_draft_handler))
+        .route("/api/invoices", post(invoices_save_handler))
+        .route("/api/invoices/{id}", get(invoices_get_handler))
+        .route(
+            "/api/invoices/{id}/finalize",
+            post(invoices_finalize_handler),
+        )
+        .route("/api/invoices/{id}/void", post(invoices_void_handler))
+        .route("/api/invoices/{id}/payment", post(invoices_payment_handler))
+        .route(
+            "/api/matters/{id}/trust/deposit",
+            post(matter_trust_deposit_handler),
+        )
+        .route(
+            "/api/matters/{id}/trust/ledger",
+            get(matter_trust_ledger_handler),
+        )
+        .route(
             "/api/matters/active",
             get(matters_active_get_handler).post(matters_active_set_handler),
         )
         .route("/api/matters/{id}/documents", get(matter_documents_handler))
         .route("/api/matters/{id}/dashboard", get(matter_dashboard_handler))
-        .route("/api/matters/{id}/deadlines", get(matter_deadlines_handler))
+        .route(
+            "/api/matters/{id}/deadlines",
+            get(matter_deadlines_handler).post(matter_deadlines_create_handler),
+        )
+        .route(
+            "/api/matters/{id}/deadlines/{deadline_id}",
+            axum::routing::patch(matter_deadlines_patch_handler)
+                .delete(matter_deadlines_delete_handler),
+        )
+        .route(
+            "/api/matters/{id}/deadlines/compute",
+            post(matter_deadlines_compute_handler),
+        )
         .route("/api/matters/{id}/templates", get(matter_templates_handler))
         .route(
             "/api/matters/{id}/templates/apply",
             post(matter_template_apply_handler),
         )
+        .route("/api/documents/generate", post(documents_generate_handler))
         .route(
             "/api/matters/{id}/filing-package",
             post(matter_filing_package_handler),
         )
         .route(
+            "/api/matters/conflict-check",
+            post(matters_conflict_check_handler),
+        )
+        .route(
             "/api/matters/conflicts/check",
             post(matters_conflicts_check_handler),
         )
+        .route(
+            "/api/matters/conflicts/reindex",
+            post(matters_conflicts_reindex_handler),
+        )
         .route("/api/legal/audit", get(legal_audit_list_handler))
+        .route("/api/legal/court-rules", get(legal_court_rules_handler))
         // Jobs
         .route("/api/jobs", get(jobs_list_handler))
         .route("/api/jobs/summary", get(jobs_summary_handler))
@@ -1318,8 +1420,16 @@ async fn memory_upload_handler(
 const MATTER_ROOT: &str = "matters";
 /// Settings key used to persist the active matter ID.
 const MATTER_ACTIVE_SETTING: &str = "legal.active_matter";
-/// Maximum number of audit log lines scanned per request.
-const MAX_AUDIT_SCAN_LINES: usize = 10_000;
+/// Maximum number of party names accepted by intake conflict endpoints.
+const MAX_INTAKE_CONFLICT_PARTIES: usize = 64;
+/// Maximum length for a single intake party name.
+const MAX_INTAKE_CONFLICT_PARTY_CHARS: usize = 160;
+/// Maximum preview length recorded for text conflict checks.
+const MAX_CONFLICT_TEXT_PREVIEW_CHARS: usize = 100;
+/// Maximum reminder offsets accepted for a single deadline.
+const MAX_DEADLINE_REMINDERS: usize = 16;
+/// Maximum allowed reminder offset in days.
+const MAX_DEADLINE_REMINDER_DAYS: i32 = 3650;
 
 fn legal_config_for_gateway(state: &GatewayState) -> crate::config::LegalConfig {
     state.legal_config.clone().unwrap_or_else(|| {
@@ -1333,20 +1443,12 @@ struct LegalAuditQuery {
     limit: Option<usize>,
     offset: Option<usize>,
     event_type: Option<String>,
+    matter_id: Option<String>,
+    severity: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
     from: Option<String>,
     to: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegalAuditEventLine {
-    ts: String,
-    event_type: String,
-    details: serde_json::Value,
-    metrics: serde_json::Value,
-    #[serde(default)]
-    prev_hash: Option<String>,
-    #[serde(default)]
-    hash: Option<String>,
 }
 
 fn parse_utc_query_ts(
@@ -1369,9 +1471,59 @@ fn parse_utc_query_ts(
     Ok(Some(parsed.with_timezone(&Utc)))
 }
 
+fn parse_audit_severity_query(
+    raw: Option<&str>,
+) -> Result<Option<AuditSeverity>, (StatusCode, String)> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed {
+        "info" => Ok(Some(AuditSeverity::Info)),
+        "warn" => Ok(Some(AuditSeverity::Warn)),
+        "critical" => Ok(Some(AuditSeverity::Critical)),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "'severity' must be one of: info, warn, critical".to_string(),
+        )),
+    }
+}
+
+async fn record_legal_audit_event(
+    state: &GatewayState,
+    event_type: &str,
+    actor: &str,
+    matter_id: Option<&str>,
+    severity: AuditSeverity,
+    details: serde_json::Value,
+) {
+    if let Some(store) = state.store.as_ref() {
+        crate::legal::audit::record_with_db(
+            event_type,
+            actor,
+            matter_id,
+            severity,
+            details,
+            store.as_ref(),
+            &state.user_id,
+        )
+        .await;
+    } else {
+        crate::legal::audit::record(event_type, details);
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct MatterDocumentsQuery {
     include_templates: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ClientsQuery {
+    q: Option<String>,
 }
 
 fn sanitize_matter_id_for_route(raw: &str) -> Result<String, (StatusCode, String)> {
@@ -1473,6 +1625,44 @@ async fn choose_template_apply_destination(
     ))
 }
 
+async fn choose_generated_document_destination(
+    workspace: &Workspace,
+    matter_prefix: &str,
+    template_name: &str,
+    timestamp: &str,
+) -> Result<String, (StatusCode, String)> {
+    let parsed = FsPath::new(template_name);
+    let stem = parsed
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("generated-document");
+    let ext = parsed
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("md");
+
+    for counter in 1usize..=999 {
+        let suffix = if counter == 1 {
+            String::new()
+        } else {
+            format!("-{}", counter)
+        };
+        let candidate = format!("{matter_prefix}/drafts/{stem}-{timestamp}{suffix}.{ext}");
+        match workspace.read(&candidate).await {
+            Ok(_) => continue,
+            Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => return Ok(candidate),
+            Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+        }
+    }
+
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Failed to pick a unique destination for generated document".to_string(),
+    ))
+}
+
 async fn list_matter_documents_recursive(
     workspace: &Workspace,
     matter_prefix: &str,
@@ -1502,9 +1692,13 @@ async fn list_matter_documents_recursive(
             }
 
             documents.push(MatterDocumentInfo {
+                id: None,
+                memory_document_id: None,
                 name,
+                display_name: None,
                 path: entry.path.clone(),
                 is_dir: entry.is_directory,
+                category: None,
                 updated_at: entry.updated_at.map(|dt| dt.to_rfc3339()),
             });
 
@@ -1698,6 +1892,32 @@ async fn read_matter_deadlines(
     }
 }
 
+async fn read_matter_deadlines_for_matter(
+    state: &GatewayState,
+    matter_id: &str,
+    matter_prefix: &str,
+    today: NaiveDate,
+) -> Result<Vec<MatterDeadlineInfo>, (StatusCode, String)> {
+    if let Some(store) = state.store.as_ref() {
+        let records = store
+            .list_matter_deadlines(&state.user_id, matter_id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        if !records.is_empty() {
+            return Ok(records
+                .iter()
+                .map(deadline_record_to_legacy_info)
+                .collect::<Vec<_>>());
+        }
+    }
+
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    read_matter_deadlines(workspace.as_ref(), matter_prefix, today).await
+}
+
 async fn list_matter_templates(
     workspace: &Workspace,
     matter_id: &str,
@@ -1718,14 +1938,152 @@ async fn list_matter_templates(
                 return None;
             }
             Some(MatterTemplateInfo {
+                id: None,
+                matter_id: Some(matter_id.to_string()),
                 name,
                 path: entry.path,
+                variables_json: None,
                 updated_at: entry.updated_at.map(|dt| dt.to_rfc3339()),
             })
         })
         .collect();
     templates.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(templates)
+}
+
+fn document_template_record_to_info(
+    record: crate::db::DocumentTemplateRecord,
+) -> MatterTemplateInfo {
+    let path = match record.matter_id.as_ref() {
+        Some(matter_id) => format!("{MATTER_ROOT}/{matter_id}/templates/{}", record.name),
+        None => format!("templates/shared/{}", record.name),
+    };
+    MatterTemplateInfo {
+        id: Some(record.id.to_string()),
+        matter_id: record.matter_id,
+        name: record.name,
+        path,
+        variables_json: Some(record.variables_json),
+        updated_at: Some(record.updated_at.to_rfc3339()),
+    }
+}
+
+fn matter_document_record_to_info(record: crate::db::MatterDocumentRecord) -> MatterDocumentInfo {
+    let fallback_name = record.path.rsplit('/').next().unwrap_or("").to_string();
+    MatterDocumentInfo {
+        id: Some(record.id.to_string()),
+        memory_document_id: Some(record.memory_document_id.to_string()),
+        name: fallback_name,
+        display_name: Some(record.display_name),
+        path: record.path,
+        is_dir: false,
+        category: Some(record.category.as_str().to_string()),
+        updated_at: Some(record.updated_at.to_rfc3339()),
+    }
+}
+
+async fn backfill_matter_templates_from_workspace(
+    state: &GatewayState,
+    matter_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(());
+    };
+    let Some(workspace) = state.workspace.as_ref() else {
+        return Ok(());
+    };
+    let existing = store
+        .list_document_templates(&state.user_id, Some(matter_id))
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if existing
+        .iter()
+        .any(|template| template.matter_id.as_deref() == Some(matter_id))
+    {
+        return Ok(());
+    }
+
+    let templates = list_matter_templates(workspace.as_ref(), matter_id).await?;
+    for template in templates {
+        let doc = workspace
+            .read(&template.path)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        store
+            .upsert_document_template(
+                &state.user_id,
+                &UpsertDocumentTemplateParams {
+                    matter_id: Some(matter_id.to_string()),
+                    name: template.name,
+                    body: doc.content,
+                    variables_json: serde_json::json!([]),
+                },
+            )
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn backfill_matter_documents_from_workspace(
+    state: &GatewayState,
+    matter_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(());
+    };
+    let Some(workspace) = state.workspace.as_ref() else {
+        return Ok(());
+    };
+
+    let existing = store
+        .list_matter_documents_db(&state.user_id, matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if !existing.is_empty() {
+        return Ok(());
+    }
+
+    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, false).await?;
+    for entry in docs.into_iter().filter(|item| !item.is_dir) {
+        let doc = workspace
+            .read(&entry.path)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        let linked = store
+            .upsert_matter_document(
+                &state.user_id,
+                matter_id,
+                &UpsertMatterDocumentParams {
+                    memory_document_id: doc.id,
+                    path: doc.path.clone(),
+                    display_name: entry.name.clone(),
+                    category: infer_matter_document_category(&entry.path),
+                },
+            )
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        let versions = store
+            .list_document_versions(&state.user_id, linked.id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        if versions.is_empty() {
+            store
+                .create_document_version(
+                    &state.user_id,
+                    &CreateDocumentVersionParams {
+                        matter_document_id: linked.id,
+                        label: "initial".to_string(),
+                        memory_document_id: doc.id,
+                    },
+                )
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn choose_filing_package_destination(
@@ -1753,44 +2111,191 @@ async fn choose_filing_package_destination(
     ))
 }
 
-async fn matters_list_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<Json<MattersListResponse>, (StatusCode, String)> {
+async fn read_workspace_matter_metadata_optional(
+    workspace: Option<&Arc<Workspace>>,
+    matter_id: &str,
+) -> Option<crate::legal::matter::MatterMetadata> {
+    let workspace = workspace?;
+    let path = format!("{MATTER_ROOT}/{matter_id}/matter.yaml");
+    let doc = workspace.read(&path).await.ok()?;
+    serde_yml::from_str(&doc.content).ok()
+}
+
+async fn db_matter_to_info(state: &GatewayState, matter: crate::db::MatterRecord) -> MatterInfo {
+    let metadata =
+        read_workspace_matter_metadata_optional(state.workspace.as_ref(), &matter.matter_id).await;
+    let client_name = if let Some(store) = state.store.as_ref() {
+        match store.get_client(&state.user_id, matter.client_id).await {
+            Ok(Some(client)) => Some(client.name),
+            _ => metadata.as_ref().map(|meta| meta.client.clone()),
+        }
+    } else {
+        metadata.as_ref().map(|meta| meta.client.clone())
+    };
+
+    MatterInfo {
+        id: matter.matter_id.clone(),
+        client_id: Some(matter.client_id.to_string()),
+        client: client_name,
+        status: Some(matter.status.as_str().to_string()),
+        stage: matter.stage.clone(),
+        confidentiality: metadata.as_ref().map(|meta| meta.confidentiality.clone()),
+        team: if let Some(meta) = metadata.as_ref() {
+            meta.team.clone()
+        } else {
+            matter.assigned_to.clone()
+        },
+        adversaries: metadata
+            .as_ref()
+            .map(|meta| meta.adversaries.clone())
+            .unwrap_or_default(),
+        retention: metadata.as_ref().map(|meta| meta.retention.clone()),
+        jurisdiction: metadata
+            .as_ref()
+            .and_then(|meta| meta.jurisdiction.clone())
+            .or(matter.jurisdiction.clone()),
+        practice_area: metadata
+            .as_ref()
+            .and_then(|meta| meta.practice_area.clone())
+            .or(matter.practice_area.clone()),
+        opened_at: metadata
+            .as_ref()
+            .and_then(|meta| meta.opened_at.clone())
+            .or_else(|| matter.opened_at.map(|dt| dt.date_naive().to_string())),
+    }
+}
+
+async fn ensure_existing_matter_db(
+    state: &GatewayState,
+    matter_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let exists = store
+        .get_matter_db(&state.user_id, matter_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_some();
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "Matter not found".to_string()));
+    }
+    Ok(())
+}
+
+async fn ensure_matter_db_row_from_workspace(
+    state: &GatewayState,
+    matter_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    if store
+        .get_matter_db(&state.user_id, matter_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_some()
+    {
+        return Ok(());
+    }
+
     let workspace = state.workspace.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-
-    // List top-level entries under the matter root. Treat a missing
-    // directory as an empty list rather than an error — the matters/ dir
-    // is seeded lazily on first use.
-    let entries = list_matters_root_entries(workspace.list(MATTER_ROOT).await)?;
-
-    let mut matters: Vec<MatterInfo> = Vec::new();
-    for entry in entries {
-        if !entry.is_directory {
-            continue;
+    let metadata = crate::legal::matter::read_matter_metadata_for_root(
+        workspace.as_ref(),
+        MATTER_ROOT,
+        matter_id,
+    )
+    .await
+    .map_err(|err| match err {
+        crate::legal::matter::MatterMetadataValidationError::Missing { path } => (
+            StatusCode::NOT_FOUND,
+            format!("Matter '{}' not found (missing '{}')", matter_id, path),
+        ),
+        crate::legal::matter::MatterMetadataValidationError::Invalid { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
         }
+        crate::legal::matter::MatterMetadataValidationError::Storage { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+        }
+    })?;
+
+    let client = store
+        .upsert_client_by_normalized_name(
+            &state.user_id,
+            &CreateClientParams {
+                name: metadata.client.clone(),
+                client_type: ClientType::Entity,
+                email: None,
+                phone: None,
+                address: None,
+                notes: None,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    let opened_at = parse_optional_datetime("opened_at", metadata.opened_at.clone())?;
+    store
+        .upsert_matter(
+            &state.user_id,
+            &UpsertMatterParams {
+                matter_id: matter_id.to_string(),
+                client_id: client.id,
+                status: MatterStatus::Active,
+                stage: None,
+                practice_area: metadata.practice_area.clone(),
+                jurisdiction: metadata.jurisdiction.clone(),
+                opened_at,
+                closed_at: None,
+                assigned_to: metadata.team.clone(),
+                custom_fields: serde_json::json!({}),
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    Ok(())
+}
+
+async fn matters_list_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<MattersListResponse>, (StatusCode, String)> {
+    if let Some(store) = state.store.as_ref() {
+        let matter_rows = store
+            .list_matters_db(&state.user_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut matters = Vec::with_capacity(matter_rows.len());
+        for matter in matter_rows {
+            matters.push(db_matter_to_info(state.as_ref(), matter).await);
+        }
+        matters.sort_by(|a, b| a.id.cmp(&b.id));
+        return Ok(Json(MattersListResponse { matters }));
+    }
+
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let entries = list_matters_root_entries(workspace.list(MATTER_ROOT).await)?;
+    let mut matters: Vec<MatterInfo> = Vec::new();
+    for entry in entries.into_iter().filter(|entry| entry.is_directory) {
         let dir_name = entry.path.rsplit('/').next().unwrap_or("").to_string();
-        // Skip the template scaffold directory written by seed_legal_workspace.
         if dir_name.is_empty() || dir_name == "_template" {
             continue;
         }
-
-        // Read matter.yaml for rich metadata; fall back to ID-only if missing
-        // or malformed (e.g. the matter was created manually without a YAML).
-        let meta: Option<crate::legal::matter::MatterMetadata> = {
-            let yaml_path = format!("{MATTER_ROOT}/{dir_name}/matter.yaml");
-            workspace
-                .read(&yaml_path)
-                .await
-                .ok()
-                .and_then(|doc| serde_yml::from_str(&doc.content).ok())
-        };
-
+        let meta = read_workspace_matter_metadata_optional(Some(workspace), &dir_name).await;
         matters.push(MatterInfo {
             id: dir_name,
+            client_id: None,
             client: meta.as_ref().map(|m| m.client.clone()),
+            status: None,
+            stage: None,
             confidentiality: meta.as_ref().map(|m| m.confidentiality.clone()),
             team: meta.as_ref().map(|m| m.team.clone()).unwrap_or_default(),
             adversaries: meta
@@ -1803,10 +2308,1196 @@ async fn matters_list_handler(
             opened_at: meta.as_ref().and_then(|m| m.opened_at.clone()),
         });
     }
-
     matters.sort_by(|a, b| a.id.cmp(&b.id));
-
     Ok(Json(MattersListResponse { matters }))
+}
+
+async fn clients_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(query): Query<ClientsQuery>,
+) -> Result<Json<ClientsListResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let clients = store
+        .list_clients(&state.user_id, query.q.as_deref())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(client_record_to_info)
+        .collect();
+    Ok(Json(ClientsListResponse { clients }))
+}
+
+async fn clients_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<CreateClientRequest>,
+) -> Result<(StatusCode, Json<ClientInfo>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let name = parse_required_matter_field("name", &req.name)?;
+    let client_type = parse_client_type(&req.client_type)?;
+    let client = store
+        .create_client(
+            &state.user_id,
+            &CreateClientParams {
+                name,
+                client_type,
+                email: parse_optional_matter_field(req.email),
+                phone: parse_optional_matter_field(req.phone),
+                address: parse_optional_matter_field(req.address),
+                notes: parse_optional_matter_field(req.notes),
+            },
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(client_record_to_info(client))))
+}
+
+async fn clients_get_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ClientInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let client_id = parse_uuid(&id, "id")?;
+    let client = store
+        .get_client(&state.user_id, client_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Client not found".to_string()))?;
+    Ok(Json(client_record_to_info(client)))
+}
+
+async fn clients_patch_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateClientRequest>,
+) -> Result<Json<ClientInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let client_id = parse_uuid(&id, "id")?;
+    let input = UpdateClientParams {
+        name: req.name.map(|value| value.trim().to_string()),
+        client_type: req
+            .client_type
+            .as_deref()
+            .map(parse_client_type)
+            .transpose()?,
+        email: req
+            .email
+            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
+        phone: req
+            .phone
+            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
+        address: req
+            .address
+            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
+        notes: req
+            .notes
+            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
+    };
+
+    let client = store
+        .update_client(&state.user_id, client_id, &input)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Client not found".to_string()))?;
+    Ok(Json(client_record_to_info(client)))
+}
+
+async fn clients_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let client_id = parse_uuid(&id, "id")?;
+    let deleted = store
+        .delete_client(&state.user_id, client_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Client not found".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn matter_get_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MatterInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    let matter = store
+        .get_matter_db(&state.user_id, &matter_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Matter not found".to_string()))?;
+    Ok(Json(db_matter_to_info(state.as_ref(), matter).await))
+}
+
+async fn matter_patch_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateMatterRequest>,
+) -> Result<Json<MatterInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    let client_id = req
+        .client_id
+        .as_deref()
+        .map(|value| parse_uuid(value, "client_id"))
+        .transpose()?;
+    if let Some(client_id) = client_id
+        && store
+            .get_client(&state.user_id, client_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, "Client not found".to_string()));
+    }
+    let status = req.status.as_deref().map(parse_matter_status).transpose()?;
+
+    let assigned_to = req.assigned_to.map(parse_matter_list);
+    let custom_fields = if let Some(value) = req.custom_fields {
+        if !value.is_object() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "'custom_fields' must be a JSON object".to_string(),
+            ));
+        }
+        Some(value)
+    } else {
+        None
+    };
+
+    let input = UpdateMatterParams {
+        client_id,
+        status,
+        stage: req
+            .stage
+            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
+        practice_area: req
+            .practice_area
+            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
+        jurisdiction: req
+            .jurisdiction
+            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
+        opened_at: parse_optional_datetime_patch("opened_at", req.opened_at)?,
+        closed_at: parse_optional_datetime_patch("closed_at", req.closed_at)?,
+        assigned_to,
+        custom_fields,
+    };
+
+    let matter = store
+        .update_matter(&state.user_id, &matter_id, &input)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Matter not found".to_string()))?;
+
+    if let Some(workspace) = state.workspace.as_ref() {
+        let metadata_path = format!("{MATTER_ROOT}/{matter_id}/matter.yaml");
+        if let Ok(doc) = workspace.read(&metadata_path).await
+            && let Ok(mut metadata) =
+                serde_yml::from_str::<crate::legal::matter::MatterMetadata>(&doc.content)
+        {
+            metadata.matter_id = matter.matter_id.clone();
+            metadata.team = matter.assigned_to.clone();
+            metadata.jurisdiction = matter.jurisdiction.clone();
+            metadata.practice_area = matter.practice_area.clone();
+            metadata.opened_at = matter.opened_at.map(|dt| dt.date_naive().to_string());
+            if let Ok(Some(client)) = store.get_client(&state.user_id, matter.client_id).await {
+                metadata.client = client.name;
+            }
+
+            if let Ok(rendered) = serde_yml::to_string(&metadata) {
+                let content = format!(
+                    "# Matter metadata schema\n# Required: matter_id, client, confidentiality, retention\n{}",
+                    rendered
+                );
+                if let Err(err) = workspace.write(&metadata_path, &content).await {
+                    tracing::warn!(
+                        matter_id = matter_id.as_str(),
+                        "failed to sync matter.yaml after matter update: {}",
+                        err
+                    );
+                }
+            }
+        }
+    }
+
+    if matches!(status, Some(MatterStatus::Closed)) {
+        record_legal_audit_event(
+            state.as_ref(),
+            "matter_closed",
+            state.user_id.as_str(),
+            Some(matter_id.as_str()),
+            AuditSeverity::Info,
+            serde_json::json!({
+                "matter_id": matter_id,
+                "status": MatterStatus::Closed.as_str(),
+            }),
+        )
+        .await;
+    }
+
+    Ok(Json(db_matter_to_info(state.as_ref(), matter).await))
+}
+
+async fn matter_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    let deleted = store
+        .delete_matter(&state.user_id, &matter_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Matter not found".to_string()));
+    }
+    if let Some(active_value) = store
+        .get_setting(&state.user_id, MATTER_ACTIVE_SETTING)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .and_then(|value| value.as_str().map(str::to_string))
+        && crate::legal::policy::sanitize_matter_id(&active_value) == matter_id
+    {
+        store
+            .delete_setting(&state.user_id, MATTER_ACTIVE_SETTING)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn matter_tasks_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MatterTasksListResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let tasks = store
+        .list_matter_tasks(&state.user_id, &matter_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(matter_task_record_to_info)
+        .collect();
+    Ok(Json(MatterTasksListResponse { tasks }))
+}
+
+async fn matter_tasks_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateMatterTaskRequest>,
+) -> Result<(StatusCode, Json<MatterTaskInfo>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let title = parse_required_matter_field("title", &req.title)?;
+    let status = req
+        .status
+        .as_deref()
+        .map(parse_matter_task_status)
+        .transpose()?
+        .unwrap_or(MatterTaskStatus::Todo);
+    let due_at = parse_optional_datetime("due_at", req.due_at)?;
+    let blocked_by = parse_uuid_list(&req.blocked_by, "blocked_by")?;
+    let task = store
+        .create_matter_task(
+            &state.user_id,
+            &matter_id,
+            &CreateMatterTaskParams {
+                title,
+                description: parse_optional_matter_field(req.description),
+                status,
+                assignee: parse_optional_matter_field(req.assignee),
+                due_at,
+                blocked_by,
+            },
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok((StatusCode::CREATED, Json(matter_task_record_to_info(task))))
+}
+
+async fn matter_tasks_patch_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, task_id)): Path<(String, String)>,
+    Json(req): Json<UpdateMatterTaskRequest>,
+) -> Result<Json<MatterTaskInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let task_id = parse_uuid(&task_id, "task_id")?;
+    let status = req
+        .status
+        .as_deref()
+        .map(parse_matter_task_status)
+        .transpose()?;
+    let blocked_by = req
+        .blocked_by
+        .as_ref()
+        .map(|values| parse_uuid_list(values, "blocked_by"))
+        .transpose()?;
+    let due_at = parse_optional_datetime_patch("due_at", req.due_at)?;
+    let task = store
+        .update_matter_task(
+            &state.user_id,
+            &matter_id,
+            task_id,
+            &UpdateMatterTaskParams {
+                title: req.title.map(|value| value.trim().to_string()),
+                description: req
+                    .description
+                    .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
+                status,
+                assignee: req
+                    .assignee
+                    .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
+                due_at,
+                blocked_by,
+            },
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Task not found".to_string()))?;
+    Ok(Json(matter_task_record_to_info(task)))
+}
+
+async fn matter_tasks_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, task_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let task_id = parse_uuid(&task_id, "task_id")?;
+    let deleted = store
+        .delete_matter_task(&state.user_id, &matter_id, task_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Task not found".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn matter_notes_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MatterNotesListResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let notes = store
+        .list_matter_notes(&state.user_id, &matter_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(matter_note_record_to_info)
+        .collect();
+    Ok(Json(MatterNotesListResponse { notes }))
+}
+
+async fn matter_notes_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateMatterNoteRequest>,
+) -> Result<(StatusCode, Json<MatterNoteInfo>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let author = parse_required_matter_field("author", &req.author)?;
+    let body = parse_required_matter_field("body", &req.body)?;
+    let note = store
+        .create_matter_note(
+            &state.user_id,
+            &matter_id,
+            &CreateMatterNoteParams {
+                author,
+                body,
+                pinned: req.pinned,
+            },
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(matter_note_record_to_info(note))))
+}
+
+async fn matter_notes_patch_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, note_id)): Path<(String, String)>,
+    Json(req): Json<UpdateMatterNoteRequest>,
+) -> Result<Json<MatterNoteInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let note_id = parse_uuid(&note_id, "note_id")?;
+    let note = store
+        .update_matter_note(
+            &state.user_id,
+            &matter_id,
+            note_id,
+            &UpdateMatterNoteParams {
+                author: req.author.map(|value| value.trim().to_string()),
+                body: req.body.map(|value| value.trim().to_string()),
+                pinned: req.pinned,
+            },
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Note not found".to_string()))?;
+    Ok(Json(matter_note_record_to_info(note)))
+}
+
+async fn matter_notes_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, note_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let note_id = parse_uuid(&note_id, "note_id")?;
+    let deleted = store
+        .delete_matter_note(&state.user_id, &matter_id, note_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Note not found".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn matter_time_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MatterTimeEntriesResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entries = store
+        .list_time_entries(&state.user_id, &matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .into_iter()
+        .map(time_entry_record_to_info)
+        .collect();
+    Ok(Json(MatterTimeEntriesResponse { entries }))
+}
+
+async fn matter_time_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateTimeEntryRequest>,
+) -> Result<(StatusCode, Json<TimeEntryInfo>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+
+    let timekeeper = parse_required_matter_field("timekeeper", &req.timekeeper)?;
+    let description = parse_required_matter_field("description", &req.description)?;
+    validate_optional_matter_field_length("timekeeper", &Some(timekeeper.clone()))?;
+    validate_optional_matter_field_length("description", &Some(description.clone()))?;
+    let hours = parse_decimal_field("hours", &req.hours)?;
+    let hourly_rate = parse_optional_decimal_field("hourly_rate", req.hourly_rate)?;
+    let entry_date = parse_date_only("entry_date", &req.entry_date)?;
+    let billable = req.billable.unwrap_or(true);
+
+    let created = store
+        .create_time_entry(
+            &state.user_id,
+            &matter_id,
+            &CreateTimeEntryParams {
+                timekeeper,
+                description,
+                hours,
+                hourly_rate,
+                entry_date,
+                billable,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(time_entry_record_to_info(created)),
+    ))
+}
+
+async fn matter_time_patch_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, entry_id)): Path<(String, String)>,
+    Json(req): Json<UpdateTimeEntryRequest>,
+) -> Result<Json<TimeEntryInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entry_id = parse_uuid(&entry_id, "entry_id")?;
+
+    let timekeeper = req.timekeeper.map(|value| value.trim().to_string());
+    if let Some(ref value) = timekeeper {
+        validate_optional_matter_field_length("timekeeper", &Some(value.clone()))?;
+    }
+    let description = req.description.map(|value| value.trim().to_string());
+    if let Some(ref value) = description {
+        validate_optional_matter_field_length("description", &Some(value.clone()))?;
+    }
+    let hours = req
+        .hours
+        .as_deref()
+        .map(|value| parse_decimal_field("hours", value))
+        .transpose()?;
+    let hourly_rate = match req.hourly_rate {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) => Some(Some(parse_decimal_field("hourly_rate", &raw)?)),
+    };
+    let entry_date = req
+        .entry_date
+        .as_deref()
+        .map(|value| parse_date_only("entry_date", value))
+        .transpose()?;
+
+    let updated = store
+        .update_time_entry(
+            &state.user_id,
+            &matter_id,
+            entry_id,
+            &UpdateTimeEntryParams {
+                timekeeper,
+                description,
+                hours,
+                hourly_rate,
+                entry_date,
+                billable: req.billable,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Time entry not found".to_string()))?;
+
+    Ok(Json(time_entry_record_to_info(updated)))
+}
+
+async fn matter_time_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, entry_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entry_id = parse_uuid(&entry_id, "entry_id")?;
+
+    let existing = store
+        .get_time_entry(&state.user_id, &matter_id, entry_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Time entry not found".to_string()))?;
+    if existing.billed_invoice_id.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "Time entry is billed and cannot be deleted".to_string(),
+        ));
+    }
+
+    let deleted = store
+        .delete_time_entry(&state.user_id, &matter_id, entry_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Time entry not found".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn matter_expenses_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MatterExpenseEntriesResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entries = store
+        .list_expense_entries(&state.user_id, &matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .into_iter()
+        .map(expense_entry_record_to_info)
+        .collect();
+    Ok(Json(MatterExpenseEntriesResponse { entries }))
+}
+
+async fn matter_expenses_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateExpenseEntryRequest>,
+) -> Result<(StatusCode, Json<ExpenseEntryInfo>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+
+    let submitted_by = parse_required_matter_field("submitted_by", &req.submitted_by)?;
+    let description = parse_required_matter_field("description", &req.description)?;
+    validate_optional_matter_field_length("submitted_by", &Some(submitted_by.clone()))?;
+    validate_optional_matter_field_length("description", &Some(description.clone()))?;
+    let amount = parse_decimal_field("amount", &req.amount)?;
+    let category = parse_expense_category(&req.category)?;
+    let entry_date = parse_date_only("entry_date", &req.entry_date)?;
+    let receipt_path = parse_optional_matter_field(req.receipt_path);
+    validate_optional_matter_field_length("receipt_path", &receipt_path)?;
+    let billable = req.billable.unwrap_or(true);
+
+    let created = store
+        .create_expense_entry(
+            &state.user_id,
+            &matter_id,
+            &CreateExpenseEntryParams {
+                submitted_by,
+                description,
+                amount,
+                category,
+                entry_date,
+                receipt_path,
+                billable,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(expense_entry_record_to_info(created)),
+    ))
+}
+
+async fn matter_expenses_patch_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, entry_id)): Path<(String, String)>,
+    Json(req): Json<UpdateExpenseEntryRequest>,
+) -> Result<Json<ExpenseEntryInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entry_id = parse_uuid(&entry_id, "entry_id")?;
+
+    let submitted_by = req.submitted_by.map(|value| value.trim().to_string());
+    if let Some(ref value) = submitted_by {
+        validate_optional_matter_field_length("submitted_by", &Some(value.clone()))?;
+    }
+    let description = req.description.map(|value| value.trim().to_string());
+    if let Some(ref value) = description {
+        validate_optional_matter_field_length("description", &Some(value.clone()))?;
+    }
+    let amount = req
+        .amount
+        .as_deref()
+        .map(|value| parse_decimal_field("amount", value))
+        .transpose()?;
+    let category = req
+        .category
+        .as_deref()
+        .map(parse_expense_category)
+        .transpose()?;
+    let entry_date = req
+        .entry_date
+        .as_deref()
+        .map(|value| parse_date_only("entry_date", value))
+        .transpose()?;
+    let receipt_path = req.receipt_path.map(|value| {
+        value.and_then(|inner| {
+            let trimmed = inner.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    });
+    if let Some(Some(ref value)) = receipt_path {
+        validate_optional_matter_field_length("receipt_path", &Some(value.clone()))?;
+    }
+
+    let updated = store
+        .update_expense_entry(
+            &state.user_id,
+            &matter_id,
+            entry_id,
+            &UpdateExpenseEntryParams {
+                submitted_by,
+                description,
+                amount,
+                category,
+                entry_date,
+                receipt_path,
+                billable: req.billable,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Expense entry not found".to_string()))?;
+
+    Ok(Json(expense_entry_record_to_info(updated)))
+}
+
+async fn matter_expenses_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, entry_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entry_id = parse_uuid(&entry_id, "entry_id")?;
+
+    let existing = store
+        .get_expense_entry(&state.user_id, &matter_id, entry_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Expense entry not found".to_string()))?;
+    if existing.billed_invoice_id.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "Expense entry is billed and cannot be deleted".to_string(),
+        ));
+    }
+
+    let deleted = store
+        .delete_expense_entry(&state.user_id, &matter_id, entry_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Expense entry not found".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn matter_time_summary_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MatterTimeSummaryResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let summary = store
+        .matter_time_summary(&state.user_id, &matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(matter_time_summary_to_response(summary)))
+}
+
+async fn invoices_draft_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<DraftInvoiceRequest>,
+) -> Result<Json<InvoiceDraftResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&req.matter_id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let invoice_number = parse_required_matter_field("invoice_number", &req.invoice_number)?;
+    let due_date = req
+        .due_date
+        .as_deref()
+        .map(|raw| parse_date_only("due_date", raw))
+        .transpose()?;
+    let notes = parse_optional_matter_field(req.notes);
+    let draft = crate::legal::billing::draft_invoice(
+        store.as_ref(),
+        &state.user_id,
+        &matter_id,
+        &invoice_number,
+        due_date,
+        notes,
+    )
+    .await
+    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    Ok(Json(InvoiceDraftResponse {
+        invoice: invoice_draft_to_info(&draft.invoice),
+        line_items: draft
+            .line_items
+            .iter()
+            .map(invoice_line_item_params_to_info)
+            .collect(),
+    }))
+}
+
+async fn invoices_save_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<DraftInvoiceRequest>,
+) -> Result<(StatusCode, Json<InvoiceDetailResponse>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&req.matter_id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let invoice_number = parse_required_matter_field("invoice_number", &req.invoice_number)?;
+    let due_date = req
+        .due_date
+        .as_deref()
+        .map(|raw| parse_date_only("due_date", raw))
+        .transpose()?;
+    let notes = parse_optional_matter_field(req.notes);
+    let draft = crate::legal::billing::draft_invoice(
+        store.as_ref(),
+        &state.user_id,
+        &matter_id,
+        &invoice_number,
+        due_date,
+        notes,
+    )
+    .await
+    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let (invoice, line_items) =
+        crate::legal::billing::save_draft(store.as_ref(), &state.user_id, &draft)
+            .await
+            .map_err(|err| {
+                let message = err.to_string();
+                if message.contains("UNIQUE constraint")
+                    || message.contains("duplicate key value")
+                    || message.contains("invoice_number")
+                {
+                    (
+                        StatusCode::CONFLICT,
+                        "Invoice number already exists".to_string(),
+                    )
+                } else {
+                    (StatusCode::INTERNAL_SERVER_ERROR, message)
+                }
+            })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(InvoiceDetailResponse {
+            invoice: invoice_record_to_info(invoice),
+            line_items: line_items
+                .into_iter()
+                .map(invoice_line_item_record_to_info)
+                .collect(),
+        }),
+    ))
+}
+
+async fn invoices_get_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let invoice_id = parse_uuid(&id, "invoice_id")?;
+    let invoice = store
+        .get_invoice(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    let line_items = store
+        .list_invoice_line_items(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(InvoiceDetailResponse {
+        invoice: invoice_record_to_info(invoice),
+        line_items: line_items
+            .into_iter()
+            .map(invoice_line_item_record_to_info)
+            .collect(),
+    }))
+}
+
+async fn invoices_finalize_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let invoice_id = parse_uuid(&id, "invoice_id")?;
+    let invoice =
+        crate::legal::billing::finalize_invoice(store.as_ref(), &state.user_id, invoice_id)
+            .await
+            .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    let line_items = store
+        .list_invoice_line_items(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    record_legal_audit_event(
+        state.as_ref(),
+        "invoice_finalized",
+        state.user_id.as_str(),
+        Some(invoice.matter_id.as_str()),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "invoice_id": invoice.id.to_string(),
+            "invoice_number": invoice.invoice_number.clone(),
+            "matter_id": invoice.matter_id.clone(),
+        }),
+    )
+    .await;
+    Ok(Json(InvoiceDetailResponse {
+        invoice: invoice_record_to_info(invoice),
+        line_items: line_items
+            .into_iter()
+            .map(invoice_line_item_record_to_info)
+            .collect(),
+    }))
+}
+
+async fn invoices_void_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let invoice_id = parse_uuid(&id, "invoice_id")?;
+    let existing = store
+        .get_invoice(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    if !matches!(existing.status, InvoiceStatus::Draft | InvoiceStatus::Sent) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Cannot void invoice with status '{}'",
+                existing.status.as_str()
+            ),
+        ));
+    }
+
+    let invoice = store
+        .set_invoice_status(&state.user_id, invoice_id, InvoiceStatus::Void, None)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    let line_items = store
+        .list_invoice_line_items(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(InvoiceDetailResponse {
+        invoice: invoice_record_to_info(invoice),
+        line_items: line_items
+            .into_iter()
+            .map(invoice_line_item_record_to_info)
+            .collect(),
+    }))
+}
+
+async fn invoices_payment_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<RecordInvoicePaymentRequest>,
+) -> Result<Json<RecordInvoicePaymentResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let invoice_id = parse_uuid(&id, "invoice_id")?;
+    let amount = parse_decimal_field("amount", &req.amount)?;
+    let recorded_by = parse_required_matter_field("recorded_by", &req.recorded_by)?;
+    let payment_result = crate::legal::billing::record_payment(
+        store.as_ref(),
+        &state.user_id,
+        invoice_id,
+        amount,
+        &recorded_by,
+        req.draw_from_trust,
+        req.description.as_deref(),
+    )
+    .await;
+    let (invoice, trust_entry) = match payment_result {
+        Ok(result) => result,
+        Err(err) => {
+            if req.draw_from_trust && err.to_ascii_lowercase().contains("insufficient") {
+                record_legal_audit_event(
+                    state.as_ref(),
+                    "trust_withdrawal_rejected",
+                    state.user_id.as_str(),
+                    None,
+                    AuditSeverity::Warn,
+                    serde_json::json!({
+                        "invoice_id": invoice_id.to_string(),
+                        "amount": amount.to_string(),
+                        "reason": "insufficient_balance",
+                    }),
+                )
+                .await;
+            }
+            return Err((StatusCode::BAD_REQUEST, err));
+        }
+    };
+    record_legal_audit_event(
+        state.as_ref(),
+        "payment_recorded",
+        state.user_id.as_str(),
+        Some(invoice.matter_id.as_str()),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "invoice_id": invoice.id.to_string(),
+            "matter_id": invoice.matter_id.clone(),
+            "amount": amount.to_string(),
+            "draw_from_trust": req.draw_from_trust,
+            "trust_entry_created": trust_entry.is_some(),
+        }),
+    )
+    .await;
+    Ok(Json(RecordInvoicePaymentResponse {
+        invoice: invoice_record_to_info(invoice),
+        trust_entry: trust_entry.map(trust_ledger_entry_record_to_info),
+    }))
+}
+
+async fn matter_trust_deposit_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<TrustDepositRequest>,
+) -> Result<(StatusCode, Json<TrustLedgerEntryInfo>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let amount = parse_decimal_field("amount", &req.amount)?;
+    let recorded_by = parse_required_matter_field("recorded_by", &req.recorded_by)?;
+    let description =
+        parse_optional_matter_field(req.description).unwrap_or_else(|| "Trust deposit".to_string());
+    let entry = crate::legal::billing::record_trust_deposit(
+        store.as_ref(),
+        &state.user_id,
+        &matter_id,
+        amount,
+        &recorded_by,
+        &description,
+    )
+    .await
+    .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    record_legal_audit_event(
+        state.as_ref(),
+        "trust_deposit",
+        state.user_id.as_str(),
+        Some(matter_id.as_str()),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "matter_id": matter_id.clone(),
+            "entry_id": entry.id.to_string(),
+            "amount": entry.amount.to_string(),
+            "recorded_by": recorded_by,
+        }),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(trust_ledger_entry_record_to_info(entry)),
+    ))
+}
+
+async fn matter_trust_ledger_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<TrustLedgerResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let entries = store
+        .list_trust_ledger_entries(&state.user_id, &matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let balance = store
+        .current_trust_balance(&state.user_id, &matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(TrustLedgerResponse {
+        matter_id,
+        balance: balance.to_string(),
+        entries: entries
+            .into_iter()
+            .map(trust_ledger_entry_record_to_info)
+            .collect(),
+    }))
 }
 
 fn parse_required_matter_field(
@@ -1832,6 +3523,14 @@ fn parse_optional_matter_field(value: Option<String>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+fn parse_optional_matter_field_patch(value: Option<Option<String>>) -> Option<Option<String>> {
+    match value {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) => Some(parse_optional_matter_field(Some(raw))),
+    }
 }
 
 const OPTIONAL_MATTER_FIELD_MAX_CHARS: usize = 256;
@@ -1870,6 +3569,766 @@ fn parse_matter_list(values: Vec<String>) -> Vec<String> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .collect()
+}
+
+fn parse_client_type(value: &str) -> Result<ClientType, (StatusCode, String)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "individual" => Ok(ClientType::Individual),
+        "entity" => Ok(ClientType::Entity),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "'client_type' must be 'individual' or 'entity'".to_string(),
+        )),
+    }
+}
+
+fn parse_matter_status(value: &str) -> Result<MatterStatus, (StatusCode, String)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "intake" => Ok(MatterStatus::Intake),
+        "active" => Ok(MatterStatus::Active),
+        "pending" => Ok(MatterStatus::Pending),
+        "closed" => Ok(MatterStatus::Closed),
+        "archived" => Ok(MatterStatus::Archived),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "'status' must be one of: intake, active, pending, closed, archived".to_string(),
+        )),
+    }
+}
+
+fn parse_matter_task_status(value: &str) -> Result<MatterTaskStatus, (StatusCode, String)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "todo" => Ok(MatterTaskStatus::Todo),
+        "in_progress" => Ok(MatterTaskStatus::InProgress),
+        "done" => Ok(MatterTaskStatus::Done),
+        "blocked" => Ok(MatterTaskStatus::Blocked),
+        "cancelled" => Ok(MatterTaskStatus::Cancelled),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "'status' must be one of: todo, in_progress, done, blocked, cancelled".to_string(),
+        )),
+    }
+}
+
+fn parse_matter_deadline_type(value: &str) -> Result<MatterDeadlineType, (StatusCode, String)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "court_date" => Ok(MatterDeadlineType::CourtDate),
+        "filing" => Ok(MatterDeadlineType::Filing),
+        "statute_of_limitations" => Ok(MatterDeadlineType::StatuteOfLimitations),
+        "response_due" => Ok(MatterDeadlineType::ResponseDue),
+        "discovery_cutoff" => Ok(MatterDeadlineType::DiscoveryCutoff),
+        "internal" => Ok(MatterDeadlineType::Internal),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "'deadline_type' must be one of: court_date, filing, statute_of_limitations, response_due, discovery_cutoff, internal".to_string(),
+        )),
+    }
+}
+
+fn parse_expense_category(value: &str) -> Result<ExpenseCategory, (StatusCode, String)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "filing_fee" => Ok(ExpenseCategory::FilingFee),
+        "travel" => Ok(ExpenseCategory::Travel),
+        "postage" => Ok(ExpenseCategory::Postage),
+        "expert" => Ok(ExpenseCategory::Expert),
+        "copying" => Ok(ExpenseCategory::Copying),
+        "court_reporter" => Ok(ExpenseCategory::CourtReporter),
+        "other" => Ok(ExpenseCategory::Other),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "'category' must be one of: filing_fee, travel, postage, expert, copying, court_reporter, other".to_string(),
+        )),
+    }
+}
+
+fn parse_date_only(field_name: &str, raw: &str) -> Result<NaiveDate, (StatusCode, String)> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' is required", field_name),
+        ));
+    }
+    let parsed = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("'{}' must be in YYYY-MM-DD format", field_name),
+        )
+    })?;
+    if parsed.format("%Y-%m-%d").to_string() != value {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' must be in YYYY-MM-DD format", field_name),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_decimal_field(field_name: &str, raw: &str) -> Result<Decimal, (StatusCode, String)> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' is required", field_name),
+        ));
+    }
+    let decimal = value.parse::<Decimal>().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("'{}' must be a valid decimal number", field_name),
+        )
+    })?;
+    if decimal <= Decimal::ZERO {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' must be greater than 0", field_name),
+        ));
+    }
+    Ok(decimal)
+}
+
+fn parse_optional_decimal_field(
+    field_name: &str,
+    raw: Option<String>,
+) -> Result<Option<Decimal>, (StatusCode, String)> {
+    match parse_optional_matter_field(raw) {
+        Some(value) => parse_decimal_field(field_name, &value).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn parse_matter_document_category(
+    value: Option<&str>,
+) -> Result<MatterDocumentCategory, (StatusCode, String)> {
+    let raw = value.unwrap_or("internal").trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "pleading" => Ok(MatterDocumentCategory::Pleading),
+        "correspondence" => Ok(MatterDocumentCategory::Correspondence),
+        "contract" => Ok(MatterDocumentCategory::Contract),
+        "filing" => Ok(MatterDocumentCategory::Filing),
+        "evidence" => Ok(MatterDocumentCategory::Evidence),
+        "internal" | "" => Ok(MatterDocumentCategory::Internal),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "'category' must be one of: pleading, correspondence, contract, filing, evidence, internal".to_string(),
+        )),
+    }
+}
+
+fn infer_matter_document_category(path: &str) -> MatterDocumentCategory {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("/filing") || lower.contains("/pleading") {
+        MatterDocumentCategory::Filing
+    } else if lower.contains("/evidence") {
+        MatterDocumentCategory::Evidence
+    } else if lower.contains("/contract") || lower.contains("/agreement") {
+        MatterDocumentCategory::Contract
+    } else if lower.contains("/correspondence") || lower.contains("/communication") {
+        MatterDocumentCategory::Correspondence
+    } else {
+        MatterDocumentCategory::Internal
+    }
+}
+
+fn normalize_reminder_days(values: &[i32]) -> Result<Vec<i32>, (StatusCode, String)> {
+    use std::collections::BTreeSet;
+
+    if values.len() > MAX_DEADLINE_REMINDERS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'reminder_days' supports at most {} values",
+                MAX_DEADLINE_REMINDERS
+            ),
+        ));
+    }
+
+    let mut unique = BTreeSet::new();
+    for day in values {
+        if *day < 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "'reminder_days' values must be >= 0".to_string(),
+            ));
+        }
+        if *day > MAX_DEADLINE_REMINDER_DAYS {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "'reminder_days' values must be <= {}",
+                    MAX_DEADLINE_REMINDER_DAYS
+                ),
+            ));
+        }
+        unique.insert(*day);
+    }
+
+    Ok(unique.into_iter().collect())
+}
+
+fn parse_datetime_value(field: &str, raw: &str) -> Result<DateTime<Utc>, (StatusCode, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' cannot be empty", field),
+        ));
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d")
+        && let Some(dt) = date.and_hms_opt(0, 0, 0)
+    {
+        return Ok(dt.and_utc());
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        format!("'{}' must be YYYY-MM-DD or RFC3339 datetime", field),
+    ))
+}
+
+fn parse_optional_datetime(
+    field: &str,
+    raw: Option<String>,
+) -> Result<Option<DateTime<Utc>>, (StatusCode, String)> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    parse_datetime_value(field, &raw).map(Some)
+}
+
+fn parse_optional_datetime_patch(
+    field: &str,
+    raw: Option<Option<String>>,
+) -> Result<Option<Option<DateTime<Utc>>>, (StatusCode, String)> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let Some(raw) = raw else {
+        return Ok(Some(None));
+    };
+    if raw.trim().is_empty() {
+        return Ok(Some(None));
+    }
+    Ok(Some(Some(parse_datetime_value(field, &raw)?)))
+}
+
+fn parse_uuid(value: &str, field: &str) -> Result<Uuid, (StatusCode, String)> {
+    Uuid::parse_str(value).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("'{}' must be a valid UUID", field),
+        )
+    })
+}
+
+fn parse_optional_uuid_field(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<Uuid>, (StatusCode, String)> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    parse_uuid(trimmed, field).map(Some)
+}
+
+fn parse_optional_uuid_patch_field(
+    value: Option<Option<String>>,
+    field: &str,
+) -> Result<Option<Option<Uuid>>, (StatusCode, String)> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let Some(raw) = raw else {
+        return Ok(Some(None));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(None));
+    }
+    parse_uuid(trimmed, field).map(|uuid| Some(Some(uuid)))
+}
+
+fn deadline_record_to_info(record: crate::db::MatterDeadlineRecord) -> MatterDeadlineRecordInfo {
+    let today = Utc::now().date_naive();
+    let due_date = record.due_at.date_naive();
+    MatterDeadlineRecordInfo {
+        id: record.id.to_string(),
+        title: record.title,
+        deadline_type: record.deadline_type.as_str().to_string(),
+        due_at: record.due_at.to_rfc3339(),
+        completed_at: record.completed_at.map(|value| value.to_rfc3339()),
+        reminder_days: record.reminder_days,
+        rule_ref: record.rule_ref,
+        computed_from: record.computed_from.map(|value| value.to_string()),
+        task_id: record.task_id.map(|value| value.to_string()),
+        is_overdue: record.completed_at.is_none() && due_date < today,
+        days_until_due: due_date.signed_duration_since(today).num_days(),
+        created_at: record.created_at.to_rfc3339(),
+        updated_at: record.updated_at.to_rfc3339(),
+    }
+}
+
+fn deadline_record_to_legacy_info(record: &crate::db::MatterDeadlineRecord) -> MatterDeadlineInfo {
+    let today = Utc::now().date_naive();
+    let due_date = record.due_at.date_naive();
+    let status = if record.completed_at.is_some() {
+        Some("completed".to_string())
+    } else {
+        Some("open".to_string())
+    };
+    MatterDeadlineInfo {
+        date: due_date.to_string(),
+        title: record.title.clone(),
+        owner: None,
+        status,
+        source: record.rule_ref.clone(),
+        is_overdue: record.completed_at.is_none() && due_date < today,
+    }
+}
+
+fn deadline_compute_preview_from_params(
+    params: &CreateMatterDeadlineParams,
+) -> MatterDeadlineComputePreview {
+    let today = Utc::now().date_naive();
+    let due_date = params.due_at.date_naive();
+    MatterDeadlineComputePreview {
+        title: params.title.clone(),
+        deadline_type: params.deadline_type.as_str().to_string(),
+        due_at: params.due_at.to_rfc3339(),
+        reminder_days: params.reminder_days.clone(),
+        rule_ref: params.rule_ref.clone(),
+        computed_from: params.computed_from.map(|value| value.to_string()),
+        task_id: params.task_id.map(|value| value.to_string()),
+        is_overdue: due_date < today,
+        days_until_due: due_date.signed_duration_since(today).num_days(),
+    }
+}
+
+fn deadline_reminder_prefix(matter_id: &str, deadline_id: Uuid) -> String {
+    format!("deadline-reminder-{matter_id}-{deadline_id}-")
+}
+
+fn deadline_reminder_name(matter_id: &str, deadline_id: Uuid, reminder_days: i32) -> String {
+    format!(
+        "{}{}",
+        deadline_reminder_prefix(matter_id, deadline_id),
+        reminder_days
+    )
+}
+
+fn deadline_reminder_schedule(run_at: DateTime<Utc>) -> String {
+    format!(
+        "{} {} {} {} {} *",
+        run_at.second(),
+        run_at.minute(),
+        run_at.hour(),
+        run_at.day(),
+        run_at.month()
+    )
+}
+
+async fn disable_deadline_reminder_routines(
+    state: &GatewayState,
+    matter_id: &str,
+    deadline_id: Uuid,
+) -> Result<(), (StatusCode, String)> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(());
+    };
+    let prefix = deadline_reminder_prefix(matter_id, deadline_id);
+    let routines = store
+        .list_routines(&state.user_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    for mut routine in routines {
+        if !routine.name.starts_with(&prefix) || !routine.enabled {
+            continue;
+        }
+        routine.enabled = false;
+        routine.next_fire_at = None;
+        store
+            .update_routine(&routine)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    }
+
+    Ok(())
+}
+
+async fn sync_deadline_reminder_routines_for_record(
+    state: &GatewayState,
+    record: &crate::db::MatterDeadlineRecord,
+) -> Result<(), (StatusCode, String)> {
+    disable_deadline_reminder_routines(state, &record.matter_id, record.id).await?;
+    let Some(store) = state.store.as_ref() else {
+        return Ok(());
+    };
+
+    if record.completed_at.is_some() || record.reminder_days.is_empty() {
+        return Ok(());
+    }
+
+    let now = Utc::now();
+    for reminder_days in &record.reminder_days {
+        let run_at = record.due_at - chrono::Duration::days(i64::from(*reminder_days));
+        if run_at <= now {
+            continue;
+        }
+
+        let name = deadline_reminder_name(&record.matter_id, record.id, *reminder_days);
+        let schedule = deadline_reminder_schedule(run_at);
+        let next_fire = crate::agent::routine::next_cron_fire(&schedule)
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        let prompt = format!(
+            "Matter `{}` deadline reminder: \"{}\" is due on {} ({} days remaining). Provide a concise reminder and immediate next action.",
+            record.matter_id,
+            record.title,
+            record.due_at.date_naive(),
+            reminder_days
+        );
+        let state_json = serde_json::json!({
+            "one_shot": true,
+            "deadline_id": record.id,
+            "matter_id": record.matter_id,
+            "reminder_days": reminder_days,
+        });
+
+        if let Some(mut existing) = store
+            .get_routine_by_name(&state.user_id, &name)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        {
+            existing.enabled = true;
+            existing.trigger = crate::agent::routine::Trigger::Cron { schedule };
+            existing.action = crate::agent::routine::RoutineAction::Lightweight {
+                prompt: prompt.clone(),
+                context_paths: vec![format!("{MATTER_ROOT}/{}/matter.yaml", record.matter_id)],
+                max_tokens: 300,
+            };
+            existing.next_fire_at = next_fire;
+            existing.state = state_json.clone();
+            store
+                .update_routine(&existing)
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+            continue;
+        }
+
+        let routine = crate::agent::routine::Routine {
+            id: Uuid::new_v4(),
+            name,
+            description: format!(
+                "One-shot reminder {} day(s) before deadline '{}'",
+                reminder_days, record.title
+            ),
+            user_id: state.user_id.clone(),
+            enabled: true,
+            trigger: crate::agent::routine::Trigger::Cron { schedule },
+            action: crate::agent::routine::RoutineAction::Lightweight {
+                prompt,
+                context_paths: vec![format!("{MATTER_ROOT}/{}/matter.yaml", record.matter_id)],
+                max_tokens: 300,
+            },
+            guardrails: crate::agent::routine::RoutineGuardrails::default(),
+            notify: crate::agent::routine::NotifyConfig::default(),
+            last_run_at: None,
+            next_fire_at: next_fire,
+            run_count: 0,
+            consecutive_failures: 0,
+            state: state_json,
+            created_at: now,
+            updated_at: now,
+        };
+        store
+            .create_routine(&routine)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    }
+
+    Ok(())
+}
+
+fn parse_uuid_list(values: &[String], field: &str) -> Result<Vec<Uuid>, (StatusCode, String)> {
+    values
+        .iter()
+        .map(|value| parse_uuid(value, field))
+        .collect()
+}
+
+fn client_record_to_info(client: crate::db::ClientRecord) -> ClientInfo {
+    ClientInfo {
+        id: client.id.to_string(),
+        name: client.name,
+        client_type: client.client_type.as_str().to_string(),
+        email: client.email,
+        phone: client.phone,
+        address: client.address,
+        notes: client.notes,
+        created_at: client.created_at.to_rfc3339(),
+        updated_at: client.updated_at.to_rfc3339(),
+    }
+}
+
+fn matter_task_record_to_info(task: crate::db::MatterTaskRecord) -> MatterTaskInfo {
+    MatterTaskInfo {
+        id: task.id.to_string(),
+        title: task.title,
+        description: task.description,
+        status: task.status.as_str().to_string(),
+        assignee: task.assignee,
+        due_at: task.due_at.map(|dt| dt.to_rfc3339()),
+        blocked_by: task
+            .blocked_by
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect(),
+        created_at: task.created_at.to_rfc3339(),
+        updated_at: task.updated_at.to_rfc3339(),
+    }
+}
+
+fn matter_note_record_to_info(note: crate::db::MatterNoteRecord) -> MatterNoteInfo {
+    MatterNoteInfo {
+        id: note.id.to_string(),
+        author: note.author,
+        body: note.body,
+        pinned: note.pinned,
+        created_at: note.created_at.to_rfc3339(),
+        updated_at: note.updated_at.to_rfc3339(),
+    }
+}
+
+fn time_entry_record_to_info(entry: crate::db::TimeEntryRecord) -> TimeEntryInfo {
+    TimeEntryInfo {
+        id: entry.id.to_string(),
+        timekeeper: entry.timekeeper,
+        description: entry.description,
+        hours: entry.hours.to_string(),
+        hourly_rate: entry.hourly_rate.map(|value| value.to_string()),
+        entry_date: entry.entry_date.to_string(),
+        billable: entry.billable,
+        billed_invoice_id: entry.billed_invoice_id,
+        created_at: entry.created_at.to_rfc3339(),
+        updated_at: entry.updated_at.to_rfc3339(),
+    }
+}
+
+fn expense_entry_record_to_info(entry: crate::db::ExpenseEntryRecord) -> ExpenseEntryInfo {
+    ExpenseEntryInfo {
+        id: entry.id.to_string(),
+        submitted_by: entry.submitted_by,
+        description: entry.description,
+        amount: entry.amount.to_string(),
+        category: entry.category.as_str().to_string(),
+        entry_date: entry.entry_date.to_string(),
+        receipt_path: entry.receipt_path,
+        billable: entry.billable,
+        billed_invoice_id: entry.billed_invoice_id,
+        created_at: entry.created_at.to_rfc3339(),
+        updated_at: entry.updated_at.to_rfc3339(),
+    }
+}
+
+fn matter_time_summary_to_response(
+    summary: crate::db::MatterTimeSummary,
+) -> MatterTimeSummaryResponse {
+    MatterTimeSummaryResponse {
+        total_hours: summary.total_hours.to_string(),
+        billable_hours: summary.billable_hours.to_string(),
+        unbilled_hours: summary.unbilled_hours.to_string(),
+        total_expenses: summary.total_expenses.to_string(),
+        billable_expenses: summary.billable_expenses.to_string(),
+        unbilled_expenses: summary.unbilled_expenses.to_string(),
+    }
+}
+
+fn invoice_record_to_info(invoice: InvoiceRecord) -> InvoiceInfo {
+    InvoiceInfo {
+        id: invoice.id.to_string(),
+        matter_id: invoice.matter_id,
+        invoice_number: invoice.invoice_number,
+        status: invoice.status.as_str().to_string(),
+        issued_date: invoice.issued_date.map(|value| value.to_string()),
+        due_date: invoice.due_date.map(|value| value.to_string()),
+        subtotal: invoice.subtotal.to_string(),
+        tax: invoice.tax.to_string(),
+        total: invoice.total.to_string(),
+        paid_amount: invoice.paid_amount.to_string(),
+        notes: invoice.notes,
+        created_at: invoice.created_at.to_rfc3339(),
+        updated_at: invoice.updated_at.to_rfc3339(),
+    }
+}
+
+fn invoice_draft_to_info(invoice: &crate::db::CreateInvoiceParams) -> InvoiceDraftInfo {
+    InvoiceDraftInfo {
+        matter_id: invoice.matter_id.clone(),
+        invoice_number: invoice.invoice_number.clone(),
+        status: invoice.status.as_str().to_string(),
+        due_date: invoice.due_date.map(|value| value.to_string()),
+        subtotal: invoice.subtotal.to_string(),
+        tax: invoice.tax.to_string(),
+        total: invoice.total.to_string(),
+        notes: invoice.notes.clone(),
+    }
+}
+
+fn invoice_line_item_record_to_info(item: InvoiceLineItemRecord) -> InvoiceLineItemInfo {
+    InvoiceLineItemInfo {
+        id: item.id.to_string(),
+        description: item.description,
+        quantity: item.quantity.to_string(),
+        unit_price: item.unit_price.to_string(),
+        amount: item.amount.to_string(),
+        time_entry_id: item.time_entry_id.map(|value| value.to_string()),
+        expense_entry_id: item.expense_entry_id.map(|value| value.to_string()),
+        sort_order: item.sort_order,
+    }
+}
+
+fn invoice_line_item_params_to_info(
+    item: &crate::db::CreateInvoiceLineItemParams,
+) -> InvoiceLineItemInfo {
+    InvoiceLineItemInfo {
+        id: "draft".to_string(),
+        description: item.description.clone(),
+        quantity: item.quantity.to_string(),
+        unit_price: item.unit_price.to_string(),
+        amount: item.amount.to_string(),
+        time_entry_id: item.time_entry_id.map(|value| value.to_string()),
+        expense_entry_id: item.expense_entry_id.map(|value| value.to_string()),
+        sort_order: item.sort_order,
+    }
+}
+
+fn trust_ledger_entry_record_to_info(entry: TrustLedgerEntryRecord) -> TrustLedgerEntryInfo {
+    TrustLedgerEntryInfo {
+        id: entry.id.to_string(),
+        matter_id: entry.matter_id,
+        entry_type: entry.entry_type.as_str().to_string(),
+        amount: entry.amount.to_string(),
+        balance_after: entry.balance_after.to_string(),
+        description: entry.description,
+        invoice_id: entry.invoice_id.map(|value| value.to_string()),
+        recorded_by: entry.recorded_by,
+        created_at: entry.created_at.to_rfc3339(),
+    }
+}
+
+fn audit_event_record_to_info(event: crate::db::AuditEventRecord) -> LegalAuditEventInfo {
+    LegalAuditEventInfo {
+        id: event.id.to_string(),
+        ts: event.created_at.to_rfc3339(),
+        event_type: event.event_type,
+        actor: event.actor,
+        matter_id: event.matter_id,
+        severity: event.severity.as_str().to_string(),
+        details: event.details,
+    }
+}
+
+fn validate_intake_party_name(field_name: &str, value: &str) -> Result<(), (StatusCode, String)> {
+    if value.chars().count() > MAX_INTAKE_CONFLICT_PARTY_CHARS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'{}' entries must be at most {} characters",
+                field_name, MAX_INTAKE_CONFLICT_PARTY_CHARS
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_intake_party_list(
+    field_name: &str,
+    values: &[String],
+) -> Result<(), (StatusCode, String)> {
+    if values.len() > MAX_INTAKE_CONFLICT_PARTIES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'{}' may include at most {} names",
+                field_name, MAX_INTAKE_CONFLICT_PARTIES
+            ),
+        ));
+    }
+    for value in values {
+        validate_intake_party_name(field_name, value)?;
+    }
+    Ok(())
+}
+
+fn conflict_text_preview(text: &str) -> String {
+    let normalized = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let preview: String = collapsed
+        .chars()
+        .take(MAX_CONFLICT_TEXT_PREVIEW_CHARS)
+        .collect();
+    if collapsed.chars().count() > MAX_CONFLICT_TEXT_PREVIEW_CHARS {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn build_checked_parties(client: &str, adversaries: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    if !client.trim().is_empty() {
+        out.push(client.trim().to_string());
+    }
+    for name in adversaries {
+        let trimmed = name.trim();
+        if trimmed.is_empty()
+            || out
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    out
+}
+
+fn json_error_string(value: serde_json::Value) -> String {
+    serde_json::to_string(&value).unwrap_or_else(|_| "{\"error\":\"serialization_error\"}".into())
+}
+
+fn conflict_required_error(hits: &[ConflictHit]) -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        json_error_string(serde_json::json!({
+            "error": "Potential conflicts detected. Review and submit a conflict decision before creating the matter.",
+            "conflict_required": true,
+            "hits": hits,
+        })),
+    )
+}
+
+fn conflict_declined_error(hits: &[ConflictHit]) -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        json_error_string(serde_json::json!({
+            "error": "Matter creation declined due to conflict review decision.",
+            "decision": "declined",
+            "hits": hits,
+        })),
+    )
 }
 
 fn list_matters_root_entries(
@@ -1915,10 +4374,22 @@ async fn matters_create_handler(
             format!("Matter '{}' already exists", sanitized),
         ));
     }
+    if store
+        .get_matter_db(&state.user_id, &sanitized)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_some()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("Matter '{}' already exists", sanitized),
+        ));
+    }
 
     let client = parse_required_matter_field("client", &req.client)?;
     let confidentiality = parse_required_matter_field("confidentiality", &req.confidentiality)?;
     let retention = parse_required_matter_field("retention", &req.retention)?;
+    validate_intake_party_name("client", &client)?;
     let jurisdiction = parse_optional_matter_field(req.jurisdiction);
     let practice_area = parse_optional_matter_field(req.practice_area);
     let opened_at = parse_optional_matter_field(req.opened_at);
@@ -1929,6 +4400,85 @@ async fn matters_create_handler(
     }
     let team = parse_matter_list(req.team);
     let adversaries = parse_matter_list(req.adversaries);
+    validate_intake_party_list("adversaries", &adversaries)?;
+    let conflict_decision = req.conflict_decision;
+    let conflict_note = parse_optional_matter_field(req.conflict_note);
+    let checked_parties = build_checked_parties(&client, &adversaries);
+    if checked_parties.len() > MAX_INTAKE_CONFLICT_PARTIES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "combined conflict-check parties may include at most {} names",
+                MAX_INTAKE_CONFLICT_PARTIES
+            ),
+        ));
+    }
+    let conflict_hits = if checked_parties.is_empty() {
+        Vec::new()
+    } else {
+        store
+            .find_conflict_hits_for_names(&checked_parties, 50)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    if !conflict_hits.is_empty() {
+        let decision = match conflict_decision {
+            Some(decision) => decision,
+            None => return Err(conflict_required_error(&conflict_hits)),
+        };
+
+        if matches!(
+            decision,
+            ConflictDecision::Waived | ConflictDecision::Declined
+        ) && conflict_note.as_deref().is_none()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "'conflict_note' is required for waived or declined decisions".to_string(),
+            ));
+        }
+
+        let clearance = ConflictClearanceRecord {
+            matter_id: sanitized.clone(),
+            checked_by: state.user_id.clone(),
+            cleared_by: if matches!(decision, ConflictDecision::Declined) {
+                None
+            } else {
+                Some(state.user_id.clone())
+            },
+            decision,
+            note: conflict_note.clone(),
+            hits_json: serde_json::to_value(&conflict_hits)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            hit_count: conflict_hits.len() as i32,
+        };
+        store
+            .record_conflict_clearance(&clearance)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        record_legal_audit_event(
+            state.as_ref(),
+            "conflict_clearance_decision",
+            state.user_id.as_str(),
+            Some(sanitized.as_str()),
+            AuditSeverity::Info,
+            serde_json::json!({
+                "matter_id": sanitized.clone(),
+                "decision": decision.as_str(),
+                "checked_by": state.user_id.clone(),
+                "cleared_by_present": clearance.cleared_by.is_some(),
+                "hit_count": clearance.hit_count,
+                "source": "create_flow",
+            }),
+        )
+        .await;
+
+        if matches!(decision, ConflictDecision::Declined) {
+            return Err(conflict_declined_error(&conflict_hits));
+        }
+    }
 
     let metadata = crate::legal::matter::MatterMetadata {
         matter_id: sanitized.clone(),
@@ -2013,6 +4563,48 @@ async fn matters_create_handler(
         ),
     ];
 
+    let opened_at_ts = parse_optional_datetime("opened_at", opened_at.clone())?;
+    let db_client = store
+        .upsert_client_by_normalized_name(
+            &state.user_id,
+            &CreateClientParams {
+                name: client.clone(),
+                client_type: ClientType::Entity,
+                email: None,
+                phone: None,
+                address: None,
+                notes: None,
+            },
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    store
+        .upsert_matter(
+            &state.user_id,
+            &UpsertMatterParams {
+                matter_id: sanitized.clone(),
+                client_id: db_client.id,
+                status: MatterStatus::Active,
+                stage: None,
+                practice_area: practice_area.clone(),
+                jurisdiction: jurisdiction.clone(),
+                opened_at: opened_at_ts,
+                closed_at: None,
+                assigned_to: team.clone(),
+                custom_fields: serde_json::json!({}),
+            },
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Seed conflict graph rows before filesystem writes so DB failures do not
+    // leave behind an unindexed matter directory that cannot be retried.
+    store
+        .seed_matter_parties(&sanitized, &client, &adversaries, opened_at.as_deref())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::legal::matter::invalidate_conflict_cache();
+
     for (path, content) in scaffold {
         workspace
             .write(&path, &content)
@@ -2026,12 +4618,29 @@ async fn matters_create_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    record_legal_audit_event(
+        state.as_ref(),
+        "matter_created",
+        state.user_id.as_str(),
+        Some(sanitized.as_str()),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "matter_id": sanitized.clone(),
+            "client_id": db_client.id.to_string(),
+            "status": MatterStatus::Active.as_str(),
+        }),
+    )
+    .await;
+
     Ok((
         StatusCode::CREATED,
         Json(CreateMatterResponse {
             matter: MatterInfo {
                 id: sanitized.clone(),
+                client_id: Some(db_client.id.to_string()),
                 client: Some(client),
+                status: Some(MatterStatus::Active.as_str().to_string()),
+                stage: None,
                 confidentiality: Some(confidentiality),
                 team,
                 adversaries,
@@ -2167,10 +4776,50 @@ async fn matter_documents_handler(
     ))?;
     let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
     let include_templates = query.include_templates.unwrap_or(false);
-    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
-    let documents =
+
+    let documents = if state.store.is_some() {
+        ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+        backfill_matter_documents_from_workspace(state.as_ref(), &matter_id).await?;
+        let store = state.store.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Database not available".to_string(),
+        ))?;
+        let mut docs = store
+            .list_matter_documents_db(&state.user_id, &matter_id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+            .into_iter()
+            .map(matter_document_record_to_info)
+            .collect::<Vec<_>>();
+        if include_templates {
+            backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
+            let templates = store
+                .list_document_templates(&state.user_id, Some(&matter_id))
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+            docs.extend(
+                templates
+                    .into_iter()
+                    .map(document_template_record_to_info)
+                    .map(|template| MatterDocumentInfo {
+                        id: template.id,
+                        memory_document_id: None,
+                        name: template.name.clone(),
+                        display_name: Some(template.name),
+                        path: template.path,
+                        is_dir: false,
+                        category: Some("template".to_string()),
+                        updated_at: template.updated_at,
+                    }),
+            );
+            docs.sort_by(|a, b| a.path.cmp(&b.path));
+        }
+        docs
+    } else {
+        let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
         list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, include_templates)
-            .await?;
+            .await?
+    };
 
     Ok(Json(MatterDocumentsResponse {
         matter_id,
@@ -2191,7 +4840,8 @@ async fn matter_dashboard_handler(
     let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, false).await?;
     let templates = list_matter_templates(workspace.as_ref(), &matter_id).await?;
     let today = Utc::now().date_naive();
-    let deadlines = read_matter_deadlines(workspace.as_ref(), &matter_prefix, today).await?;
+    let deadlines =
+        read_matter_deadlines_for_matter(state.as_ref(), &matter_id, &matter_prefix, today).await?;
 
     let document_count = docs.iter().filter(|doc| !doc.is_dir).count();
     let draft_prefix = format!("{matter_prefix}/drafts/");
@@ -2264,13 +4914,239 @@ async fn matter_deadlines_handler(
     ))?;
     let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
     let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
-    let deadlines =
-        read_matter_deadlines(workspace.as_ref(), &matter_prefix, Utc::now().date_naive()).await?;
+    let deadlines = read_matter_deadlines_for_matter(
+        state.as_ref(),
+        &matter_id,
+        &matter_prefix,
+        Utc::now().date_naive(),
+    )
+    .await?;
 
     Ok(Json(MatterDeadlinesResponse {
         matter_id,
         deadlines,
     }))
+}
+
+fn court_rule_to_info(rule: &crate::legal::calendar::CourtRule) -> CourtRuleInfo {
+    CourtRuleInfo {
+        id: rule.id.clone(),
+        citation: rule.citation.clone(),
+        deadline_type: rule.deadline_type.as_str().to_string(),
+        offset_days: rule.offset_days,
+        court_days: rule.court_days,
+    }
+}
+
+async fn matter_deadlines_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateMatterDeadlineRequest>,
+) -> Result<(StatusCode, Json<MatterDeadlineRecordInfo>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+
+    let title = req.title.trim();
+    if title.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "'title' is required".to_string()));
+    }
+    let deadline_type = parse_matter_deadline_type(&req.deadline_type)?;
+    let due_at = parse_datetime_value("due_at", &req.due_at)?;
+    let completed_at = parse_optional_datetime("completed_at", req.completed_at)?;
+    let reminder_days = normalize_reminder_days(&req.reminder_days)?;
+    let rule_ref = parse_optional_matter_field(req.rule_ref);
+    validate_optional_matter_field_length("rule_ref", &rule_ref)?;
+    let computed_from = parse_optional_uuid_field(req.computed_from, "computed_from")?;
+    let task_id = parse_optional_uuid_field(req.task_id, "task_id")?;
+
+    let created = store
+        .create_matter_deadline(
+            &state.user_id,
+            &matter_id,
+            &CreateMatterDeadlineParams {
+                title: title.to_string(),
+                deadline_type,
+                due_at,
+                completed_at,
+                reminder_days,
+                rule_ref,
+                computed_from,
+                task_id,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    sync_deadline_reminder_routines_for_record(state.as_ref(), &created).await?;
+
+    Ok((StatusCode::CREATED, Json(deadline_record_to_info(created))))
+}
+
+async fn matter_deadlines_patch_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, deadline_id)): Path<(String, String)>,
+    Json(req): Json<UpdateMatterDeadlineRequest>,
+) -> Result<Json<MatterDeadlineRecordInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+    let deadline_id = parse_uuid(deadline_id.trim(), "deadline_id")?;
+
+    let title = req.title.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+    let deadline_type = req
+        .deadline_type
+        .as_deref()
+        .map(parse_matter_deadline_type)
+        .transpose()?;
+    let due_at = req
+        .due_at
+        .as_deref()
+        .map(|value| parse_datetime_value("due_at", value))
+        .transpose()?;
+    let completed_at = parse_optional_datetime_patch("completed_at", req.completed_at)?;
+    let reminder_days = req
+        .reminder_days
+        .as_ref()
+        .map(|values| normalize_reminder_days(values))
+        .transpose()?;
+    let rule_ref = parse_optional_matter_field_patch(req.rule_ref);
+    if let Some(Some(ref value)) = rule_ref {
+        validate_optional_matter_field_length("rule_ref", &Some(value.clone()))?;
+    }
+    let computed_from = parse_optional_uuid_patch_field(req.computed_from, "computed_from")?;
+    let task_id = parse_optional_uuid_patch_field(req.task_id, "task_id")?;
+
+    let updated = store
+        .update_matter_deadline(
+            &state.user_id,
+            &matter_id,
+            deadline_id,
+            &UpdateMatterDeadlineParams {
+                title,
+                deadline_type,
+                due_at,
+                completed_at,
+                reminder_days,
+                rule_ref,
+                computed_from,
+                task_id,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Deadline not found".to_string()))?;
+
+    sync_deadline_reminder_routines_for_record(state.as_ref(), &updated).await?;
+
+    Ok(Json(deadline_record_to_info(updated)))
+}
+
+async fn matter_deadlines_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, deadline_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+    let deadline_id = parse_uuid(deadline_id.trim(), "deadline_id")?;
+
+    let existing = store
+        .get_matter_deadline(&state.user_id, &matter_id, deadline_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Deadline not found".to_string()))?;
+
+    let deleted = store
+        .delete_matter_deadline(&state.user_id, &matter_id, deadline_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Deadline not found".to_string()));
+    }
+
+    disable_deadline_reminder_routines(state.as_ref(), &existing.matter_id, existing.id).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn matter_deadlines_compute_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<MatterDeadlineComputeRequest>,
+) -> Result<Json<MatterDeadlineComputeResponse>, (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
+    let rule_id = req.rule_id.trim();
+    if rule_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "'rule_id' is required".to_string()));
+    }
+
+    let rule = crate::legal::calendar::get_court_rule(rule_id)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            format!("Unknown rule_id '{}'", rule_id),
+        ))?;
+    let trigger = parse_datetime_value("trigger_date", &req.trigger_date)?;
+    let reminder_days = normalize_reminder_days(&req.reminder_days)?;
+    let computed_from = parse_optional_uuid_field(req.computed_from, "computed_from")?;
+    let task_id = parse_optional_uuid_field(req.task_id, "task_id")?;
+    let title = parse_optional_matter_field(req.title)
+        .unwrap_or_else(|| format!("{} deadline", rule.citation));
+
+    let computed = crate::legal::calendar::deadline_from_rule(
+        &title,
+        &rule,
+        trigger,
+        reminder_days,
+        computed_from,
+        task_id,
+    );
+
+    Ok(Json(MatterDeadlineComputeResponse {
+        matter_id,
+        rule: court_rule_to_info(&rule),
+        deadline: deadline_compute_preview_from_params(&computed),
+    }))
+}
+
+async fn legal_court_rules_handler() -> Result<Json<CourtRulesResponse>, (StatusCode, String)> {
+    let rules = crate::legal::calendar::all_court_rules()
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let payload = rules.iter().map(court_rule_to_info).collect::<Vec<_>>();
+    Ok(Json(CourtRulesResponse { rules: payload }))
 }
 
 async fn matter_templates_handler(
@@ -2282,7 +5158,19 @@ async fn matter_templates_handler(
         "Workspace not available".to_string(),
     ))?;
     let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
-    let templates = list_matter_templates(workspace.as_ref(), &matter_id).await?;
+    let templates = if let Some(store) = state.store.as_ref() {
+        ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+        backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
+        store
+            .list_document_templates(&state.user_id, Some(&matter_id))
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+            .into_iter()
+            .map(document_template_record_to_info)
+            .collect::<Vec<_>>()
+    } else {
+        list_matter_templates(workspace.as_ref(), &matter_id).await?
+    };
 
     Ok(Json(MatterTemplatesResponse {
         matter_id,
@@ -2302,18 +5190,33 @@ async fn matter_template_apply_handler(
     let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &id).await?;
     let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
     let template_name = parse_template_name(&req.template_name)?;
-    let template_path = format!("{matter_prefix}/templates/{template_name}");
 
-    let template_doc = workspace
-        .read(&template_path)
-        .await
-        .map_err(|err| match err {
-            crate::error::WorkspaceError::DocumentNotFound { .. } => (
+    let template_body = if let Some(store) = state.store.as_ref() {
+        ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+        backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
+        let template = store
+            .get_document_template_by_name(&state.user_id, Some(&matter_id), &template_name)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+            .ok_or((
                 StatusCode::NOT_FOUND,
                 format!("Template '{}' not found", template_name),
-            ),
-            other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
+            ))?;
+        template.body
+    } else {
+        let template_path = format!("{matter_prefix}/templates/{template_name}");
+        workspace
+            .read(&template_path)
+            .await
+            .map_err(|err| match err {
+                crate::error::WorkspaceError::DocumentNotFound { .. } => (
+                    StatusCode::NOT_FOUND,
+                    format!("Template '{}' not found", template_name),
+                ),
+                other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            })?
+            .content
+    };
 
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let destination = choose_template_apply_destination(
@@ -2324,16 +5227,184 @@ async fn matter_template_apply_handler(
     )
     .await?;
 
-    workspace
-        .write(&destination, &template_doc.content)
+    let written = workspace
+        .write(&destination, &template_body)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if let Some(store) = state.store.as_ref() {
+        let linked = store
+            .upsert_matter_document(
+                &state.user_id,
+                &matter_id,
+                &UpsertMatterDocumentParams {
+                    memory_document_id: written.id,
+                    path: written.path.clone(),
+                    display_name: template_name.clone(),
+                    category: MatterDocumentCategory::Internal,
+                },
+            )
+            .await;
+        let linked = match linked {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = workspace.delete(&destination).await;
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+            }
+        };
+        if let Err(err) = store
+            .create_document_version(
+                &state.user_id,
+                &CreateDocumentVersionParams {
+                    matter_document_id: linked.id,
+                    label: "draft".to_string(),
+                    memory_document_id: written.id,
+                },
+            )
+            .await
+        {
+            let _ = store
+                .delete_matter_document(&state.user_id, &matter_id, linked.id)
+                .await;
+            let _ = workspace.delete(&destination).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+        }
+    }
 
     Ok((
         StatusCode::CREATED,
         Json(MatterTemplateApplyResponse {
             path: destination,
             status: "created",
+        }),
+    ))
+}
+
+async fn documents_generate_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<GenerateDocumentRequest>,
+) -> Result<(StatusCode, Json<GenerateDocumentResponse>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &req.matter_id).await?;
+    ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
+    backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
+
+    let template_id = parse_uuid(req.template_id.trim(), "template_id")?;
+    let template = store
+        .get_document_template(&state.user_id, template_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Template not found".to_string()))?;
+    if let Some(ref template_matter) = template.matter_id
+        && template_matter != &matter_id
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Template not available for this matter".to_string(),
+        ));
+    }
+
+    let matter = store
+        .get_matter_db(&state.user_id, &matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Matter not found".to_string()))?;
+    let client = store
+        .get_client(&state.user_id, matter.client_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Matter is missing an associated client record".to_string(),
+        ))?;
+
+    let extra = if req.extra.is_object() {
+        req.extra
+    } else {
+        serde_json::json!({})
+    };
+    let context = crate::legal::docgen::build_context(&matter, &client, Some(&extra));
+    let rendered = crate::legal::docgen::render_template(&template.body, &context)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+
+    let category = parse_matter_document_category(req.category.as_deref())?;
+    let display_name =
+        parse_optional_matter_field(req.display_name).unwrap_or_else(|| template.name.clone());
+    let label = parse_optional_matter_field(req.label).unwrap_or_else(|| "draft".to_string());
+    validate_optional_matter_field_length("display_name", &Some(display_name.clone()))?;
+    validate_optional_matter_field_length("label", &Some(label.clone()))?;
+
+    let matter_prefix = format!("{MATTER_ROOT}/{matter_id}");
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let destination = choose_generated_document_destination(
+        workspace.as_ref(),
+        &matter_prefix,
+        &template.name,
+        &timestamp,
+    )
+    .await?;
+
+    let written = workspace
+        .write(&destination, &rendered)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let linked = match store
+        .upsert_matter_document(
+            &state.user_id,
+            &matter_id,
+            &UpsertMatterDocumentParams {
+                memory_document_id: written.id,
+                path: written.path.clone(),
+                display_name: display_name.clone(),
+                category,
+            },
+        )
+        .await
+    {
+        Ok(linked) => linked,
+        Err(err) => {
+            let _ = workspace.delete(&destination).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+        }
+    };
+
+    let version = match store
+        .create_document_version(
+            &state.user_id,
+            &CreateDocumentVersionParams {
+                matter_document_id: linked.id,
+                label: label.clone(),
+                memory_document_id: written.id,
+            },
+        )
+        .await
+    {
+        Ok(version) => version,
+        Err(err) => {
+            let _ = store
+                .delete_matter_document(&state.user_id, &matter_id, linked.id)
+                .await;
+            let _ = workspace.delete(&destination).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+        }
+    };
+
+    Ok((
+        StatusCode::CREATED,
+        Json(GenerateDocumentResponse {
+            matter_document_id: linked.id.to_string(),
+            memory_document_id: linked.memory_document_id.to_string(),
+            path: linked.path,
+            display_name: linked.display_name,
+            category: linked.category.as_str().to_string(),
+            version_number: version.version_number,
+            label: version.label,
         }),
     ))
 }
@@ -2363,7 +5434,8 @@ async fn matter_filing_package_handler(
     let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, true).await?;
     let templates = list_matter_templates(workspace.as_ref(), &matter_id).await?;
     let today = generated_at.date_naive();
-    let deadlines = read_matter_deadlines(workspace.as_ref(), &matter_prefix, today).await?;
+    let deadlines =
+        read_matter_deadlines_for_matter(state.as_ref(), &matter_id, &matter_prefix, today).await?;
 
     let checklist_files = [
         format!("{matter_prefix}/workflows/intake_checklist.md"),
@@ -2475,15 +5547,113 @@ async fn matter_filing_package_handler(
     ))
 }
 
+async fn matters_conflict_check_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<MatterIntakeConflictCheckRequest>,
+) -> Result<Json<MatterIntakeConflictCheckResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let legal = legal_config_for_gateway(state.as_ref());
+    if !legal.enabled || !legal.conflict_check_enabled {
+        return Err((
+            StatusCode::CONFLICT,
+            "Conflict check is disabled by legal policy".to_string(),
+        ));
+    }
+
+    let matter_id = crate::legal::policy::sanitize_matter_id(req.matter_id.trim());
+    if matter_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'matter_id' is empty after sanitization".to_string(),
+        ));
+    }
+
+    let client_names = parse_matter_list(req.client_names);
+    if client_names.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'client_names' must include at least one non-empty name".to_string(),
+        ));
+    }
+    validate_intake_party_list("client_names", &client_names)?;
+    let adversary_names = parse_matter_list(req.adversary_names);
+    validate_intake_party_list("adversary_names", &adversary_names)?;
+
+    let mut checked_parties: Vec<String> = Vec::new();
+    for value in client_names.iter().chain(adversary_names.iter()) {
+        if checked_parties
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(value))
+        {
+            continue;
+        }
+        checked_parties.push(value.clone());
+    }
+    if checked_parties.len() > MAX_INTAKE_CONFLICT_PARTIES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "combined client/adversary names may include at most {} values",
+                MAX_INTAKE_CONFLICT_PARTIES
+            ),
+        ));
+    }
+
+    let hits = store
+        .find_conflict_hits_for_names(&checked_parties, 100)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let matched = !hits.is_empty();
+    let top_conflict = hits.first().map(|hit| hit.party.clone());
+
+    record_legal_audit_event(
+        state.as_ref(),
+        "matter_intake_conflict_check",
+        state.user_id.as_str(),
+        Some(matter_id.as_str()),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "matter_id": matter_id.clone(),
+            "matched": matched,
+            "hit_count": hits.len(),
+            "top_conflict": top_conflict,
+            "checked_party_count": checked_parties.len(),
+            "checked_by": state.user_id.clone(),
+        }),
+    )
+    .await;
+    if matched {
+        record_legal_audit_event(
+            state.as_ref(),
+            "conflict_detected",
+            state.user_id.as_str(),
+            Some(matter_id.as_str()),
+            AuditSeverity::Warn,
+            serde_json::json!({
+                "source": "intake_conflict_check",
+                "hit_count": hits.len(),
+                "top_conflict": hits.first().map(|hit| hit.party.clone()),
+            }),
+        )
+        .await;
+    }
+
+    Ok(Json(MatterIntakeConflictCheckResponse {
+        matched,
+        hits,
+        matter_id,
+        checked_parties,
+    }))
+}
+
 async fn matters_conflicts_check_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<MatterConflictCheckRequest>,
 ) -> Result<Json<MatterConflictCheckResponse>, (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-
     let text = req.text.trim();
     if text.is_empty() {
         return Err((
@@ -2517,19 +5687,130 @@ async fn matters_conflicts_check_handler(
     } else {
         load_active_matter_for_chat(state.as_ref()).await
     };
-
-    legal.active_matter = effective_matter_id.clone();
-
-    match workspace.read("conflicts.json").await {
-        Ok(_) | Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => {}
-        Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    if legal.require_matter_context && effective_matter_id.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Active matter is required by legal policy for conflict checks".to_string(),
+        ));
     }
 
-    let conflict = crate::legal::matter::detect_conflict(workspace.as_ref(), &legal, text).await;
+    legal.active_matter = effective_matter_id.clone();
+    let db_available = state.store.is_some();
+    let db_hits = if let Some(store) = state.store.as_ref() {
+        match store
+            .find_conflict_hits_for_text(text, legal.active_matter.as_deref(), 50)
+            .await
+        {
+            Ok(hits) => hits,
+            Err(err) => {
+                tracing::warn!(
+                    "DB text conflict check failed, falling back to workspace cache: {err}"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let conflict = if let Some(first_hit) = db_hits.first() {
+        Some(first_hit.party.clone())
+    } else if db_available && !legal.conflict_file_fallback_enabled {
+        None
+    } else {
+        let workspace = state.workspace.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Workspace not available".to_string(),
+        ))?;
+        crate::legal::matter::detect_conflict_with_store(None, workspace.as_ref(), &legal, text)
+            .await
+    };
+    let matched = conflict.is_some();
+
+    record_legal_audit_event(
+        state.as_ref(),
+        "matter_conflict_check",
+        state.user_id.as_str(),
+        effective_matter_id.as_deref(),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "matter_id": effective_matter_id.clone(),
+            "matched": matched,
+            "conflict": conflict.clone(),
+            "text_preview": conflict_text_preview(text),
+            "checked_by": state.user_id.clone(),
+            "source": "manual_text_check",
+        }),
+    )
+    .await;
+    if matched {
+        record_legal_audit_event(
+            state.as_ref(),
+            "conflict_detected",
+            state.user_id.as_str(),
+            effective_matter_id.as_deref(),
+            AuditSeverity::Warn,
+            serde_json::json!({
+                "source": "manual_text_check",
+                "conflict": conflict.clone(),
+                "hit_count": db_hits.len(),
+            }),
+        )
+        .await;
+    }
+
     Ok(Json(MatterConflictCheckResponse {
-        matched: conflict.is_some(),
+        matched,
         conflict,
         matter_id: effective_matter_id,
+        hits: db_hits,
+    }))
+}
+
+async fn matters_conflicts_reindex_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<MatterConflictGraphReindexResponse>, (StatusCode, String)> {
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let legal = legal_config_for_gateway(state.as_ref());
+    if !legal.enabled || !legal.conflict_check_enabled {
+        return Err((
+            StatusCode::CONFLICT,
+            "Conflict reindex is disabled by legal policy".to_string(),
+        ));
+    }
+
+    let report = crate::legal::matter::reindex_conflict_graph(workspace.as_ref(), store, &legal)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+
+    record_legal_audit_event(
+        state.as_ref(),
+        "conflict_graph_reindexed",
+        state.user_id.as_str(),
+        None,
+        AuditSeverity::Info,
+        serde_json::json!({
+            "triggered_by": state.user_id.clone(),
+            "scanned_matters": report.scanned_matters,
+            "seeded_matters": report.seeded_matters,
+            "skipped_matters": report.skipped_matters,
+            "global_conflicts_seeded": report.global_conflicts_seeded,
+            "global_aliases_seeded": report.global_aliases_seeded,
+            "warning_count": report.warnings.len(),
+        }),
+    )
+    .await;
+
+    Ok(Json(MatterConflictGraphReindexResponse {
+        status: "ok",
+        report,
     }))
 }
 
@@ -2544,6 +5825,10 @@ async fn legal_audit_list_handler(
             "Legal audit logging is disabled".to_string(),
         ));
     }
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
 
     let limit = query.limit.unwrap_or(50);
     if limit == 0 || limit > 200 {
@@ -2561,102 +5846,46 @@ async fn legal_audit_list_handler(
             Some(trimmed.to_string())
         }
     });
-    let from_ts = parse_utc_query_ts("from", query.from.as_deref())?;
-    let to_ts = parse_utc_query_ts("to", query.to.as_deref())?;
+    let matter_id_filter = query.matter_id.as_ref().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    let severity_filter = parse_audit_severity_query(query.severity.as_deref())?;
+    // Keep backward compatibility with existing `from`/`to` query names.
+    let since_ts = parse_utc_query_ts("since", query.since.as_deref().or(query.from.as_deref()))?;
+    let until_ts = parse_utc_query_ts("until", query.until.as_deref().or(query.to.as_deref()))?;
 
-    if let (Some(from), Some(to)) = (from_ts, to_ts)
-        && from > to
+    if let (Some(since), Some(until)) = (since_ts, until_ts)
+        && since > until
     {
         return Err((
             StatusCode::BAD_REQUEST,
-            "'from' must be earlier than or equal to 'to'".to_string(),
+            "'since' must be earlier than or equal to 'until'".to_string(),
         ));
     }
 
-    let path = &legal.audit.path;
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Json(LegalAuditListResponse {
-                events: Vec::new(),
-                total: 0,
-                next_offset: None,
-                parse_errors: 0,
-                truncated: false,
-            }));
-        }
-        Err(err) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to open legal audit log {:?}: {}", path, err),
-            ));
-        }
+    let db_query = DbAuditEventQuery {
+        event_type: event_type_filter,
+        matter_id: matter_id_filter,
+        severity: severity_filter,
+        since: since_ts,
+        until: until_ts,
     };
-
-    let mut parse_errors = 0usize;
-    let mut truncated = false;
-    let mut filtered: Vec<LegalAuditEventInfo> = Vec::new();
-
-    for (idx, line_res) in BufReader::new(file).lines().enumerate() {
-        if idx >= MAX_AUDIT_SCAN_LINES {
-            truncated = true;
-            break;
-        }
-        let line_no = idx + 1;
-        let line = line_res.map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to read legal audit log {:?}: {}", path, err),
-            )
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let parsed: LegalAuditEventLine = match serde_json::from_str(&line) {
-            Ok(event) => event,
-            Err(_) => {
-                parse_errors += 1;
-                continue;
-            }
-        };
-        let ts = match DateTime::parse_from_rfc3339(&parsed.ts) {
-            Ok(ts) => ts.with_timezone(&Utc),
-            Err(_) => {
-                parse_errors += 1;
-                continue;
-            }
-        };
-
-        if let Some(ref wanted) = event_type_filter
-            && &parsed.event_type != wanted
-        {
-            continue;
-        }
-        if let Some(from) = from_ts
-            && ts < from
-        {
-            continue;
-        }
-        if let Some(to) = to_ts
-            && ts > to
-        {
-            continue;
-        }
-
-        filtered.push(LegalAuditEventInfo {
-            line_no,
-            ts: parsed.ts,
-            event_type: parsed.event_type,
-            details: parsed.details,
-            metrics: parsed.metrics,
-            prev_hash: parsed.prev_hash,
-            hash: parsed.hash,
-        });
-    }
-
-    let total = filtered.len();
-    let events: Vec<LegalAuditEventInfo> = filtered.into_iter().skip(offset).take(limit).collect();
+    let total = store
+        .count_audit_events(&state.user_id, &db_query)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let events = store
+        .list_audit_events(&state.user_id, &db_query, limit, offset)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .into_iter()
+        .map(audit_event_record_to_info)
+        .collect::<Vec<_>>();
     let next_offset = if offset + events.len() < total {
         Some(offset + events.len())
     } else {
@@ -2667,8 +5896,6 @@ async fn legal_audit_list_handler(
         events,
         total,
         next_offset,
-        parse_errors,
-        truncated,
     }))
 }
 
@@ -4262,9 +7489,6 @@ struct GatewayStatusResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::io::Write;
-
     use super::*;
     use regex::Regex;
 
@@ -4798,6 +8022,8 @@ mod tests {
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn matters_create_creates_scaffold_and_sets_active() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
         let state =
@@ -4815,6 +8041,8 @@ mod tests {
                 opened_at: Some("2024-03-15".to_string()),
                 team: vec!["Lead Counsel".to_string()],
                 adversaries: vec!["Foo LLC".to_string()],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -4873,6 +8101,12 @@ mod tests {
             stored.and_then(|v| v.as_str().map(|s| s.to_string())),
             Some("acme-v--foo".to_string())
         );
+        let events = crate::legal::audit::test_events_snapshot();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "matter_created")
+        );
     }
 
     #[cfg(feature = "libsql")]
@@ -4895,6 +8129,8 @@ mod tests {
                 opened_at: Some("2024-03-15".to_string()),
                 team: vec!["Lead Counsel".to_string()],
                 adversaries: vec!["Foo LLC".to_string()],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -4934,6 +8170,8 @@ mod tests {
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -4951,6 +8189,8 @@ mod tests {
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -4979,6 +8219,8 @@ mod tests {
                 opened_at: Some("03/15/2024".to_string()),
                 team: vec![],
                 adversaries: vec![],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -5007,6 +8249,8 @@ mod tests {
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -5036,6 +8280,8 @@ mod tests {
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
+                conflict_decision: None,
+                conflict_note: None,
             }),
         )
         .await
@@ -5047,7 +8293,385 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn intake_conflict_check_returns_structured_hits() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
+        let (db, _tmp) = crate::testing::test_db().await;
+        db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
+            .await
+            .expect("seed matter parties");
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = true;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let Json(resp) = matters_conflict_check_handler(
+            State(state),
+            Json(MatterIntakeConflictCheckRequest {
+                matter_id: "new-matter".to_string(),
+                client_names: vec!["Acme Corp".to_string()],
+                adversary_names: vec!["Other Party".to_string()],
+            }),
+        )
+        .await
+        .expect("intake conflict check should succeed");
+
+        assert!(resp.matched);
+        assert_eq!(resp.matter_id, "new-matter");
+        assert_eq!(resp.checked_parties.len(), 2);
+        assert!(!resp.hits.is_empty());
+        assert!(resp.hits.iter().any(|hit| hit.party == "Acme Corp"));
+
+        let events = crate::legal::audit::test_events_snapshot();
+        let intake_event = events
+            .iter()
+            .find(|event| event.event_type == "matter_intake_conflict_check")
+            .expect("expected intake conflict audit event");
+        assert_eq!(intake_event.details["matched"], true);
+        assert_eq!(intake_event.details["matter_id"], "new-matter");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn intake_conflict_check_rejects_empty_client_names() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let err = matters_conflict_check_handler(
+            State(state),
+            Json(MatterIntakeConflictCheckRequest {
+                matter_id: "new-matter".to_string(),
+                client_names: vec!["   ".to_string()],
+                adversary_names: vec![],
+            }),
+        )
+        .await
+        .expect_err("empty client list should fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("client_names"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn intake_conflict_check_rejects_excessive_client_names() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+        let client_names: Vec<String> = (0..=MAX_INTAKE_CONFLICT_PARTIES)
+            .map(|idx| format!("Client {idx}"))
+            .collect();
+
+        let err = matters_conflict_check_handler(
+            State(state),
+            Json(MatterIntakeConflictCheckRequest {
+                matter_id: "new-matter".to_string(),
+                client_names,
+                adversary_names: vec![],
+            }),
+        )
+        .await
+        .expect_err("oversized client list should fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("client_names"));
+        assert!(err.1.contains("at most"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn intake_conflict_check_respects_disabled_policy() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.conflict_check_enabled = false;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let err = matters_conflict_check_handler(
+            State(state),
+            Json(MatterIntakeConflictCheckRequest {
+                matter_id: "new-matter".to_string(),
+                client_names: vec!["Acme Corp".to_string()],
+                adversary_names: vec![],
+            }),
+        )
+        .await
+        .expect_err("disabled policy should reject");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("disabled"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conflicts_reindex_backfills_graph_and_emits_audit_event() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "matters/demo/matter.yaml",
+                r#"
+matter_id: demo
+client: Demo Client
+team:
+  - Lead Counsel
+confidentiality: attorney-client-privileged
+adversaries:
+  - Foo Industries
+retention: follow-firm-policy
+opened_at: 2026-02-28
+"#,
+            )
+            .await
+            .expect("seed matter metadata");
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Example Adverse Party","aliases":["Example Co"]}]"#,
+            )
+            .await
+            .expect("seed conflicts");
+
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+        let state = test_gateway_state_with_store_workspace_and_legal(
+            Arc::clone(&db),
+            Arc::clone(&workspace),
+            legal,
+        );
+
+        let Json(resp) = matters_conflicts_reindex_handler(State(state))
+            .await
+            .expect("reindex should succeed");
+
+        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.report.seeded_matters, 1);
+        assert_eq!(resp.report.global_conflicts_seeded, 1);
+        assert_eq!(resp.report.global_aliases_seeded, 1);
+
+        let alias_hits = db
+            .find_conflict_hits_for_names(&["Example Co".to_string()], 20)
+            .await
+            .expect("query seeded alias");
+        assert!(
+            alias_hits.iter().any(|hit| {
+                hit.matter_id == crate::legal::matter::GLOBAL_CONFLICT_GRAPH_MATTER_ID
+            })
+        );
+
+        let events = crate::legal::audit::test_events_snapshot();
+        assert!(events.iter().any(|event| {
+            event.event_type == "conflict_graph_reindexed"
+                && event.details["seeded_matters"] == 1
+                && event.details["global_conflicts_seeded"] == 1
+        }));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conflicts_reindex_respects_disabled_policy() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.conflict_check_enabled = false;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let err = matters_conflicts_reindex_handler(State(state))
+            .await
+            .expect_err("disabled policy should reject reindex");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("disabled"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_create_requires_conflict_decision_when_hits_exist() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
+            .await
+            .expect("seed matter parties");
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let err = matters_create_handler(
+            State(state),
+            Json(CreateMatterRequest {
+                matter_id: "new-matter".to_string(),
+                client: "Acme Corp".to_string(),
+                confidentiality: "privileged".to_string(),
+                retention: "policy".to_string(),
+                jurisdiction: None,
+                practice_area: None,
+                opened_at: None,
+                team: vec![],
+                adversaries: vec![],
+                conflict_decision: None,
+                conflict_note: None,
+            }),
+        )
+        .await
+        .expect_err("missing conflict decision should fail");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_str(&err.1).expect("conflict body should be json");
+        assert_eq!(body["conflict_required"], true);
+        assert!(body["hits"].as_array().is_some_and(|hits| !hits.is_empty()));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_create_declined_records_audit_and_blocks_creation() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
+        let (db, _tmp) = crate::testing::test_db().await;
+        db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
+            .await
+            .expect("seed matter parties");
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let err = matters_create_handler(
+            State(state),
+            Json(CreateMatterRequest {
+                matter_id: "new-matter".to_string(),
+                client: "Acme Corp".to_string(),
+                confidentiality: "privileged".to_string(),
+                retention: "policy".to_string(),
+                jurisdiction: None,
+                practice_area: None,
+                opened_at: None,
+                team: vec![],
+                adversaries: vec![],
+                conflict_decision: Some(ConflictDecision::Declined),
+                conflict_note: Some("Escalated to conflicts counsel".to_string()),
+            }),
+        )
+        .await
+        .expect_err("declined decision should block creation");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_str(&err.1).expect("declined body should be json");
+        assert_eq!(body["decision"], "declined");
+        let created = workspace.read("matters/new-matter/matter.yaml").await;
+        assert!(matches!(
+            created,
+            Err(crate::error::WorkspaceError::DocumentNotFound { .. })
+        ));
+
+        let events = crate::legal::audit::test_events_snapshot();
+        let decision_event = events
+            .iter()
+            .find(|event| event.event_type == "conflict_clearance_decision")
+            .expect("expected conflict_clearance_decision event");
+        assert_eq!(decision_event.details["decision"], "declined");
+        assert_eq!(decision_event.details["source"], "create_flow");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_create_waived_records_and_proceeds() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
+        let (db, _tmp) = crate::testing::test_db().await;
+        db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
+            .await
+            .expect("seed matter parties");
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let (status, Json(resp)) = matters_create_handler(
+            State(state),
+            Json(CreateMatterRequest {
+                matter_id: "new-matter".to_string(),
+                client: "Acme Corp".to_string(),
+                confidentiality: "privileged".to_string(),
+                retention: "policy".to_string(),
+                jurisdiction: None,
+                practice_area: None,
+                opened_at: Some("2026-02-28".to_string()),
+                team: vec![],
+                adversaries: vec!["Other Party".to_string()],
+                conflict_decision: Some(ConflictDecision::Waived),
+                conflict_note: Some("Waived after documented informed consent".to_string()),
+            }),
+        )
+        .await
+        .expect("waived decision should allow creation");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.matter.id, "new-matter");
+        workspace
+            .read("matters/new-matter/matter.yaml")
+            .await
+            .expect("matter yaml should exist");
+
+        let hits = db
+            .find_conflict_hits_for_names(&["Acme Corp".to_string()], 20)
+            .await
+            .expect("conflict search should succeed");
+        assert!(
+            hits.iter().any(|hit| hit.matter_id == "new-matter"),
+            "seed_matter_parties should register new matter parties"
+        );
+
+        let events = crate::legal::audit::test_events_snapshot();
+        assert!(events.iter().any(|event| {
+            event.event_type == "conflict_clearance_decision"
+                && event.details["decision"] == "waived"
+        }));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_create_rejects_excessive_adversaries() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+        let adversaries: Vec<String> = (0..=MAX_INTAKE_CONFLICT_PARTIES)
+            .map(|idx| format!("Adverse Party {idx}"))
+            .collect();
+
+        let err = matters_create_handler(
+            State(state),
+            Json(CreateMatterRequest {
+                matter_id: "new-matter".to_string(),
+                client: "Acme Corp".to_string(),
+                confidentiality: "privileged".to_string(),
+                retention: "policy".to_string(),
+                jurisdiction: None,
+                practice_area: None,
+                opened_at: None,
+                team: vec![],
+                adversaries,
+                conflict_decision: None,
+                conflict_note: None,
+            }),
+        )
+        .await
+        .expect_err("oversized adversary list should fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("adversaries"));
+        assert!(err.1.contains("at most"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     async fn conflicts_check_returns_hit_for_matching_entry() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
         crate::legal::matter::reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
@@ -5061,6 +8685,7 @@ mod tests {
 
         let mut legal = test_legal_config();
         legal.enabled = true;
+        legal.require_matter_context = false;
         legal.conflict_check_enabled = true;
         let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
 
@@ -5076,6 +8701,105 @@ mod tests {
 
         assert!(resp.matched);
         assert_eq!(resp.conflict.as_deref(), Some("Alpha Holdings"));
+        assert!(
+            resp.hits.is_empty(),
+            "legacy file fallback should not return db hits"
+        );
+
+        let events = crate::legal::audit::test_events_snapshot();
+        let event = events
+            .iter()
+            .find(|entry| {
+                entry.event_type == "matter_conflict_check"
+                    && entry.details.get("source").and_then(|v| v.as_str())
+                        == Some("manual_text_check")
+                    && entry.details.get("conflict").and_then(|v| v.as_str())
+                        == Some("Alpha Holdings")
+            })
+            .expect("expected manual conflict check audit event");
+        assert_eq!(event.details["matched"], true);
+        assert_eq!(event.details["conflict"], "Alpha Holdings");
+        assert_eq!(event.details["source"], "manual_text_check");
+        assert!(
+            event.details["text_preview"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(events.iter().any(|entry| {
+            entry.event_type == "conflict_detected"
+                && entry.details.get("source").and_then(|v| v.as_str()) == Some("manual_text_check")
+        }));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conflicts_check_returns_db_hits_context() {
+        crate::legal::matter::reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
+            .await
+            .expect("seed matter parties");
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = true;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let Json(resp) = matters_conflicts_check_handler(
+            State(state),
+            Json(MatterConflictCheckRequest {
+                text: "Please analyze exposure for Acme Corp".to_string(),
+                matter_id: None,
+            }),
+        )
+        .await
+        .expect("conflicts check should succeed");
+
+        assert!(resp.matched);
+        assert_eq!(resp.conflict.as_deref(), Some("Acme Corp"));
+        assert!(!resp.hits.is_empty());
+        assert!(
+            resp.hits
+                .iter()
+                .any(|hit| hit.matter_id == "existing-matter")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conflicts_check_skips_file_fallback_when_db_authoritative_mode_enabled() {
+        crate::legal::matter::reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "conflicts.json",
+                r#"[{"name":"Fallback Party","aliases":["Fallback Co"]}]"#,
+            )
+            .await
+            .expect("seed fallback conflicts");
+
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = false;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let Json(resp) = matters_conflicts_check_handler(
+            State(state),
+            Json(MatterConflictCheckRequest {
+                text: "Review communications with Fallback Party".to_string(),
+                matter_id: None,
+            }),
+        )
+        .await
+        .expect("manual conflict check should succeed");
+
+        assert!(!resp.matched);
+        assert!(resp.conflict.is_none());
+        assert!(resp.hits.is_empty());
     }
 
     #[cfg(feature = "libsql")]
@@ -5126,25 +8850,47 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn conflicts_check_requires_active_matter_when_policy_enabled() {
+        crate::legal::matter::reset_conflict_cache_for_tests();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let mut legal = test_legal_config();
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+        legal.require_matter_context = true;
+        legal.active_matter = None;
+        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+
+        let err = matters_conflicts_check_handler(
+            State(state),
+            Json(MatterConflictCheckRequest {
+                text: "Alpha".to_string(),
+                matter_id: None,
+            }),
+        )
+        .await
+        .expect_err("missing matter context should fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("Active matter"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     async fn legal_audit_list_returns_empty_when_missing() {
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
-        let dir = tempfile::tempdir().expect("tempdir");
-
         let mut legal = test_legal_config();
         legal.audit.enabled = true;
-        legal.audit.path = dir.path().join("missing-audit.jsonl");
         let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
 
         let Json(resp) = legal_audit_list_handler(State(state), Query(LegalAuditQuery::default()))
             .await
-            .expect("missing file should not error");
+            .expect("empty DB list should not error");
 
         assert!(resp.events.is_empty());
         assert_eq!(resp.total, 0);
         assert_eq!(resp.next_offset, None);
-        assert_eq!(resp.parse_errors, 0);
-        assert!(!resp.truncated);
     }
 
     #[cfg(feature = "libsql")]
@@ -5152,44 +8898,45 @@ mod tests {
     async fn legal_audit_list_supports_filters_and_paging() {
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("audit.jsonl");
-
-        let mut file = fs::File::create(&path).expect("create audit file");
-        writeln!(
-            file,
-            r#"{{"ts":"2026-01-01T00:00:00Z","event_type":"prompt_received","details":{{}},"metrics":{{}}}}"#
-        )
-        .expect("write line");
-        writeln!(
-            file,
-            r#"{{"ts":"2026-01-02T00:00:00Z","event_type":"approval_required","details":{{"id":1}},"metrics":{{"approval_required":1}}}}"#
-        )
-        .expect("write line");
-        writeln!(
-            file,
-            r#"{{"ts":"2026-01-03T00:00:00Z","event_type":"approval_required","details":{{"id":2}},"metrics":{{"approval_required":2}}}}"#
-        )
-        .expect("write line");
-        writeln!(
-            file,
-            r#"{{"ts":"2026-01-04T00:00:00Z","event_type":"approval_required","details":{{"id":3}},"metrics":{{"approval_required":3}}}}"#
-        )
-        .expect("write line");
 
         let mut legal = test_legal_config();
         legal.audit.enabled = true;
-        legal.audit.path = path;
-        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
+        let state =
+            test_gateway_state_with_store_workspace_and_legal(Arc::clone(&db), workspace, legal);
+        let store = state.store.as_ref().expect("store should exist");
+        for idx in 1..=4 {
+            let severity = if idx % 2 == 0 {
+                crate::db::AuditSeverity::Warn
+            } else {
+                crate::db::AuditSeverity::Info
+            };
+            store
+                .append_audit_event(
+                    &state.user_id,
+                    &crate::db::AppendAuditEventParams {
+                        event_type: "approval_required".to_string(),
+                        actor: "gateway".to_string(),
+                        matter_id: Some("demo".to_string()),
+                        severity,
+                        details: serde_json::json!({ "id": idx }),
+                    },
+                )
+                .await
+                .expect("append audit event");
+        }
 
         let Json(resp) = legal_audit_list_handler(
-            State(state),
+            State(Arc::clone(&state)),
             Query(LegalAuditQuery {
                 limit: Some(1),
                 offset: Some(0),
                 event_type: Some("approval_required".to_string()),
-                from: Some("2026-01-02T00:00:00Z".to_string()),
-                to: Some("2026-01-03T23:59:59Z".to_string()),
+                matter_id: Some("demo".to_string()),
+                severity: Some("warn".to_string()),
+                since: None,
+                until: None,
+                from: None,
+                to: None,
             }),
         )
         .await
@@ -5198,43 +8945,72 @@ mod tests {
         assert_eq!(resp.total, 2);
         assert_eq!(resp.events.len(), 1);
         assert_eq!(resp.next_offset, Some(1));
-        assert_eq!(resp.events[0].line_no, 2);
         assert_eq!(resp.events[0].event_type, "approval_required");
+        assert_eq!(resp.events[0].matter_id.as_deref(), Some("demo"));
+        assert_eq!(resp.events[0].severity, "warn");
     }
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
-    async fn legal_audit_list_tracks_parse_errors() {
+    async fn legal_audit_list_filters_since_until() {
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("audit.jsonl");
-
-        let mut file = fs::File::create(&path).expect("create audit file");
-        writeln!(
-            file,
-            r#"{{"ts":"2026-01-01T00:00:00Z","event_type":"prompt_received","details":{{}},"metrics":{{}}}}"#
-        )
-        .expect("write valid line");
-        writeln!(file, "not-json").expect("write invalid json line");
-        writeln!(
-            file,
-            r#"{{"ts":"not-a-timestamp","event_type":"prompt_received","details":{{}},"metrics":{{}}}}"#
-        )
-        .expect("write invalid ts line");
 
         let mut legal = test_legal_config();
         legal.audit.enabled = true;
-        legal.audit.path = path;
-        let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
-
-        let Json(resp) = legal_audit_list_handler(State(state), Query(LegalAuditQuery::default()))
+        let state =
+            test_gateway_state_with_store_workspace_and_legal(Arc::clone(&db), workspace, legal);
+        let store = state.store.as_ref().expect("store should exist");
+        store
+            .append_audit_event(
+                &state.user_id,
+                &crate::db::AppendAuditEventParams {
+                    event_type: "matter_created".to_string(),
+                    actor: "gateway".to_string(),
+                    matter_id: Some("demo".to_string()),
+                    severity: crate::db::AuditSeverity::Info,
+                    details: serde_json::json!({ "step": 1 }),
+                },
+            )
             .await
-            .expect("audit list should succeed");
+            .expect("append");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let checkpoint = Utc::now().to_rfc3339();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        store
+            .append_audit_event(
+                &state.user_id,
+                &crate::db::AppendAuditEventParams {
+                    event_type: "matter_closed".to_string(),
+                    actor: "gateway".to_string(),
+                    matter_id: Some("demo".to_string()),
+                    severity: crate::db::AuditSeverity::Critical,
+                    details: serde_json::json!({ "step": 2 }),
+                },
+            )
+            .await
+            .expect("append");
+
+        let Json(resp) = legal_audit_list_handler(
+            State(state),
+            Query(LegalAuditQuery {
+                limit: Some(50),
+                offset: Some(0),
+                event_type: None,
+                matter_id: Some("demo".to_string()),
+                severity: None,
+                since: Some(checkpoint),
+                until: None,
+                from: None,
+                to: None,
+            }),
+        )
+        .await
+        .expect("audit list should succeed");
 
         assert_eq!(resp.total, 1);
         assert_eq!(resp.events.len(), 1);
-        assert_eq!(resp.parse_errors, 2);
+        assert_eq!(resp.events[0].event_type, "matter_closed");
     }
 
     #[cfg(feature = "libsql")]
@@ -5394,6 +9170,75 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn documents_generate_creates_matter_link_and_version() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        // Ensure matter + client rows exist for docgen context.
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+
+        let Json(templates_resp) =
+            matter_templates_handler(State(Arc::clone(&state)), Path("demo".to_string()))
+                .await
+                .expect("templates request should succeed");
+        let template_id = templates_resp
+            .templates
+            .iter()
+            .find(|template| template.name == "chronology.md")
+            .and_then(|template| template.id.clone())
+            .expect("template id should exist");
+
+        let (status, Json(resp)) = documents_generate_handler(
+            State(Arc::clone(&state)),
+            Json(GenerateDocumentRequest {
+                template_id,
+                matter_id: "demo".to_string(),
+                extra: serde_json::json!({ "event": "hearing" }),
+                display_name: Some("Chronology Draft".to_string()),
+                category: Some("internal".to_string()),
+                label: Some("draft".to_string()),
+            }),
+        )
+        .await
+        .expect("generate request should succeed");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(resp.path.starts_with("matters/demo/drafts/chronology-"));
+
+        let generated = workspace
+            .read(&resp.path)
+            .await
+            .expect("generated doc exists");
+        assert!(
+            generated.content.contains("# Chronology Template"),
+            "rendered content should contain template body"
+        );
+
+        let matter_docs = db
+            .list_matter_documents_db("test-user", "demo")
+            .await
+            .expect("matter documents query");
+        let linked = matter_docs
+            .iter()
+            .find(|doc| doc.id.to_string() == resp.matter_document_id)
+            .expect("generated link should exist");
+        assert_eq!(linked.display_name, "Chronology Draft");
+
+        let versions = db
+            .list_document_versions("test-user", linked.id)
+            .await
+            .expect("document versions query");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].label, "draft");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     async fn matter_deadlines_handler_parses_calendar_rows() {
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
@@ -5431,6 +9276,146 @@ mod tests {
             resp.deadlines[2].source.as_deref(),
             Some("scheduling order")
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_deadlines_db_entries_prefer_over_workspace_calendar() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        workspace
+            .write(
+                "matters/demo/deadlines/calendar.md",
+                "| Date | Deadline / Event | Owner | Status | Source |\n|---|---|---|---|---|\n| 2030-01-01 | Legacy calendar row | Team | open | file |\n",
+            )
+            .await
+            .expect("seed legacy calendar");
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let due_at = (Utc::now() + chrono::TimeDelta::days(7)).to_rfc3339();
+        let (status, Json(created)) = matter_deadlines_create_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Json(CreateMatterDeadlineRequest {
+                title: "File opposition brief".to_string(),
+                deadline_type: "filing".to_string(),
+                due_at: due_at.clone(),
+                completed_at: None,
+                reminder_days: vec![3],
+                rule_ref: Some("FRCP 56(c)(1)".to_string()),
+                computed_from: None,
+                task_id: None,
+            }),
+        )
+        .await
+        .expect("create deadline should succeed");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.title, "File opposition brief");
+
+        let Json(resp) = matter_deadlines_handler(State(state), Path("demo".to_string()))
+            .await
+            .expect("deadlines handler should succeed");
+        assert_eq!(resp.deadlines.len(), 1);
+        assert_eq!(resp.deadlines[0].title, "File opposition brief");
+        assert_eq!(resp.deadlines[0].source.as_deref(), Some("FRCP 56(c)(1)"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn legal_court_rules_and_compute_deadline() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+        let Json(rules_resp) = legal_court_rules_handler()
+            .await
+            .expect("rules handler should succeed");
+        assert!(rules_resp.rules.iter().any(|rule| rule.id == "frcp_12_a_1"));
+
+        let Json(computed) = matter_deadlines_compute_handler(
+            State(state),
+            Path("demo".to_string()),
+            Json(MatterDeadlineComputeRequest {
+                rule_id: "frcp_12_a_1".to_string(),
+                trigger_date: "2026-03-02".to_string(),
+                title: Some("Response due".to_string()),
+                reminder_days: vec![7, 3],
+                computed_from: None,
+                task_id: None,
+            }),
+        )
+        .await
+        .expect("compute handler should succeed");
+        assert_eq!(computed.rule.id, "frcp_12_a_1");
+        assert!(
+            computed.deadline.due_at.starts_with("2026-03-23T"),
+            "unexpected due_at {}",
+            computed.deadline.due_at
+        );
+        assert_eq!(computed.deadline.reminder_days, vec![3, 7]);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_deadline_delete_disables_reminder_routines() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let due_at = (Utc::now() + chrono::TimeDelta::days(10)).to_rfc3339();
+        let (_status, Json(created)) = matter_deadlines_create_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Json(CreateMatterDeadlineRequest {
+                title: "Serve discovery requests".to_string(),
+                deadline_type: "discovery_cutoff".to_string(),
+                due_at,
+                completed_at: None,
+                reminder_days: vec![1, 3],
+                rule_ref: None,
+                computed_from: None,
+                task_id: None,
+            }),
+        )
+        .await
+        .expect("create deadline should succeed");
+
+        let deadline_id = Uuid::parse_str(&created.id).expect("deadline uuid");
+        let prefix = deadline_reminder_prefix("demo", deadline_id);
+
+        let before_delete = db
+            .list_routines("test-user")
+            .await
+            .expect("list routines before delete");
+        let active_count = before_delete
+            .iter()
+            .filter(|routine| routine.name.starts_with(&prefix) && routine.enabled)
+            .count();
+        assert_eq!(active_count, 2);
+
+        let status = matter_deadlines_delete_handler(
+            State(state),
+            Path(("demo".to_string(), created.id.clone())),
+        )
+        .await
+        .expect("delete deadline should succeed");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let after_delete = db
+            .list_routines("test-user")
+            .await
+            .expect("list routines after delete");
+        let routines: Vec<_> = after_delete
+            .into_iter()
+            .filter(|routine| routine.name.starts_with(&prefix))
+            .collect();
+        assert_eq!(routines.len(), 2);
+        assert!(routines.iter().all(|routine| !routine.enabled));
     }
 
     #[cfg(feature = "libsql")]
@@ -5554,6 +9539,813 @@ mod tests {
             }))
             .expect("missing matter root should be treated as empty");
         assert!(entries.is_empty());
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn invoices_finalize_marks_entries_billed_and_supports_trust_payment() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        let time_entry = store
+            .create_time_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateTimeEntryParams {
+                    timekeeper: "Lead".to_string(),
+                    description: "Motion draft".to_string(),
+                    hours: rust_decimal::Decimal::new(150, 2),
+                    hourly_rate: Some(rust_decimal::Decimal::new(20000, 2)),
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("valid date"),
+                    billable: true,
+                },
+            )
+            .await
+            .expect("seed time entry");
+        let expense_entry = store
+            .create_expense_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateExpenseEntryParams {
+                    submitted_by: "Lead".to_string(),
+                    description: "Filing fee".to_string(),
+                    amount: rust_decimal::Decimal::new(4000, 2),
+                    category: crate::db::ExpenseCategory::FilingFee,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("valid date"),
+                    receipt_path: None,
+                    billable: true,
+                },
+            )
+            .await
+            .expect("seed expense entry");
+
+        let (created_status, Json(created)) = invoices_save_handler(
+            State(Arc::clone(&state)),
+            Json(DraftInvoiceRequest {
+                matter_id: "demo".to_string(),
+                invoice_number: "INV-1001".to_string(),
+                due_date: Some("2026-05-30".to_string()),
+                notes: Some("Initial billing cycle".to_string()),
+            }),
+        )
+        .await
+        .expect("save draft should succeed");
+        assert_eq!(created_status, StatusCode::CREATED);
+        assert_eq!(created.invoice.status, "draft");
+        assert_eq!(created.line_items.len(), 2);
+        let invoice_id = created.invoice.id.clone();
+
+        let Json(finalized) =
+            invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
+                .await
+                .expect("finalize should succeed");
+        assert_eq!(finalized.invoice.status, "sent");
+
+        let invoice_uuid = Uuid::parse_str(&invoice_id).expect("invoice uuid");
+        let time_after = store
+            .get_time_entry(&state.user_id, "demo", time_entry.id)
+            .await
+            .expect("get time entry")
+            .expect("time entry exists");
+        let expense_after = store
+            .get_expense_entry(&state.user_id, "demo", expense_entry.id)
+            .await
+            .expect("get expense entry")
+            .expect("expense entry exists");
+        let invoice_id_str = invoice_uuid.to_string();
+        assert_eq!(
+            time_after.billed_invoice_id.as_deref(),
+            Some(invoice_id_str.as_str())
+        );
+        assert_eq!(
+            expense_after.billed_invoice_id.as_deref(),
+            Some(invoice_id_str.as_str())
+        );
+
+        let (deposit_status, _deposit_body) = matter_trust_deposit_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Json(TrustDepositRequest {
+                amount: "500.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                description: Some("Retainer deposit".to_string()),
+            }),
+        )
+        .await
+        .expect("trust deposit should succeed");
+        assert_eq!(deposit_status, StatusCode::CREATED);
+
+        let Json(payment) = invoices_payment_handler(
+            State(Arc::clone(&state)),
+            Path(invoice_id.clone()),
+            Json(RecordInvoicePaymentRequest {
+                amount: "50.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                draw_from_trust: true,
+                description: Some("Apply trust funds".to_string()),
+            }),
+        )
+        .await
+        .expect("payment should succeed");
+        let paid = payment
+            .invoice
+            .paid_amount
+            .parse::<rust_decimal::Decimal>()
+            .expect("paid amount should parse");
+        assert_eq!(paid, rust_decimal::Decimal::new(5000, 2));
+        assert!(payment.trust_entry.is_some());
+
+        let Json(ledger) = matter_trust_ledger_handler(State(state), Path("demo".to_string()))
+            .await
+            .expect("ledger should load");
+        let balance = ledger
+            .balance
+            .parse::<rust_decimal::Decimal>()
+            .expect("balance should parse");
+        assert_eq!(balance, rust_decimal::Decimal::new(45000, 2));
+        assert_eq!(ledger.entries.len(), 2);
+
+        let events = crate::legal::audit::test_events_snapshot();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "invoice_finalized")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "payment_recorded")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "trust_deposit")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn invoices_payment_rejects_trust_overdraw() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        store
+            .create_expense_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateExpenseEntryParams {
+                    submitted_by: "Lead".to_string(),
+                    description: "Service fee".to_string(),
+                    amount: rust_decimal::Decimal::new(10000, 2),
+                    category: crate::db::ExpenseCategory::Other,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 2).expect("valid date"),
+                    receipt_path: None,
+                    billable: true,
+                },
+            )
+            .await
+            .expect("seed expense entry");
+
+        let (_status, Json(created)) = invoices_save_handler(
+            State(Arc::clone(&state)),
+            Json(DraftInvoiceRequest {
+                matter_id: "demo".to_string(),
+                invoice_number: "INV-2001".to_string(),
+                due_date: Some("2026-06-01".to_string()),
+                notes: None,
+            }),
+        )
+        .await
+        .expect("save draft should succeed");
+        let _ =
+            invoices_finalize_handler(State(Arc::clone(&state)), Path(created.invoice.id.clone()))
+                .await
+                .expect("finalize should succeed");
+
+        let (_deposit_status, _deposit_body) = matter_trust_deposit_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Json(TrustDepositRequest {
+                amount: "10.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                description: Some("Small deposit".to_string()),
+            }),
+        )
+        .await
+        .expect("trust deposit should succeed");
+
+        let result = invoices_payment_handler(
+            State(state),
+            Path(created.invoice.id),
+            Json(RecordInvoicePaymentRequest {
+                amount: "20.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                draw_from_trust: true,
+                description: Some("Attempt overdraw".to_string()),
+            }),
+        )
+        .await;
+        let err = result.expect_err("overdraw payment should fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("insufficient"));
+        let events = crate::legal::audit::test_events_snapshot();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "trust_withdrawal_rejected")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn invoices_payment_rejects_draft_invoice_status() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        store
+            .create_expense_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateExpenseEntryParams {
+                    submitted_by: "Lead".to_string(),
+                    description: "Draft-only charge".to_string(),
+                    amount: rust_decimal::Decimal::new(10000, 2),
+                    category: crate::db::ExpenseCategory::Other,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 6).expect("valid date"),
+                    receipt_path: None,
+                    billable: true,
+                },
+            )
+            .await
+            .expect("seed expense entry");
+
+        let (_status, Json(created)) = invoices_save_handler(
+            State(Arc::clone(&state)),
+            Json(DraftInvoiceRequest {
+                matter_id: "demo".to_string(),
+                invoice_number: "INV-DRAFT-100".to_string(),
+                due_date: Some("2026-06-06".to_string()),
+                notes: None,
+            }),
+        )
+        .await
+        .expect("save draft should succeed");
+
+        let err = invoices_payment_handler(
+            State(Arc::clone(&state)),
+            Path(created.invoice.id.clone()),
+            Json(RecordInvoicePaymentRequest {
+                amount: "25.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                draw_from_trust: false,
+                description: Some("Should fail on draft".to_string()),
+            }),
+        )
+        .await
+        .expect_err("payment on draft invoice should fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("status 'draft'"));
+
+        let invoice_after = store
+            .get_invoice(
+                &state.user_id,
+                Uuid::parse_str(&created.invoice.id).expect("invoice uuid"),
+            )
+            .await
+            .expect("load invoice")
+            .expect("invoice exists");
+        assert_eq!(invoice_after.status, crate::db::InvoiceStatus::Draft);
+        assert_eq!(invoice_after.paid_amount, rust_decimal::Decimal::ZERO);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn invoices_payment_rejects_amount_above_remaining_balance() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        store
+            .create_expense_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateExpenseEntryParams {
+                    submitted_by: "Lead".to_string(),
+                    description: "Large service".to_string(),
+                    amount: rust_decimal::Decimal::new(10000, 2),
+                    category: crate::db::ExpenseCategory::Other,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 8).expect("valid date"),
+                    receipt_path: None,
+                    billable: true,
+                },
+            )
+            .await
+            .expect("seed expense entry");
+
+        let (_status, Json(created)) = invoices_save_handler(
+            State(Arc::clone(&state)),
+            Json(DraftInvoiceRequest {
+                matter_id: "demo".to_string(),
+                invoice_number: "INV-REM-100".to_string(),
+                due_date: Some("2026-06-08".to_string()),
+                notes: None,
+            }),
+        )
+        .await
+        .expect("save draft should succeed");
+        let invoice_id = created.invoice.id.clone();
+        let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
+            .await
+            .expect("finalize should succeed");
+
+        let _ = invoices_payment_handler(
+            State(Arc::clone(&state)),
+            Path(invoice_id.clone()),
+            Json(RecordInvoicePaymentRequest {
+                amount: "60.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                draw_from_trust: false,
+                description: Some("Initial partial payment".to_string()),
+            }),
+        )
+        .await
+        .expect("first payment should succeed");
+
+        let err = invoices_payment_handler(
+            State(Arc::clone(&state)),
+            Path(invoice_id.clone()),
+            Json(RecordInvoicePaymentRequest {
+                amount: "50.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                draw_from_trust: false,
+                description: Some("Should exceed remaining".to_string()),
+            }),
+        )
+        .await
+        .expect_err("payment above remaining should fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("exceeds remaining balance"));
+
+        let invoice_after = store
+            .get_invoice(
+                &state.user_id,
+                Uuid::parse_str(&invoice_id).expect("invoice uuid"),
+            )
+            .await
+            .expect("load invoice")
+            .expect("invoice exists");
+        assert_eq!(
+            invoice_after.paid_amount,
+            rust_decimal::Decimal::new(6000, 2)
+        );
+        assert_eq!(invoice_after.status, crate::db::InvoiceStatus::Sent);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn invoices_void_rejects_paid_invoice_status() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        store
+            .create_expense_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateExpenseEntryParams {
+                    submitted_by: "Lead".to_string(),
+                    description: "Payable service".to_string(),
+                    amount: rust_decimal::Decimal::new(10000, 2),
+                    category: crate::db::ExpenseCategory::Other,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 7).expect("valid date"),
+                    receipt_path: None,
+                    billable: true,
+                },
+            )
+            .await
+            .expect("seed expense entry");
+
+        let (_status, Json(created)) = invoices_save_handler(
+            State(Arc::clone(&state)),
+            Json(DraftInvoiceRequest {
+                matter_id: "demo".to_string(),
+                invoice_number: "INV-PAID-100".to_string(),
+                due_date: Some("2026-06-07".to_string()),
+                notes: None,
+            }),
+        )
+        .await
+        .expect("save draft should succeed");
+
+        let invoice_id = created.invoice.id.clone();
+        let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
+            .await
+            .expect("finalize should succeed");
+
+        let _ = invoices_payment_handler(
+            State(Arc::clone(&state)),
+            Path(invoice_id.clone()),
+            Json(RecordInvoicePaymentRequest {
+                amount: "100.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                draw_from_trust: false,
+                description: Some("Mark paid".to_string()),
+            }),
+        )
+        .await
+        .expect("payment should succeed");
+
+        let err = invoices_void_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
+            .await
+            .expect_err("void on paid invoice should fail");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("status 'paid'"));
+
+        let invoice_after = store
+            .get_invoice(
+                &state.user_id,
+                Uuid::parse_str(&invoice_id).expect("invoice uuid"),
+            )
+            .await
+            .expect("load invoice")
+            .expect("invoice exists");
+        assert_eq!(invoice_after.status, crate::db::InvoiceStatus::Paid);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn trust_deposits_concurrently_update_balance_atomically() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist").clone();
+        let user_id = state.user_id.clone();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let barrier_a = Arc::clone(&barrier);
+        let store_a = Arc::clone(&store);
+        let user_a = user_id.clone();
+        let task_a = tokio::spawn(async move {
+            barrier_a.wait().await;
+            crate::legal::billing::record_trust_deposit(
+                store_a.as_ref(),
+                &user_a,
+                "demo",
+                rust_decimal::Decimal::new(5000, 2),
+                "Lead A",
+                "Concurrent deposit A",
+            )
+            .await
+        });
+
+        let barrier_b = Arc::clone(&barrier);
+        let store_b = Arc::clone(&store);
+        let user_b = user_id.clone();
+        let task_b = tokio::spawn(async move {
+            barrier_b.wait().await;
+            crate::legal::billing::record_trust_deposit(
+                store_b.as_ref(),
+                &user_b,
+                "demo",
+                rust_decimal::Decimal::new(5000, 2),
+                "Lead B",
+                "Concurrent deposit B",
+            )
+            .await
+        });
+
+        barrier.wait().await;
+        let entry_a = task_a
+            .await
+            .expect("task A should join")
+            .expect("deposit A should succeed");
+        let entry_b = task_b
+            .await
+            .expect("task B should join")
+            .expect("deposit B should succeed");
+
+        let mut balances = vec![entry_a.balance_after, entry_b.balance_after];
+        balances.sort();
+        assert_eq!(
+            balances,
+            vec![
+                rust_decimal::Decimal::new(5000, 2),
+                rust_decimal::Decimal::new(10000, 2)
+            ]
+        );
+
+        let balance = store
+            .current_trust_balance(&state.user_id, "demo")
+            .await
+            .expect("read balance");
+        assert_eq!(balance, rust_decimal::Decimal::new(10000, 2));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_time_create_rejects_non_positive_hours() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+
+        let result = matter_time_create_handler(
+            State(state),
+            Path("demo".to_string()),
+            Json(CreateTimeEntryRequest {
+                timekeeper: "Paralegal".to_string(),
+                description: "Prepare draft".to_string(),
+                hours: "0".to_string(),
+                hourly_rate: Some("200".to_string()),
+                entry_date: "2026-04-10".to_string(),
+                billable: Some(true),
+            }),
+        )
+        .await;
+
+        let err = result.expect_err("zero-hour time entry should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("'hours' must be greater than 0"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_expense_create_rejects_non_positive_amount() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+
+        let result = matter_expenses_create_handler(
+            State(state),
+            Path("demo".to_string()),
+            Json(CreateExpenseEntryRequest {
+                submitted_by: "Associate".to_string(),
+                description: "Filing fee".to_string(),
+                amount: "0".to_string(),
+                category: "filing_fee".to_string(),
+                entry_date: "2026-04-10".to_string(),
+                receipt_path: None,
+                billable: Some(true),
+            }),
+        )
+        .await;
+
+        let err = result.expect_err("zero-amount expense entry should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("'amount' must be greater than 0"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_time_delete_rejects_billed_entry() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        let billed_entry = store
+            .create_time_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateTimeEntryParams {
+                    timekeeper: "Lead".to_string(),
+                    description: "Billed work".to_string(),
+                    hours: rust_decimal::Decimal::new(150, 2),
+                    hourly_rate: Some(rust_decimal::Decimal::new(30000, 2)),
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 9).expect("valid date"),
+                    billable: true,
+                },
+            )
+            .await
+            .expect("create billed seed entry");
+        let unbilled_entry = store
+            .create_time_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateTimeEntryParams {
+                    timekeeper: "Lead".to_string(),
+                    description: "Unbilled work".to_string(),
+                    hours: rust_decimal::Decimal::new(50, 2),
+                    hourly_rate: Some(rust_decimal::Decimal::new(30000, 2)),
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 10).expect("valid date"),
+                    billable: true,
+                },
+            )
+            .await
+            .expect("create unbilled seed entry");
+
+        let marked = store
+            .mark_time_entries_billed(&state.user_id, &[billed_entry.id], "inv-1001")
+            .await
+            .expect("mark billed entry");
+        assert_eq!(marked, 1);
+
+        let billed_after = store
+            .get_time_entry(&state.user_id, "demo", billed_entry.id)
+            .await
+            .expect("load billed entry")
+            .expect("billed entry should exist");
+        let unbilled_after = store
+            .get_time_entry(&state.user_id, "demo", unbilled_entry.id)
+            .await
+            .expect("load unbilled entry")
+            .expect("unbilled entry should exist");
+        assert_eq!(billed_after.billed_invoice_id.as_deref(), Some("inv-1001"));
+        assert!(unbilled_after.billed_invoice_id.is_none());
+
+        let billed_delete = matter_time_delete_handler(
+            State(Arc::clone(&state)),
+            Path(("demo".to_string(), billed_entry.id.to_string())),
+        )
+        .await;
+        let err = billed_delete.expect_err("billed entry should not be deletable");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("billed"));
+
+        let unbilled_delete = matter_time_delete_handler(
+            State(state),
+            Path(("demo".to_string(), unbilled_entry.id.to_string())),
+        )
+        .await
+        .expect("unbilled entry should be deletable");
+        assert_eq!(unbilled_delete, StatusCode::NO_CONTENT);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_time_summary_aggregates_hours_and_expenses() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        let time_one = store
+            .create_time_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateTimeEntryParams {
+                    timekeeper: "Lead".to_string(),
+                    description: "Billable review".to_string(),
+                    hours: rust_decimal::Decimal::new(150, 2),
+                    hourly_rate: Some(rust_decimal::Decimal::new(35000, 2)),
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 11).expect("valid date"),
+                    billable: true,
+                },
+            )
+            .await
+            .expect("create first time entry");
+        store
+            .create_time_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateTimeEntryParams {
+                    timekeeper: "Paralegal".to_string(),
+                    description: "Internal prep".to_string(),
+                    hours: rust_decimal::Decimal::new(50, 2),
+                    hourly_rate: None,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 11).expect("valid date"),
+                    billable: false,
+                },
+            )
+            .await
+            .expect("create second time entry");
+        let expense_one = store
+            .create_expense_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateExpenseEntryParams {
+                    submitted_by: "Lead".to_string(),
+                    description: "Court filing fee".to_string(),
+                    amount: rust_decimal::Decimal::new(10000, 2),
+                    category: crate::db::ExpenseCategory::FilingFee,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 11).expect("valid date"),
+                    receipt_path: None,
+                    billable: true,
+                },
+            )
+            .await
+            .expect("create first expense entry");
+        store
+            .create_expense_entry(
+                &state.user_id,
+                "demo",
+                &crate::db::CreateExpenseEntryParams {
+                    submitted_by: "Lead".to_string(),
+                    description: "Internal courier".to_string(),
+                    amount: rust_decimal::Decimal::new(4000, 2),
+                    category: crate::db::ExpenseCategory::Other,
+                    entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 11).expect("valid date"),
+                    receipt_path: None,
+                    billable: false,
+                },
+            )
+            .await
+            .expect("create second expense entry");
+        store
+            .mark_time_entries_billed(&state.user_id, &[time_one.id], "inv-2001")
+            .await
+            .expect("mark one time entry billed");
+        store
+            .mark_expense_entries_billed(&state.user_id, &[expense_one.id], "inv-2001")
+            .await
+            .expect("mark one expense entry billed");
+
+        let Json(summary) = matter_time_summary_handler(State(state), Path("demo".to_string()))
+            .await
+            .expect("summary handler should succeed");
+
+        let total_hours = summary
+            .total_hours
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse total hours");
+        let billable_hours = summary
+            .billable_hours
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse billable hours");
+        let unbilled_hours = summary
+            .unbilled_hours
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse unbilled hours");
+        let total_expenses = summary
+            .total_expenses
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse total expenses");
+        let billable_expenses = summary
+            .billable_expenses
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse billable expenses");
+        let unbilled_expenses = summary
+            .unbilled_expenses
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse unbilled expenses");
+
+        assert_eq!(total_hours, rust_decimal::Decimal::new(200, 2));
+        assert_eq!(billable_hours, rust_decimal::Decimal::new(150, 2));
+        assert_eq!(unbilled_hours, rust_decimal::Decimal::new(50, 2));
+        assert_eq!(total_expenses, rust_decimal::Decimal::new(14000, 2));
+        assert_eq!(billable_expenses, rust_decimal::Decimal::new(10000, 2));
+        assert_eq!(unbilled_expenses, rust_decimal::Decimal::new(4000, 2));
     }
 
     #[cfg(feature = "libsql")]

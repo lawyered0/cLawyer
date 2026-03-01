@@ -11,6 +11,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::config::LegalAuditConfig;
+use crate::db::{AppendAuditEventParams, AuditEventStore, AuditSeverity};
 
 #[derive(Debug, Default, Clone, Serialize)]
 struct SecurityMetrics {
@@ -87,6 +88,7 @@ impl AuditLogger {
             hash: None,
         };
 
+        let mut next_hash: Option<String> = None;
         if self.hash_chain {
             let to_hash = match serde_json::to_string(&event) {
                 Ok(s) => s,
@@ -99,7 +101,7 @@ impl AuditLogger {
             hasher.update(to_hash.as_bytes());
             let hash = format!("{:x}", hasher.finalize());
             event.hash = Some(hash.clone());
-            *state = Some(hash);
+            next_hash = Some(hash);
         }
 
         let line = match serde_json::to_string(&event) {
@@ -149,6 +151,8 @@ impl AuditLogger {
                 }
                 if let Err(e) = writeln!(f, "{line}") {
                     tracing::warn!("Failed to append legal audit event: {}", e);
+                } else if let Some(hash) = next_hash {
+                    *state = Some(hash);
                 }
             }
             Err(e) => {
@@ -161,6 +165,8 @@ impl AuditLogger {
 static LOGGER: OnceLock<AuditLogger> = OnceLock::new();
 #[cfg(test)]
 static TEST_EVENTS: OnceLock<Mutex<Vec<TestAuditEvent>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_EVENT_SCENARIO_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
@@ -185,6 +191,68 @@ pub fn record(event_type: &str, details: serde_json::Value) {
     if let Some(logger) = LOGGER.get() {
         logger.write(event_type, details);
     }
+}
+
+/// Record an audit event to the file audit log first, then mirror to the DB.
+///
+/// File logging remains authoritative. Database write errors are logged and
+/// never propagated to callers.
+pub async fn record_with_db(
+    event_type: &str,
+    actor: &str,
+    matter_id: Option<&str>,
+    severity: AuditSeverity,
+    details: serde_json::Value,
+    db: &dyn AuditEventStore,
+    user_id: &str,
+) {
+    record(event_type, details.clone());
+    let input = AppendAuditEventParams {
+        event_type: event_type.to_string(),
+        actor: actor.to_string(),
+        matter_id: matter_id.map(str::to_string),
+        severity,
+        details,
+    };
+    if let Err(err) = db.append_audit_event(user_id, &input).await {
+        tracing::warn!(
+            event_type,
+            user_id,
+            actor,
+            matter_id = ?matter_id,
+            "Failed to mirror legal audit event to DB: {}",
+            err
+        );
+    }
+}
+
+#[macro_export]
+macro_rules! audit_db {
+    ($db_opt:expr, $user_id:expr, $event_type:expr, $actor:expr, $matter_id:expr, $severity:expr, $details:expr) => {{
+        let __db_opt = $db_opt.clone();
+        let __user_id = $user_id.to_string();
+        let __event_type = $event_type.to_string();
+        let __actor = $actor.to_string();
+        let __matter_id: Option<String> = $matter_id;
+        let __severity = $severity;
+        let __details = $details;
+        tokio::spawn(async move {
+            if let Some(db) = __db_opt {
+                $crate::legal::audit::record_with_db(
+                    &__event_type,
+                    &__actor,
+                    __matter_id.as_deref(),
+                    __severity,
+                    __details,
+                    db.as_ref(),
+                    &__user_id,
+                )
+                .await;
+            } else {
+                $crate::legal::audit::record(&__event_type, __details);
+            }
+        });
+    }};
 }
 
 /// Increment the blocked-action counter.
@@ -242,12 +310,54 @@ pub(crate) fn test_events_snapshot() -> Vec<TestAuditEvent> {
 }
 
 #[cfg(test)]
+pub(crate) async fn lock_test_event_scenario() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_EVENT_SCENARIO_LOCK.lock().await
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
 
     use serde_json::Value;
+    use uuid::Uuid;
 
-    use super::{AuditLogger, clear_test_events, record, test_events_snapshot};
+    use super::{
+        AuditLogger, clear_test_events, lock_test_event_scenario, record, record_with_db,
+        test_events_snapshot,
+    };
+
+    struct FailingAuditStore;
+
+    #[async_trait::async_trait]
+    impl crate::db::AuditEventStore for FailingAuditStore {
+        async fn append_audit_event(
+            &self,
+            _user_id: &str,
+            _input: &crate::db::AppendAuditEventParams,
+        ) -> Result<crate::db::AuditEventRecord, crate::error::DatabaseError> {
+            Err(crate::error::DatabaseError::Query(
+                "forced audit write failure".to_string(),
+            ))
+        }
+
+        async fn list_audit_events(
+            &self,
+            _user_id: &str,
+            _query: &crate::db::AuditEventQuery,
+            _limit: usize,
+            _offset: usize,
+        ) -> Result<Vec<crate::db::AuditEventRecord>, crate::error::DatabaseError> {
+            Ok(Vec::new())
+        }
+
+        async fn count_audit_events(
+            &self,
+            _user_id: &str,
+            _query: &crate::db::AuditEventQuery,
+        ) -> Result<usize, crate::error::DatabaseError> {
+            Ok(0)
+        }
+    }
 
     #[test]
     fn hash_chain_links_consecutive_events() {
@@ -278,6 +388,29 @@ mod tests {
             .expect("second prev_hash");
         assert_eq!(second_prev, first_hash);
         assert!(second.get("hash").and_then(|v| v.as_str()).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hash_chain_does_not_advance_when_write_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        fs::write(&path, "existing\n").expect("seed existing file");
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set permissive mode");
+        let logger = AuditLogger::new(path.clone(), true);
+
+        logger.write("event", serde_json::json!({"kind": "blocked"}));
+
+        let raw = fs::read_to_string(&path).expect("read audit log");
+        assert_eq!(raw, "existing\n");
+        let state = logger.state.lock().expect("hash state lock");
+        assert!(
+            state.is_none(),
+            "hash state should not advance on failed write"
+        );
     }
 
     #[cfg(unix)]
@@ -315,8 +448,9 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
-    #[test]
-    fn audit_hook_events_capture_metadata_only_fields() {
+    #[tokio::test]
+    async fn audit_hook_events_capture_metadata_only_fields() {
+        let _audit_lock = lock_test_event_scenario().await;
         clear_test_events();
         record(
             "tool_call_completed",
@@ -339,5 +473,32 @@ mod tests {
         assert!(events[0].details.get("content").is_none());
         assert!(events[0].details.get("parameters").is_none());
         assert!(events[0].details.get("output").is_none());
+    }
+
+    #[tokio::test]
+    async fn record_with_db_keeps_file_path_on_db_failure() {
+        let _audit_lock = lock_test_event_scenario().await;
+        clear_test_events();
+        let store = FailingAuditStore;
+        record_with_db(
+            "matter_created",
+            "gateway",
+            Some("demo"),
+            crate::db::AuditSeverity::Info,
+            serde_json::json!({
+                "matter_id": "demo",
+                "trace_id": Uuid::new_v4().to_string(),
+            }),
+            &store,
+            "test-user",
+        )
+        .await;
+        let events = test_events_snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "matter_created");
+        assert_eq!(
+            events[0].details.get("matter_id").and_then(|v| v.as_str()),
+            Some("demo")
+        );
     }
 }

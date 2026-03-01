@@ -477,6 +477,380 @@ CREATE TABLE IF NOT EXISTS settings (
 
 CREATE INDEX IF NOT EXISTS idx_settings_user ON settings(user_id);
 
+-- ==================== Legal conflict graph ====================
+
+CREATE TABLE IF NOT EXISTS parties (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    name_normalized TEXT NOT NULL UNIQUE,
+    party_type TEXT NOT NULL CHECK (party_type IN ('individual', 'entity')),
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_parties_name_normalized ON parties(name_normalized);
+
+CREATE TABLE IF NOT EXISTS party_aliases (
+    id TEXT PRIMARY KEY,
+    party_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+    alias TEXT NOT NULL,
+    alias_normalized TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (party_id, alias_normalized)
+);
+
+CREATE INDEX IF NOT EXISTS idx_party_aliases_party_id ON party_aliases(party_id);
+CREATE INDEX IF NOT EXISTS idx_party_aliases_alias_normalized ON party_aliases(alias_normalized);
+
+CREATE TABLE IF NOT EXISTS party_relationships (
+    id TEXT PRIMARY KEY,
+    parent_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+    child_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (parent_id, child_id, kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_party_relationships_parent_id ON party_relationships(parent_id);
+CREATE INDEX IF NOT EXISTS idx_party_relationships_child_id ON party_relationships(child_id);
+
+CREATE TABLE IF NOT EXISTS matter_parties (
+    id TEXT PRIMARY KEY,
+    matter_id TEXT NOT NULL,
+    party_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('client', 'adverse', 'related', 'witness')),
+    opened_at TEXT,
+    closed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (matter_id, party_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_matter_parties_party_id ON matter_parties(party_id);
+CREATE INDEX IF NOT EXISTS idx_matter_parties_matter_id ON matter_parties(matter_id);
+CREATE INDEX IF NOT EXISTS idx_matter_parties_role_closed_at ON matter_parties(role, closed_at);
+
+CREATE TABLE IF NOT EXISTS conflict_clearances (
+    id TEXT PRIMARY KEY,
+    matter_id TEXT NOT NULL,
+    checked_by TEXT NOT NULL,
+    cleared_by TEXT,
+    decision TEXT NOT NULL CHECK (decision IN ('clear', 'waived', 'declined')),
+    note TEXT,
+    hits_json TEXT NOT NULL,
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_conflict_clearances_matter_created_at
+    ON conflict_clearances(matter_id, created_at DESC);
+
+-- ==================== Matter/client core ====================
+
+CREATE TABLE IF NOT EXISTS clients (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    name_normalized TEXT NOT NULL,
+    client_type TEXT NOT NULL CHECK (client_type IN ('individual', 'entity')),
+    email TEXT,
+    phone TEXT,
+    address TEXT,
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (user_id, name_normalized)
+);
+
+CREATE INDEX IF NOT EXISTS idx_clients_user ON clients(user_id);
+CREATE INDEX IF NOT EXISTS idx_clients_user_name_normalized
+    ON clients(user_id, name_normalized);
+
+CREATE TABLE IF NOT EXISTS matters (
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    client_id TEXT NOT NULL REFERENCES clients(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status IN ('intake', 'active', 'pending', 'closed', 'archived')),
+    stage TEXT,
+    practice_area TEXT,
+    jurisdiction TEXT,
+    opened_at TEXT,
+    closed_at TEXT,
+    assigned_to TEXT NOT NULL DEFAULT '[]',
+    custom_fields TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, matter_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_matters_user_status ON matters(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_matters_client ON matters(client_id);
+
+CREATE TABLE IF NOT EXISTS matter_tasks (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL CHECK (status IN ('todo', 'in_progress', 'done', 'blocked', 'cancelled')),
+    assignee TEXT,
+    due_at TEXT,
+    blocked_by TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_matter_tasks_user_matter ON matter_tasks(user_id, matter_id);
+CREATE INDEX IF NOT EXISTS idx_matter_tasks_user_status ON matter_tasks(user_id, status);
+
+CREATE TABLE IF NOT EXISTS matter_notes (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    author TEXT NOT NULL,
+    body TEXT NOT NULL,
+    pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_matter_notes_user_matter ON matter_notes(user_id, matter_id);
+CREATE INDEX IF NOT EXISTS idx_matter_notes_user_created ON matter_notes(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS matter_deadlines (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    deadline_type TEXT NOT NULL CHECK (deadline_type IN (
+        'court_date',
+        'filing',
+        'statute_of_limitations',
+        'response_due',
+        'discovery_cutoff',
+        'internal'
+    )),
+    due_at TEXT NOT NULL,
+    completed_at TEXT,
+    reminder_days TEXT NOT NULL DEFAULT '[]',
+    rule_ref TEXT,
+    computed_from TEXT REFERENCES matter_deadlines(id) ON DELETE SET NULL,
+    task_id TEXT REFERENCES matter_tasks(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_matter_deadlines_user_matter_due
+    ON matter_deadlines(user_id, matter_id, due_at);
+CREATE INDEX IF NOT EXISTS idx_matter_deadlines_user_matter_completed
+    ON matter_deadlines(user_id, matter_id, completed_at);
+CREATE INDEX IF NOT EXISTS idx_matter_deadlines_rule_ref
+    ON matter_deadlines(rule_ref);
+
+CREATE TABLE IF NOT EXISTS matter_documents (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    memory_document_id TEXT NOT NULL REFERENCES memory_documents(id) ON DELETE CASCADE,
+    display_name TEXT NOT NULL,
+    category TEXT NOT NULL CHECK (category IN (
+        'pleading',
+        'correspondence',
+        'contract',
+        'filing',
+        'evidence',
+        'internal'
+    )),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE,
+    UNIQUE (user_id, matter_id, memory_document_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_matter_documents_user_matter
+    ON matter_documents(user_id, matter_id);
+CREATE INDEX IF NOT EXISTS idx_matter_documents_memory_document
+    ON matter_documents(memory_document_id);
+
+CREATE TABLE IF NOT EXISTS document_versions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_document_id TEXT NOT NULL REFERENCES matter_documents(id) ON DELETE CASCADE,
+    version_number INTEGER NOT NULL CHECK (version_number > 0),
+    label TEXT NOT NULL,
+    memory_document_id TEXT NOT NULL REFERENCES memory_documents(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (matter_document_id, version_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_versions_user_matter_document
+    ON document_versions(user_id, matter_document_id);
+CREATE INDEX IF NOT EXISTS idx_document_versions_memory_document
+    ON document_versions(memory_document_id);
+
+CREATE TABLE IF NOT EXISTS document_templates (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT,
+    name TEXT NOT NULL,
+    body TEXT NOT NULL,
+    variables_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE,
+    UNIQUE (user_id, matter_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_templates_user_matter
+    ON document_templates(user_id, matter_id);
+CREATE INDEX IF NOT EXISTS idx_document_templates_user_name
+    ON document_templates(user_id, name);
+
+CREATE TABLE IF NOT EXISTS time_entries (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    timekeeper TEXT NOT NULL,
+    description TEXT NOT NULL,
+    hours TEXT NOT NULL CHECK (CAST(hours AS REAL) > 0),
+    hourly_rate TEXT,
+    entry_date TEXT NOT NULL,
+    billable INTEGER NOT NULL DEFAULT 1 CHECK (billable IN (0, 1)),
+    billed_invoice_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_time_entries_user_matter_date
+    ON time_entries(user_id, matter_id, entry_date DESC);
+CREATE INDEX IF NOT EXISTS idx_time_entries_user_billed
+    ON time_entries(user_id, billed_invoice_id);
+
+CREATE TABLE IF NOT EXISTS expense_entries (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    submitted_by TEXT NOT NULL,
+    description TEXT NOT NULL,
+    amount TEXT NOT NULL CHECK (CAST(amount AS REAL) > 0),
+    category TEXT NOT NULL CHECK (category IN (
+        'filing_fee',
+        'travel',
+        'postage',
+        'expert',
+        'copying',
+        'court_reporter',
+        'other'
+    )),
+    entry_date TEXT NOT NULL,
+    receipt_path TEXT,
+    billable INTEGER NOT NULL DEFAULT 1 CHECK (billable IN (0, 1)),
+    billed_invoice_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_expense_entries_user_matter_date
+    ON expense_entries(user_id, matter_id, entry_date DESC);
+CREATE INDEX IF NOT EXISTS idx_expense_entries_user_billed
+    ON expense_entries(user_id, billed_invoice_id);
+
+CREATE TABLE IF NOT EXISTS invoices (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    invoice_number TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('draft', 'sent', 'paid', 'void', 'write_off')),
+    issued_date TEXT,
+    due_date TEXT,
+    subtotal TEXT NOT NULL CHECK (CAST(subtotal AS REAL) >= 0),
+    tax TEXT NOT NULL CHECK (CAST(tax AS REAL) >= 0),
+    total TEXT NOT NULL CHECK (CAST(total AS REAL) >= 0),
+    paid_amount TEXT NOT NULL CHECK (CAST(paid_amount AS REAL) >= 0),
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE,
+    UNIQUE (user_id, invoice_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_invoices_user_matter
+    ON invoices(user_id, matter_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_user_status
+    ON invoices(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_invoices_user_due_date
+    ON invoices(user_id, due_date);
+
+CREATE TABLE IF NOT EXISTS invoice_line_items (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    invoice_id TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+    description TEXT NOT NULL,
+    quantity TEXT NOT NULL CHECK (CAST(quantity AS REAL) > 0),
+    unit_price TEXT NOT NULL CHECK (CAST(unit_price AS REAL) >= 0),
+    amount TEXT NOT NULL CHECK (CAST(amount AS REAL) >= 0),
+    time_entry_id TEXT REFERENCES time_entries(id) ON DELETE SET NULL,
+    expense_entry_id TEXT REFERENCES expense_entries(id) ON DELETE SET NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_invoice_line_items_invoice
+    ON invoice_line_items(invoice_id, sort_order);
+CREATE INDEX IF NOT EXISTS idx_invoice_line_items_time
+    ON invoice_line_items(time_entry_id);
+CREATE INDEX IF NOT EXISTS idx_invoice_line_items_expense
+    ON invoice_line_items(expense_entry_id);
+
+CREATE TABLE IF NOT EXISTS trust_ledger (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    entry_type TEXT NOT NULL CHECK (entry_type IN ('deposit', 'withdrawal', 'invoice_payment', 'refund')),
+    amount TEXT NOT NULL CHECK (CAST(amount AS REAL) > 0),
+    balance_after TEXT NOT NULL CHECK (CAST(balance_after AS REAL) >= 0),
+    description TEXT NOT NULL,
+    invoice_id TEXT REFERENCES invoices(id) ON DELETE SET NULL,
+    recorded_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id, matter_id) REFERENCES matters(user_id, matter_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trust_ledger_user_matter_created
+    ON trust_ledger(user_id, matter_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trust_ledger_user_invoice
+    ON trust_ledger(user_id, invoice_id);
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    matter_id TEXT,
+    severity TEXT NOT NULL CHECK (severity IN ('info', 'warn', 'critical')),
+    details TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_events_user_created
+    ON audit_events(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_user_event_type
+    ON audit_events(user_id, event_type);
+CREATE INDEX IF NOT EXISTS idx_audit_events_user_matter_id
+    ON audit_events(user_id, matter_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_user_severity
+    ON audit_events(user_id, severity);
+
 -- ==================== Missing indexes (parity with PostgreSQL) ====================
 
 -- agent_jobs

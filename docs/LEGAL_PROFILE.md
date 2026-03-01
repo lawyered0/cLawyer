@@ -10,6 +10,8 @@
 - `legal.require_matter_context = true`
 - `legal.citation_required = true`
 - `legal.matter_root = "matters"`
+- `legal.conflict_file_fallback_enabled = true`
+- `legal.conflict_reindex_on_startup = true`
 - `legal.network.deny_by_default = true`
 - `legal.audit.enabled = true`
 - `legal.audit.path = "logs/legal_audit.jsonl"`
@@ -75,15 +77,49 @@ For web-first firm workflows, matter detail now includes:
 - `GET /api/matters/{id}/dashboard`
   - scorecard totals for documents, drafts, templates, checklist completion, and deadline risk.
 - `GET /api/matters/{id}/deadlines`
-  - parsed deadline rows from `deadlines/calendar.md` with overdue flags.
+  - DB-backed deadline list (falls back to `deadlines/calendar.md` when DB rows are absent).
+- `POST /api/matters/{id}/deadlines`
+  - create deadline records with type, due date, optional completion/rule/task linkage, and reminder offsets.
+- `PATCH /api/matters/{id}/deadlines/{deadline_id}`
+  - update deadline fields and reminder settings.
+- `DELETE /api/matters/{id}/deadlines/{deadline_id}`
+  - delete a deadline and disable any scheduled reminder routines for it.
+- `POST /api/matters/{id}/deadlines/compute`
+  - computes deadline previews from bundled court rules without persisting.
+- `GET /api/legal/court-rules`
+- `GET /api/legal/audit`
+  - returns DB-backed, user-scoped legal audit events with filters:
+    - `event_type`, `matter_id`, `severity`, `since`, `until`, `limit`, `offset`
+  - file audit log remains authoritative; DB records are best-effort mirrors.
+  - lists bundled rule metadata (citation, deadline type, offset, court-day behavior).
 - `POST /api/matters/{id}/filing-package`
   - writes a matter-local filing package index to `matters/<id>/exports/`.
+- `GET /api/matters/{id}/documents`
+  - DB-backed matter document index linked to `memory_documents` (workspace backfill for legacy files).
+- `GET /api/matters/{id}/templates`
+  - DB-backed template list (workspace templates are backfilled for compatibility).
+- `POST /api/documents/generate`
+  - renders a DB template with matter/client context, writes a draft document, links it to the matter, and records a version row.
+- `POST /api/matters/conflict-check`
+  - runs intake-time conflict review against the DB-backed party graph and returns structured `ConflictHit` rows.
+- `POST /api/matters`
+  - server-hard-gated on conflict hits: `clear`/`waived` can proceed, `declined` blocks creation and records clearance.
+- `POST /api/matters/conflicts/reindex`
+  - rebuilds DB conflict graph from `matters/*/matter.yaml` plus workspace `conflicts.json`.
 
 ## Conflict Check Limits
 
-- Conflict detection currently reads the workspace-global `conflicts.json` (not a per-matter conflict graph).
-- The chat-flow conflict gate and `/api/matters/conflicts/check` endpoint use this same global source, and also check active-matter `adversaries` terms when an active matter is set.
-- Matching is normalized and boundary-aware, but still heuristic; short aliases are intentionally ignored to reduce false positives.
+- Intake conflict checks use a DB-backed party graph (`parties`, `party_aliases`, `matter_parties`) with exact+alias+fuzzy matching.
+- Chat conflict checks are DB-first. Fallback to workspace-global `conflicts.json` is controlled by `legal.conflict_file_fallback_enabled`.
+- Startup can auto-reindex DB conflict graph from workspace (`legal.conflict_reindex_on_startup = true`).
+- Existing `POST /api/matters/conflicts/check` remains for compatibility and now uses the same DB-first path plus fallback.
+- Matching remains normalized/boundary-aware and heuristic; short aliases are intentionally ignored to reduce false positives.
+
+## Deadline Reminder Notes
+
+- Deadline reminders are stored as one-shot routines named `deadline-reminder-{matter_id}-{deadline_id}-{days}`.
+- Reminder routines are auto-disabled after a successful/attention run.
+- Updating, completing, or deleting a deadline disables obsolete reminder routines and re-syncs current ones.
 
 ## Citation Check Limits
 
@@ -93,7 +129,7 @@ For web-first firm workflows, matter detail now includes:
 ## Deferred Architecture Items
 
 - Self-repair stuck-job handling is still attempt-count based; time-threshold stuck detection is not implemented yet.
-- Conflict checks still use workspace-global `conflicts.json`; a per-matter conflict-graph model is deferred.
+- Conflict checks do not yet traverse `party_relationships` recursively for affiliate/corporate-family logic.
 
 ## Bundled Legal Skills
 
@@ -124,6 +160,9 @@ Audit log events include:
 - LLM lifecycle events (`llm_call_started`, `llm_call_completed`, `llm_call_failed`)
 - tool lifecycle events (`tool_call_started`, `tool_call_completed`)
 - explicit approval decision events (`approval_decision`)
+- matter lifecycle events (`matter_created`, `matter_closed`)
+- billing/trust events (`invoice_finalized`, `payment_recorded`, `trust_deposit`, `trust_withdrawal_rejected`)
+- conflict system events (`conflict_detected`, `conflict_graph_reindexed`)
 
 Counters tracked in audit state:
 

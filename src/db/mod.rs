@@ -18,12 +18,13 @@ pub mod libsql;
 #[cfg(feature = "libsql")]
 pub mod libsql_migrations;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent::BrokenTool;
@@ -86,6 +87,929 @@ pub async fn connect_from_config(
             "No database backend available. Enable 'postgres' or 'libsql' feature.".to_string(),
         )),
     }
+}
+
+/// Role a party plays in a matter for conflict screening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PartyRole {
+    Client,
+    Adverse,
+    Related,
+    Witness,
+}
+
+impl PartyRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Adverse => "adverse",
+            Self::Related => "related",
+            Self::Witness => "witness",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "client" => Some(Self::Client),
+            "adverse" => Some(Self::Adverse),
+            "related" => Some(Self::Related),
+            "witness" => Some(Self::Witness),
+            _ => None,
+        }
+    }
+}
+
+/// Structured conflict match for legal intake and attorney review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictHit {
+    pub party: String,
+    pub role: PartyRole,
+    pub matter_id: String,
+    pub matter_status: String,
+    pub matched_via: String,
+}
+
+/// Attorney decision after reviewing potential conflict hits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictDecision {
+    Clear,
+    Waived,
+    Declined,
+}
+
+impl ConflictDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Waived => "waived",
+            Self::Declined => "declined",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "clear" => Some(Self::Clear),
+            "waived" => Some(Self::Waived),
+            "declined" => Some(Self::Declined),
+            _ => None,
+        }
+    }
+}
+
+/// Row persisted for legal conflict clearance history.
+#[derive(Debug, Clone)]
+pub struct ConflictClearanceRecord {
+    pub matter_id: String,
+    pub checked_by: String,
+    pub cleared_by: Option<String>,
+    pub decision: ConflictDecision,
+    pub note: Option<String>,
+    pub hits_json: serde_json::Value,
+    pub hit_count: i32,
+}
+
+/// Client entity type for conflict and matter tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientType {
+    Individual,
+    Entity,
+}
+
+impl ClientType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Individual => "individual",
+            Self::Entity => "entity",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "individual" => Some(Self::Individual),
+            "entity" => Some(Self::Entity),
+            _ => None,
+        }
+    }
+}
+
+/// Matter lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatterStatus {
+    Intake,
+    Active,
+    Pending,
+    Closed,
+    Archived,
+}
+
+impl MatterStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Intake => "intake",
+            Self::Active => "active",
+            Self::Pending => "pending",
+            Self::Closed => "closed",
+            Self::Archived => "archived",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "intake" => Some(Self::Intake),
+            "active" => Some(Self::Active),
+            "pending" => Some(Self::Pending),
+            "closed" => Some(Self::Closed),
+            "archived" => Some(Self::Archived),
+            _ => None,
+        }
+    }
+}
+
+/// Matter task state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatterTaskStatus {
+    Todo,
+    InProgress,
+    Done,
+    Blocked,
+    Cancelled,
+}
+
+impl MatterTaskStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Todo => "todo",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "todo" => Some(Self::Todo),
+            "in_progress" => Some(Self::InProgress),
+            "done" => Some(Self::Done),
+            "blocked" => Some(Self::Blocked),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub name: String,
+    pub name_normalized: String,
+    pub client_type: ClientType,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateClientParams {
+    pub name: String,
+    pub client_type: ClientType,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateClientParams {
+    pub name: Option<String>,
+    pub client_type: Option<ClientType>,
+    pub email: Option<Option<String>>,
+    pub phone: Option<Option<String>>,
+    pub address: Option<Option<String>>,
+    pub notes: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterRecord {
+    pub user_id: String,
+    pub matter_id: String,
+    pub client_id: Uuid,
+    pub status: MatterStatus,
+    pub stage: Option<String>,
+    pub practice_area: Option<String>,
+    pub jurisdiction: Option<String>,
+    pub opened_at: Option<DateTime<Utc>>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub assigned_to: Vec<String>,
+    pub custom_fields: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertMatterParams {
+    pub matter_id: String,
+    pub client_id: Uuid,
+    pub status: MatterStatus,
+    pub stage: Option<String>,
+    pub practice_area: Option<String>,
+    pub jurisdiction: Option<String>,
+    pub opened_at: Option<DateTime<Utc>>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub assigned_to: Vec<String>,
+    pub custom_fields: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateMatterParams {
+    pub client_id: Option<Uuid>,
+    pub status: Option<MatterStatus>,
+    pub stage: Option<Option<String>>,
+    pub practice_area: Option<Option<String>>,
+    pub jurisdiction: Option<Option<String>>,
+    pub opened_at: Option<Option<DateTime<Utc>>>,
+    pub closed_at: Option<Option<DateTime<Utc>>>,
+    pub assigned_to: Option<Vec<String>>,
+    pub custom_fields: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterTaskRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: MatterTaskStatus,
+    pub assignee: Option<String>,
+    pub due_at: Option<DateTime<Utc>>,
+    pub blocked_by: Vec<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateMatterTaskParams {
+    pub title: String,
+    pub description: Option<String>,
+    pub status: MatterTaskStatus,
+    pub assignee: Option<String>,
+    pub due_at: Option<DateTime<Utc>>,
+    pub blocked_by: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateMatterTaskParams {
+    pub title: Option<String>,
+    pub description: Option<Option<String>>,
+    pub status: Option<MatterTaskStatus>,
+    pub assignee: Option<Option<String>>,
+    pub due_at: Option<Option<DateTime<Utc>>>,
+    pub blocked_by: Option<Vec<Uuid>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterNoteRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub author: String,
+    pub body: String,
+    pub pinned: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateMatterNoteParams {
+    pub author: String,
+    pub body: String,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateMatterNoteParams {
+    pub author: Option<String>,
+    pub body: Option<String>,
+    pub pinned: Option<bool>,
+}
+
+/// Matter deadline category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatterDeadlineType {
+    CourtDate,
+    Filing,
+    StatuteOfLimitations,
+    ResponseDue,
+    DiscoveryCutoff,
+    Internal,
+}
+
+impl MatterDeadlineType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CourtDate => "court_date",
+            Self::Filing => "filing",
+            Self::StatuteOfLimitations => "statute_of_limitations",
+            Self::ResponseDue => "response_due",
+            Self::DiscoveryCutoff => "discovery_cutoff",
+            Self::Internal => "internal",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "court_date" => Some(Self::CourtDate),
+            "filing" => Some(Self::Filing),
+            "statute_of_limitations" => Some(Self::StatuteOfLimitations),
+            "response_due" => Some(Self::ResponseDue),
+            "discovery_cutoff" => Some(Self::DiscoveryCutoff),
+            "internal" => Some(Self::Internal),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterDeadlineRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub title: String,
+    pub deadline_type: MatterDeadlineType,
+    pub due_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub reminder_days: Vec<i32>,
+    pub rule_ref: Option<String>,
+    pub computed_from: Option<Uuid>,
+    pub task_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateMatterDeadlineParams {
+    pub title: String,
+    pub deadline_type: MatterDeadlineType,
+    pub due_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub reminder_days: Vec<i32>,
+    pub rule_ref: Option<String>,
+    pub computed_from: Option<Uuid>,
+    pub task_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateMatterDeadlineParams {
+    pub title: Option<String>,
+    pub deadline_type: Option<MatterDeadlineType>,
+    pub due_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<Option<DateTime<Utc>>>,
+    pub reminder_days: Option<Vec<i32>>,
+    pub rule_ref: Option<Option<String>>,
+    pub computed_from: Option<Option<Uuid>>,
+    pub task_id: Option<Option<Uuid>>,
+}
+
+/// Matter document category for attorney workflows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatterDocumentCategory {
+    Pleading,
+    Correspondence,
+    Contract,
+    Filing,
+    Evidence,
+    Internal,
+}
+
+impl MatterDocumentCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pleading => "pleading",
+            Self::Correspondence => "correspondence",
+            Self::Contract => "contract",
+            Self::Filing => "filing",
+            Self::Evidence => "evidence",
+            Self::Internal => "internal",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "pleading" => Some(Self::Pleading),
+            "correspondence" => Some(Self::Correspondence),
+            "contract" => Some(Self::Contract),
+            "filing" => Some(Self::Filing),
+            "evidence" => Some(Self::Evidence),
+            "internal" => Some(Self::Internal),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterDocumentRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub memory_document_id: Uuid,
+    pub path: String,
+    pub display_name: String,
+    pub category: MatterDocumentCategory,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertMatterDocumentParams {
+    pub memory_document_id: Uuid,
+    pub path: String,
+    pub display_name: String,
+    pub category: MatterDocumentCategory,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateMatterDocumentParams {
+    pub display_name: Option<String>,
+    pub category: Option<MatterDocumentCategory>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentVersionRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_document_id: Uuid,
+    pub version_number: i32,
+    pub label: String,
+    pub memory_document_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateDocumentVersionParams {
+    pub matter_document_id: Uuid,
+    pub label: String,
+    pub memory_document_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentTemplateRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: Option<String>,
+    pub name: String,
+    pub body: String,
+    pub variables_json: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertDocumentTemplateParams {
+    pub matter_id: Option<String>,
+    pub name: String,
+    pub body: String,
+    pub variables_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateDocumentTemplateParams {
+    pub name: Option<String>,
+    pub body: Option<String>,
+    pub variables_json: Option<serde_json::Value>,
+}
+
+/// Expense category for matter accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpenseCategory {
+    FilingFee,
+    Travel,
+    Postage,
+    Expert,
+    Copying,
+    CourtReporter,
+    Other,
+}
+
+impl ExpenseCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FilingFee => "filing_fee",
+            Self::Travel => "travel",
+            Self::Postage => "postage",
+            Self::Expert => "expert",
+            Self::Copying => "copying",
+            Self::CourtReporter => "court_reporter",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "filing_fee" => Some(Self::FilingFee),
+            "travel" => Some(Self::Travel),
+            "postage" => Some(Self::Postage),
+            "expert" => Some(Self::Expert),
+            "copying" => Some(Self::Copying),
+            "court_reporter" => Some(Self::CourtReporter),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeEntryRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub timekeeper: String,
+    pub description: String,
+    pub hours: Decimal,
+    pub hourly_rate: Option<Decimal>,
+    pub entry_date: NaiveDate,
+    pub billable: bool,
+    pub billed_invoice_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateTimeEntryParams {
+    pub timekeeper: String,
+    pub description: String,
+    pub hours: Decimal,
+    pub hourly_rate: Option<Decimal>,
+    pub entry_date: NaiveDate,
+    pub billable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateTimeEntryParams {
+    pub timekeeper: Option<String>,
+    pub description: Option<String>,
+    pub hours: Option<Decimal>,
+    pub hourly_rate: Option<Option<Decimal>>,
+    pub entry_date: Option<NaiveDate>,
+    pub billable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpenseEntryRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub submitted_by: String,
+    pub description: String,
+    pub amount: Decimal,
+    pub category: ExpenseCategory,
+    pub entry_date: NaiveDate,
+    pub receipt_path: Option<String>,
+    pub billable: bool,
+    pub billed_invoice_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateExpenseEntryParams {
+    pub submitted_by: String,
+    pub description: String,
+    pub amount: Decimal,
+    pub category: ExpenseCategory,
+    pub entry_date: NaiveDate,
+    pub receipt_path: Option<String>,
+    pub billable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateExpenseEntryParams {
+    pub submitted_by: Option<String>,
+    pub description: Option<String>,
+    pub amount: Option<Decimal>,
+    pub category: Option<ExpenseCategory>,
+    pub entry_date: Option<NaiveDate>,
+    pub receipt_path: Option<Option<String>>,
+    pub billable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterTimeSummary {
+    pub total_hours: Decimal,
+    pub billable_hours: Decimal,
+    pub unbilled_hours: Decimal,
+    pub total_expenses: Decimal,
+    pub billable_expenses: Decimal,
+    pub unbilled_expenses: Decimal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvoiceStatus {
+    Draft,
+    Sent,
+    Paid,
+    Void,
+    WriteOff,
+}
+
+impl InvoiceStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Sent => "sent",
+            Self::Paid => "paid",
+            Self::Void => "void",
+            Self::WriteOff => "write_off",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "draft" => Some(Self::Draft),
+            "sent" => Some(Self::Sent),
+            "paid" => Some(Self::Paid),
+            "void" => Some(Self::Void),
+            "write_off" => Some(Self::WriteOff),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvoiceRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub invoice_number: String,
+    pub status: InvoiceStatus,
+    pub issued_date: Option<NaiveDate>,
+    pub due_date: Option<NaiveDate>,
+    pub subtotal: Decimal,
+    pub tax: Decimal,
+    pub total: Decimal,
+    pub paid_amount: Decimal,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateInvoiceParams {
+    pub matter_id: String,
+    pub invoice_number: String,
+    pub status: InvoiceStatus,
+    pub issued_date: Option<NaiveDate>,
+    pub due_date: Option<NaiveDate>,
+    pub subtotal: Decimal,
+    pub tax: Decimal,
+    pub total: Decimal,
+    pub paid_amount: Decimal,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvoiceLineItemRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub invoice_id: Uuid,
+    pub description: String,
+    pub quantity: Decimal,
+    pub unit_price: Decimal,
+    pub amount: Decimal,
+    pub time_entry_id: Option<Uuid>,
+    pub expense_entry_id: Option<Uuid>,
+    pub sort_order: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateInvoiceLineItemParams {
+    pub description: String,
+    pub quantity: Decimal,
+    pub unit_price: Decimal,
+    pub amount: Decimal,
+    pub time_entry_id: Option<Uuid>,
+    pub expense_entry_id: Option<Uuid>,
+    pub sort_order: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustLedgerEntryType {
+    Deposit,
+    Withdrawal,
+    InvoicePayment,
+    Refund,
+}
+
+impl TrustLedgerEntryType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deposit => "deposit",
+            Self::Withdrawal => "withdrawal",
+            Self::InvoicePayment => "invoice_payment",
+            Self::Refund => "refund",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "deposit" => Some(Self::Deposit),
+            "withdrawal" => Some(Self::Withdrawal),
+            "invoice_payment" => Some(Self::InvoicePayment),
+            "refund" => Some(Self::Refund),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustLedgerEntryRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub entry_type: TrustLedgerEntryType,
+    pub amount: Decimal,
+    pub balance_after: Decimal,
+    pub description: String,
+    pub invoice_id: Option<Uuid>,
+    pub recorded_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateTrustLedgerEntryParams {
+    pub entry_type: TrustLedgerEntryType,
+    pub amount: Decimal,
+    /// Signed balance delta applied atomically by the backend.
+    /// Positive values credit trust; negative values debit trust.
+    pub delta: Decimal,
+    pub description: String,
+    pub invoice_id: Option<Uuid>,
+    pub recorded_by: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditSeverity {
+    Info,
+    Warn,
+    Critical,
+}
+
+impl AuditSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Critical => "critical",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "info" => Some(Self::Info),
+            "warn" => Some(Self::Warn),
+            "critical" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEventRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub event_type: String,
+    pub actor: String,
+    pub matter_id: Option<String>,
+    pub severity: AuditSeverity,
+    pub details: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppendAuditEventParams {
+    pub event_type: String,
+    pub actor: String,
+    pub matter_id: Option<String>,
+    pub severity: AuditSeverity,
+    pub details: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AuditEventQuery {
+    pub event_type: Option<String>,
+    pub matter_id: Option<String>,
+    pub severity: Option<AuditSeverity>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+}
+
+/// Normalize names/text for conflict matching.
+pub fn normalize_party_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_sep = true;
+
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        } else if !prev_sep {
+            out.push(' ');
+            prev_sep = true;
+        }
+    }
+
+    out.trim().to_string()
+}
+
+fn trigrams(text: &str) -> HashSet<String> {
+    let normalized = normalize_party_name(text);
+    if normalized.is_empty() {
+        return HashSet::new();
+    }
+    let padded = format!("  {normalized}  ");
+    let chars: Vec<char> = padded.chars().collect();
+    let mut set = HashSet::new();
+    if chars.len() < 3 {
+        set.insert(padded);
+        return set;
+    }
+    for i in 0..=(chars.len() - 3) {
+        let tri = [chars[i], chars[i + 1], chars[i + 2]];
+        set.insert(tri.iter().collect::<String>());
+    }
+    set
+}
+
+/// Jaccard-style trigram similarity in [0, 1].
+pub fn trigram_similarity(a: &str, b: &str) -> f64 {
+    let a_set = trigrams(a);
+    let b_set = trigrams(b);
+    if a_set.is_empty() || b_set.is_empty() {
+        return 0.0;
+    }
+    let intersection = a_set.intersection(&b_set).count() as f64;
+    let union = a_set.union(&b_set).count() as f64;
+    if union == 0.0 {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+/// Build normalized candidate terms from free text for conflict matching.
+pub fn conflict_terms_from_text(text: &str, active_matter: Option<&str>) -> Vec<String> {
+    const MAX_TOKENS: usize = 32;
+    const MAX_NGRAM: usize = 4;
+
+    let normalized = normalize_party_name(text);
+    let mut terms: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let tokens: Vec<&str> = normalized
+        .split_whitespace()
+        .filter(|token| token.len() >= 2)
+        .take(MAX_TOKENS)
+        .collect();
+
+    for width in 1..=MAX_NGRAM {
+        if width > tokens.len() {
+            break;
+        }
+        for i in 0..=(tokens.len() - width) {
+            let candidate = tokens[i..(i + width)].join(" ");
+            if candidate.len() < 3 || !seen.insert(candidate.clone()) {
+                continue;
+            }
+            terms.push(candidate);
+        }
+    }
+
+    if let Some(matter) = active_matter {
+        let normalized_matter = normalize_party_name(matter);
+        if !normalized_matter.is_empty() && seen.insert(normalized_matter.clone()) {
+            terms.push(normalized_matter);
+        }
+    }
+
+    terms
 }
 
 // ==================== Sub-traits ====================
@@ -294,6 +1218,425 @@ pub trait ToolFailureStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait LegalConflictStore: Send + Sync {
+    async fn find_conflict_hits_for_names(
+        &self,
+        input_names: &[String],
+        limit: usize,
+    ) -> Result<Vec<ConflictHit>, DatabaseError>;
+    async fn find_conflict_hits_for_text(
+        &self,
+        text: &str,
+        active_matter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConflictHit>, DatabaseError>;
+    async fn seed_matter_parties(
+        &self,
+        matter_id: &str,
+        client: &str,
+        adversaries: &[String],
+        opened_at: Option<&str>,
+    ) -> Result<(), DatabaseError>;
+    async fn seed_conflict_entry(
+        &self,
+        matter_id: &str,
+        canonical_name: &str,
+        aliases: &[String],
+        opened_at: Option<&str>,
+    ) -> Result<(), DatabaseError>;
+    async fn reset_conflict_graph(&self) -> Result<(), DatabaseError>;
+    async fn upsert_party_aliases(
+        &self,
+        canonical_name: &str,
+        aliases: &[String],
+    ) -> Result<(), DatabaseError>;
+    async fn record_conflict_clearance(
+        &self,
+        row: &ConflictClearanceRecord,
+    ) -> Result<(), DatabaseError>;
+}
+
+#[async_trait]
+pub trait ClientStore: Send + Sync {
+    async fn create_client(
+        &self,
+        user_id: &str,
+        input: &CreateClientParams,
+    ) -> Result<ClientRecord, DatabaseError>;
+    async fn upsert_client_by_normalized_name(
+        &self,
+        user_id: &str,
+        input: &CreateClientParams,
+    ) -> Result<ClientRecord, DatabaseError>;
+    async fn list_clients(
+        &self,
+        user_id: &str,
+        query: Option<&str>,
+    ) -> Result<Vec<ClientRecord>, DatabaseError>;
+    async fn get_client(
+        &self,
+        user_id: &str,
+        client_id: Uuid,
+    ) -> Result<Option<ClientRecord>, DatabaseError>;
+    async fn update_client(
+        &self,
+        user_id: &str,
+        client_id: Uuid,
+        input: &UpdateClientParams,
+    ) -> Result<Option<ClientRecord>, DatabaseError>;
+    async fn delete_client(&self, user_id: &str, client_id: Uuid) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
+pub trait MatterStore: Send + Sync {
+    async fn upsert_matter(
+        &self,
+        user_id: &str,
+        input: &UpsertMatterParams,
+    ) -> Result<MatterRecord, DatabaseError>;
+    async fn list_matters_db(&self, user_id: &str) -> Result<Vec<MatterRecord>, DatabaseError>;
+    async fn get_matter_db(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Option<MatterRecord>, DatabaseError>;
+    async fn update_matter(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &UpdateMatterParams,
+    ) -> Result<Option<MatterRecord>, DatabaseError>;
+    async fn delete_matter(&self, user_id: &str, matter_id: &str) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
+pub trait MatterTaskStore: Send + Sync {
+    async fn list_matter_tasks(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterTaskRecord>, DatabaseError>;
+    async fn create_matter_task(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateMatterTaskParams,
+    ) -> Result<MatterTaskRecord, DatabaseError>;
+    async fn update_matter_task(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        task_id: Uuid,
+        input: &UpdateMatterTaskParams,
+    ) -> Result<Option<MatterTaskRecord>, DatabaseError>;
+    async fn delete_matter_task(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        task_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
+pub trait MatterNoteStore: Send + Sync {
+    async fn list_matter_notes(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterNoteRecord>, DatabaseError>;
+    async fn create_matter_note(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateMatterNoteParams,
+    ) -> Result<MatterNoteRecord, DatabaseError>;
+    async fn update_matter_note(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        note_id: Uuid,
+        input: &UpdateMatterNoteParams,
+    ) -> Result<Option<MatterNoteRecord>, DatabaseError>;
+    async fn delete_matter_note(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        note_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
+pub trait MatterDeadlineStore: Send + Sync {
+    async fn list_matter_deadlines(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterDeadlineRecord>, DatabaseError>;
+    async fn get_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+    ) -> Result<Option<MatterDeadlineRecord>, DatabaseError>;
+    async fn create_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateMatterDeadlineParams,
+    ) -> Result<MatterDeadlineRecord, DatabaseError>;
+    async fn update_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+        input: &UpdateMatterDeadlineParams,
+    ) -> Result<Option<MatterDeadlineRecord>, DatabaseError>;
+    async fn delete_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
+pub trait MatterDocumentStore: Send + Sync {
+    async fn list_matter_documents_db(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterDocumentRecord>, DatabaseError>;
+    async fn get_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError>;
+    async fn upsert_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &UpsertMatterDocumentParams,
+    ) -> Result<MatterDocumentRecord, DatabaseError>;
+    async fn update_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+        input: &UpdateMatterDocumentParams,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError>;
+    async fn delete_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
+pub trait DocumentVersionStore: Send + Sync {
+    async fn list_document_versions(
+        &self,
+        user_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Vec<DocumentVersionRecord>, DatabaseError>;
+    async fn create_document_version(
+        &self,
+        user_id: &str,
+        input: &CreateDocumentVersionParams,
+    ) -> Result<DocumentVersionRecord, DatabaseError>;
+}
+
+#[async_trait]
+pub trait DocumentTemplateStore: Send + Sync {
+    async fn list_document_templates(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+    ) -> Result<Vec<DocumentTemplateRecord>, DatabaseError>;
+    async fn get_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError>;
+    async fn get_document_template_by_name(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError>;
+    async fn upsert_document_template(
+        &self,
+        user_id: &str,
+        input: &UpsertDocumentTemplateParams,
+    ) -> Result<DocumentTemplateRecord, DatabaseError>;
+    async fn update_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+        input: &UpdateDocumentTemplateParams,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError>;
+    async fn delete_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
+pub trait TimeExpenseStore: Send + Sync {
+    async fn list_time_entries(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<TimeEntryRecord>, DatabaseError>;
+    async fn get_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<Option<TimeEntryRecord>, DatabaseError>;
+    async fn create_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateTimeEntryParams,
+    ) -> Result<TimeEntryRecord, DatabaseError>;
+    async fn update_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+        input: &UpdateTimeEntryParams,
+    ) -> Result<Option<TimeEntryRecord>, DatabaseError>;
+    async fn delete_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+
+    async fn list_expense_entries(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<ExpenseEntryRecord>, DatabaseError>;
+    async fn get_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<Option<ExpenseEntryRecord>, DatabaseError>;
+    async fn create_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateExpenseEntryParams,
+    ) -> Result<ExpenseEntryRecord, DatabaseError>;
+    async fn update_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+        input: &UpdateExpenseEntryParams,
+    ) -> Result<Option<ExpenseEntryRecord>, DatabaseError>;
+    async fn delete_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<bool, DatabaseError>;
+
+    async fn mark_time_entries_billed(
+        &self,
+        user_id: &str,
+        entry_ids: &[Uuid],
+        invoice_id: &str,
+    ) -> Result<u64, DatabaseError>;
+    async fn mark_expense_entries_billed(
+        &self,
+        user_id: &str,
+        entry_ids: &[Uuid],
+        invoice_id: &str,
+    ) -> Result<u64, DatabaseError>;
+    async fn matter_time_summary(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<MatterTimeSummary, DatabaseError>;
+}
+
+#[async_trait]
+pub trait BillingStore: Send + Sync {
+    async fn save_invoice_draft(
+        &self,
+        user_id: &str,
+        invoice: &CreateInvoiceParams,
+        line_items: &[CreateInvoiceLineItemParams],
+    ) -> Result<(InvoiceRecord, Vec<InvoiceLineItemRecord>), DatabaseError>;
+    async fn get_invoice(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError>;
+    async fn list_invoice_line_items(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+    ) -> Result<Vec<InvoiceLineItemRecord>, DatabaseError>;
+    async fn set_invoice_status(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+        status: InvoiceStatus,
+        issued_date: Option<NaiveDate>,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError>;
+    async fn apply_invoice_payment(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+        amount: Decimal,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError>;
+    async fn append_trust_ledger_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateTrustLedgerEntryParams,
+    ) -> Result<TrustLedgerEntryRecord, DatabaseError>;
+    async fn list_trust_ledger_entries(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<TrustLedgerEntryRecord>, DatabaseError>;
+    async fn current_trust_balance(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Decimal, DatabaseError>;
+}
+
+#[async_trait]
+pub trait AuditEventStore: Send + Sync {
+    async fn append_audit_event(
+        &self,
+        user_id: &str,
+        input: &AppendAuditEventParams,
+    ) -> Result<AuditEventRecord, DatabaseError>;
+    async fn list_audit_events(
+        &self,
+        user_id: &str,
+        query: &AuditEventQuery,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<AuditEventRecord>, DatabaseError>;
+    async fn count_audit_events(
+        &self,
+        user_id: &str,
+        query: &AuditEventQuery,
+    ) -> Result<usize, DatabaseError>;
+}
+
+#[async_trait]
 pub trait SettingsStore: Send + Sync {
     async fn get_setting(
         &self,
@@ -403,6 +1746,18 @@ pub trait Database:
     + SandboxStore
     + RoutineStore
     + ToolFailureStore
+    + LegalConflictStore
+    + ClientStore
+    + MatterStore
+    + MatterTaskStore
+    + MatterNoteStore
+    + MatterDeadlineStore
+    + MatterDocumentStore
+    + DocumentVersionStore
+    + DocumentTemplateStore
+    + TimeExpenseStore
+    + BillingStore
+    + AuditEventStore
     + SettingsStore
     + WorkspaceStore
     + Send

@@ -1,0 +1,27 @@
+[[rules]]
+id = "frcp_12_a_1"
+citation = "FRCP 12(a)(1)"
+deadline_type = "response_due"
+offset_days = 21
+court_days = false
+
+[[rules]]
+id = "frcp_26_a_1"
+citation = "FRCP 26(a)(1)"
+deadline_type = "discovery_cutoff"
+offset_days = 14
+court_days = false
+
+[[rules]]
+id = "frcp_56_c_1"
+citation = "FRCP 56(c)(1)"
+deadline_type = "filing"
+offset_days = 30
+court_days = false
+
+[[rules]]
+id = "ca_ccp_412_20"
+citation = "CA CCP 412.20"
+deadline_type = "response_due"
+offset_days = 30
+court_days = false

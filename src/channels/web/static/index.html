@@ -360,7 +360,30 @@
               </label>
             </div>
             <p class="matters-create-help">Opened date format: YYYY-MM-DD.</p>
-            <button class="btn-ext activate" id="matters-create-btn" type="submit">Create &amp; Activate</button>
+            <div class="matters-create-actions">
+              <button class="btn-ext" id="matters-review-btn" type="button">Review Conflicts</button>
+              <button class="btn-ext activate" id="matters-create-btn" type="submit" disabled>Create &amp; Activate</button>
+            </div>
+            <div class="matters-create-review" id="matters-create-review">
+              <div class="matters-create-review-status" id="matters-create-review-status">
+                Run conflict review before creating this matter.
+              </div>
+              <div class="matters-create-review-hits" id="matters-create-review-hits"></div>
+              <div class="matters-create-clearance-controls" id="matters-create-clearance-controls" style="display:none">
+                <label>
+                  Conflict decision
+                  <select id="matter-create-conflict-decision">
+                    <option value="clear">Clear</option>
+                    <option value="waived">Waive</option>
+                    <option value="declined">Decline / Escalate</option>
+                  </select>
+                </label>
+                <label>
+                  Decision note
+                  <textarea id="matter-create-conflict-note" rows="3" placeholder="Required for waived or declined decisions"></textarea>
+                </label>
+              </div>
+            </div>
           </form>
         </div>
         <div class="matters-active-bar" id="matters-active-bar">

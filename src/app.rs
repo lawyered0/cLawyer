@@ -691,6 +691,101 @@ impl AppBuilder {
                 tracing::warn!("Failed to seed legal workspace scaffolding: {}", e);
             }
 
+            if self.config.legal.enabled
+                && let Some(ref db) = self.db
+            {
+                let gateway_user_id = self
+                    .config
+                    .channels
+                    .gateway
+                    .as_ref()
+                    .map(|cfg| cfg.user_id.as_str())
+                    .unwrap_or("default");
+                match crate::legal::matter::reindex_matters_from_workspace(
+                    ws.as_ref(),
+                    db,
+                    &self.config.legal,
+                    gateway_user_id,
+                )
+                .await
+                {
+                    Ok(report) => {
+                        tracing::info!(
+                            scanned_matters = report.scanned_matters,
+                            upserted_matters = report.upserted_matters,
+                            skipped_matters = report.skipped_matters,
+                            warning_count = report.warnings.len(),
+                            "Matter metadata DB backfill completed at startup"
+                        );
+                        for warning in report.warnings.iter().take(10) {
+                            tracing::warn!(warning = %warning, "Matter DB backfill warning");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Matter metadata DB backfill failed at startup: {}", e);
+                    }
+                }
+            }
+
+            if self.config.legal.enabled
+                && self.config.legal.conflict_check_enabled
+                && self.config.legal.conflict_reindex_on_startup
+                && let Some(ref db) = self.db
+            {
+                let startup_legal = self.config.legal.clone();
+                match crate::legal::matter::reindex_conflict_graph(ws.as_ref(), db, &startup_legal)
+                    .await
+                {
+                    Ok(report) => {
+                        tracing::info!(
+                            scanned_matters = report.scanned_matters,
+                            seeded_matters = report.seeded_matters,
+                            skipped_matters = report.skipped_matters,
+                            global_conflicts_seeded = report.global_conflicts_seeded,
+                            global_aliases_seeded = report.global_aliases_seeded,
+                            warning_count = report.warnings.len(),
+                            "Conflict graph reindex completed at startup"
+                        );
+                        let startup_user_id = self
+                            .config
+                            .channels
+                            .gateway
+                            .as_ref()
+                            .map(|cfg| cfg.user_id.as_str())
+                            .unwrap_or("default")
+                            .to_string();
+                        crate::audit_db!(
+                            self.db.clone(),
+                            startup_user_id,
+                            "conflict_graph_reindexed",
+                            "startup",
+                            None,
+                            crate::db::AuditSeverity::Info,
+                            serde_json::json!({
+                                "triggered_by": "startup",
+                                "scanned_matters": report.scanned_matters,
+                                "seeded_matters": report.seeded_matters,
+                                "skipped_matters": report.skipped_matters,
+                                "global_conflicts_seeded": report.global_conflicts_seeded,
+                                "global_aliases_seeded": report.global_aliases_seeded,
+                                "warning_count": report.warnings.len(),
+                            })
+                        );
+                    }
+                    Err(e) => {
+                        if !startup_legal.conflict_file_fallback_enabled {
+                            tracing::error!(
+                                "Conflict graph startup reindex failed in DB-authoritative mode: {}; enabling file fallback for this process",
+                                e
+                            );
+                            self.config.legal.conflict_file_fallback_enabled = true;
+                        } else {
+                            tracing::warn!("Conflict graph startup reindex failed: {}", e);
+                        }
+                    }
+                }
+            }
+
             if embeddings.is_some() {
                 let ws_bg = Arc::clone(ws);
                 tokio::spawn(async move {

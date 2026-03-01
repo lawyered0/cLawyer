@@ -3,12 +3,13 @@
 //! Delegates to the existing `Store` (history) and `Repository` (workspace)
 //! implementations, avoiding SQL duplication.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use deadpool_postgres::Pool;
+use chrono::{DateTime, NaiveDate, Utc};
+use deadpool_postgres::{GenericClient, Pool};
 use rust_decimal::Decimal;
+use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
 use crate::agent::BrokenTool;
@@ -16,8 +17,24 @@ use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
-    ConversationStore, Database, JobStore, RoutineStore, SandboxStore, SettingsStore,
-    ToolFailureStore, WorkspaceStore,
+    AppendAuditEventParams, AuditEventQuery, AuditEventRecord, AuditEventStore, AuditSeverity,
+    BillingStore, ClientRecord, ClientStore, ClientType, ConflictClearanceRecord, ConflictHit,
+    ConversationStore, CreateClientParams, CreateDocumentVersionParams, CreateExpenseEntryParams,
+    CreateInvoiceLineItemParams, CreateInvoiceParams, CreateMatterDeadlineParams,
+    CreateMatterNoteParams, CreateMatterTaskParams, CreateTimeEntryParams,
+    CreateTrustLedgerEntryParams, Database, DocumentTemplateRecord, DocumentTemplateStore,
+    DocumentVersionRecord, DocumentVersionStore, ExpenseCategory, ExpenseEntryRecord,
+    InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus, JobStore, LegalConflictStore,
+    MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType, MatterDocumentCategory,
+    MatterDocumentRecord, MatterDocumentStore, MatterNoteRecord, MatterNoteStore, MatterRecord,
+    MatterStatus, MatterStore, MatterTaskRecord, MatterTaskStatus, MatterTaskStore,
+    MatterTimeSummary, PartyRole, RoutineStore, SandboxStore, SettingsStore, TimeEntryRecord,
+    TimeExpenseStore, ToolFailureStore, TrustLedgerEntryRecord, TrustLedgerEntryType,
+    UpdateClientParams, UpdateDocumentTemplateParams, UpdateExpenseEntryParams,
+    UpdateMatterDeadlineParams, UpdateMatterDocumentParams, UpdateMatterNoteParams,
+    UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
+    UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams, WorkspaceStore,
+    conflict_terms_from_text, normalize_party_name,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -52,6 +69,447 @@ impl PgBackend {
     pub fn pool(&self) -> Pool {
         self.store.pool()
     }
+}
+
+fn normalize_input_terms(input_names: &[String]) -> Vec<String> {
+    input_names
+        .iter()
+        .map(|name| normalize_party_name(name))
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn sql_or_eq(column: &str, start_idx: usize, count: usize) -> String {
+    (0..count)
+        .map(|i| format!("{column} = ${}", start_idx + i))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn sql_values_terms(start_idx: usize, count: usize) -> String {
+    (0..count)
+        .map(|i| format!("(${})", start_idx + i))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn match_priority(matched_via: &str) -> u8 {
+    if matched_via == "direct" {
+        3
+    } else if matched_via.starts_with("alias:") {
+        2
+    } else {
+        1
+    }
+}
+
+fn parse_opened_at_ts(raw: Option<&str>) -> Result<Option<DateTime<Utc>>, DatabaseError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        let dt = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| DatabaseError::Serialization("invalid opened_at date".to_string()))?;
+        return Ok(Some(dt.and_utc()));
+    }
+
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Ok(Some(dt.with_timezone(&Utc)));
+    }
+
+    Err(DatabaseError::Serialization(format!(
+        "invalid opened_at timestamp '{}'",
+        raw
+    )))
+}
+
+async fn upsert_party_pg<C>(conn: &C, name: &str) -> Result<Option<Uuid>, DatabaseError>
+where
+    C: GenericClient + Sync,
+{
+    let display_name = name.trim();
+    if display_name.is_empty() {
+        return Ok(None);
+    }
+    let normalized = normalize_party_name(display_name);
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    let row = conn
+        .query_one(
+            "INSERT INTO parties (id, name, name_normalized, party_type) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (name_normalized) DO UPDATE \
+             SET name = EXCLUDED.name, updated_at = NOW() \
+             RETURNING id",
+            &[&Uuid::new_v4(), &display_name, &normalized, &"entity"],
+        )
+        .await?;
+    Ok(Some(row.get::<_, Uuid>(0)))
+}
+
+fn dedupe_hits(
+    rows: Vec<(String, String, String, String, String, f64)>,
+    limit: usize,
+) -> Vec<ConflictHit> {
+    let mut best: std::collections::HashMap<(String, String, String), (u8, f64, ConflictHit)> =
+        std::collections::HashMap::new();
+
+    for (party, role_raw, matter_id, matter_status, matched_via, score) in rows {
+        let Some(role) = PartyRole::from_db_value(&role_raw) else {
+            continue;
+        };
+        let key = (party.clone(), role_raw, matter_id.clone());
+        let hit = ConflictHit {
+            party,
+            role,
+            matter_id,
+            matter_status,
+            matched_via: matched_via.clone(),
+        };
+        let priority = match_priority(&matched_via);
+
+        match best.get(&key) {
+            Some((existing_priority, existing_score, _))
+                if *existing_priority > priority
+                    || (*existing_priority == priority && *existing_score >= score) => {}
+            _ => {
+                best.insert(key, (priority, score, hit));
+            }
+        }
+    }
+
+    let mut hits: Vec<ConflictHit> = best.into_values().map(|(_, _, hit)| hit).collect();
+    hits.sort_by(|a, b| {
+        a.party
+            .cmp(&b.party)
+            .then_with(|| a.matter_id.cmp(&b.matter_id))
+            .then_with(|| a.matched_via.cmp(&b.matched_via))
+    });
+    if hits.len() > limit {
+        hits.truncate(limit);
+    }
+    hits
+}
+
+fn parse_json_string_array(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_json_uuid_array(value: &serde_json::Value) -> Vec<Uuid> {
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| entry.as_str())
+                .filter_map(|raw| Uuid::parse_str(raw).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn row_to_client_record(row: &tokio_postgres::Row) -> Result<ClientRecord, DatabaseError> {
+    let client_type_raw: String = row.get("client_type");
+    let client_type = ClientType::from_db_value(&client_type_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid client_type '{}'", client_type_raw))
+    })?;
+    Ok(ClientRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        name: row.get("name"),
+        name_normalized: row.get("name_normalized"),
+        client_type,
+        email: row.get("email"),
+        phone: row.get("phone"),
+        address: row.get("address"),
+        notes: row.get("notes"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_matter_record(row: &tokio_postgres::Row) -> Result<MatterRecord, DatabaseError> {
+    let status_raw: String = row.get("status");
+    let status = MatterStatus::from_db_value(&status_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid matter status '{}'", status_raw))
+    })?;
+    let assigned_to_value: serde_json::Value = row.get("assigned_to");
+    let custom_fields: serde_json::Value = row.get("custom_fields");
+    Ok(MatterRecord {
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        client_id: row.get("client_id"),
+        status,
+        stage: row.get("stage"),
+        practice_area: row.get("practice_area"),
+        jurisdiction: row.get("jurisdiction"),
+        opened_at: row.get("opened_at"),
+        closed_at: row.get("closed_at"),
+        assigned_to: parse_json_string_array(&assigned_to_value),
+        custom_fields,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_matter_task_record(row: &tokio_postgres::Row) -> Result<MatterTaskRecord, DatabaseError> {
+    let status_raw: String = row.get("status");
+    let status = MatterTaskStatus::from_db_value(&status_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid matter task status '{}'", status_raw))
+    })?;
+    let blocked_by_value: serde_json::Value = row.get("blocked_by");
+    Ok(MatterTaskRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        title: row.get("title"),
+        description: row.get("description"),
+        status,
+        assignee: row.get("assignee"),
+        due_at: row.get("due_at"),
+        blocked_by: parse_json_uuid_array(&blocked_by_value),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_matter_note_record(row: &tokio_postgres::Row) -> MatterNoteRecord {
+    MatterNoteRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        author: row.get("author"),
+        body: row.get("body"),
+        pinned: row.get("pinned"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+fn parse_json_i32_array(value: &serde_json::Value) -> Vec<i32> {
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| entry.as_i64())
+                .filter_map(|raw| i32::try_from(raw).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn row_to_matter_deadline_record(
+    row: &tokio_postgres::Row,
+) -> Result<MatterDeadlineRecord, DatabaseError> {
+    let deadline_type_raw: String = row.get("deadline_type");
+    let deadline_type = MatterDeadlineType::from_db_value(&deadline_type_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid deadline_type '{}'", deadline_type_raw))
+    })?;
+    let reminder_days: serde_json::Value = row.get("reminder_days");
+    Ok(MatterDeadlineRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        title: row.get("title"),
+        deadline_type,
+        due_at: row.get("due_at"),
+        completed_at: row.get("completed_at"),
+        reminder_days: parse_json_i32_array(&reminder_days),
+        rule_ref: row.get("rule_ref"),
+        computed_from: row.get("computed_from"),
+        task_id: row.get("task_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_matter_document_record(
+    row: &tokio_postgres::Row,
+) -> Result<MatterDocumentRecord, DatabaseError> {
+    let category_raw: String = row.get("category");
+    let category = MatterDocumentCategory::from_db_value(&category_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!(
+            "invalid matter document category '{}'",
+            category_raw
+        ))
+    })?;
+    Ok(MatterDocumentRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        memory_document_id: row.get("memory_document_id"),
+        path: row.get("path"),
+        display_name: row.get("display_name"),
+        category,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_document_version_record(
+    row: &tokio_postgres::Row,
+) -> Result<DocumentVersionRecord, DatabaseError> {
+    Ok(DocumentVersionRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_document_id: row.get("matter_document_id"),
+        version_number: row.get("version_number"),
+        label: row.get("label"),
+        memory_document_id: row.get("memory_document_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_document_template_record(
+    row: &tokio_postgres::Row,
+) -> Result<DocumentTemplateRecord, DatabaseError> {
+    let variables_json: serde_json::Value = row.get("variables_json");
+    Ok(DocumentTemplateRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        name: row.get("name"),
+        body: row.get("body"),
+        variables_json,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_time_entry_record(row: &tokio_postgres::Row) -> Result<TimeEntryRecord, DatabaseError> {
+    Ok(TimeEntryRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        timekeeper: row.get("timekeeper"),
+        description: row.get("description"),
+        hours: row.get("hours"),
+        hourly_rate: row.get("hourly_rate"),
+        entry_date: row.get("entry_date"),
+        billable: row.get("billable"),
+        billed_invoice_id: row.get("billed_invoice_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_expense_entry_record(
+    row: &tokio_postgres::Row,
+) -> Result<ExpenseEntryRecord, DatabaseError> {
+    let category_raw: String = row.get("category");
+    let category = ExpenseCategory::from_db_value(&category_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid expense category '{}'", category_raw))
+    })?;
+
+    Ok(ExpenseEntryRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        submitted_by: row.get("submitted_by"),
+        description: row.get("description"),
+        amount: row.get("amount"),
+        category,
+        entry_date: row.get("entry_date"),
+        receipt_path: row.get("receipt_path"),
+        billable: row.get("billable"),
+        billed_invoice_id: row.get("billed_invoice_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_invoice_record(row: &tokio_postgres::Row) -> Result<InvoiceRecord, DatabaseError> {
+    let status_raw: String = row.get("status");
+    let status = InvoiceStatus::from_db_value(&status_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid invoice status '{}'", status_raw))
+    })?;
+    Ok(InvoiceRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        invoice_number: row.get("invoice_number"),
+        status,
+        issued_date: row.get("issued_date"),
+        due_date: row.get("due_date"),
+        subtotal: row.get("subtotal"),
+        tax: row.get("tax"),
+        total: row.get("total"),
+        paid_amount: row.get("paid_amount"),
+        notes: row.get("notes"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_invoice_line_item_record(
+    row: &tokio_postgres::Row,
+) -> Result<InvoiceLineItemRecord, DatabaseError> {
+    Ok(InvoiceLineItemRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        invoice_id: row.get("invoice_id"),
+        description: row.get("description"),
+        quantity: row.get("quantity"),
+        unit_price: row.get("unit_price"),
+        amount: row.get("amount"),
+        time_entry_id: row.get("time_entry_id"),
+        expense_entry_id: row.get("expense_entry_id"),
+        sort_order: row.get("sort_order"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_trust_ledger_entry_record(
+    row: &tokio_postgres::Row,
+) -> Result<TrustLedgerEntryRecord, DatabaseError> {
+    let entry_type_raw: String = row.get("entry_type");
+    let entry_type = TrustLedgerEntryType::from_db_value(&entry_type_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!(
+            "invalid trust ledger entry type '{}'",
+            entry_type_raw
+        ))
+    })?;
+    Ok(TrustLedgerEntryRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        matter_id: row.get("matter_id"),
+        entry_type,
+        amount: row.get("amount"),
+        balance_after: row.get("balance_after"),
+        description: row.get("description"),
+        invoice_id: row.get("invoice_id"),
+        recorded_by: row.get("recorded_by"),
+        created_at: row.get("created_at"),
+    })
+}
+
+fn row_to_audit_event_record(row: &tokio_postgres::Row) -> Result<AuditEventRecord, DatabaseError> {
+    let severity_raw: String = row.get("severity");
+    let severity = AuditSeverity::from_db_value(&severity_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid audit severity '{}'", severity_raw))
+    })?;
+    let details: serde_json::Value = row.get("details");
+    Ok(AuditEventRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        event_type: row.get("event_type"),
+        actor: row.get("actor"),
+        matter_id: row.get("matter_id"),
+        severity,
+        details,
+        created_at: row.get("created_at"),
+    })
 }
 
 // ==================== Database (supertrait) ====================
@@ -471,6 +929,2215 @@ impl ToolFailureStore for PgBackend {
 
     async fn increment_repair_attempts(&self, tool_name: &str) -> Result<(), DatabaseError> {
         self.store.increment_repair_attempts(tool_name).await
+    }
+}
+
+// ==================== LegalConflictStore ====================
+
+#[async_trait]
+impl LegalConflictStore for PgBackend {
+    async fn find_conflict_hits_for_names(
+        &self,
+        input_names: &[String],
+        limit: usize,
+    ) -> Result<Vec<ConflictHit>, DatabaseError> {
+        let terms = normalize_input_terms(input_names);
+        if terms.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let limit = limit.min(200);
+        let conn = self.store.conn().await?;
+        let mut rows: Vec<(String, String, String, String, String, f64)> = Vec::new();
+
+        let direct_clause = sql_or_eq("p.name_normalized", 1, terms.len());
+        let direct_query = format!(
+            "SELECT p.name, mp.role, mp.matter_id, \
+                    CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
+                    'direct' AS matched_via, \
+                    1.0::double precision AS score \
+             FROM parties p \
+             JOIN matter_parties mp ON mp.party_id = p.id \
+             WHERE {direct_clause} \
+             LIMIT ${}",
+            terms.len() + 1
+        );
+        let direct_limit = limit as i64;
+        let mut direct_params: Vec<&(dyn ToSql + Sync)> = terms
+            .iter()
+            .map(|term| term as &(dyn ToSql + Sync))
+            .collect();
+        direct_params.push(&direct_limit);
+        for row in conn.query(&direct_query, &direct_params).await? {
+            rows.push((
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+            ));
+        }
+
+        let alias_clause = sql_or_eq("pa.alias_normalized", 1, terms.len());
+        let alias_query = format!(
+            "SELECT p.name, mp.role, mp.matter_id, \
+                    CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
+                    ('alias:' || pa.alias) AS matched_via, \
+                    0.9::double precision AS score \
+             FROM party_aliases pa \
+             JOIN parties p ON p.id = pa.party_id \
+             JOIN matter_parties mp ON mp.party_id = p.id \
+             WHERE {alias_clause} \
+             LIMIT ${}",
+            terms.len() + 1
+        );
+        let alias_limit = limit as i64;
+        let mut alias_params: Vec<&(dyn ToSql + Sync)> = terms
+            .iter()
+            .map(|term| term as &(dyn ToSql + Sync))
+            .collect();
+        alias_params.push(&alias_limit);
+        for row in conn.query(&alias_query, &alias_params).await? {
+            rows.push((
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+            ));
+        }
+
+        // Fuzzy fallback via pg_trgm similarity.
+        let values = sql_values_terms(1, terms.len());
+        let fuzzy_names_query = format!(
+            "WITH input_terms(term) AS (VALUES {values}) \
+             SELECT p.name, mp.role, mp.matter_id, \
+                    CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
+                    ('fuzzy:' || input_terms.term) AS matched_via, \
+                    similarity(p.name_normalized, input_terms.term) AS score \
+             FROM input_terms \
+             JOIN parties p ON p.name_normalized % input_terms.term \
+             JOIN matter_parties mp ON mp.party_id = p.id \
+             WHERE similarity(p.name_normalized, input_terms.term) >= 0.45 \
+             LIMIT ${}",
+            terms.len() + 1
+        );
+        let fuzzy_names_limit = limit as i64;
+        let mut fuzzy_name_params: Vec<&(dyn ToSql + Sync)> = terms
+            .iter()
+            .map(|term| term as &(dyn ToSql + Sync))
+            .collect();
+        fuzzy_name_params.push(&fuzzy_names_limit);
+        for row in conn.query(&fuzzy_names_query, &fuzzy_name_params).await? {
+            rows.push((
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+            ));
+        }
+
+        let fuzzy_alias_query = format!(
+            "WITH input_terms(term) AS (VALUES {values}) \
+             SELECT p.name, mp.role, mp.matter_id, \
+                    CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
+                    ('fuzzy:' || input_terms.term) AS matched_via, \
+                    similarity(pa.alias_normalized, input_terms.term) AS score \
+             FROM input_terms \
+             JOIN party_aliases pa ON pa.alias_normalized % input_terms.term \
+             JOIN parties p ON p.id = pa.party_id \
+             JOIN matter_parties mp ON mp.party_id = p.id \
+             WHERE similarity(pa.alias_normalized, input_terms.term) >= 0.45 \
+             LIMIT ${}",
+            terms.len() + 1
+        );
+        let fuzzy_alias_limit = limit as i64;
+        let mut fuzzy_alias_params: Vec<&(dyn ToSql + Sync)> = terms
+            .iter()
+            .map(|term| term as &(dyn ToSql + Sync))
+            .collect();
+        fuzzy_alias_params.push(&fuzzy_alias_limit);
+        for row in conn.query(&fuzzy_alias_query, &fuzzy_alias_params).await? {
+            rows.push((
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+            ));
+        }
+
+        Ok(dedupe_hits(rows, limit))
+    }
+
+    async fn find_conflict_hits_for_text(
+        &self,
+        text: &str,
+        active_matter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConflictHit>, DatabaseError> {
+        let terms = conflict_terms_from_text(text, active_matter);
+        self.find_conflict_hits_for_names(&terms, limit).await
+    }
+
+    async fn seed_matter_parties(
+        &self,
+        matter_id: &str,
+        client: &str,
+        adversaries: &[String],
+        opened_at: Option<&str>,
+    ) -> Result<(), DatabaseError> {
+        let matter_id = matter_id.trim();
+        if matter_id.is_empty() {
+            return Err(DatabaseError::Serialization(
+                "matter_id cannot be empty".to_string(),
+            ));
+        }
+
+        let opened_at = parse_opened_at_ts(opened_at)?;
+        let mut conn = self.store.conn().await?;
+
+        let tx = conn.transaction().await?;
+
+        if let Some(client_party_id) = upsert_party_pg(&tx, client).await? {
+            tx.execute(
+                "INSERT INTO matter_parties (id, matter_id, party_id, role, opened_at, closed_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (matter_id, party_id, role) DO UPDATE \
+                 SET opened_at = COALESCE(matter_parties.opened_at, EXCLUDED.opened_at), \
+                     updated_at = NOW()",
+                &[
+                    &Uuid::new_v4(),
+                    &matter_id,
+                    &client_party_id,
+                    &PartyRole::Client.as_str(),
+                    &opened_at,
+                    &Option::<DateTime<Utc>>::None,
+                ],
+            )
+            .await?;
+        }
+
+        for name in adversaries {
+            let Some(adverse_party_id) = upsert_party_pg(&tx, name).await? else {
+                continue;
+            };
+            tx.execute(
+                "INSERT INTO matter_parties (id, matter_id, party_id, role, opened_at, closed_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (matter_id, party_id, role) DO UPDATE \
+                 SET opened_at = COALESCE(matter_parties.opened_at, EXCLUDED.opened_at), \
+                     updated_at = NOW()",
+                &[
+                    &Uuid::new_v4(),
+                    &matter_id,
+                    &adverse_party_id,
+                    &PartyRole::Adverse.as_str(),
+                    &opened_at,
+                    &Option::<DateTime<Utc>>::None,
+                ],
+            )
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn seed_conflict_entry(
+        &self,
+        matter_id: &str,
+        canonical_name: &str,
+        aliases: &[String],
+        opened_at: Option<&str>,
+    ) -> Result<(), DatabaseError> {
+        let matter_id = matter_id.trim();
+        if matter_id.is_empty() {
+            return Err(DatabaseError::Serialization(
+                "matter_id cannot be empty".to_string(),
+            ));
+        }
+
+        let opened_at = parse_opened_at_ts(opened_at)?;
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+
+        let Some(party_id) = upsert_party_pg(&tx, canonical_name).await? else {
+            tx.commit().await?;
+            return Ok(());
+        };
+
+        tx.execute(
+            "INSERT INTO matter_parties (id, matter_id, party_id, role, opened_at, closed_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (matter_id, party_id, role) DO UPDATE \
+             SET opened_at = COALESCE(matter_parties.opened_at, EXCLUDED.opened_at), \
+                 updated_at = NOW()",
+            &[
+                &Uuid::new_v4(),
+                &matter_id,
+                &party_id,
+                &PartyRole::Adverse.as_str(),
+                &opened_at,
+                &Option::<DateTime<Utc>>::None,
+            ],
+        )
+        .await?;
+
+        let mut seen = HashSet::new();
+        for alias in aliases {
+            let display_alias = alias.trim();
+            if display_alias.is_empty() {
+                continue;
+            }
+            let normalized_alias = normalize_party_name(display_alias);
+            if normalized_alias.is_empty() || !seen.insert(normalized_alias.clone()) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO party_aliases (id, party_id, alias, alias_normalized) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (party_id, alias_normalized) DO UPDATE \
+                 SET alias = EXCLUDED.alias, updated_at = NOW()",
+                &[
+                    &Uuid::new_v4(),
+                    &party_id,
+                    &display_alias,
+                    &normalized_alias,
+                ],
+            )
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn reset_conflict_graph(&self) -> Result<(), DatabaseError> {
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+        tx.execute("DELETE FROM matter_parties", &[]).await?;
+        tx.execute("DELETE FROM party_aliases", &[]).await?;
+        tx.execute("DELETE FROM party_relationships", &[]).await?;
+        tx.execute("DELETE FROM parties", &[]).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn upsert_party_aliases(
+        &self,
+        canonical_name: &str,
+        aliases: &[String],
+    ) -> Result<(), DatabaseError> {
+        if aliases.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.store.conn().await?;
+        let Some(party_id) = upsert_party_pg(&conn, canonical_name).await? else {
+            return Ok(());
+        };
+
+        let mut seen = HashSet::new();
+        for alias in aliases {
+            let display_alias = alias.trim();
+            if display_alias.is_empty() {
+                continue;
+            }
+            let normalized_alias = normalize_party_name(display_alias);
+            if normalized_alias.is_empty() || !seen.insert(normalized_alias.clone()) {
+                continue;
+            }
+            conn.execute(
+                "INSERT INTO party_aliases (id, party_id, alias, alias_normalized) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (party_id, alias_normalized) DO UPDATE \
+                 SET alias = EXCLUDED.alias, updated_at = NOW()",
+                &[
+                    &Uuid::new_v4(),
+                    &party_id,
+                    &display_alias,
+                    &normalized_alias,
+                ],
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn record_conflict_clearance(
+        &self,
+        row: &ConflictClearanceRecord,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO conflict_clearances \
+             (id, matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                &Uuid::new_v4(),
+                &row.matter_id,
+                &row.checked_by,
+                &row.cleared_by,
+                &row.decision.as_str(),
+                &row.note,
+                &row.hits_json,
+                &row.hit_count,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+// ==================== ClientStore ====================
+
+#[async_trait]
+impl ClientStore for PgBackend {
+    async fn create_client(
+        &self,
+        user_id: &str,
+        input: &CreateClientParams,
+    ) -> Result<ClientRecord, DatabaseError> {
+        let normalized_name = normalize_party_name(&input.name);
+        if normalized_name.is_empty() {
+            return Err(DatabaseError::Serialization(
+                "client name cannot be empty".to_string(),
+            ));
+        }
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO clients \
+                 (id, user_id, name, name_normalized, client_type, email, phone, address, notes) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 RETURNING id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &input.name.trim(),
+                    &normalized_name,
+                    &input.client_type.as_str(),
+                    &input.email,
+                    &input.phone,
+                    &input.address,
+                    &input.notes,
+                ],
+            )
+            .await?;
+        row_to_client_record(&row)
+    }
+
+    async fn upsert_client_by_normalized_name(
+        &self,
+        user_id: &str,
+        input: &CreateClientParams,
+    ) -> Result<ClientRecord, DatabaseError> {
+        let normalized_name = normalize_party_name(&input.name);
+        if normalized_name.is_empty() {
+            return Err(DatabaseError::Serialization(
+                "client name cannot be empty".to_string(),
+            ));
+        }
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO clients \
+                 (id, user_id, name, name_normalized, client_type, email, phone, address, notes) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 ON CONFLICT (user_id, name_normalized) DO UPDATE SET \
+                    name = EXCLUDED.name, \
+                    client_type = EXCLUDED.client_type, \
+                    email = COALESCE(EXCLUDED.email, clients.email), \
+                    phone = COALESCE(EXCLUDED.phone, clients.phone), \
+                    address = COALESCE(EXCLUDED.address, clients.address), \
+                    notes = COALESCE(EXCLUDED.notes, clients.notes), \
+                    updated_at = NOW() \
+                 RETURNING id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &input.name.trim(),
+                    &normalized_name,
+                    &input.client_type.as_str(),
+                    &input.email,
+                    &input.phone,
+                    &input.address,
+                    &input.notes,
+                ],
+            )
+            .await?;
+        row_to_client_record(&row)
+    }
+
+    async fn list_clients(
+        &self,
+        user_id: &str,
+        query: Option<&str>,
+    ) -> Result<Vec<ClientRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = if let Some(search_raw) = query {
+            let search = normalize_party_name(search_raw);
+            if search.is_empty() {
+                conn.query(
+                    "SELECT id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at \
+                     FROM clients \
+                     WHERE user_id = $1 \
+                     ORDER BY name ASC",
+                    &[&user_id],
+                )
+                .await?
+            } else {
+                let like = format!("%{search}%");
+                conn.query(
+                    "SELECT id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at \
+                     FROM clients \
+                     WHERE user_id = $1 AND (name_normalized LIKE $2 OR name_normalized % $3) \
+                     ORDER BY similarity(name_normalized, $3) DESC, name ASC",
+                    &[&user_id, &like, &search],
+                )
+                .await?
+            }
+        } else {
+            conn.query(
+                "SELECT id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at \
+                 FROM clients \
+                 WHERE user_id = $1 \
+                 ORDER BY name ASC",
+                &[&user_id],
+            )
+            .await?
+        };
+
+        rows.into_iter()
+            .map(|row| row_to_client_record(&row))
+            .collect()
+    }
+
+    async fn get_client(
+        &self,
+        user_id: &str,
+        client_id: Uuid,
+    ) -> Result<Option<ClientRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at \
+                 FROM clients \
+                 WHERE user_id = $1 AND id = $2",
+                &[&user_id, &client_id],
+            )
+            .await?;
+        row.map(|row| row_to_client_record(&row)).transpose()
+    }
+
+    async fn update_client(
+        &self,
+        user_id: &str,
+        client_id: Uuid,
+        input: &UpdateClientParams,
+    ) -> Result<Option<ClientRecord>, DatabaseError> {
+        let Some(existing) = self.get_client(user_id, client_id).await? else {
+            return Ok(None);
+        };
+
+        let merged_name = input
+            .name
+            .as_deref()
+            .unwrap_or(existing.name.as_str())
+            .trim();
+        let normalized_name = normalize_party_name(merged_name);
+        if normalized_name.is_empty() {
+            return Err(DatabaseError::Serialization(
+                "client name cannot be empty".to_string(),
+            ));
+        }
+        let merged_client_type = input.client_type.unwrap_or(existing.client_type);
+        let merged_email = input.email.clone().unwrap_or(existing.email);
+        let merged_phone = input.phone.clone().unwrap_or(existing.phone);
+        let merged_address = input.address.clone().unwrap_or(existing.address);
+        let merged_notes = input.notes.clone().unwrap_or(existing.notes);
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "UPDATE clients SET \
+                    name = $3, \
+                    name_normalized = $4, \
+                    client_type = $5, \
+                    email = $6, \
+                    phone = $7, \
+                    address = $8, \
+                    notes = $9, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND id = $2 \
+                 RETURNING id, user_id, name, name_normalized, client_type, email, phone, address, notes, created_at, updated_at",
+                &[
+                    &user_id,
+                    &client_id,
+                    &merged_name,
+                    &normalized_name,
+                    &merged_client_type.as_str(),
+                    &merged_email,
+                    &merged_phone,
+                    &merged_address,
+                    &merged_notes,
+                ],
+            )
+            .await?;
+
+        Ok(Some(row_to_client_record(&row)?))
+    }
+
+    async fn delete_client(&self, user_id: &str, client_id: Uuid) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM clients WHERE user_id = $1 AND id = $2",
+                &[&user_id, &client_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+// ==================== MatterStore ====================
+
+#[async_trait]
+impl MatterStore for PgBackend {
+    async fn upsert_matter(
+        &self,
+        user_id: &str,
+        input: &UpsertMatterParams,
+    ) -> Result<MatterRecord, DatabaseError> {
+        let assigned_to = serde_json::to_value(&input.assigned_to)
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let custom_fields = if input.custom_fields.is_object() {
+            input.custom_fields.clone()
+        } else {
+            serde_json::json!({})
+        };
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO matters \
+                 (user_id, matter_id, client_id, status, stage, practice_area, jurisdiction, opened_at, closed_at, assigned_to, custom_fields) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT (user_id, matter_id) DO UPDATE SET \
+                    client_id = EXCLUDED.client_id, \
+                    status = EXCLUDED.status, \
+                    stage = EXCLUDED.stage, \
+                    practice_area = EXCLUDED.practice_area, \
+                    jurisdiction = EXCLUDED.jurisdiction, \
+                    opened_at = EXCLUDED.opened_at, \
+                    closed_at = EXCLUDED.closed_at, \
+                    assigned_to = EXCLUDED.assigned_to, \
+                    custom_fields = EXCLUDED.custom_fields, \
+                    updated_at = NOW() \
+                 RETURNING user_id, matter_id, client_id, status, stage, practice_area, jurisdiction, opened_at, closed_at, assigned_to, custom_fields, created_at, updated_at",
+                &[
+                    &user_id,
+                    &input.matter_id,
+                    &input.client_id,
+                    &input.status.as_str(),
+                    &input.stage,
+                    &input.practice_area,
+                    &input.jurisdiction,
+                    &input.opened_at,
+                    &input.closed_at,
+                    &assigned_to,
+                    &custom_fields,
+                ],
+            )
+            .await?;
+        row_to_matter_record(&row)
+    }
+
+    async fn list_matters_db(&self, user_id: &str) -> Result<Vec<MatterRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT user_id, matter_id, client_id, status, stage, practice_area, jurisdiction, opened_at, closed_at, assigned_to, custom_fields, created_at, updated_at \
+                 FROM matters \
+                 WHERE user_id = $1 \
+                 ORDER BY matter_id ASC",
+                &[&user_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_matter_record(&row))
+            .collect()
+    }
+
+    async fn get_matter_db(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Option<MatterRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT user_id, matter_id, client_id, status, stage, practice_area, jurisdiction, opened_at, closed_at, assigned_to, custom_fields, created_at, updated_at \
+                 FROM matters \
+                 WHERE user_id = $1 AND matter_id = $2",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        row.map(|row| row_to_matter_record(&row)).transpose()
+    }
+
+    async fn update_matter(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &UpdateMatterParams,
+    ) -> Result<Option<MatterRecord>, DatabaseError> {
+        let Some(existing) = self.get_matter_db(user_id, matter_id).await? else {
+            return Ok(None);
+        };
+
+        let merged = UpsertMatterParams {
+            matter_id: existing.matter_id.clone(),
+            client_id: input.client_id.unwrap_or(existing.client_id),
+            status: input.status.unwrap_or(existing.status),
+            stage: input.stage.clone().unwrap_or(existing.stage),
+            practice_area: input
+                .practice_area
+                .clone()
+                .unwrap_or(existing.practice_area),
+            jurisdiction: input.jurisdiction.clone().unwrap_or(existing.jurisdiction),
+            opened_at: input.opened_at.unwrap_or(existing.opened_at),
+            closed_at: input.closed_at.unwrap_or(existing.closed_at),
+            assigned_to: input.assigned_to.clone().unwrap_or(existing.assigned_to),
+            custom_fields: input
+                .custom_fields
+                .clone()
+                .unwrap_or(existing.custom_fields),
+        };
+
+        let updated = self.upsert_matter(user_id, &merged).await?;
+        Ok(Some(updated))
+    }
+
+    async fn delete_matter(&self, user_id: &str, matter_id: &str) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM matters WHERE user_id = $1 AND matter_id = $2",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+// ==================== MatterTaskStore ====================
+
+#[async_trait]
+impl MatterTaskStore for PgBackend {
+    async fn list_matter_tasks(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterTaskRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_id, title, description, status, assignee, due_at, blocked_by, created_at, updated_at \
+                 FROM matter_tasks \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY created_at DESC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_matter_task_record(&row))
+            .collect()
+    }
+
+    async fn create_matter_task(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateMatterTaskParams,
+    ) -> Result<MatterTaskRecord, DatabaseError> {
+        let blocked_by = serde_json::to_value(
+            input
+                .blocked_by
+                .iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO matter_tasks \
+                 (id, user_id, matter_id, title, description, status, assignee, due_at, blocked_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 RETURNING id, user_id, matter_id, title, description, status, assignee, due_at, blocked_by, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.title,
+                    &input.description,
+                    &input.status.as_str(),
+                    &input.assignee,
+                    &input.due_at,
+                    &blocked_by,
+                ],
+            )
+            .await?;
+        row_to_matter_task_record(&row)
+    }
+
+    async fn update_matter_task(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        task_id: Uuid,
+        input: &UpdateMatterTaskParams,
+    ) -> Result<Option<MatterTaskRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let existing = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, title, description, status, assignee, due_at, blocked_by, created_at, updated_at \
+                 FROM matter_tasks \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &task_id],
+            )
+            .await?;
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        let existing = row_to_matter_task_record(&existing)?;
+
+        let blocked_by = input.blocked_by.clone().unwrap_or(existing.blocked_by);
+        let blocked_by = serde_json::to_value(
+            blocked_by
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+
+        let merged_title = input.title.clone().unwrap_or(existing.title);
+        let merged_description = input.description.clone().unwrap_or(existing.description);
+        let merged_status = input.status.unwrap_or(existing.status);
+        let merged_assignee = input.assignee.clone().unwrap_or(existing.assignee);
+        let merged_due_at = input.due_at.unwrap_or(existing.due_at);
+
+        let updated = conn
+            .query_one(
+                "UPDATE matter_tasks SET \
+                    title = $4, \
+                    description = $5, \
+                    status = $6, \
+                    assignee = $7, \
+                    due_at = $8, \
+                    blocked_by = $9, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
+                 RETURNING id, user_id, matter_id, title, description, status, assignee, due_at, blocked_by, created_at, updated_at",
+                &[
+                    &user_id,
+                    &matter_id,
+                    &task_id,
+                    &merged_title,
+                    &merged_description,
+                    &merged_status.as_str(),
+                    &merged_assignee,
+                    &merged_due_at,
+                    &blocked_by,
+                ],
+            )
+            .await?;
+        Ok(Some(row_to_matter_task_record(&updated)?))
+    }
+
+    async fn delete_matter_task(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        task_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM matter_tasks WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &task_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+// ==================== MatterNoteStore ====================
+
+#[async_trait]
+impl MatterNoteStore for PgBackend {
+    async fn list_matter_notes(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterNoteRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_id, author, body, pinned, created_at, updated_at \
+                 FROM matter_notes \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY pinned DESC, created_at DESC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(row_to_matter_note_record)
+            .collect::<Vec<_>>())
+    }
+
+    async fn create_matter_note(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateMatterNoteParams,
+    ) -> Result<MatterNoteRecord, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO matter_notes (id, user_id, matter_id, author, body, pinned) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 RETURNING id, user_id, matter_id, author, body, pinned, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.author,
+                    &input.body,
+                    &input.pinned,
+                ],
+            )
+            .await?;
+        Ok(row_to_matter_note_record(&row))
+    }
+
+    async fn update_matter_note(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        note_id: Uuid,
+        input: &UpdateMatterNoteParams,
+    ) -> Result<Option<MatterNoteRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let existing = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, author, body, pinned, created_at, updated_at \
+                 FROM matter_notes \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &note_id],
+            )
+            .await?;
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        let existing = row_to_matter_note_record(&existing);
+
+        let merged_author = input.author.clone().unwrap_or(existing.author);
+        let merged_body = input.body.clone().unwrap_or(existing.body);
+        let merged_pinned = input.pinned.unwrap_or(existing.pinned);
+
+        let updated = conn
+            .query_one(
+                "UPDATE matter_notes SET \
+                    author = $4, \
+                    body = $5, \
+                    pinned = $6, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
+                 RETURNING id, user_id, matter_id, author, body, pinned, created_at, updated_at",
+                &[
+                    &user_id,
+                    &matter_id,
+                    &note_id,
+                    &merged_author,
+                    &merged_body,
+                    &merged_pinned,
+                ],
+            )
+            .await?;
+        Ok(Some(row_to_matter_note_record(&updated)))
+    }
+
+    async fn delete_matter_note(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        note_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM matter_notes WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &note_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+// ==================== MatterDeadlineStore ====================
+
+#[async_trait]
+impl MatterDeadlineStore for PgBackend {
+    async fn list_matter_deadlines(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterDeadlineRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at \
+                 FROM matter_deadlines \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY due_at ASC, created_at ASC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_matter_deadline_record(&row))
+            .collect()
+    }
+
+    async fn get_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+    ) -> Result<Option<MatterDeadlineRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at \
+                 FROM matter_deadlines \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &deadline_id],
+            )
+            .await?;
+        row.map(|row| row_to_matter_deadline_record(&row))
+            .transpose()
+    }
+
+    async fn create_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateMatterDeadlineParams,
+    ) -> Result<MatterDeadlineRecord, DatabaseError> {
+        let reminder_days = serde_json::to_value(&input.reminder_days)
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO matter_deadlines \
+                 (id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 RETURNING id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.title,
+                    &input.deadline_type.as_str(),
+                    &input.due_at,
+                    &input.completed_at,
+                    &reminder_days,
+                    &input.rule_ref,
+                    &input.computed_from,
+                    &input.task_id,
+                ],
+            )
+            .await?;
+        row_to_matter_deadline_record(&row)
+    }
+
+    async fn update_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+        input: &UpdateMatterDeadlineParams,
+    ) -> Result<Option<MatterDeadlineRecord>, DatabaseError> {
+        let Some(existing) = self
+            .get_matter_deadline(user_id, matter_id, deadline_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let merged_title = input.title.clone().unwrap_or(existing.title);
+        let merged_deadline_type = input.deadline_type.unwrap_or(existing.deadline_type);
+        let merged_due_at = input.due_at.unwrap_or(existing.due_at);
+        let merged_completed_at = input.completed_at.unwrap_or(existing.completed_at);
+        let merged_reminder_days = input
+            .reminder_days
+            .clone()
+            .unwrap_or(existing.reminder_days);
+        let merged_rule_ref = input.rule_ref.clone().unwrap_or(existing.rule_ref);
+        let merged_computed_from = input.computed_from.unwrap_or(existing.computed_from);
+        let merged_task_id = input.task_id.unwrap_or(existing.task_id);
+        let reminder_days = serde_json::to_value(&merged_reminder_days)
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "UPDATE matter_deadlines SET \
+                    title = $4, \
+                    deadline_type = $5, \
+                    due_at = $6, \
+                    completed_at = $7, \
+                    reminder_days = $8, \
+                    rule_ref = $9, \
+                    computed_from = $10, \
+                    task_id = $11, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
+                 RETURNING id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at",
+                &[
+                    &user_id,
+                    &matter_id,
+                    &deadline_id,
+                    &merged_title,
+                    &merged_deadline_type.as_str(),
+                    &merged_due_at,
+                    &merged_completed_at,
+                    &reminder_days,
+                    &merged_rule_ref,
+                    &merged_computed_from,
+                    &merged_task_id,
+                ],
+            )
+            .await?;
+        Ok(Some(row_to_matter_deadline_record(&row)?))
+    }
+
+    async fn delete_matter_deadline(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM matter_deadlines WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &deadline_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+// ==================== MatterDocumentStore ====================
+
+#[async_trait]
+impl MatterDocumentStore for PgBackend {
+    async fn list_matter_documents_db(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterDocumentRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at \
+                 FROM matter_documents md \
+                 JOIN memory_documents d ON d.id = md.memory_document_id \
+                 WHERE md.user_id = $1 AND md.matter_id = $2 \
+                 ORDER BY d.path ASC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_matter_document_record(&row))
+            .collect()
+    }
+
+    async fn get_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at \
+                 FROM matter_documents md \
+                 JOIN memory_documents d ON d.id = md.memory_document_id \
+                 WHERE md.user_id = $1 AND md.matter_id = $2 AND md.id = $3",
+                &[&user_id, &matter_id, &matter_document_id],
+            )
+            .await?;
+        row.map(|row| row_to_matter_document_record(&row))
+            .transpose()
+    }
+
+    async fn upsert_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &UpsertMatterDocumentParams,
+    ) -> Result<MatterDocumentRecord, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO matter_documents \
+                 (id, user_id, matter_id, memory_document_id, display_name, category) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (user_id, matter_id, memory_document_id) DO UPDATE SET \
+                    display_name = EXCLUDED.display_name, \
+                    category = EXCLUDED.category, \
+                    updated_at = NOW() \
+                 RETURNING id",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.memory_document_id,
+                    &input.display_name,
+                    &input.category.as_str(),
+                ],
+            )
+            .await?;
+        let id: Uuid = row.get("id");
+        self.get_matter_document(user_id, matter_id, id)
+            .await?
+            .ok_or_else(|| {
+                DatabaseError::Query("failed to load upserted matter document".to_string())
+            })
+    }
+
+    async fn update_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+        input: &UpdateMatterDocumentParams,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError> {
+        let Some(existing) = self
+            .get_matter_document(user_id, matter_id, matter_document_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let merged_display_name = input
+            .display_name
+            .clone()
+            .unwrap_or(existing.display_name.clone());
+        let merged_category = input.category.unwrap_or(existing.category);
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "UPDATE matter_documents SET \
+                display_name = $4, \
+                category = $5, \
+                updated_at = NOW() \
+             WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+            &[
+                &user_id,
+                &matter_id,
+                &matter_document_id,
+                &merged_display_name,
+                &merged_category.as_str(),
+            ],
+        )
+        .await?;
+
+        self.get_matter_document(user_id, matter_id, matter_document_id)
+            .await
+    }
+
+    async fn delete_matter_document(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM matter_documents WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &matter_document_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+// ==================== DocumentVersionStore ====================
+
+#[async_trait]
+impl DocumentVersionStore for PgBackend {
+    async fn list_document_versions(
+        &self,
+        user_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Vec<DocumentVersionRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_document_id, version_number, label, memory_document_id, created_at, updated_at \
+                 FROM document_versions \
+                 WHERE user_id = $1 AND matter_document_id = $2 \
+                 ORDER BY version_number DESC",
+                &[&user_id, &matter_document_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_document_version_record(&row))
+            .collect()
+    }
+
+    async fn create_document_version(
+        &self,
+        user_id: &str,
+        input: &CreateDocumentVersionParams,
+    ) -> Result<DocumentVersionRecord, DatabaseError> {
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+        let next_row = tx
+            .query_one(
+                "SELECT COALESCE(MAX(version_number), 0) + 1 \
+                 FROM document_versions \
+                 WHERE user_id = $1 AND matter_document_id = $2",
+                &[&user_id, &input.matter_document_id],
+            )
+            .await?;
+        let next_version: i32 = next_row.get(0);
+        let inserted = tx
+            .query_one(
+                "INSERT INTO document_versions \
+                 (id, user_id, matter_document_id, version_number, label, memory_document_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 RETURNING id, user_id, matter_document_id, version_number, label, memory_document_id, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &input.matter_document_id,
+                    &next_version,
+                    &input.label,
+                    &input.memory_document_id,
+                ],
+            )
+            .await?;
+        tx.commit().await?;
+        row_to_document_version_record(&inserted)
+    }
+}
+
+// ==================== DocumentTemplateStore ====================
+
+#[async_trait]
+impl DocumentTemplateStore for PgBackend {
+    async fn list_document_templates(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+    ) -> Result<Vec<DocumentTemplateRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = if let Some(matter_id) = matter_id {
+            conn.query(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = $1 AND (matter_id = $2 OR matter_id IS NULL) \
+                 ORDER BY CASE WHEN matter_id = $2 THEN 0 ELSE 1 END, name ASC",
+                &[&user_id, &matter_id],
+            )
+            .await?
+        } else {
+            conn.query(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = $1 \
+                 ORDER BY name ASC",
+                &[&user_id],
+            )
+            .await?
+        };
+        rows.into_iter()
+            .map(|row| row_to_document_template_record(&row))
+            .collect()
+    }
+
+    async fn get_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = $1 AND id = $2",
+                &[&user_id, &template_id],
+            )
+            .await?;
+        row.map(|row| row_to_document_template_record(&row))
+            .transpose()
+    }
+
+    async fn get_document_template_by_name(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = if let Some(matter_id) = matter_id {
+            conn.query_opt(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = $1 AND name = $2 AND (matter_id = $3 OR matter_id IS NULL) \
+                 ORDER BY CASE WHEN matter_id = $3 THEN 0 ELSE 1 END \
+                 LIMIT 1",
+                &[&user_id, &name, &matter_id],
+            )
+            .await?
+        } else {
+            conn.query_opt(
+                "SELECT id, user_id, matter_id, name, body, variables_json, created_at, updated_at \
+                 FROM document_templates \
+                 WHERE user_id = $1 AND name = $2 AND matter_id IS NULL \
+                 LIMIT 1",
+                &[&user_id, &name],
+            )
+            .await?
+        };
+
+        row.map(|row| row_to_document_template_record(&row))
+            .transpose()
+    }
+
+    async fn upsert_document_template(
+        &self,
+        user_id: &str,
+        input: &UpsertDocumentTemplateParams,
+    ) -> Result<DocumentTemplateRecord, DatabaseError> {
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+        let variables_json = if input.variables_json.is_array() || input.variables_json.is_object()
+        {
+            input.variables_json.clone()
+        } else {
+            serde_json::json!([])
+        };
+
+        let row = if let Some(ref matter_id) = input.matter_id {
+            tx.query_one(
+                "INSERT INTO document_templates \
+                 (id, user_id, matter_id, name, body, variables_json) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (user_id, matter_id, name) DO UPDATE SET \
+                    body = EXCLUDED.body, \
+                    variables_json = EXCLUDED.variables_json, \
+                    updated_at = NOW() \
+                 RETURNING id, user_id, matter_id, name, body, variables_json, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.name,
+                    &input.body,
+                    &variables_json,
+                ],
+            )
+            .await?
+        } else if let Some(existing) = tx
+            .query_opt(
+                "SELECT id FROM document_templates \
+                 WHERE user_id = $1 AND matter_id IS NULL AND name = $2 \
+                 LIMIT 1",
+                &[&user_id, &input.name],
+            )
+            .await?
+        {
+            let existing_id: Uuid = existing.get("id");
+            tx.query_one(
+                "UPDATE document_templates SET \
+                    body = $3, \
+                    variables_json = $4, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND id = $2 \
+                 RETURNING id, user_id, matter_id, name, body, variables_json, created_at, updated_at",
+                &[&user_id, &existing_id, &input.body, &variables_json],
+            )
+            .await?
+        } else {
+            tx.query_one(
+                "INSERT INTO document_templates \
+                 (id, user_id, matter_id, name, body, variables_json) \
+                 VALUES ($1, $2, NULL, $3, $4, $5) \
+                 RETURNING id, user_id, matter_id, name, body, variables_json, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &input.name,
+                    &input.body,
+                    &variables_json,
+                ],
+            )
+            .await?
+        };
+        tx.commit().await?;
+        row_to_document_template_record(&row)
+    }
+
+    async fn update_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+        input: &UpdateDocumentTemplateParams,
+    ) -> Result<Option<DocumentTemplateRecord>, DatabaseError> {
+        let Some(existing) = self.get_document_template(user_id, template_id).await? else {
+            return Ok(None);
+        };
+
+        let merged_name = input.name.clone().unwrap_or(existing.name);
+        let merged_body = input.body.clone().unwrap_or(existing.body);
+        let merged_vars = input
+            .variables_json
+            .clone()
+            .unwrap_or(existing.variables_json);
+        let merged_vars = if merged_vars.is_array() || merged_vars.is_object() {
+            merged_vars
+        } else {
+            serde_json::json!([])
+        };
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "UPDATE document_templates SET \
+                    name = $3, \
+                    body = $4, \
+                    variables_json = $5, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND id = $2 \
+                 RETURNING id, user_id, matter_id, name, body, variables_json, created_at, updated_at",
+                &[&user_id, &template_id, &merged_name, &merged_body, &merged_vars],
+            )
+            .await?;
+        Ok(Some(row_to_document_template_record(&row)?))
+    }
+
+    async fn delete_document_template(
+        &self,
+        user_id: &str,
+        template_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM document_templates WHERE user_id = $1 AND id = $2",
+                &[&user_id, &template_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+}
+
+// ==================== TimeExpenseStore ====================
+
+#[async_trait]
+impl TimeExpenseStore for PgBackend {
+    async fn list_time_entries(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<TimeEntryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at \
+                 FROM time_entries \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY entry_date DESC, created_at DESC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_time_entry_record(&row))
+            .collect()
+    }
+
+    async fn get_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<Option<TimeEntryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at \
+                 FROM time_entries \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &entry_id],
+            )
+            .await?;
+        row.map(|row| row_to_time_entry_record(&row)).transpose()
+    }
+
+    async fn create_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateTimeEntryParams,
+    ) -> Result<TimeEntryRecord, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO time_entries \
+                 (id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 RETURNING id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.timekeeper,
+                    &input.description,
+                    &input.hours,
+                    &input.hourly_rate,
+                    &input.entry_date,
+                    &input.billable,
+                ],
+            )
+            .await?;
+        row_to_time_entry_record(&row)
+    }
+
+    async fn update_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+        input: &UpdateTimeEntryParams,
+    ) -> Result<Option<TimeEntryRecord>, DatabaseError> {
+        let Some(existing) = self.get_time_entry(user_id, matter_id, entry_id).await? else {
+            return Ok(None);
+        };
+
+        let merged_timekeeper = input.timekeeper.clone().unwrap_or(existing.timekeeper);
+        let merged_description = input.description.clone().unwrap_or(existing.description);
+        let merged_hours = input.hours.unwrap_or(existing.hours);
+        let merged_hourly_rate = input.hourly_rate.unwrap_or(existing.hourly_rate);
+        let merged_entry_date = input.entry_date.unwrap_or(existing.entry_date);
+        let merged_billable = input.billable.unwrap_or(existing.billable);
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "UPDATE time_entries SET \
+                    timekeeper = $4, \
+                    description = $5, \
+                    hours = $6, \
+                    hourly_rate = $7, \
+                    entry_date = $8, \
+                    billable = $9, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
+                 RETURNING id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at",
+                &[
+                    &user_id,
+                    &matter_id,
+                    &entry_id,
+                    &merged_timekeeper,
+                    &merged_description,
+                    &merged_hours,
+                    &merged_hourly_rate,
+                    &merged_entry_date,
+                    &merged_billable,
+                ],
+            )
+            .await?;
+        Ok(Some(row_to_time_entry_record(&row)?))
+    }
+
+    async fn delete_time_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM time_entries WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &entry_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+
+    async fn list_expense_entries(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<ExpenseEntryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_id, submitted_by, description, amount, category, entry_date, receipt_path, billable, billed_invoice_id, created_at, updated_at \
+                 FROM expense_entries \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY entry_date DESC, created_at DESC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_expense_entry_record(&row))
+            .collect()
+    }
+
+    async fn get_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<Option<ExpenseEntryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, submitted_by, description, amount, category, entry_date, receipt_path, billable, billed_invoice_id, created_at, updated_at \
+                 FROM expense_entries \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &entry_id],
+            )
+            .await?;
+        row.map(|row| row_to_expense_entry_record(&row)).transpose()
+    }
+
+    async fn create_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateExpenseEntryParams,
+    ) -> Result<ExpenseEntryRecord, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO expense_entries \
+                 (id, user_id, matter_id, submitted_by, description, amount, category, entry_date, receipt_path, billable) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                 RETURNING id, user_id, matter_id, submitted_by, description, amount, category, entry_date, receipt_path, billable, billed_invoice_id, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.submitted_by,
+                    &input.description,
+                    &input.amount,
+                    &input.category.as_str(),
+                    &input.entry_date,
+                    &input.receipt_path,
+                    &input.billable,
+                ],
+            )
+            .await?;
+        row_to_expense_entry_record(&row)
+    }
+
+    async fn update_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+        input: &UpdateExpenseEntryParams,
+    ) -> Result<Option<ExpenseEntryRecord>, DatabaseError> {
+        let Some(existing) = self.get_expense_entry(user_id, matter_id, entry_id).await? else {
+            return Ok(None);
+        };
+
+        let merged_submitted_by = input.submitted_by.clone().unwrap_or(existing.submitted_by);
+        let merged_description = input.description.clone().unwrap_or(existing.description);
+        let merged_amount = input.amount.unwrap_or(existing.amount);
+        let merged_category = input.category.unwrap_or(existing.category);
+        let merged_entry_date = input.entry_date.unwrap_or(existing.entry_date);
+        let merged_receipt_path = input.receipt_path.clone().unwrap_or(existing.receipt_path);
+        let merged_billable = input.billable.unwrap_or(existing.billable);
+
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "UPDATE expense_entries SET \
+                    submitted_by = $4, \
+                    description = $5, \
+                    amount = $6, \
+                    category = $7, \
+                    entry_date = $8, \
+                    receipt_path = $9, \
+                    billable = $10, \
+                    updated_at = NOW() \
+                 WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
+                 RETURNING id, user_id, matter_id, submitted_by, description, amount, category, entry_date, receipt_path, billable, billed_invoice_id, created_at, updated_at",
+                &[
+                    &user_id,
+                    &matter_id,
+                    &entry_id,
+                    &merged_submitted_by,
+                    &merged_description,
+                    &merged_amount,
+                    &merged_category.as_str(),
+                    &merged_entry_date,
+                    &merged_receipt_path,
+                    &merged_billable,
+                ],
+            )
+            .await?;
+        Ok(Some(row_to_expense_entry_record(&row)?))
+    }
+
+    async fn delete_expense_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        entry_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM expense_entries WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &[&user_id, &matter_id, &entry_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+
+    async fn mark_time_entries_billed(
+        &self,
+        user_id: &str,
+        entry_ids: &[Uuid],
+        invoice_id: &str,
+    ) -> Result<u64, DatabaseError> {
+        if entry_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.store.conn().await?;
+        let updated = conn
+            .execute(
+                "UPDATE time_entries SET billed_invoice_id = $3, updated_at = NOW() \
+             WHERE user_id = $1 AND id = ANY($2) AND billed_invoice_id IS NULL",
+                &[&user_id, &entry_ids, &invoice_id],
+            )
+            .await?;
+        Ok(updated)
+    }
+
+    async fn mark_expense_entries_billed(
+        &self,
+        user_id: &str,
+        entry_ids: &[Uuid],
+        invoice_id: &str,
+    ) -> Result<u64, DatabaseError> {
+        if entry_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.store.conn().await?;
+        let updated = conn
+            .execute(
+                "UPDATE expense_entries SET billed_invoice_id = $3, updated_at = NOW() \
+             WHERE user_id = $1 AND id = ANY($2) AND billed_invoice_id IS NULL",
+                &[&user_id, &entry_ids, &invoice_id],
+            )
+            .await?;
+        Ok(updated)
+    }
+
+    async fn matter_time_summary(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<MatterTimeSummary, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "SELECT \
+                    COALESCE(SUM(hours), 0)::numeric AS total_hours, \
+                    COALESCE(SUM(CASE WHEN billable THEN hours ELSE 0 END), 0)::numeric AS billable_hours, \
+                    COALESCE(SUM(CASE WHEN billed_invoice_id IS NULL THEN hours ELSE 0 END), 0)::numeric AS unbilled_hours, \
+                    COALESCE((SELECT SUM(amount) FROM expense_entries WHERE user_id = $1 AND matter_id = $2), 0)::numeric AS total_expenses, \
+                    COALESCE((SELECT SUM(CASE WHEN billable THEN amount ELSE 0 END) FROM expense_entries WHERE user_id = $1 AND matter_id = $2), 0)::numeric AS billable_expenses, \
+                    COALESCE((SELECT SUM(CASE WHEN billed_invoice_id IS NULL THEN amount ELSE 0 END) FROM expense_entries WHERE user_id = $1 AND matter_id = $2), 0)::numeric AS unbilled_expenses \
+                 FROM time_entries \
+                 WHERE user_id = $1 AND matter_id = $2",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+
+        Ok(MatterTimeSummary {
+            total_hours: row.get("total_hours"),
+            billable_hours: row.get("billable_hours"),
+            unbilled_hours: row.get("unbilled_hours"),
+            total_expenses: row.get("total_expenses"),
+            billable_expenses: row.get("billable_expenses"),
+            unbilled_expenses: row.get("unbilled_expenses"),
+        })
+    }
+}
+
+// ==================== BillingStore ====================
+
+#[async_trait]
+impl BillingStore for PgBackend {
+    async fn save_invoice_draft(
+        &self,
+        user_id: &str,
+        invoice: &CreateInvoiceParams,
+        line_items: &[CreateInvoiceLineItemParams],
+    ) -> Result<(InvoiceRecord, Vec<InvoiceLineItemRecord>), DatabaseError> {
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+
+        let invoice_row = tx
+            .query_one(
+                "INSERT INTO invoices (id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                 RETURNING id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &invoice.matter_id,
+                    &invoice.invoice_number,
+                    &invoice.status.as_str(),
+                    &invoice.issued_date,
+                    &invoice.due_date,
+                    &invoice.subtotal,
+                    &invoice.tax,
+                    &invoice.total,
+                    &invoice.paid_amount,
+                    &invoice.notes,
+                ],
+            )
+            .await?;
+        let invoice_record = row_to_invoice_record(&invoice_row)?;
+
+        let mut persisted_items = Vec::with_capacity(line_items.len());
+        for item in line_items {
+            let row = tx
+                .query_one(
+                    "INSERT INTO invoice_line_items (id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                     RETURNING id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at",
+                    &[
+                        &Uuid::new_v4(),
+                        &user_id,
+                        &invoice_record.id,
+                        &item.description,
+                        &item.quantity,
+                        &item.unit_price,
+                        &item.amount,
+                        &item.time_entry_id,
+                        &item.expense_entry_id,
+                        &item.sort_order,
+                    ],
+                )
+                .await?;
+            persisted_items.push(row_to_invoice_line_item_record(&row)?);
+        }
+
+        tx.commit().await?;
+        Ok((invoice_record, persisted_items))
+    }
+
+    async fn get_invoice(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at \
+                 FROM invoices WHERE user_id = $1 AND id = $2",
+                &[&user_id, &invoice_id],
+            )
+            .await?;
+        row.map(|row| row_to_invoice_record(&row)).transpose()
+    }
+
+    async fn list_invoice_line_items(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+    ) -> Result<Vec<InvoiceLineItemRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at \
+                 FROM invoice_line_items \
+                 WHERE user_id = $1 AND invoice_id = $2 \
+                 ORDER BY sort_order ASC, created_at ASC",
+                &[&user_id, &invoice_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_invoice_line_item_record(&row))
+            .collect()
+    }
+
+    async fn set_invoice_status(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+        status: InvoiceStatus,
+        issued_date: Option<NaiveDate>,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "UPDATE invoices \
+                 SET status = $3, \
+                     issued_date = CASE WHEN $4::date IS NULL THEN issued_date ELSE $4 END, \
+                     updated_at = NOW() \
+                 WHERE user_id = $1 AND id = $2 \
+                 RETURNING id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at",
+                &[&user_id, &invoice_id, &status.as_str(), &issued_date],
+            )
+            .await?;
+        row.map(|row| row_to_invoice_record(&row)).transpose()
+    }
+
+    async fn apply_invoice_payment(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+        amount: Decimal,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "UPDATE invoices \
+                 SET paid_amount = LEAST(paid_amount + $3, total), \
+                     status = CASE WHEN LEAST(paid_amount + $3, total) >= total THEN 'paid' ELSE status END, \
+                     updated_at = NOW() \
+                 WHERE user_id = $1 AND id = $2 \
+                 RETURNING id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at",
+                &[&user_id, &invoice_id, &amount],
+            )
+            .await?;
+        row.map(|row| row_to_invoice_record(&row)).transpose()
+    }
+
+    async fn append_trust_ledger_entry(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        input: &CreateTrustLedgerEntryParams,
+    ) -> Result<TrustLedgerEntryRecord, DatabaseError> {
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+        tx.query(
+            "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+            &[&user_id, &matter_id],
+        )
+        .await?;
+        let current_row = tx
+            .query_opt(
+                "SELECT balance_after \
+                 FROM trust_ledger \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY created_at DESC, id DESC \
+                 LIMIT 1 \
+                 FOR UPDATE",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        let current_balance = current_row
+            .as_ref()
+            .map(|row| row.get::<_, Decimal>("balance_after"))
+            .unwrap_or(Decimal::ZERO);
+        let balance_after = (current_balance + input.delta).round_dp(2);
+        if balance_after < Decimal::ZERO {
+            return Err(DatabaseError::Constraint(
+                "insufficient trust balance for requested entry".to_string(),
+            ));
+        }
+        let row = tx
+            .query_one(
+                "INSERT INTO trust_ledger (id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 RETURNING id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &matter_id,
+                    &input.entry_type.as_str(),
+                    &input.amount,
+                    &balance_after,
+                    &input.description,
+                    &input.invoice_id,
+                    &input.recorded_by,
+                ],
+            )
+            .await?;
+        tx.commit().await?;
+        row_to_trust_ledger_entry_record(&row)
+    }
+
+    async fn list_trust_ledger_entries(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<TrustLedgerEntryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at \
+                 FROM trust_ledger \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY created_at DESC, id DESC",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_trust_ledger_entry_record(&row))
+            .collect()
+    }
+
+    async fn current_trust_balance(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<Decimal, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "SELECT COALESCE((SELECT balance_after FROM trust_ledger WHERE user_id = $1 AND matter_id = $2 ORDER BY created_at DESC, id DESC LIMIT 1), 0)::numeric AS balance",
+                &[&user_id, &matter_id],
+            )
+            .await?;
+        Ok(row.get("balance"))
+    }
+}
+
+// ==================== AuditEventStore ====================
+
+#[async_trait]
+impl AuditEventStore for PgBackend {
+    async fn append_audit_event(
+        &self,
+        user_id: &str,
+        input: &AppendAuditEventParams,
+    ) -> Result<AuditEventRecord, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO audit_events (id, user_id, event_type, actor, matter_id, severity, details) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 RETURNING id, user_id, event_type, actor, matter_id, severity, details, created_at",
+                &[
+                    &Uuid::new_v4(),
+                    &user_id,
+                    &input.event_type,
+                    &input.actor,
+                    &input.matter_id,
+                    &input.severity.as_str(),
+                    &input.details,
+                ],
+            )
+            .await?;
+        row_to_audit_event_record(&row)
+    }
+
+    async fn list_audit_events(
+        &self,
+        user_id: &str,
+        query: &AuditEventQuery,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<AuditEventRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let limit_i64 = i64::try_from(limit)
+            .map_err(|_| DatabaseError::Serialization("limit too large".to_string()))?;
+        let offset_i64 = i64::try_from(offset)
+            .map_err(|_| DatabaseError::Serialization("offset too large".to_string()))?;
+        let severity_filter = query.severity.map(|value| value.as_str().to_string());
+
+        let rows = conn
+            .query(
+                "SELECT id, user_id, event_type, actor, matter_id, severity, details, created_at \
+                 FROM audit_events \
+                 WHERE user_id = $1 \
+                   AND ($2::text IS NULL OR event_type = $2) \
+                   AND ($3::text IS NULL OR matter_id = $3) \
+                   AND ($4::text IS NULL OR severity = $4) \
+                   AND ($5::timestamptz IS NULL OR created_at >= $5) \
+                   AND ($6::timestamptz IS NULL OR created_at <= $6) \
+                 ORDER BY created_at DESC, id DESC \
+                 LIMIT $7 OFFSET $8",
+                &[
+                    &user_id,
+                    &query.event_type,
+                    &query.matter_id,
+                    &severity_filter,
+                    &query.since,
+                    &query.until,
+                    &limit_i64,
+                    &offset_i64,
+                ],
+            )
+            .await?;
+
+        rows.into_iter()
+            .map(|row| row_to_audit_event_record(&row))
+            .collect()
+    }
+
+    async fn count_audit_events(
+        &self,
+        user_id: &str,
+        query: &AuditEventQuery,
+    ) -> Result<usize, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let severity_filter = query.severity.map(|value| value.as_str().to_string());
+        let row = conn
+            .query_one(
+                "SELECT COUNT(*)::bigint AS count \
+                 FROM audit_events \
+                 WHERE user_id = $1 \
+                   AND ($2::text IS NULL OR event_type = $2) \
+                   AND ($3::text IS NULL OR matter_id = $3) \
+                   AND ($4::text IS NULL OR severity = $4) \
+                   AND ($5::timestamptz IS NULL OR created_at >= $5) \
+                   AND ($6::timestamptz IS NULL OR created_at <= $6)",
+                &[
+                    &user_id,
+                    &query.event_type,
+                    &query.matter_id,
+                    &severity_filter,
+                    &query.since,
+                    &query.until,
+                ],
+            )
+            .await?;
+        let count_i64: i64 = row.get("count");
+        usize::try_from(count_i64)
+            .map_err(|_| DatabaseError::Serialization("audit count overflow".to_string()))
     }
 }
 

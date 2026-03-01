@@ -3471,6 +3471,108 @@ mark {
   color: var(--text-secondary);
 }
 
+.matters-create-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.matters-create-actions button[disabled] {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.matters-create-review {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-primary);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.matters-create-review-status {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.matters-create-review-status.state-error {
+  color: var(--error);
+}
+
+.matters-create-review-status.state-success {
+  color: var(--success, #2ecc71);
+}
+
+.matters-create-review-status.state-warning {
+  color: var(--warning, #f39c12);
+}
+
+.matters-create-review-hits {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.matter-review-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.matter-review-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.matter-review-table th,
+.matter-review-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.matter-review-table th {
+  color: var(--text-secondary);
+  font-weight: 600;
+  background: var(--bg-secondary);
+}
+
+.matter-review-table tr:last-child td {
+  border-bottom: none;
+}
+
+.matters-create-clearance-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.matters-create-clearance-controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.matters-create-clearance-controls select,
+.matters-create-clearance-controls textarea {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 7px 10px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.matters-create-clearance-controls textarea {
+  resize: vertical;
+  min-height: 70px;
+}
+
 .matters-active-bar {
   display: flex;
   align-items: center;
@@ -3848,6 +3950,15 @@ mark {
 
 @media (max-width: 900px) {
   .matters-create-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .matters-create-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .matters-create-clearance-controls {
     grid-template-columns: 1fr;
   }
 
