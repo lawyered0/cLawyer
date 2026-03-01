@@ -86,6 +86,7 @@ impl AuditLogger {
             prev_hash,
             hash: None,
         };
+        let mut next_hash: Option<String> = None;
 
         if self.hash_chain {
             let to_hash = match serde_json::to_string(&event) {
@@ -99,7 +100,7 @@ impl AuditLogger {
             hasher.update(to_hash.as_bytes());
             let hash = format!("{:x}", hasher.finalize());
             event.hash = Some(hash.clone());
-            *state = Some(hash);
+            next_hash = Some(hash);
         }
 
         let line = match serde_json::to_string(&event) {
@@ -149,6 +150,8 @@ impl AuditLogger {
                 }
                 if let Err(e) = writeln!(f, "{line}") {
                     tracing::warn!("Failed to append legal audit event: {}", e);
+                } else if self.hash_chain {
+                    *state = next_hash;
                 }
             }
             Err(e) => {
@@ -313,6 +316,33 @@ mod tests {
 
         let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hash_chain_state_not_advanced_when_write_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit-hash-rejected.jsonl");
+        fs::write(&path, "").expect("seed file");
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set permissive mode");
+
+        let logger = AuditLogger::new(path.clone(), true);
+        logger.write("blocked", serde_json::json!({"n": 1}));
+
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("set secure mode");
+        logger.write("accepted", serde_json::json!({"n": 2}));
+
+        let raw = fs::read_to_string(path).expect("read audit log");
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 1, "rejected write must not append");
+
+        let only: Value = serde_json::from_str(lines[0]).expect("line json");
+        assert!(only.get("prev_hash").map(|v| v.is_null()).unwrap_or(true));
+        assert_eq!(only["event_type"], "accepted");
     }
 
     #[test]

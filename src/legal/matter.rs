@@ -27,6 +27,7 @@ struct ConflictCacheState {
     entries: Vec<ConflictEntry>,
     generation: u64,
     refreshed_at: Option<Instant>,
+    failure_started_at: Option<Instant>,
     ready: bool,
 }
 
@@ -618,9 +619,13 @@ fn cache_snapshot() -> Option<(Vec<ConflictEntry>, bool)> {
         return None;
     }
 
-    let within_window = cache
-        .refreshed_at
-        .is_some_and(|t| t.elapsed() <= CONFLICT_CACHE_REFRESH_WINDOW);
+    let within_window = if let Some(failure_started_at) = cache.failure_started_at {
+        failure_started_at.elapsed() <= CONFLICT_CACHE_REFRESH_WINDOW
+    } else {
+        cache
+            .refreshed_at
+            .is_some_and(|t| t.elapsed() <= CONFLICT_CACHE_REFRESH_WINDOW)
+    };
     let stale = cache.generation != generation || !within_window;
     Some((cache.entries.clone(), stale))
 }
@@ -631,6 +636,7 @@ fn store_conflict_cache(entries: Vec<ConflictEntry>) {
         cache.entries = entries;
         cache.generation = generation;
         cache.refreshed_at = Some(Instant::now());
+        cache.failure_started_at = None;
         cache.ready = true;
     }
     #[cfg(test)]
@@ -644,10 +650,12 @@ fn mark_conflict_cache_refresh_failure() {
     if let Ok(mut cache) = CONFLICT_CACHE.lock()
         && cache.ready
     {
-        // Keep the stale snapshot for a bounded fallback window so temporary
-        // read/parse failures do not cause repeated filesystem churn.
+        // Keep a stale snapshot for one bounded fallback window when reads/parses fail.
+        // Do not extend the window on repeated failures.
         cache.generation = generation;
-        cache.refreshed_at = Some(Instant::now());
+        if cache.failure_started_at.is_none() {
+            cache.failure_started_at = Some(Instant::now());
+        }
     }
 }
 
@@ -677,7 +685,9 @@ pub async fn detect_conflict(
     }
 
     mark_conflict_cache_refresh_failure();
-    if let Some((entries, _)) = cache_snapshot() {
+    if let Some((entries, stale)) = cache_snapshot()
+        && !stale
+    {
         return detect_conflict_in_entries(&entries, message, active_matter);
     }
 
@@ -821,17 +831,25 @@ mod tests {
 #[cfg(all(test, feature = "libsql"))]
 mod cache_tests {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
-    use super::{
-        conflict_cache_refresh_count_for_tests, detect_conflict, invalidate_conflict_cache,
-        reset_conflict_cache_for_tests,
-    };
     use crate::config::LegalConfig;
     use crate::settings::Settings;
     use crate::workspace::Workspace;
 
+    use super::{
+        CONFLICT_CACHE, CONFLICT_CACHE_GENERATION, CONFLICT_CACHE_REFRESH_WINDOW, ConflictEntry,
+        conflict_cache_refresh_count_for_tests, detect_conflict, invalidate_conflict_cache,
+        mark_conflict_cache_refresh_failure, normalize_conflict_text,
+        reset_conflict_cache_for_tests,
+    };
+
+    static CACHE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn detect_conflict_uses_cache_until_invalidated() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
         reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
@@ -882,6 +900,79 @@ mod cache_tests {
             conflict_cache_refresh_count_for_tests(),
             2,
             "cache invalidation should force a refresh on next lookup"
+        );
+    }
+
+    #[test]
+    fn failure_fallback_window_is_not_extended_by_repeated_failures() {
+        reset_conflict_cache_for_tests();
+        let generation = CONFLICT_CACHE_GENERATION.load(Ordering::Relaxed);
+        {
+            let mut cache = CONFLICT_CACHE.lock().expect("cache lock");
+            cache.ready = true;
+            cache.generation = generation;
+            cache.refreshed_at = Some(Instant::now());
+            cache.failure_started_at = None;
+        }
+
+        mark_conflict_cache_refresh_failure();
+        let first = {
+            let cache = CONFLICT_CACHE.lock().expect("cache lock");
+            cache
+                .failure_started_at
+                .expect("failure window should be set")
+        };
+        mark_conflict_cache_refresh_failure();
+        let second = {
+            let cache = CONFLICT_CACHE.lock().expect("cache lock");
+            cache
+                .failure_started_at
+                .expect("failure window should remain set")
+        };
+
+        assert_eq!(
+            first, second,
+            "repeated failures should not extend stale fallback window"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_conflict_does_not_use_expired_failure_fallback_cache() {
+        let _guard = CACHE_TEST_LOCK.lock().await;
+        reset_conflict_cache_for_tests();
+
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+
+        let generation = CONFLICT_CACHE_GENERATION.load(Ordering::Relaxed);
+        {
+            let mut cache = CONFLICT_CACHE.lock().expect("cache lock");
+            cache.entries = vec![ConflictEntry {
+                canonical_name: "Alpha Holdings".to_string(),
+                terms: vec![normalize_conflict_text("Alpha Holdings")],
+            }];
+            cache.generation = generation;
+            cache.refreshed_at = Some(Instant::now());
+            cache.failure_started_at =
+                Some(Instant::now() - CONFLICT_CACHE_REFRESH_WINDOW - Duration::from_secs(1));
+            cache.ready = true;
+        }
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.conflict_check_enabled = true;
+        legal.active_matter = None;
+
+        let hit = detect_conflict(
+            workspace.as_ref(),
+            &legal,
+            "Please check conflict for Alpha Holdings",
+        )
+        .await;
+        assert_eq!(
+            hit, None,
+            "expired fallback window must not keep serving stale conflicts"
         );
     }
 }

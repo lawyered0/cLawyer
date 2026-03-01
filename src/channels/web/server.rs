@@ -1838,6 +1838,18 @@ fn list_matters_root_entries(
     }
 }
 
+async fn cleanup_partial_matter_scaffold(workspace: &Workspace, written_paths: &[String]) {
+    for path in written_paths.iter().rev() {
+        if let Err(err) = workspace.delete(path).await {
+            tracing::warn!(
+                path = %path,
+                error = %err,
+                "Failed to clean up partially-created matter scaffold file"
+            );
+        }
+    }
+}
+
 async fn matters_create_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<CreateMatterRequest>,
@@ -1958,18 +1970,23 @@ async fn matters_create_handler(
         ),
     ];
 
+    let mut written_paths = Vec::with_capacity(scaffold.len());
     for (path, content) in scaffold {
-        workspace
-            .write(&path, &content)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if let Err(err) = workspace.write(&path, &content).await {
+            cleanup_partial_matter_scaffold(workspace.as_ref(), &written_paths).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+        }
+        written_paths.push(path);
     }
 
     let value = serde_json::json!(sanitized);
-    store
+    if let Err(err) = store
         .set_setting(&state.user_id, MATTER_ACTIVE_SETTING, &value)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    {
+        cleanup_partial_matter_scaffold(workspace.as_ref(), &written_paths).await;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -4860,6 +4877,34 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("empty after sanitization"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn cleanup_partial_matter_scaffold_removes_written_files() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let written_paths = vec![
+            "matters/demo/README.md".to_string(),
+            "matters/demo/workflows/intake_checklist.md".to_string(),
+        ];
+
+        for path in &written_paths {
+            workspace.write(path, "seed").await.expect("seed file");
+        }
+
+        cleanup_partial_matter_scaffold(workspace.as_ref(), &written_paths).await;
+
+        for path in &written_paths {
+            let err = workspace
+                .read(path)
+                .await
+                .expect_err("path should be removed by cleanup");
+            assert!(matches!(
+                err,
+                crate::error::WorkspaceError::DocumentNotFound { .. }
+            ));
+        }
     }
 
     #[cfg(feature = "libsql")]
