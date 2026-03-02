@@ -28,7 +28,7 @@
 
 1. Request enters preflight.
 2. cLawyer checks: active matter (for non-trivial legal requests), conflict list, tool approval policy, and domain allowlist.
-3. When active matter is set and metadata is valid, structured `matter.yaml` fields are injected into legal prompt context (`matter_id`, `client`, `confidentiality`, `retention`, `team`, `adversaries`, optional `jurisdiction`, optional `practice_area`, optional `opened_at`) as untrusted data.
+3. When active matter is set and metadata is valid, structured `matter.yaml` fields are injected into legal prompt context (`matter_id`, `client`, `confidentiality`, `retention`, `team`, `adversaries`, optional `jurisdiction`, optional `practice_area`, optional `opened_date`) as untrusted data.
 4. cLawyer also injects curated matter memory files when present (`facts.md`, `parties.md`, `strategy.md`, `documents.md`) with strict sanitization/truncation.
 5. Sensitive tool calls are approval-gated in `max_lockdown`.
 6. Memory/file writes are scoped to `matters/<matter_id>/...` when matter context is required.
@@ -64,7 +64,10 @@ Optional metadata fields:
 
 - `jurisdiction`
 - `practice_area`
-- `opened_at` (`YYYY-MM-DD`)
+- `opened_date` (`YYYY-MM-DD`)
+
+Backward compatibility:
+- legacy `opened_at` values are accepted and normalized.
 
 If metadata is missing or invalid, legal task execution is blocked with guidance.
 

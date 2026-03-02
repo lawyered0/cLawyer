@@ -2359,6 +2359,11 @@ async fn db_matter_to_info(state: &GatewayState, matter: crate::db::MatterRecord
         metadata.as_ref().map(|meta| meta.client.clone())
     };
 
+    let opened_date = metadata
+        .as_ref()
+        .and_then(|meta| meta.opened_date.clone())
+        .or_else(|| matter.opened_at.map(|dt| dt.date_naive().to_string()));
+
     MatterInfo {
         id: matter.matter_id.clone(),
         client_id: Some(matter.client_id.to_string()),
@@ -2384,10 +2389,8 @@ async fn db_matter_to_info(state: &GatewayState, matter: crate::db::MatterRecord
             .as_ref()
             .and_then(|meta| meta.practice_area.clone())
             .or(matter.practice_area.clone()),
-        opened_at: metadata
-            .as_ref()
-            .and_then(|meta| meta.opened_at.clone())
-            .or_else(|| matter.opened_at.map(|dt| dt.date_naive().to_string())),
+        opened_date: opened_date.clone(),
+        opened_at: opened_date,
     }
 }
 
@@ -2466,7 +2469,7 @@ async fn ensure_matter_db_row_from_workspace(
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
-    let opened_at = parse_optional_datetime("opened_at", metadata.opened_at.clone())?;
+    let opened_at = parse_optional_datetime("opened_date", metadata.opened_date.clone())?;
     store
         .upsert_matter(
             &state.user_id,
@@ -2534,7 +2537,8 @@ async fn matters_list_handler(
             retention: meta.as_ref().map(|m| m.retention.clone()),
             jurisdiction: meta.as_ref().and_then(|m| m.jurisdiction.clone()),
             practice_area: meta.as_ref().and_then(|m| m.practice_area.clone()),
-            opened_at: meta.as_ref().and_then(|m| m.opened_at.clone()),
+            opened_date: meta.as_ref().and_then(|m| m.opened_date.clone()),
+            opened_at: meta.as_ref().and_then(|m| m.opened_date.clone()),
         });
     }
     matters.sort_by(|a, b| a.id.cmp(&b.id));
@@ -2751,7 +2755,7 @@ async fn matter_patch_handler(
             metadata.team = matter.assigned_to.clone();
             metadata.jurisdiction = matter.jurisdiction.clone();
             metadata.practice_area = matter.practice_area.clone();
-            metadata.opened_at = matter.opened_at.map(|dt| dt.date_naive().to_string());
+            metadata.opened_date = matter.opened_at.map(|dt| dt.date_naive().to_string());
             if let Ok(Some(client)) = store.get_client(&state.user_id, matter.client_id).await {
                 metadata.client = client.name;
             }
@@ -3782,12 +3786,12 @@ fn validate_optional_matter_field_length(
     Ok(())
 }
 
-fn validate_opened_at(value: &str) -> Result<(), (StatusCode, String)> {
+fn validate_opened_date(value: &str) -> Result<(), (StatusCode, String)> {
     match NaiveDate::parse_from_str(value, "%Y-%m-%d") {
         Ok(parsed) if parsed.format("%Y-%m-%d").to_string() == value => Ok(()),
         _ => Err((
             StatusCode::BAD_REQUEST,
-            "'opened_at' must be in YYYY-MM-DD format".to_string(),
+            "'opened_date' must be in YYYY-MM-DD format".to_string(),
         )),
     }
 }
@@ -4622,11 +4626,11 @@ async fn matters_create_handler(
     validate_intake_party_name("client", &client)?;
     let jurisdiction = parse_optional_matter_field(req.jurisdiction);
     let practice_area = parse_optional_matter_field(req.practice_area);
-    let opened_at = parse_optional_matter_field(req.opened_at);
+    let opened_date = parse_optional_matter_field(req.opened_date.or(req.opened_at));
     validate_optional_matter_field_length("jurisdiction", &jurisdiction)?;
     validate_optional_matter_field_length("practice_area", &practice_area)?;
-    if let Some(value) = opened_at.as_deref() {
-        validate_opened_at(value)?;
+    if let Some(value) = opened_date.as_deref() {
+        validate_opened_date(value)?;
     }
     let team = parse_matter_list(req.team);
     let adversaries = parse_matter_list(req.adversaries);
@@ -4719,7 +4723,7 @@ async fn matters_create_handler(
         retention: retention.clone(),
         jurisdiction: jurisdiction.clone(),
         practice_area: practice_area.clone(),
-        opened_at: opened_at.clone(),
+        opened_date: opened_date.clone(),
     };
     let matter_yaml = serde_yml::to_string(&metadata)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -4793,7 +4797,7 @@ async fn matters_create_handler(
         ),
     ];
 
-    let opened_at_ts = parse_optional_datetime("opened_at", opened_at.clone())?;
+    let opened_at_ts = parse_optional_datetime("opened_date", opened_date.clone())?;
     let db_client = store
         .upsert_client_by_normalized_name(
             &state.user_id,
@@ -4830,7 +4834,7 @@ async fn matters_create_handler(
     // Seed conflict graph rows before filesystem writes so DB failures do not
     // leave behind an unindexed matter directory that cannot be retried.
     store
-        .seed_matter_parties(&sanitized, &client, &adversaries, opened_at.as_deref())
+        .seed_matter_parties(&sanitized, &client, &adversaries, opened_date.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::legal::matter::invalidate_conflict_cache();
@@ -4877,7 +4881,8 @@ async fn matters_create_handler(
                 retention: Some(retention),
                 jurisdiction,
                 practice_area,
-                opened_at,
+                opened_date: opened_date.clone(),
+                opened_at: opened_date,
             },
             active_matter_id: sanitized,
         }),
@@ -8854,7 +8859,8 @@ mod tests {
                 retention: "follow-firm-policy".to_string(),
                 jurisdiction: Some("SDNY / Delaware".to_string()),
                 practice_area: Some("commercial litigation".to_string()),
-                opened_at: Some("2024-03-15".to_string()),
+                opened_date: Some("2024-03-15".to_string()),
+                opened_at: None,
                 team: vec!["Lead Counsel".to_string()],
                 adversaries: vec!["Foo LLC".to_string()],
                 conflict_decision: None,
@@ -8875,7 +8881,7 @@ mod tests {
             response.matter.practice_area.as_deref(),
             Some("commercial litigation")
         );
-        assert_eq!(response.matter.opened_at.as_deref(), Some("2024-03-15"));
+        assert_eq!(response.matter.opened_date.as_deref(), Some("2024-03-15"));
 
         let metadata = workspace
             .read("matters/acme-v--foo/matter.yaml")
@@ -8889,7 +8895,7 @@ mod tests {
             parsed.practice_area.as_deref(),
             Some("commercial litigation")
         );
-        assert_eq!(parsed.opened_at.as_deref(), Some("2024-03-15"));
+        assert_eq!(parsed.opened_date.as_deref(), Some("2024-03-15"));
         let workflow = workspace
             .read("matters/acme-v--foo/workflows/intake_checklist.md")
             .await
@@ -8942,7 +8948,8 @@ mod tests {
                 retention: "follow-firm-policy".to_string(),
                 jurisdiction: Some("SDNY / Delaware".to_string()),
                 practice_area: Some("commercial litigation".to_string()),
-                opened_at: Some("2024-03-15".to_string()),
+                opened_date: Some("2024-03-15".to_string()),
+                opened_at: None,
                 team: vec!["Lead Counsel".to_string()],
                 adversaries: vec!["Foo LLC".to_string()],
                 conflict_decision: None,
@@ -8963,7 +8970,7 @@ mod tests {
             matter.practice_area.as_deref(),
             Some("commercial litigation")
         );
-        assert_eq!(matter.opened_at.as_deref(), Some("2024-03-15"));
+        assert_eq!(matter.opened_date.as_deref(), Some("2024-03-15"));
     }
 
     #[cfg(feature = "libsql")]
@@ -8983,6 +8990,7 @@ mod tests {
                 retention: "policy".to_string(),
                 jurisdiction: None,
                 practice_area: None,
+                opened_date: None,
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
@@ -9002,6 +9010,7 @@ mod tests {
                 retention: "policy".to_string(),
                 jurisdiction: None,
                 practice_area: None,
+                opened_date: None,
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
@@ -9018,7 +9027,7 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
-    async fn matters_create_rejects_invalid_opened_at() {
+    async fn matters_create_rejects_invalid_opened_date() {
         let (db, _tmp) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
         let state = test_gateway_state_with_store_and_workspace(db, workspace);
@@ -9032,7 +9041,8 @@ mod tests {
                 retention: "policy".to_string(),
                 jurisdiction: None,
                 practice_area: None,
-                opened_at: Some("03/15/2024".to_string()),
+                opened_date: Some("03/15/2024".to_string()),
+                opened_at: None,
                 team: vec![],
                 adversaries: vec![],
                 conflict_decision: None,
@@ -9040,7 +9050,7 @@ mod tests {
             }),
         )
         .await
-        .expect_err("invalid opened_at should fail");
+        .expect_err("invalid opened_date should fail");
 
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("YYYY-MM-DD"));
@@ -9062,6 +9072,7 @@ mod tests {
                 retention: "policy".to_string(),
                 jurisdiction: Some("X".repeat(257)),
                 practice_area: None,
+                opened_date: None,
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
@@ -9093,6 +9104,7 @@ mod tests {
                 retention: "policy".to_string(),
                 jurisdiction: None,
                 practice_area: None,
+                opened_date: None,
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
@@ -9326,6 +9338,7 @@ opened_at: 2026-02-28
                 retention: "policy".to_string(),
                 jurisdiction: None,
                 practice_area: None,
+                opened_date: None,
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
@@ -9365,6 +9378,7 @@ opened_at: 2026-02-28
                 retention: "policy".to_string(),
                 jurisdiction: None,
                 practice_area: None,
+                opened_date: None,
                 opened_at: None,
                 team: vec![],
                 adversaries: vec![],
@@ -9416,7 +9430,8 @@ opened_at: 2026-02-28
                 retention: "policy".to_string(),
                 jurisdiction: None,
                 practice_area: None,
-                opened_at: Some("2026-02-28".to_string()),
+                opened_date: Some("2026-02-28".to_string()),
+                opened_at: None,
                 team: vec![],
                 adversaries: vec!["Other Party".to_string()],
                 conflict_decision: Some(ConflictDecision::Waived),
@@ -9468,6 +9483,7 @@ opened_at: 2026-02-28
                 retention: "policy".to_string(),
                 jurisdiction: None,
                 practice_area: None,
+                opened_date: None,
                 opened_at: None,
                 team: vec![],
                 adversaries,

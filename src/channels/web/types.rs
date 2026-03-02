@@ -280,6 +280,10 @@ pub struct MatterInfo {
     pub retention: Option<String>,
     pub jurisdiction: Option<String>,
     pub practice_area: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opened_date: Option<String>,
+    /// Backward-compatible alias retained for older clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub opened_at: Option<String>,
 }
 
@@ -658,6 +662,9 @@ pub struct CreateMatterRequest {
     pub jurisdiction: Option<String>,
     #[serde(default)]
     pub practice_area: Option<String>,
+    #[serde(default)]
+    pub opened_date: Option<String>,
+    /// Backward-compatible alias retained for older clients.
     #[serde(default)]
     pub opened_at: Option<String>,
     #[serde(default)]

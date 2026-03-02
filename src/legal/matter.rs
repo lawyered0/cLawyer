@@ -73,8 +73,8 @@ pub struct MatterMetadata {
     pub jurisdiction: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub practice_area: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opened_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "opened_at")]
+    pub opened_date: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +87,7 @@ pub struct ActiveMatterPromptContext {
     pub adversaries: Vec<String>,
     pub jurisdiction: Option<String>,
     pub practice_area: Option<String>,
-    pub opened_at: Option<String>,
+    pub opened_date: Option<String>,
     pub curated_files: Vec<ActiveMatterCuratedFile>,
 }
 
@@ -141,6 +141,8 @@ struct LegacyMatterMetadata {
     jurisdiction: Option<String>,
     #[serde(default)]
     practice_area: Option<String>,
+    #[serde(default)]
+    opened_date: Option<String>,
     #[serde(default)]
     opened_at: Option<String>,
     #[serde(default)]
@@ -418,8 +420,8 @@ pub async fn load_active_matter_prompt_context(
             .as_deref()
             .map(|value| sanitize_prompt_field(value, MATTER_PROMPT_FIELD_MAX_CHARS))
             .filter(|value| !value.is_empty()),
-        opened_at: metadata
-            .opened_at
+        opened_date: metadata
+            .opened_date
             .as_deref()
             .map(|value| sanitize_prompt_field(value, MATTER_PROMPT_FIELD_MAX_CHARS))
             .filter(|value| !value.is_empty()),
@@ -529,7 +531,7 @@ pub async fn seed_legal_workspace(
         retention: "follow-firm-policy".to_string(),
         jurisdiction: None,
         practice_area: None,
-        opened_at: None,
+        opened_date: None,
     };
     let matter_yaml =
         serde_yml::to_string(&metadata).map_err(|e| WorkspaceError::SearchFailed {
@@ -639,7 +641,7 @@ fn parse_optional_opened_at_ts(raw: Option<&str>) -> Result<Option<DateTime<Utc>
     if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
         let dt = date
             .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| "invalid opened_at date".to_string())?;
+            .ok_or_else(|| "invalid opened_date date".to_string())?;
         return Ok(Some(dt.and_utc()));
     }
 
@@ -647,7 +649,7 @@ fn parse_optional_opened_at_ts(raw: Option<&str>) -> Result<Option<DateTime<Utc>
         return Ok(Some(dt.with_timezone(&Utc)));
     }
 
-    Err(format!("invalid opened_at timestamp '{}'", raw))
+    Err(format!("invalid opened_date timestamp '{}'", raw))
 }
 
 fn parse_matter_status_hint(raw: Option<&str>) -> MatterStatus {
@@ -754,7 +756,8 @@ async fn load_reindex_matter_data_for_root(
         retention,
         jurisdiction: parse_optional_trimmed(legacy.jurisdiction),
         practice_area: parse_optional_trimmed(legacy.practice_area),
-        opened_at: parse_optional_trimmed(legacy.opened_at),
+        opened_date: parse_optional_trimmed(legacy.opened_date)
+            .or_else(|| parse_optional_trimmed(legacy.opened_at)),
     };
 
     metadata
@@ -850,14 +853,14 @@ pub async fn reindex_matters_from_workspace(
             }
         };
 
-        let opened_at = match parse_optional_opened_at_ts(data.metadata.opened_at.as_deref()) {
+        let opened_at = match parse_optional_opened_at_ts(data.metadata.opened_date.as_deref()) {
             Ok(value) => value,
             Err(err) => {
                 report.skipped_matters += 1;
                 push_matter_reindex_warning(
                     &mut report,
                     format!(
-                        "failed to parse opened_at for matter '{}': {}",
+                        "failed to parse opened_date for matter '{}': {}",
                         matter_id, err
                     ),
                 );
@@ -958,7 +961,7 @@ pub async fn reindex_conflict_graph(
                 &matter_id,
                 &metadata.client,
                 &metadata.adversaries,
-                metadata.opened_at.as_deref(),
+                metadata.opened_date.as_deref(),
             )
             .await
         {
@@ -1461,7 +1464,7 @@ mod tests {
             retention: "".to_string(),
             jurisdiction: None,
             practice_area: None,
-            opened_at: None,
+            opened_date: None,
         };
         assert!(missing.validate_required_fields().is_err());
 
@@ -1474,7 +1477,7 @@ mod tests {
             retention: "follow-firm-policy".to_string(),
             jurisdiction: None,
             practice_area: None,
-            opened_at: None,
+            opened_date: None,
         };
         assert!(ok.validate_required_fields().is_ok());
     }
@@ -1493,7 +1496,7 @@ adversaries:
 retention: follow-firm-policy
 jurisdiction: SDNY / Delaware
 practice_area: commercial litigation
-opened_at: 2024-03-15
+opened_date: 2024-03-15
 "#,
         )
         .expect("yaml should parse");
@@ -1503,7 +1506,7 @@ opened_at: 2024-03-15
             parsed.practice_area.as_deref(),
             Some("commercial litigation")
         );
-        assert_eq!(parsed.opened_at.as_deref(), Some("2024-03-15"));
+        assert_eq!(parsed.opened_date.as_deref(), Some("2024-03-15"));
     }
 
     #[test]
@@ -1952,7 +1955,7 @@ confidentiality: attorney-client-privileged
 adversaries:
   - Foo Industries
 retention: follow-firm-policy
-opened_at: 2026-02-28
+opened_date: 2026-02-28
 "#,
             )
             .await
@@ -2094,7 +2097,7 @@ adversaries:
 retention: follow-firm-policy
 jurisdiction: SDNY / Delaware
 practice_area: commercial litigation
-opened_at: 2024-03-15
+opened_date: 2024-03-15
 "#,
             )
             .await
@@ -2111,7 +2114,7 @@ opened_at: 2024-03-15
             .expect("active matter context should be present");
         assert_eq!(ctx.jurisdiction.as_deref(), Some("SDNY / Delaware"));
         assert_eq!(ctx.practice_area.as_deref(), Some("commercial litigation"));
-        assert_eq!(ctx.opened_at.as_deref(), Some("2024-03-15"));
+        assert_eq!(ctx.opened_date.as_deref(), Some("2024-03-15"));
     }
 
     #[cfg(feature = "libsql")]
