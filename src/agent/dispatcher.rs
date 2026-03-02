@@ -1700,6 +1700,124 @@ mod tests {
         assert!(!super::is_group_chat_from_trusted_metadata(&untrusted));
     }
 
+    #[tokio::test]
+    async fn conversation_matter_mismatch_blocks_before_llm_call() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
+
+        let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = false;
+        legal.citation_required = false;
+
+        let llm_calls = Arc::new(AtomicUsize::new(0));
+        let agent = make_test_agent_with_components(
+            Arc::new(CountingStaticLlmProvider {
+                calls: Arc::clone(&llm_calls),
+            }),
+            Arc::new(ToolRegistry::new()),
+            None,
+            legal,
+        );
+
+        let session = Arc::new(tokio::sync::Mutex::new(Session::new("user-1")));
+        let thread_id = {
+            let mut s = session.lock().await;
+            let thread = s.get_or_create_thread();
+            thread.metadata = serde_json::json!({ "matter_id": "matter-a" });
+            thread.id
+        };
+
+        let message = IncomingMessage::new("gateway", "user-1", "Continue analysis").with_metadata(
+            serde_json::json!({
+                "active_matter": "matter-b"
+            }),
+        );
+        let result = agent
+            .process_user_input(&message, Arc::clone(&session), thread_id, &message.content)
+            .await
+            .expect("process_user_input should succeed");
+
+        match result {
+            SubmissionResult::Error { message } => {
+                assert!(
+                    message.contains("Thread is bound to matter"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("expected mismatch block, got {other:?}"),
+        }
+        assert_eq!(
+            llm_calls.load(Ordering::SeqCst),
+            0,
+            "mismatch should block before the first LLM call"
+        );
+
+        let events = crate::legal::audit::test_events_snapshot();
+        assert!(events.iter().any(|event| {
+            event.event_type == "conversation_matter_mismatch_blocked"
+                && event.details.get("source").and_then(|v| v.as_str()) == Some("memory")
+        }));
+    }
+
+    #[tokio::test]
+    async fn conversation_matter_binds_in_memory_when_unbound() {
+        let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+        crate::legal::audit::clear_test_events();
+
+        let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        legal.enabled = true;
+        legal.require_matter_context = false;
+        legal.conflict_check_enabled = false;
+        legal.citation_required = false;
+
+        let agent = make_test_agent_with_components(
+            Arc::new(StaticLlmProvider),
+            Arc::new(ToolRegistry::new()),
+            None,
+            legal,
+        );
+        let session = Arc::new(tokio::sync::Mutex::new(Session::new("user-1")));
+        let thread_id = {
+            let mut s = session.lock().await;
+            s.get_or_create_thread().id
+        };
+
+        let message = IncomingMessage::new("gateway", "user-1", "Draft opening summary")
+            .with_metadata(serde_json::json!({
+                "active_matter": "Matter A"
+            }));
+        let result = agent
+            .process_user_input(&message, Arc::clone(&session), thread_id, &message.content)
+            .await
+            .expect("process_user_input should succeed");
+        assert!(
+            matches!(result, SubmissionResult::Response { .. }),
+            "expected normal response after in-memory bind"
+        );
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).expect("thread should exist");
+        assert_eq!(
+            thread
+                .metadata
+                .get("matter_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+            "matter-a"
+        );
+
+        let events = crate::legal::audit::test_events_snapshot();
+        assert!(events.iter().any(|event| {
+            event.event_type == "conversation_matter_bound"
+                && event.details.get("matter_id").and_then(|v| v.as_str()) == Some("matter-a")
+                && event.details.get("source").and_then(|v| v.as_str()) == Some("memory")
+        }));
+    }
+
     #[cfg(feature = "libsql")]
     async fn make_test_workspace(user_id: &str) -> Arc<Workspace> {
         let db_path = std::env::temp_dir().join(format!(

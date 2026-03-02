@@ -96,6 +96,7 @@ impl ConversationStore for LibSqlBackend {
                     c.id,
                     c.started_at,
                     c.last_activity,
+                    c.matter_id,
                     c.metadata,
                     (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id) AS message_count,
                     (SELECT substr(m2.content, 1, 100)
@@ -120,7 +121,7 @@ impl ConversationStore for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?
         {
-            let metadata = get_json(&row, 3);
+            let metadata = get_json(&row, 4);
             let thread_type = metadata
                 .get("thread_type")
                 .and_then(|v| v.as_str())
@@ -133,8 +134,73 @@ impl ConversationStore for LibSqlBackend {
                     .unwrap_or_default(),
                 started_at: get_ts(&row, 1),
                 last_activity: get_ts(&row, 2),
-                message_count: get_i64(&row, 4),
-                title: get_opt_text(&row, 5),
+                matter_id: get_opt_text(&row, 3),
+                message_count: get_i64(&row, 5),
+                title: get_opt_text(&row, 6),
+                thread_type,
+            });
+        }
+        Ok(results)
+    }
+
+    async fn list_conversations_with_preview_for_matter(
+        &self,
+        user_id: &str,
+        channel: &str,
+        matter_id: &str,
+        limit: i64,
+    ) -> Result<Vec<ConversationSummary>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    c.id,
+                    c.started_at,
+                    c.last_activity,
+                    c.matter_id,
+                    c.metadata,
+                    (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id) AS message_count,
+                    (SELECT substr(m2.content, 1, 100)
+                     FROM conversation_messages m2
+                     WHERE m2.conversation_id = c.id AND m2.role = 'user'
+                     ORDER BY m2.created_at ASC, m2.rowid ASC
+                     LIMIT 1
+                    ) AS title
+                FROM conversations c
+                WHERE c.user_id = ?1
+                  AND c.channel = ?2
+                  AND c.matter_id = ?3
+                ORDER BY c.last_activity DESC
+                LIMIT ?4
+                "#,
+                params![user_id, channel, matter_id, limit],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            let metadata = get_json(&row, 4);
+            let thread_type = metadata
+                .get("thread_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            results.push(ConversationSummary {
+                id: row
+                    .get::<String>(0)
+                    .unwrap_or_default()
+                    .parse()
+                    .unwrap_or_default(),
+                started_at: get_ts(&row, 1),
+                last_activity: get_ts(&row, 2),
+                matter_id: get_opt_text(&row, 3),
+                message_count: get_i64(&row, 5),
+                title: get_opt_text(&row, 6),
                 thread_type,
             });
         }
@@ -351,5 +417,70 @@ impl ConversationStore for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(found.is_some())
+    }
+
+    async fn bind_conversation_to_matter(
+        &self,
+        conversation_id: Uuid,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT matter_id FROM conversations WHERE id = ?1 AND user_id = ?2 LIMIT 1",
+                params![conversation_id.to_string(), user_id],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        else {
+            return Err(DatabaseError::NotFound {
+                entity: "conversation".to_string(),
+                id: conversation_id.to_string(),
+            });
+        };
+        let existing = get_opt_text(&row, 0);
+        match existing.as_deref() {
+            Some(current) if current != matter_id => {
+                return Err(DatabaseError::Constraint(format!(
+                    "conversation {} already bound to matter '{}'",
+                    conversation_id, current
+                )));
+            }
+            Some(_) => return Ok(()),
+            None => {}
+        }
+
+        conn.execute(
+            "UPDATE conversations SET matter_id = ?3, last_activity = ?4 WHERE id = ?1 AND user_id = ?2",
+            params![conversation_id.to_string(), user_id, matter_id, fmt_ts(&Utc::now())],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_conversation_matter_id(
+        &self,
+        conversation_id: Uuid,
+        user_id: &str,
+    ) -> Result<Option<String>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT matter_id FROM conversations WHERE id = ?1 AND user_id = ?2 LIMIT 1",
+                params![conversation_id.to_string(), user_id],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        let found = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(found.as_ref().and_then(|row| get_opt_text(row, 0)))
     }
 }

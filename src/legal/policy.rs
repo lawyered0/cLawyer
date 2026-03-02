@@ -101,6 +101,24 @@ pub fn sanitize_matter_id(matter_id: &str) -> String {
         .to_string()
 }
 
+/// Sanitize a matter ID and return `None` when it becomes empty.
+pub fn sanitize_optional_matter_id(matter_id: &str) -> Option<String> {
+    let sanitized = sanitize_matter_id(matter_id);
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+/// Read and sanitize `matter_id` from JSON metadata.
+pub fn matter_id_from_metadata(metadata: &serde_json::Value) -> Option<String> {
+    metadata
+        .get("matter_id")
+        .and_then(|value| value.as_str())
+        .and_then(sanitize_optional_matter_id)
+}
+
 /// Basic heuristic for identifying non-trivial legal tasks.
 pub fn is_non_trivial_request(content: &str) -> bool {
     let trimmed = content.trim();
@@ -254,5 +272,25 @@ mod tests {
     #[test]
     fn sanitize_matter_id_removes_unsafe_chars() {
         assert_eq!(sanitize_matter_id(" Acme v. Foo/2026 "), "acme-v--foo-2026");
+    }
+
+    #[test]
+    fn sanitize_optional_matter_id_returns_none_for_empty_result() {
+        assert_eq!(sanitize_optional_matter_id("!!!"), None);
+        assert_eq!(
+            sanitize_optional_matter_id(" demo "),
+            Some("demo".to_string())
+        );
+    }
+
+    #[test]
+    fn matter_id_from_metadata_sanitizes_and_filters() {
+        let metadata = serde_json::json!({ "matter_id": "Acme v. Foo" });
+        assert_eq!(
+            matter_id_from_metadata(&metadata),
+            Some("acme-v--foo".to_string())
+        );
+        let invalid = serde_json::json!({ "matter_id": "!!!" });
+        assert_eq!(matter_id_from_metadata(&invalid), None);
     }
 }

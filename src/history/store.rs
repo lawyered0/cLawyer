@@ -1262,6 +1262,8 @@ pub struct ConversationSummary {
     pub message_count: i64,
     pub started_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
+    /// Bound matter identifier when legal thread isolation is active.
+    pub matter_id: Option<String>,
     /// Thread type extracted from metadata (e.g. "assistant", "thread").
     pub thread_type: Option<String>,
 }
@@ -1315,6 +1317,7 @@ impl Store {
                     c.id,
                     c.started_at,
                     c.last_activity,
+                    c.matter_id,
                     c.metadata,
                     (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id) AS message_count,
                     (SELECT LEFT(m2.content, 100)
@@ -1346,6 +1349,64 @@ impl Store {
                     message_count: r.get("message_count"),
                     started_at: r.get("started_at"),
                     last_activity: r.get("last_activity"),
+                    matter_id: r.get("matter_id"),
+                    thread_type,
+                }
+            })
+            .collect())
+    }
+
+    /// List conversations scoped to a single bound matter.
+    pub async fn list_conversations_with_preview_for_matter(
+        &self,
+        user_id: &str,
+        channel: &str,
+        matter_id: &str,
+        limit: i64,
+    ) -> Result<Vec<ConversationSummary>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT
+                    c.id,
+                    c.started_at,
+                    c.last_activity,
+                    c.matter_id,
+                    c.metadata,
+                    (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id) AS message_count,
+                    (SELECT LEFT(m2.content, 100)
+                     FROM conversation_messages m2
+                     WHERE m2.conversation_id = c.id AND m2.role = 'user'
+                     ORDER BY m2.created_at ASC
+                     LIMIT 1
+                    ) AS title
+                FROM conversations c
+                WHERE c.user_id = $1
+                  AND c.channel = $2
+                  AND c.matter_id = $3
+                ORDER BY c.last_activity DESC
+                LIMIT $4
+                "#,
+                &[&user_id, &channel, &matter_id, &limit],
+            )
+            .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let metadata: serde_json::Value = r.get("metadata");
+                let thread_type = metadata
+                    .get("thread_type")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                ConversationSummary {
+                    id: r.get("id"),
+                    title: r.get("title"),
+                    message_count: r.get("message_count"),
+                    started_at: r.get("started_at"),
+                    last_activity: r.get("last_activity"),
+                    matter_id: r.get("matter_id"),
                     thread_type,
                 }
             })
@@ -1427,6 +1488,64 @@ impl Store {
             )
             .await?;
         Ok(row.is_some())
+    }
+
+    /// Bind a conversation to a matter identifier. Once set, the binding is immutable.
+    pub async fn bind_conversation_to_matter(
+        &self,
+        conversation_id: Uuid,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT matter_id FROM conversations WHERE id = $1 AND user_id = $2",
+                &[&conversation_id, &user_id],
+            )
+            .await?;
+
+        let Some(row) = row else {
+            return Err(DatabaseError::NotFound {
+                entity: "conversation".to_string(),
+                id: conversation_id.to_string(),
+            });
+        };
+
+        let existing: Option<String> = row.get("matter_id");
+        match existing.as_deref() {
+            Some(current) if current != matter_id => {
+                return Err(DatabaseError::Constraint(format!(
+                    "conversation {} already bound to matter '{}'",
+                    conversation_id, current
+                )));
+            }
+            Some(_) => return Ok(()),
+            None => {}
+        }
+
+        conn.execute(
+            "UPDATE conversations SET matter_id = $3, last_activity = NOW() WHERE id = $1 AND user_id = $2",
+            &[&conversation_id, &user_id, &matter_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Return the bound matter for a conversation, if present.
+    pub async fn get_conversation_matter_id(
+        &self,
+        conversation_id: Uuid,
+        user_id: &str,
+    ) -> Result<Option<String>, DatabaseError> {
+        let conn = self.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT matter_id FROM conversations WHERE id = $1 AND user_id = $2",
+                &[&conversation_id, &user_id],
+            )
+            .await?;
+        Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
     }
 
     /// Load messages for a conversation with cursor-based pagination.

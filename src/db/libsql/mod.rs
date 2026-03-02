@@ -294,6 +294,36 @@ impl Database for LibSqlBackend {
         conn.execute_batch(libsql_migrations::SCHEMA)
             .await
             .map_err(|e| DatabaseError::Migration(format!("libSQL migration failed: {}", e)))?;
+
+        // Backfill post-bootstrap schema additions for existing databases.
+        // `SCHEMA` only creates objects when absent, so previously-created
+        // tables need explicit ALTER statements for new columns.
+        match conn
+            .execute("ALTER TABLE conversations ADD COLUMN matter_id TEXT", ())
+            .await
+        {
+            Ok(_) => {}
+            Err(err) => {
+                let msg = err.to_string();
+                if !msg.to_ascii_lowercase().contains("duplicate column name") {
+                    return Err(DatabaseError::Migration(format!(
+                        "failed to add conversations.matter_id: {msg}"
+                    )));
+                }
+            }
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversations_user_channel_matter_last_activity \
+             ON conversations(user_id, channel, matter_id, last_activity DESC)",
+            (),
+        )
+        .await
+        .map_err(|e| {
+            DatabaseError::Migration(format!(
+                "failed to ensure conversations matter index: {}",
+                e
+            ))
+        })?;
         Ok(())
     }
 }

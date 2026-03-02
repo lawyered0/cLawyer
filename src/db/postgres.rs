@@ -574,6 +574,18 @@ impl ConversationStore for PgBackend {
             .await
     }
 
+    async fn list_conversations_with_preview_for_matter(
+        &self,
+        user_id: &str,
+        channel: &str,
+        matter_id: &str,
+        limit: i64,
+    ) -> Result<Vec<ConversationSummary>, DatabaseError> {
+        self.store
+            .list_conversations_with_preview_for_matter(user_id, channel, matter_id, limit)
+            .await
+    }
+
     async fn get_or_create_assistant_conversation(
         &self,
         user_id: &str,
@@ -638,6 +650,27 @@ impl ConversationStore for PgBackend {
     ) -> Result<bool, DatabaseError> {
         self.store
             .conversation_belongs_to_user(conversation_id, user_id)
+            .await
+    }
+
+    async fn bind_conversation_to_matter(
+        &self,
+        conversation_id: Uuid,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<(), DatabaseError> {
+        self.store
+            .bind_conversation_to_matter(conversation_id, user_id, matter_id)
+            .await
+    }
+
+    async fn get_conversation_matter_id(
+        &self,
+        conversation_id: Uuid,
+        user_id: &str,
+    ) -> Result<Option<String>, DatabaseError> {
+        self.store
+            .get_conversation_matter_id(conversation_id, user_id)
             .await
     }
 }

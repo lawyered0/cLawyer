@@ -20,6 +20,7 @@ const MIN_ALIAS_SINGLE_TOKEN_LEN: usize = 4;
 const MATTER_PROMPT_LIST_MAX_ITEMS: usize = 8;
 const MATTER_PROMPT_FIELD_MAX_CHARS: usize = 160;
 const MATTER_PROMPT_LIST_ITEM_MAX_CHARS: usize = 96;
+const MATTER_PROMPT_FILE_MAX_CHARS: usize = 2000;
 pub const GLOBAL_CONFLICT_GRAPH_MATTER_ID: &str = "__global_conflicts__";
 const REINDEX_WARNING_LIMIT: usize = 50;
 
@@ -87,6 +88,14 @@ pub struct ActiveMatterPromptContext {
     pub jurisdiction: Option<String>,
     pub practice_area: Option<String>,
     pub opened_at: Option<String>,
+    pub curated_files: Vec<ActiveMatterCuratedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveMatterCuratedFile {
+    pub name: String,
+    pub content: String,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -298,6 +307,54 @@ fn sanitize_prompt_list(values: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn sanitize_prompt_file(value: &str, max_chars: usize) -> (String, bool) {
+    let sanitized = sanitize_prompt_field(value, max_chars);
+    let original_trimmed_len = value
+        .chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'))
+        .count();
+    let truncated = original_trimmed_len > sanitized.chars().count();
+    (sanitized, truncated)
+}
+
+async fn load_curated_prompt_file(
+    workspace: &Workspace,
+    path: &str,
+    name: &str,
+) -> Option<ActiveMatterCuratedFile> {
+    let doc = match workspace.read(path).await {
+        Ok(doc) => doc,
+        Err(WorkspaceError::DocumentNotFound { .. }) => return None,
+        Err(err) => {
+            tracing::warn!("Failed to read curated matter context '{}': {}", path, err);
+            return None;
+        }
+    };
+    let (content, truncated) = sanitize_prompt_file(&doc.content, MATTER_PROMPT_FILE_MAX_CHARS);
+    if content.is_empty() {
+        return None;
+    }
+    Some(ActiveMatterCuratedFile {
+        name: name.to_string(),
+        content,
+        truncated,
+    })
+}
+
+async fn write_if_missing(
+    workspace: &Workspace,
+    path: &str,
+    content: &str,
+) -> Result<(), WorkspaceError> {
+    match workspace.read(path).await {
+        Ok(_) => Ok(()),
+        Err(WorkspaceError::DocumentNotFound { .. }) => {
+            workspace.write(path, content).await.map(|_| ())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Build active matter context fields suitable for inclusion in the legal
 /// system prompt as untrusted data.
 pub async fn load_active_matter_prompt_context(
@@ -321,6 +378,25 @@ pub async fn load_active_matter_prompt_context(
     } else {
         sanitize_prompt_field(&sanitized_matter_id, MATTER_PROMPT_FIELD_MAX_CHARS)
     };
+    let matter_prefix = format!(
+        "{}/{}",
+        config.matter_root.trim_matches('/'),
+        sanitized_matter_id
+    );
+    let facts_path = format!("{matter_prefix}/facts.md");
+    let parties_path = format!("{matter_prefix}/parties.md");
+    let strategy_path = format!("{matter_prefix}/strategy.md");
+    let documents_path = format!("{matter_prefix}/documents.md");
+    let (facts, parties, strategy, documents) = tokio::join!(
+        load_curated_prompt_file(workspace, &facts_path, "facts.md"),
+        load_curated_prompt_file(workspace, &parties_path, "parties.md"),
+        load_curated_prompt_file(workspace, &strategy_path, "strategy.md"),
+        load_curated_prompt_file(workspace, &documents_path, "documents.md")
+    );
+    let curated_files = [facts, parties, strategy, documents]
+        .into_iter()
+        .flatten()
+        .collect();
 
     Ok(Some(ActiveMatterPromptContext {
         matter_id,
@@ -347,6 +423,7 @@ pub async fn load_active_matter_prompt_context(
             .as_deref()
             .map(|value| sanitize_prompt_field(value, MATTER_PROMPT_FIELD_MAX_CHARS))
             .filter(|value| !value.is_empty()),
+        curated_files,
     }))
 }
 
@@ -380,18 +457,12 @@ pub async fn seed_legal_workspace(
     }
 
     // Seed conflict list template.
-    match workspace.read("conflicts.json").await {
-        Ok(_) => {}
-        Err(WorkspaceError::DocumentNotFound { .. }) => {
-            workspace
-                .write(
-                    "conflicts.json",
-                    "[\n  {\n    \"name\": \"Example Adverse Party\",\n    \"aliases\": [\"Example Co\"]\n  }\n]\n",
-                )
-                .await?;
-        }
-        Err(e) => return Err(e),
-    }
+    write_if_missing(
+        workspace,
+        "conflicts.json",
+        "[\n  {\n    \"name\": \"Example Adverse Party\",\n    \"aliases\": [\"Example Co\"]\n  }\n]\n",
+    )
+    .await?;
 
     let root_seeds = [
         (
@@ -439,13 +510,7 @@ pub async fn seed_legal_workspace(
     ];
 
     for (path, content) in root_seeds {
-        match workspace.read(&path).await {
-            Ok(_) => {}
-            Err(WorkspaceError::DocumentNotFound { .. }) => {
-                workspace.write(&path, &content).await?;
-            }
-            Err(e) => return Err(e),
-        }
+        write_if_missing(workspace, &path, &content).await?;
     }
 
     let matter_id = match config.active_matter.as_deref() {
@@ -548,13 +613,7 @@ pub async fn seed_legal_workspace(
     ];
 
     for (path, content) in seeds {
-        match workspace.read(&path).await {
-            Ok(_) => {}
-            Err(WorkspaceError::DocumentNotFound { .. }) => {
-                workspace.write(&path, &content).await?;
-            }
-            Err(e) => return Err(e),
-        }
+        write_if_missing(workspace, &path, &content).await?;
     }
 
     Ok(())
@@ -1544,7 +1603,7 @@ mod cache_tests {
     use std::time::Duration;
 
     use super::{
-        CONFLICT_REINDEX_LOCK, GLOBAL_CONFLICT_GRAPH_MATTER_ID,
+        CONFLICT_REINDEX_LOCK, GLOBAL_CONFLICT_GRAPH_MATTER_ID, MATTER_PROMPT_FILE_MAX_CHARS,
         conflict_cache_refresh_count_for_tests, detect_conflict, invalidate_conflict_cache,
         load_active_matter_prompt_context, reindex_conflict_graph, reset_conflict_cache_for_tests,
     };
@@ -2053,5 +2112,105 @@ opened_at: 2024-03-15
         assert_eq!(ctx.jurisdiction.as_deref(), Some("SDNY / Delaware"));
         assert_eq!(ctx.practice_area.as_deref(), Some("commercial litigation"));
         assert_eq!(ctx.opened_at.as_deref(), Some("2024-03-15"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn load_active_matter_prompt_context_includes_curated_files_when_present() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "matters/demo/matter.yaml",
+                r#"
+matter_id: demo
+client: Demo Client
+team:
+  - Lead Counsel
+confidentiality: attorney-client-privileged
+adversaries:
+  - Foo Industries
+retention: follow-firm-policy
+"#,
+            )
+            .await
+            .expect("seed matter metadata");
+        workspace
+            .write("matters/demo/facts.md", " Fact 1\n\nFact 2 ")
+            .await
+            .expect("seed facts");
+        workspace
+            .write(
+                "matters/demo/strategy.md",
+                " Preserve defenses and seek early settlement. ",
+            )
+            .await
+            .expect("seed strategy");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.active_matter = Some("demo".to_string());
+
+        let ctx = load_active_matter_prompt_context(workspace.as_ref(), &legal)
+            .await
+            .expect("context load should succeed")
+            .expect("active matter context should be present");
+        assert!(ctx.curated_files.iter().any(|f| f.name == "facts.md"));
+        assert!(
+            ctx.curated_files
+                .iter()
+                .any(|f| f.name == "strategy.md" && f.content.contains("Preserve defenses"))
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn load_active_matter_prompt_context_marks_truncated_curated_files() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        workspace
+            .write(
+                "matters/demo/matter.yaml",
+                r#"
+matter_id: demo
+client: Demo Client
+team:
+  - Lead Counsel
+confidentiality: attorney-client-privileged
+adversaries:
+  - Foo Industries
+retention: follow-firm-policy
+"#,
+            )
+            .await
+            .expect("seed matter metadata");
+        workspace
+            .write(
+                "matters/demo/facts.md",
+                &"x".repeat(MATTER_PROMPT_FILE_MAX_CHARS + 500),
+            )
+            .await
+            .expect("seed long facts");
+
+        let mut legal =
+            LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
+        legal.enabled = true;
+        legal.active_matter = Some("demo".to_string());
+
+        let ctx = load_active_matter_prompt_context(workspace.as_ref(), &legal)
+            .await
+            .expect("context load should succeed")
+            .expect("active matter context should be present");
+        let facts = ctx
+            .curated_files
+            .iter()
+            .find(|entry| entry.name == "facts.md")
+            .expect("facts file should be present");
+        assert!(facts.truncated, "facts.md should be marked truncated");
+        assert!(
+            facts.content.chars().count() <= MATTER_PROMPT_FILE_MAX_CHARS,
+            "facts content should be capped"
+        );
     }
 }

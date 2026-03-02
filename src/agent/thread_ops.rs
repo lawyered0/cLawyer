@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::agent::Agent;
-use crate::agent::compaction::ContextCompactor;
+use crate::agent::compaction::{ContextCompactor, MatterCompactionScope};
 use crate::agent::dispatcher::{
     AgenticLoopResult, ToolAuditContext, check_auth_required, execute_chat_tool_standalone,
     parse_auth_result,
@@ -29,6 +29,64 @@ fn approval_requirement_label(requirement: ApprovalRequirement) -> &'static str 
         ApprovalRequirement::UnlessAutoApproved => "unless_auto_approved",
         ApprovalRequirement::Always => "always",
     }
+}
+
+fn thread_set_matter_id_metadata(thread: &mut crate::agent::session::Thread, matter_id: &str) {
+    let Some(matter_id) = crate::legal::policy::sanitize_optional_matter_id(matter_id) else {
+        return;
+    };
+
+    let mut object = thread.metadata.as_object().cloned().unwrap_or_default();
+    object.insert(
+        "matter_id".to_string(),
+        serde_json::Value::String(matter_id),
+    );
+    thread.metadata = serde_json::Value::Object(object);
+}
+
+fn thread_compaction_scope(
+    thread: &crate::agent::session::Thread,
+    legal: &crate::config::LegalConfig,
+) -> Option<MatterCompactionScope> {
+    if !legal.enabled {
+        return None;
+    }
+    let matter_id = crate::legal::policy::matter_id_from_metadata(&thread.metadata)?;
+    Some(MatterCompactionScope {
+        matter_root: legal.matter_root.clone(),
+        matter_id,
+    })
+}
+
+fn conversation_matter_mismatch_message(bound: &str, active: &str) -> String {
+    format!(
+        "Thread is bound to matter '{}'. Start a new thread to work in matter '{}'.",
+        bound, active
+    )
+}
+
+fn audit_conversation_matter_mismatch(thread_id: Uuid, bound: &str, active: &str, source: &str) {
+    crate::legal::audit::inc_blocked_action();
+    crate::legal::audit::record(
+        "conversation_matter_mismatch_blocked",
+        serde_json::json!({
+            "thread_id": thread_id.to_string(),
+            "bound_matter": bound,
+            "requested_matter": active,
+            "source": source,
+        }),
+    );
+}
+
+fn audit_conversation_matter_bound(thread_id: Uuid, active: &str, source: &str) {
+    crate::legal::audit::record(
+        "conversation_matter_bound",
+        serde_json::json!({
+            "thread_id": thread_id.to_string(),
+            "matter_id": active,
+            "source": source,
+        }),
+    );
 }
 
 impl Agent {
@@ -66,6 +124,7 @@ impl Agent {
 
         // Load history from DB (may be empty for a newly created thread).
         let mut chat_messages: Vec<ChatMessage> = Vec::new();
+        let mut bound_matter: Option<String> = None;
         let msg_count;
 
         if let Some(store) = self.store() {
@@ -74,6 +133,11 @@ impl Agent {
                 .await
                 .unwrap_or_default();
             msg_count = db_messages.len();
+            bound_matter = store
+                .get_conversation_matter_id(thread_uuid, &message.user_id)
+                .await
+                .ok()
+                .flatten();
             chat_messages = db_messages
                 .iter()
                 .filter_map(|m| match m.role.as_str() {
@@ -95,6 +159,9 @@ impl Agent {
         let mut thread = crate::agent::session::Thread::with_id(thread_uuid, session_id);
         if !chat_messages.is_empty() {
             thread.restore_from_messages(chat_messages);
+        }
+        if let Some(matter_id) = bound_matter.as_deref() {
+            thread_set_matter_id_metadata(&mut thread, matter_id);
         }
 
         // Insert into session and register with session manager
@@ -119,6 +186,108 @@ impl Agent {
             thread_uuid,
             msg_count
         );
+    }
+
+    async fn enforce_thread_matter_scope(
+        &self,
+        message: &IncomingMessage,
+        session: &Arc<Mutex<Session>>,
+        thread_id: Uuid,
+        legal: &crate::config::LegalConfig,
+    ) -> Result<(), String> {
+        if !legal.enabled {
+            return Ok(());
+        }
+
+        let active_matter = legal
+            .active_matter
+            .as_deref()
+            .and_then(crate::legal::policy::sanitize_optional_matter_id);
+
+        if let Some(store) = self.store() {
+            let ensure_result = store
+                .ensure_conversation(thread_id, "gateway", &message.user_id, None)
+                .await;
+            if let Err(err) = ensure_result {
+                tracing::warn!(
+                    "Failed to ensure conversation {} before matter-scope enforcement: {}",
+                    thread_id,
+                    err
+                );
+            } else {
+                match store
+                    .get_conversation_matter_id(thread_id, &message.user_id)
+                    .await
+                {
+                    Ok(bound) => {
+                        if let Some(ref bound_matter) = bound {
+                            // Keep in-memory metadata synchronized for compaction/UI.
+                            let mut sess = session.lock().await;
+                            if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                                thread_set_matter_id_metadata(thread, bound_matter);
+                            }
+                        }
+
+                        match (bound.as_deref(), active_matter.as_deref()) {
+                            (Some(bound), Some(active)) if bound != active => {
+                                audit_conversation_matter_mismatch(thread_id, bound, active, "db");
+                                return Err(conversation_matter_mismatch_message(bound, active));
+                            }
+                            (None, Some(active)) => {
+                                store
+                                    .bind_conversation_to_matter(
+                                        thread_id,
+                                        &message.user_id,
+                                        active,
+                                    )
+                                    .await
+                                    .map_err(|err| {
+                                        format!(
+                                            "Failed to bind thread to active matter '{}': {}",
+                                            active, err
+                                        )
+                                    })?;
+                                {
+                                    let mut sess = session.lock().await;
+                                    if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                                        thread_set_matter_id_metadata(thread, active);
+                                    }
+                                }
+                                audit_conversation_matter_bound(thread_id, active, "db");
+                            }
+                            _ => {}
+                        }
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to load conversation matter binding for {}: {}",
+                            thread_id,
+                            err
+                        );
+                    }
+                }
+            }
+        }
+
+        // No DB (or DB failed): enforce with in-memory thread metadata.
+        let mut sess = session.lock().await;
+        let Some(thread) = sess.threads.get_mut(&thread_id) else {
+            return Ok(());
+        };
+        let bound = crate::legal::policy::matter_id_from_metadata(&thread.metadata);
+        match (bound.as_deref(), active_matter.as_deref()) {
+            (Some(bound), Some(active)) if bound != active => {
+                audit_conversation_matter_mismatch(thread_id, bound, active, "memory");
+                Err(conversation_matter_mismatch_message(bound, active))
+            }
+            (None, Some(active)) => {
+                thread_set_matter_id_metadata(thread, active);
+                audit_conversation_matter_bound(thread_id, active, "memory");
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     pub(super) async fn process_user_input(
@@ -205,6 +374,13 @@ impl Agent {
         }
 
         let effective_legal_config = self.effective_legal_config_for(message);
+
+        if let Err(reason) = self
+            .enforce_thread_matter_scope(message, &session, thread_id, &effective_legal_config)
+            .await
+        {
+            return Ok(SubmissionResult::error(reason));
+        }
 
         if effective_legal_config.enabled
             && effective_legal_config.require_matter_context
@@ -299,8 +475,14 @@ impl Agent {
                     .await;
 
                 let compactor = ContextCompactor::new(self.llm().clone(), self.safety().clone());
+                let scope = thread_compaction_scope(thread, &effective_legal_config);
                 if let Err(e) = compactor
-                    .compact(thread, strategy, self.workspace().map(|w| w.as_ref()))
+                    .compact(
+                        thread,
+                        strategy,
+                        self.workspace().map(|w| w.as_ref()),
+                        scope.as_ref(),
+                    )
                     .await
                 {
                     tracing::warn!("Auto-compaction failed: {}", e);
@@ -459,15 +641,13 @@ impl Agent {
         }
     }
 
-    /// Persist the user message to the DB at turn start (before the agentic loop).
-    ///
-    /// This ensures the user message is durable even if the process crashes
-    /// mid-response. Call this right after `thread.start_turn()`.
-    pub(super) async fn persist_user_message(
+    async fn persist_conversation_message(
         &self,
         thread_id: Uuid,
         user_id: &str,
-        user_input: &str,
+        role: &str,
+        content: &str,
+        failure_label: &str,
     ) {
         let store = match self.store() {
             Some(s) => Arc::clone(s),
@@ -483,11 +663,25 @@ impl Agent {
         }
 
         if let Err(e) = store
-            .add_conversation_message(thread_id, "user", user_input)
+            .add_conversation_message(thread_id, role, content)
             .await
         {
-            tracing::warn!("Failed to persist user message: {}", e);
+            tracing::warn!("Failed to persist {}: {}", failure_label, e);
         }
+    }
+
+    /// Persist the user message to the DB at turn start (before the agentic loop).
+    ///
+    /// This ensures the user message is durable even if the process crashes
+    /// mid-response. Call this right after `thread.start_turn()`.
+    pub(super) async fn persist_user_message(
+        &self,
+        thread_id: Uuid,
+        user_id: &str,
+        user_input: &str,
+    ) {
+        self.persist_conversation_message(thread_id, user_id, "user", user_input, "user message")
+            .await;
     }
 
     /// Persist the assistant response to the DB after the agentic loop completes.
@@ -501,25 +695,14 @@ impl Agent {
         user_id: &str,
         response: &str,
     ) {
-        let store = match self.store() {
-            Some(s) => Arc::clone(s),
-            None => return,
-        };
-
-        if let Err(e) = store
-            .ensure_conversation(thread_id, "gateway", user_id, None)
-            .await
-        {
-            tracing::warn!("Failed to ensure conversation {}: {}", thread_id, e);
-            return;
-        }
-
-        if let Err(e) = store
-            .add_conversation_message(thread_id, "assistant", response)
-            .await
-        {
-            tracing::warn!("Failed to persist assistant message: {}", e);
-        }
+        self.persist_conversation_message(
+            thread_id,
+            user_id,
+            "assistant",
+            response,
+            "assistant message",
+        )
+        .await;
     }
 
     pub(super) async fn process_undo(
@@ -633,8 +816,14 @@ impl Agent {
             );
 
         let compactor = ContextCompactor::new(self.llm().clone(), self.safety().clone());
+        let scope = thread_compaction_scope(thread, self.base_legal_config());
         match compactor
-            .compact(thread, strategy, self.workspace().map(|w| w.as_ref()))
+            .compact(
+                thread,
+                strategy,
+                self.workspace().map(|w| w.as_ref()),
+                scope.as_ref(),
+            )
             .await
         {
             Ok(result) => {
@@ -682,6 +871,13 @@ impl Agent {
         always: bool,
     ) -> Result<SubmissionResult, Error> {
         let effective_legal_config = self.effective_legal_config_for(message);
+
+        if let Err(reason) = self
+            .enforce_thread_matter_scope(message, &session, thread_id, &effective_legal_config)
+            .await
+        {
+            return Ok(SubmissionResult::error(reason));
+        }
 
         // Get pending approval for this thread
         let pending = {

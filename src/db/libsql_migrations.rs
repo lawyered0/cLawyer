@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     channel TEXT NOT NULL,
     user_id TEXT NOT NULL,
     thread_id TEXT,
+    matter_id TEXT,
     started_at TEXT NOT NULL DEFAULT (datetime('now')),
     last_activity TEXT NOT NULL DEFAULT (datetime('now')),
     metadata TEXT NOT NULL DEFAULT '{}'
@@ -41,6 +42,8 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE INDEX IF NOT EXISTS idx_conversations_channel ON conversations(channel);
 CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_last_activity ON conversations(last_activity);
+CREATE INDEX IF NOT EXISTS idx_conversations_user_channel_matter_last_activity
+    ON conversations(user_id, channel, matter_id, last_activity DESC);
 
 CREATE TABLE IF NOT EXISTS conversation_messages (
     id TEXT PRIMARY KEY,

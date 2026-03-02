@@ -590,12 +590,7 @@ async fn load_active_matter_for_chat(state: &GatewayState) -> Option<String> {
         }
     }?;
     let raw = value.as_str()?;
-    let sanitized = crate::legal::policy::sanitize_matter_id(raw);
-    if sanitized.is_empty() {
-        None
-    } else {
-        Some(sanitized)
-    }
+    crate::legal::policy::sanitize_optional_matter_id(raw)
 }
 
 async fn build_chat_message_metadata(
@@ -1040,75 +1035,130 @@ fn build_turns_from_db_messages(messages: &[crate::history::ConversationMessage]
     turns
 }
 
+#[derive(Debug, Deserialize)]
+struct ThreadListQuery {
+    matter_id: Option<String>,
+}
+
 async fn chat_threads_handler(
     State(state): State<Arc<GatewayState>>,
+    Query(query): Query<ThreadListQuery>,
 ) -> Result<Json<ThreadListResponse>, (StatusCode, String)> {
+    let matter_filter = query
+        .matter_id
+        .as_deref()
+        .and_then(crate::legal::policy::sanitize_optional_matter_id);
+    if query.matter_id.as_deref().is_some() && matter_filter.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'matter_id' is empty after sanitization".to_string(),
+        ));
+    }
+
     let session_manager = state.session_manager.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Session manager not available".to_string(),
     ))?;
 
     let session = session_manager.get_or_create_session(&state.user_id).await;
-    let sess = session.lock().await;
+    let active_thread = {
+        let sess = session.lock().await;
+        sess.active_thread
+    };
 
     // Try DB first for persistent thread list
     if let Some(ref store) = state.store {
-        // Auto-create assistant thread if it doesn't exist
-        let assistant_id = store
-            .get_or_create_assistant_conversation(&state.user_id, "gateway")
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let assistant_id = if matter_filter.is_none() {
+            Some(
+                store
+                    .get_or_create_assistant_conversation(&state.user_id, "gateway")
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            )
+        } else {
+            None
+        };
 
-        if let Ok(summaries) = store
-            .list_conversations_with_preview(&state.user_id, "gateway", 50)
-            .await
-        {
-            let mut assistant_thread = None;
-            let mut threads = Vec::new();
+        let summaries_result = if let Some(ref matter_id) = matter_filter {
+            store.list_conversations_with_preview_for_matter(
+                &state.user_id,
+                "gateway",
+                matter_id,
+                50,
+            )
+        } else {
+            store.list_conversations_with_preview(&state.user_id, "gateway", 50)
+        };
 
-            for s in &summaries {
-                let info = ThreadInfo {
-                    id: s.id,
-                    state: "Idle".to_string(),
-                    turn_count: (s.message_count / 2).max(0) as usize,
-                    created_at: s.started_at.to_rfc3339(),
-                    updated_at: s.last_activity.to_rfc3339(),
-                    title: s.title.clone(),
-                    thread_type: s.thread_type.clone(),
-                };
+        match summaries_result.await {
+            Ok(summaries) => {
+                let mut assistant_thread = None;
+                let mut threads = Vec::new();
 
-                if s.id == assistant_id {
-                    assistant_thread = Some(info);
-                } else {
-                    threads.push(info);
+                for summary in summaries {
+                    let info = ThreadInfo {
+                        id: summary.id,
+                        state: "Idle".to_string(),
+                        turn_count: (summary.message_count / 2).max(0) as usize,
+                        created_at: summary.started_at.to_rfc3339(),
+                        updated_at: summary.last_activity.to_rfc3339(),
+                        title: summary.title,
+                        matter_id: summary.matter_id,
+                        thread_type: summary.thread_type,
+                    };
+
+                    if assistant_id.is_some_and(|id| summary.id == id) {
+                        assistant_thread = Some(info);
+                    } else {
+                        threads.push(info);
+                    }
                 }
-            }
 
-            // If assistant wasn't in the list (0 messages), synthesize it
-            if assistant_thread.is_none() {
-                assistant_thread = Some(ThreadInfo {
-                    id: assistant_id,
-                    state: "Idle".to_string(),
-                    turn_count: 0,
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    updated_at: chrono::Utc::now().to_rfc3339(),
-                    title: None,
-                    thread_type: Some("assistant".to_string()),
-                });
-            }
+                // If assistant wasn't in the list (0 messages), synthesize it
+                if assistant_thread.is_none()
+                    && let Some(id) = assistant_id
+                {
+                    assistant_thread = Some(ThreadInfo {
+                        id,
+                        state: "Idle".to_string(),
+                        turn_count: 0,
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        updated_at: chrono::Utc::now().to_rfc3339(),
+                        title: None,
+                        matter_id: None,
+                        thread_type: Some("assistant".to_string()),
+                    });
+                }
 
-            return Ok(Json(ThreadListResponse {
-                assistant_thread,
-                threads,
-                active_thread: sess.active_thread,
-            }));
+                return Ok(Json(ThreadListResponse {
+                    assistant_thread,
+                    threads,
+                    active_thread,
+                }));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Falling back to in-memory thread list after DB query error: {}",
+                    err
+                );
+            }
         }
     }
 
     // Fallback: in-memory only (no assistant thread without DB)
+    let sess = session.lock().await;
     let threads: Vec<ThreadInfo> = sess
         .threads
         .values()
+        .filter(|thread| {
+            if let Some(ref filter) = matter_filter {
+                crate::legal::policy::matter_id_from_metadata(&thread.metadata)
+                    .as_ref()
+                    .is_some_and(|matter_id| matter_id == filter)
+            } else {
+                true
+            }
+        })
         .map(|t| ThreadInfo {
             id: t.id,
             state: format!("{:?}", t.state),
@@ -1116,6 +1166,7 @@ async fn chat_threads_handler(
             created_at: t.created_at.to_rfc3339(),
             updated_at: t.updated_at.to_rfc3339(),
             title: None,
+            matter_id: crate::legal::policy::matter_id_from_metadata(&t.metadata),
             thread_type: None,
         })
         .collect();
@@ -1135,39 +1186,60 @@ async fn chat_new_thread_handler(
         "Session manager not available".to_string(),
     ))?;
 
+    let active_matter = load_active_matter_for_chat(state.as_ref()).await;
     let session = session_manager.get_or_create_session(&state.user_id).await;
-    let mut sess = session.lock().await;
-    let thread = sess.create_thread();
-    let thread_id = thread.id;
+    let (thread_id, state_label, turn_count, created_at, updated_at) = {
+        let mut sess = session.lock().await;
+        let thread = sess.create_thread();
+        if let Some(ref matter_id) = active_matter {
+            thread.metadata = serde_json::json!({ "matter_id": matter_id });
+        }
+        (
+            thread.id,
+            format!("{:?}", thread.state),
+            thread.turns.len(),
+            thread.created_at.to_rfc3339(),
+            thread.updated_at.to_rfc3339(),
+        )
+    };
     let info = ThreadInfo {
-        id: thread.id,
-        state: format!("{:?}", thread.state),
-        turn_count: thread.turns.len(),
-        created_at: thread.created_at.to_rfc3339(),
-        updated_at: thread.updated_at.to_rfc3339(),
+        id: thread_id,
+        state: state_label,
+        turn_count,
+        created_at,
+        updated_at,
         title: None,
+        matter_id: active_matter.clone(),
         thread_type: Some("thread".to_string()),
     };
 
     // Persist the empty conversation row with thread_type metadata
     if let Some(ref store) = state.store {
-        let store = Arc::clone(store);
-        let user_id = state.user_id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = store
-                .ensure_conversation(thread_id, "gateway", &user_id, None)
+        if let Err(e) = store
+            .ensure_conversation(thread_id, "gateway", &state.user_id, None)
+            .await
+        {
+            tracing::warn!("Failed to persist new thread: {}", e);
+        }
+        let metadata_val = serde_json::json!("thread");
+        if let Err(e) = store
+            .update_conversation_metadata_field(thread_id, "thread_type", &metadata_val)
+            .await
+        {
+            tracing::warn!("Failed to set thread_type metadata: {}", e);
+        }
+        if let Some(matter_id) = active_matter
+            && let Err(e) = store
+                .bind_conversation_to_matter(thread_id, &state.user_id, &matter_id)
                 .await
-            {
-                tracing::warn!("Failed to persist new thread: {}", e);
-            }
-            let metadata_val = serde_json::json!("thread");
-            if let Err(e) = store
-                .update_conversation_metadata_field(thread_id, "thread_type", &metadata_val)
-                .await
-            {
-                tracing::warn!("Failed to set thread_type metadata: {}", e);
-            }
-        });
+        {
+            tracing::warn!(
+                "Failed to bind new thread {} to matter {}: {}",
+                thread_id,
+                matter_id,
+                e
+            );
+        }
     }
 
     Ok(Json(info))
@@ -8223,6 +8295,39 @@ mod tests {
     }
 
     #[cfg(feature = "libsql")]
+    fn test_gateway_state_with_store_workspace_and_chat(
+        store: Arc<dyn crate::db::Database>,
+        workspace: Arc<Workspace>,
+    ) -> Arc<GatewayState> {
+        Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: SseManager::new(),
+            workspace: Some(workspace),
+            session_manager: Some(Arc::new(SessionManager::new())),
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: Some(store),
+            job_manager: None,
+            prompt_queue: None,
+            user_id: "test-user".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: Some(Arc::new(
+                crate::channels::web::ws::WsConnectionTracker::new(),
+            )),
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            chat_rate_limiter: RateLimiter::new(30, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            startup_time: std::time::Instant::now(),
+            legal_config: Some(test_legal_config()),
+        })
+    }
+
+    #[cfg(feature = "libsql")]
     async fn seed_valid_matter(workspace: &Workspace, matter_id: &str) {
         let metadata = format!(
             "matter_id: {matter_id}\nclient: Demo Client\nteam:\n  - Lead Counsel\nconfidentiality: attorney-client-privileged\nadversaries:\n  - Example Co\nretention: follow-firm-policy\n"
@@ -8597,6 +8702,137 @@ mod tests {
             }
             other => panic!("expected ExecApproval payload, got {:?}", other),
         }
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn chat_new_thread_binds_active_matter_to_conversation() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_workspace_and_chat(Arc::clone(&db), workspace);
+
+        state
+            .store
+            .as_ref()
+            .expect("store")
+            .set_setting(
+                "test-user",
+                MATTER_ACTIVE_SETTING,
+                &serde_json::Value::String("DEMO".to_string()),
+            )
+            .await
+            .expect("set active matter setting");
+
+        let Json(resp) = chat_new_thread_handler(State(Arc::clone(&state)))
+            .await
+            .expect("new thread should succeed");
+        assert_eq!(resp.matter_id.as_deref(), Some("demo"));
+
+        let bound = state
+            .store
+            .as_ref()
+            .expect("store")
+            .get_conversation_matter_id(resp.id, "test-user")
+            .await
+            .expect("conversation lookup should succeed");
+        assert_eq!(bound.as_deref(), Some("demo"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn chat_threads_filter_returns_only_requested_matter() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_workspace_and_chat(Arc::clone(&db), workspace);
+
+        state
+            .store
+            .as_ref()
+            .expect("store")
+            .set_setting(
+                "test-user",
+                MATTER_ACTIVE_SETTING,
+                &serde_json::Value::String("demo".to_string()),
+            )
+            .await
+            .expect("set active matter setting");
+        let Json(demo_thread) = chat_new_thread_handler(State(Arc::clone(&state)))
+            .await
+            .expect("demo thread create should succeed");
+
+        state
+            .store
+            .as_ref()
+            .expect("store")
+            .set_setting(
+                "test-user",
+                MATTER_ACTIVE_SETTING,
+                &serde_json::Value::String("other".to_string()),
+            )
+            .await
+            .expect("set active matter setting");
+        let Json(other_thread) = chat_new_thread_handler(State(Arc::clone(&state)))
+            .await
+            .expect("other thread create should succeed");
+
+        let Json(filtered) = chat_threads_handler(
+            State(Arc::clone(&state)),
+            Query(ThreadListQuery {
+                matter_id: Some("demo".to_string()),
+            }),
+        )
+        .await
+        .expect("filtered threads call should succeed");
+
+        assert!(
+            filtered.assistant_thread.is_none(),
+            "matter-filtered thread list should not include assistant thread"
+        );
+        assert!(
+            filtered
+                .threads
+                .iter()
+                .any(|thread| thread.id == demo_thread.id),
+            "expected demo thread in filtered result"
+        );
+        assert!(
+            filtered
+                .threads
+                .iter()
+                .all(|thread| thread.id != other_thread.id),
+            "other matter thread should be excluded"
+        );
+        assert!(
+            filtered
+                .threads
+                .iter()
+                .all(|thread| thread.matter_id.as_deref() == Some("demo")),
+            "all returned threads should include demo matter id"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn chat_threads_filter_rejects_empty_after_sanitization() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_and_workspace(Arc::clone(&db), workspace);
+
+        let err = chat_threads_handler(
+            State(state),
+            Query(ThreadListQuery {
+                matter_id: Some("!!!".to_string()),
+            }),
+        )
+        .await
+        .expect_err("invalid matter filter should fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.contains("empty after sanitization"),
+            "unexpected error message: {}",
+            err.1
+        );
     }
 
     #[cfg(feature = "libsql")]

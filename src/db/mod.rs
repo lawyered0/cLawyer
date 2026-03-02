@@ -1046,6 +1046,13 @@ pub trait ConversationStore: Send + Sync {
         channel: &str,
         limit: i64,
     ) -> Result<Vec<ConversationSummary>, DatabaseError>;
+    async fn list_conversations_with_preview_for_matter(
+        &self,
+        user_id: &str,
+        channel: &str,
+        matter_id: &str,
+        limit: i64,
+    ) -> Result<Vec<ConversationSummary>, DatabaseError>;
     async fn get_or_create_assistant_conversation(
         &self,
         user_id: &str,
@@ -1082,6 +1089,17 @@ pub trait ConversationStore: Send + Sync {
         conversation_id: Uuid,
         user_id: &str,
     ) -> Result<bool, DatabaseError>;
+    async fn bind_conversation_to_matter(
+        &self,
+        conversation_id: Uuid,
+        user_id: &str,
+        matter_id: &str,
+    ) -> Result<(), DatabaseError>;
+    async fn get_conversation_matter_id(
+        &self,
+        conversation_id: Uuid,
+        user_id: &str,
+    ) -> Result<Option<String>, DatabaseError>;
 }
 
 #[async_trait]

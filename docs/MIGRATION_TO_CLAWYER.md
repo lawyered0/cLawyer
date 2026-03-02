@@ -52,6 +52,13 @@ hash_chain = true
 - Bundled legal skills are trusted.
 - Non-bundled skills are not auto-trusted in `max_lockdown`.
 
+## Conversation Binding Migration
+
+- `conversations` now includes nullable `matter_id`.
+- Existing rows remain valid with `NULL matter_id`.
+- cLawyer lazily binds legacy conversations on first legal use when an active matter is present.
+- After a conversation is bound, cross-matter reuse is blocked and a new thread is required for another matter.
+
 ## Post-Migration Validation
 
 1. Start with a matter:
@@ -62,4 +69,3 @@ hash_chain = true
    - attempt `write_file` outside `matters/demo-matter` and verify block.
 4. Confirm audit log:
    - check `logs/legal_audit.jsonl` for hash-linked entries.
-
