@@ -816,11 +816,11 @@ Example:
                 })
                 .unwrap_or_default();
             let opened_at_line = ctx
-                .opened_at
+                .opened_date
                 .as_deref()
                 .map(|value| {
                     format!(
-                        "                 - `opened_at`: {}\n",
+                        "                 - `opened_date`: {}\n",
                         quote_legal_context_value(value, LEGAL_PROMPT_CONTEXT_VALUE_MAX_CHARS)
                     )
                 })
@@ -1665,7 +1665,7 @@ mod tests {
                 adversaries: vec!["Contoso LLC".to_string()],
                 jurisdiction: None,
                 practice_area: None,
-                opened_at: None,
+                opened_date: None,
                 curated_files: vec![],
             })
             .build_legal_section();
@@ -1701,7 +1701,7 @@ mod tests {
                 adversaries: vec!["Mega\nCorp".to_string()],
                 jurisdiction: None,
                 practice_area: None,
-                opened_at: None,
+                opened_date: None,
                 curated_files: vec![],
             })
             .build_legal_section();
@@ -1732,7 +1732,7 @@ mod tests {
                 adversaries: vec![payload.to_string()],
                 jurisdiction: None,
                 practice_area: None,
-                opened_at: None,
+                opened_date: None,
                 curated_files: vec![],
             })
             .build_legal_section();
@@ -1764,14 +1764,14 @@ mod tests {
                 adversaries: vec!["Contoso LLC".to_string()],
                 jurisdiction: Some("SDNY / Delaware".to_string()),
                 practice_area: Some("commercial litigation".to_string()),
-                opened_at: Some("2024-03-15".to_string()),
+                opened_date: Some("2024-03-15".to_string()),
                 curated_files: vec![],
             })
             .build_legal_section();
 
         assert!(section.contains("- `jurisdiction`: \"SDNY / Delaware\""));
         assert!(section.contains("- `practice_area`: \"commercial litigation\""));
-        assert!(section.contains("- `opened_at`: \"2024-03-15\""));
+        assert!(section.contains("- `opened_date`: \"2024-03-15\""));
     }
 
     #[test]
@@ -1792,14 +1792,14 @@ mod tests {
                 adversaries: vec!["Contoso LLC".to_string()],
                 jurisdiction: None,
                 practice_area: None,
-                opened_at: None,
+                opened_date: None,
                 curated_files: vec![],
             })
             .build_legal_section();
 
         assert!(!section.contains("`jurisdiction`:"));
         assert!(!section.contains("`practice_area`:"));
-        assert!(!section.contains("`opened_at`:"));
+        assert!(!section.contains("`opened_date`:"));
     }
 
     #[test]
@@ -1820,7 +1820,7 @@ mod tests {
                 adversaries: vec!["Contoso LLC".to_string()],
                 jurisdiction: None,
                 practice_area: None,
-                opened_at: None,
+                opened_date: None,
                 curated_files: vec![crate::legal::matter::ActiveMatterCuratedFile {
                     name: "facts.md".to_string(),
                     content: "Key fact summary".to_string(),

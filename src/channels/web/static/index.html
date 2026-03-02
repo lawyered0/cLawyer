@@ -16,12 +16,10 @@
   ></script>
 </head>
 <body>
-  <!-- Auth Screen -->
   <div id="auth-screen">
     <div class="auth-card-login">
       <div class="auth-brand">
         <h1>cLawyer</h1>
-        <p class="auth-tagline">Experimental build - not safe for production use. Use at your own risk.</p>
       </div>
       <div class="auth-form">
         <label for="token-input">Gateway Token</label>
@@ -30,28 +28,32 @@
       </div>
       <div id="auth-error"></div>
       <p class="auth-hint">Enter the GATEWAY_AUTH_TOKEN from your .env configuration.</p>
+      <p class="auth-tagline auth-tagline-subtle">Experimental build - not safe for production use. Use at your own risk.</p>
     </div>
   </div>
 
-  <!-- Main App (hidden until authenticated) -->
   <div id="app">
-    <!-- Tab Bar -->
     <div class="tab-bar">
       <button class="active" data-tab="chat">Chat</button>
+      <button data-tab="matters">Matters</button>
       <button data-tab="memory">Memory</button>
       <button data-tab="jobs">Jobs</button>
-      <button data-tab="routines">Routines</button>
-      <button data-tab="extensions">Extensions</button>
-      <button data-tab="skills">Skills</button>
-      <button data-tab="settings">Settings</button>
-      <button data-tab="matters">Matters</button>
+      <div class="tab-overflow" id="tab-overflow">
+        <button id="tab-overflow-trigger" class="tab-overflow-trigger" type="button" title="More">⋯</button>
+        <div id="tab-overflow-menu" class="tab-overflow-menu is-hidden">
+          <button type="button" data-tab="routines">Routines</button>
+          <button type="button" data-tab="extensions">Extensions</button>
+          <button type="button" data-tab="skills">Skills</button>
+          <button type="button" data-tab="settings" data-settings-section="general">Settings</button>
+          <button type="button" data-tab="settings" data-settings-section="logs">Logs &amp; Audit</button>
+        </div>
+      </div>
       <div class="spacer"></div>
-      <div class="matter-badge" id="matter-badge" style="display:none" data-action="open-matters-tab" title="Active matter — click to manage">
+      <div class="matter-badge is-hidden" id="matter-badge" data-action="open-matters-tab" title="Active matter — click to manage">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
         <span id="matter-badge-label"></span>
       </div>
-      <button class="status-logs-btn" data-tab="logs" title="Logs">Logs</button>
-      <div class="tee-shield" id="tee-shield" style="display:none" title="Running in a Trusted Execution Environment">
+      <div class="tee-shield is-hidden" id="tee-shield" title="Running in a Trusted Execution Environment">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
         </svg>
@@ -65,26 +67,23 @@
       </div>
     </div>
 
-    <!-- Chat Tab -->
     <div class="tab-panel active" id="tab-chat">
       <div class="thread-sidebar" id="thread-sidebar">
         <div class="thread-sidebar-header">
           <span>Threads</span>
-          <button class="thread-new-btn" id="thread-new-btn" type="button" title="New thread (Ctrl/Cmd+N)">+</button>
+          <button class="thread-new-btn" id="thread-new-btn" type="button" title="New thread (Ctrl/Cmd+N)">New thread</button>
           <button class="thread-toggle-btn" id="thread-toggle-btn" type="button" title="Toggle sidebar">&laquo;</button>
-        </div>
-        <div class="assistant-item" id="assistant-thread">
-          <span class="assistant-label">Assistant</span>
-          <span class="assistant-meta" id="assistant-meta"></span>
-        </div>
-        <div class="threads-section-header">
-          <span>Conversations</span>
         </div>
         <div class="thread-list" id="thread-list"></div>
       </div>
       <div class="chat-container">
         <div class="chat-messages" id="chat-messages"></div>
         <div class="chat-status" id="chat-status"></div>
+        <div class="chat-active-matter-slot">
+          <button class="chat-active-matter-banner is-hidden" id="chat-active-matter-banner" type="button" title="Open Matters">
+            Active matter: <span id="chat-active-matter-label"></span>
+          </button>
+        </div>
         <div class="chat-input">
           <textarea id="chat-input" placeholder="Type a message..." rows="1"></textarea>
           <button id="send-btn" type="button">Send</button>
@@ -92,7 +91,6 @@
       </div>
     </div>
 
-    <!-- Memory Tab -->
     <div class="tab-panel" id="tab-memory">
       <div class="memory-container">
         <div class="memory-sidebar">
@@ -104,16 +102,16 @@
         <div class="memory-content">
           <div class="memory-breadcrumb" id="memory-breadcrumb">
             <span id="memory-breadcrumb-path">workspace /</span>
-            <div style="display:flex;gap:6px;align-items:center;">
-              <button class="memory-edit-btn" id="memory-edit-btn" style="display:none" type="button">Edit</button>
-              <button class="memory-upload-btn" id="memory-upload-btn" type="button" title="Upload text files to workspace">Upload</button>
-              <input type="file" id="memory-upload-input" multiple accept=".txt,.md,.json,.yaml,.yml,.toml,.csv,.xml,.html,.css,.js,.ts,.rs,.py,.rb,.go,.sh,.env,.conf,.cfg,.ini,.log" style="display:none">
+            <div class="memory-breadcrumb-actions">
+              <button class="memory-edit-btn is-hidden" id="memory-edit-btn" type="button">Edit</button>
+              <button class="memory-upload-btn" id="memory-upload-btn" type="button" title="Upload text files to workspace">Upload files</button>
+              <input class="is-hidden" type="file" id="memory-upload-input" multiple accept=".txt,.md,.json,.yaml,.yml,.toml,.csv,.xml,.html,.css,.js,.ts,.rs,.py,.rb,.go,.sh,.env,.conf,.cfg,.ini,.log">
             </div>
           </div>
           <div class="memory-viewer" id="memory-viewer">
             <div class="empty">Select a file to view its contents</div>
           </div>
-          <div class="memory-editor" id="memory-editor" style="display:none">
+          <div class="memory-editor is-hidden" id="memory-editor">
             <textarea id="memory-edit-textarea"></textarea>
             <div class="memory-editor-actions">
               <button class="btn-save" id="memory-save-btn" type="button">Save</button>
@@ -124,7 +122,6 @@
       </div>
     </div>
 
-    <!-- Jobs Tab -->
     <div class="tab-panel" id="tab-jobs">
       <div class="jobs-container">
         <div class="jobs-summary" id="jobs-summary"></div>
@@ -141,61 +138,13 @@
           </thead>
           <tbody id="jobs-tbody"></tbody>
         </table>
-        <div class="empty-state" id="jobs-empty" style="display:none">No jobs found</div>
+        <div class="empty-state is-hidden" id="jobs-empty">No jobs found. Send a message in Chat to start a job.</div>
       </div>
     </div>
 
-    <!-- Logs Tab -->
-    <div class="tab-panel" id="tab-logs">
-      <div class="logs-container">
-        <div class="logs-toolbar">
-          <select id="logs-server-level" title="Server-side log level (changes what the server emits)">
-            <option value="error">Server: ERROR</option>
-            <option value="warn">Server: WARN</option>
-            <option value="info" selected>Server: INFO</option>
-            <option value="debug">Server: DEBUG</option>
-          </select>
-          <select id="logs-level-filter">
-            <option value="all">All Levels</option>
-            <option value="ERROR">Error</option>
-            <option value="WARN">Warn</option>
-            <option value="INFO">Info</option>
-            <option value="DEBUG">Debug</option>
-          </select>
-          <input type="text" id="logs-target-filter" placeholder="Filter by target...">
-          <label class="logs-checkbox"><input type="checkbox" id="logs-autoscroll" checked> Auto-scroll</label>
-          <button id="logs-pause-btn" type="button">Pause</button>
-          <button id="logs-clear-btn" type="button">Clear</button>
-        </div>
-        <div class="logs-output" id="logs-output"></div>
-        <div class="logs-audit-panel">
-          <div class="logs-audit-title-row">
-            <h4>Legal Audit</h4>
-            <button id="legal-audit-refresh-btn" type="button">Refresh</button>
-          </div>
-          <div class="logs-audit-filters">
-            <input type="text" id="legal-audit-event-type" placeholder="Event type (optional)">
-            <input type="datetime-local" id="legal-audit-from">
-            <input type="datetime-local" id="legal-audit-to">
-            <input type="number" id="legal-audit-limit" min="1" max="200" value="50" title="Rows per page">
-          </div>
-          <div class="logs-audit-pagination">
-            <button id="legal-audit-prev-btn" type="button">Previous</button>
-            <button id="legal-audit-next-btn" type="button">Next</button>
-            <span id="legal-audit-page-meta"></span>
-          </div>
-          <div class="logs-audit-list" id="legal-audit-list">
-            <div class="empty-state">Select Logs tab to load legal audit events.</div>
-          </div>
-          <pre class="logs-audit-detail" id="legal-audit-detail"></pre>
-        </div>
-      </div>
-    </div>
-
-    <!-- Routines Tab -->
     <div class="tab-panel" id="tab-routines">
       <div class="routines-container">
-        <div class="section-header-row" style="padding: 0 0 12px 0;">
+        <div class="section-header-row routines-header-row">
           <div></div>
           <button class="btn-ext" id="routine-create-btn">+ New Routine</button>
         </div>
@@ -215,14 +164,11 @@
           </thead>
           <tbody id="routines-tbody"></tbody>
         </table>
-        <div class="empty-state" id="routines-empty" style="display:none">
-          No routines configured.
-        </div>
-        <div class="routine-detail" id="routine-detail" style="display:none"></div>
+        <div class="empty-state is-hidden" id="routines-empty">No routines configured.</div>
+        <div class="routine-detail is-hidden" id="routine-detail"></div>
       </div>
     </div>
 
-    <!-- Extensions Tab -->
     <div class="tab-panel" id="tab-extensions">
       <div class="extensions-container">
         <div class="extensions-section">
@@ -263,46 +209,11 @@
             <thead><tr><th>Name</th><th>Description</th></tr></thead>
             <tbody id="tools-tbody"></tbody>
           </table>
-          <div class="empty-state" id="tools-empty" style="display:none">No tools registered</div>
+          <div class="empty-state is-hidden" id="tools-empty">No tools registered</div>
         </div>
       </div>
     </div>
 
-    <!-- Settings Tab -->
-    <div class="tab-panel" id="tab-settings">
-      <div class="extensions-container">
-        <div class="extensions-section">
-          <div class="section-header-row">
-            <h3>Settings</h3>
-            <div class="section-header-actions">
-              <button class="btn-ext" id="settings-add-btn">+ New</button>
-              <button class="btn-ext" id="settings-export-btn">Export</button>
-              <button class="btn-ext" id="settings-import-btn">Import</button>
-              <input type="file" id="settings-import-file" accept=".json" style="display:none">
-            </div>
-          </div>
-          <div id="settings-list">
-            <div class="empty-state">Loading…</div>
-          </div>
-        </div>
-        <div class="extensions-section">
-          <div class="section-header-row">
-            <h3>Backups</h3>
-            <div class="section-header-actions">
-              <button class="btn-ext" id="backups-create-btn">Create Backup</button>
-              <button class="btn-ext" id="backups-verify-btn">Verify Backup</button>
-              <button class="btn-ext" id="backups-restore-btn">Restore Backup</button>
-              <input type="file" id="backups-restore-file" accept=".clawyerbak,.json" style="display:none">
-            </div>
-          </div>
-          <div id="backups-last-result" class="backups-result">
-            <div class="empty-state">No backup actions yet.</div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Skills Tab -->
     <div class="tab-panel" id="tab-skills">
       <div class="extensions-container">
         <div class="extensions-section">
@@ -329,88 +240,103 @@
         </div>
       </div>
     </div>
-    <!-- Matters Tab -->
+
+    <div class="tab-panel" id="tab-settings">
+      <div class="settings-shell">
+        <div class="settings-section-tabs">
+          <button type="button" id="settings-section-general-btn" class="active" data-settings-section="general">Settings</button>
+          <button type="button" id="settings-section-logs-btn" data-settings-section="logs">Logs &amp; Audit</button>
+        </div>
+
+        <div id="settings-section-general" class="settings-section active">
+          <div class="extensions-container">
+            <div class="extensions-section">
+              <div class="section-header-row">
+                <h3>Settings</h3>
+                <div class="section-header-actions">
+                  <button class="btn-ext" id="settings-add-btn">+ New</button>
+                  <button class="btn-ext" id="settings-export-btn">Export</button>
+                  <button class="btn-ext" id="settings-import-btn">Import</button>
+                  <input class="is-hidden" type="file" id="settings-import-file" accept=".json">
+                </div>
+              </div>
+              <div id="settings-list">
+                <div class="empty-state">Loading…</div>
+              </div>
+            </div>
+            <div class="extensions-section">
+              <div class="section-header-row">
+                <h3>Backups</h3>
+                <div class="section-header-actions">
+                  <button class="btn-ext" id="backups-create-btn">Create Backup</button>
+                  <button class="btn-ext" id="backups-verify-btn">Verify Backup</button>
+                  <button class="btn-ext" id="backups-restore-btn">Restore Backup</button>
+                  <input class="is-hidden" type="file" id="backups-restore-file" accept=".clawyerbak,.json">
+                </div>
+              </div>
+              <div id="backups-last-result" class="backups-result">
+                <div class="empty-state">No backup actions yet.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="settings-section-logs" class="settings-section">
+          <div class="logs-container">
+            <div class="logs-toolbar">
+              <select id="logs-server-level" title="Server-side log level (changes what the server emits)">
+                <option value="error">Server: ERROR</option>
+                <option value="warn">Server: WARN</option>
+                <option value="info" selected>Server: INFO</option>
+                <option value="debug">Server: DEBUG</option>
+              </select>
+              <select id="logs-level-filter">
+                <option value="all">All Levels</option>
+                <option value="ERROR">Error</option>
+                <option value="WARN">Warn</option>
+                <option value="INFO">Info</option>
+                <option value="DEBUG">Debug</option>
+              </select>
+              <input type="text" id="logs-target-filter" placeholder="Filter by target...">
+              <label class="logs-checkbox"><input type="checkbox" id="logs-autoscroll" checked> Auto-scroll</label>
+              <button id="logs-pause-btn" type="button">Pause</button>
+              <button id="logs-clear-btn" type="button">Clear</button>
+            </div>
+            <div class="logs-output" id="logs-output"></div>
+            <div class="logs-audit-panel">
+              <div class="logs-audit-title-row">
+                <h4>Legal Audit</h4>
+                <button id="legal-audit-refresh-btn" type="button">Refresh</button>
+              </div>
+              <div class="logs-audit-filters">
+                <input type="text" id="legal-audit-event-type" placeholder="Event type (optional)">
+                <input type="datetime-local" id="legal-audit-from">
+                <input type="datetime-local" id="legal-audit-to">
+                <input type="number" id="legal-audit-limit" min="1" max="200" value="50" title="Rows per page">
+              </div>
+              <div class="logs-audit-pagination">
+                <button id="legal-audit-prev-btn" type="button">Previous</button>
+                <button id="legal-audit-next-btn" type="button">Next</button>
+                <span id="legal-audit-page-meta"></span>
+              </div>
+              <div class="logs-audit-list" id="legal-audit-list">
+                <div class="empty-state">Open Logs &amp; Audit to load legal audit events.</div>
+              </div>
+              <pre class="logs-audit-detail" id="legal-audit-detail"></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="tab-panel" id="tab-matters">
       <div class="matters-container">
-        <div class="matters-create-panel">
-          <h3>Create Matter</h3>
-          <form id="matters-create-form" class="matters-create-form" autocomplete="off">
-            <div class="matters-create-grid">
-              <label>
-                Matter ID
-                <input id="matter-create-id" type="text" placeholder="acme-v-foo-2026" required>
-              </label>
-              <label>
-                Client
-                <input id="matter-create-client" type="text" placeholder="Acme Corp" required>
-              </label>
-              <label>
-                Confidentiality
-                <input id="matter-create-confidentiality" type="text" placeholder="attorney-client-privileged" required>
-              </label>
-              <label>
-                Retention
-                <input id="matter-create-retention" type="text" placeholder="follow-firm-policy" required>
-              </label>
-              <label>
-                Team (optional)
-                <input id="matter-create-team" type="text" placeholder="Lead Counsel, Associate">
-              </label>
-              <label>
-                Adversaries (optional)
-                <input id="matter-create-adversaries" type="text" placeholder="Foo LLC, Bar Inc">
-              </label>
-              <label>
-                Jurisdiction (optional)
-                <input id="matter-create-jurisdiction" type="text" placeholder="SDNY / Delaware">
-              </label>
-              <label>
-                Practice area (optional)
-                <input id="matter-create-practice-area" type="text" placeholder="Commercial litigation">
-              </label>
-              <label>
-                Opened date (optional)
-                <input id="matter-create-opened-at" type="text" placeholder="YYYY-MM-DD">
-              </label>
-            </div>
-            <p class="matters-create-help">Opened date format: YYYY-MM-DD.</p>
-            <div class="matters-create-actions">
-              <button class="btn-ext" id="matters-review-btn" type="button">Review Conflicts</button>
-              <button class="btn-ext activate" id="matters-create-btn" type="submit" disabled>Create &amp; Activate</button>
-            </div>
-            <div class="matters-create-review" id="matters-create-review">
-              <div class="matters-create-review-status" id="matters-create-review-status">
-                Run conflict review before creating this matter.
-              </div>
-              <div class="matters-create-review-hits" id="matters-create-review-hits"></div>
-              <div class="matters-create-clearance-controls" id="matters-create-clearance-controls" style="display:none">
-                <label>
-                  Conflict decision
-                  <select id="matter-create-conflict-decision">
-                    <option value="clear">Clear</option>
-                    <option value="waived">Waive</option>
-                    <option value="declined">Decline / Escalate</option>
-                  </select>
-                </label>
-                <label>
-                  Decision note
-                  <textarea id="matter-create-conflict-note" rows="3" placeholder="Required for waived or declined decisions"></textarea>
-                </label>
-              </div>
-            </div>
-          </form>
-        </div>
         <div class="matters-active-bar" id="matters-active-bar">
           <span class="matters-active-label">Active matter:</span>
           <span id="matters-active-name" class="matters-active-name">None</span>
-          <button class="matters-clear-btn" id="matters-clear-btn" style="display:none" type="button">Clear</button>
+          <button class="matters-clear-btn is-hidden" id="matters-clear-btn" type="button">Clear</button>
         </div>
-        <div class="matters-toolbar">
-          <label class="matters-group-toggle">
-            <input id="matters-group-by-client" type="checkbox">
-            Group by client
-          </label>
-        </div>
+
         <div class="matters-conflict-panel">
           <h4>Conflict Check</h4>
           <form id="matters-conflict-form" autocomplete="off">
@@ -418,10 +344,20 @@
             <div class="matters-conflict-actions">
               <select id="matters-conflict-matter"></select>
               <button id="matters-conflict-btn" type="submit">Check Conflict</button>
+              <button id="matters-conflict-clear-btn" type="button">Clear</button>
             </div>
           </form>
           <div id="matters-conflict-result" class="matters-conflict-result"></div>
         </div>
+
+        <div class="matters-toolbar">
+          <button class="btn-ext" id="matters-new-btn" type="button">+ New Matter</button>
+          <label class="matters-group-toggle">
+            <input id="matters-group-by-client" type="checkbox">
+            Group by client
+          </label>
+        </div>
+
         <div class="matters-content">
           <div class="matters-list" id="matters-list">
             <div class="empty-state">Loading matters…</div>
@@ -431,6 +367,96 @@
           </aside>
         </div>
       </div>
+    </div>
+  </div>
+
+  <div class="configure-overlay is-hidden" id="matter-create-modal">
+    <div class="configure-modal matter-create-modal" role="dialog" aria-modal="true" aria-labelledby="matter-create-modal-title" tabindex="-1">
+      <div class="matter-create-modal-header">
+        <h3 id="matter-create-modal-title">Create Matter</h3>
+        <button type="button" id="matter-create-modal-close" class="btn-ext">Close</button>
+      </div>
+      <form id="matters-create-form" class="matters-create-form" autocomplete="off">
+        <div class="matters-create-grid">
+          <label>
+            Matter ID
+            <input id="matter-create-id" type="text" placeholder="acme-v-foo-2026" required>
+          </label>
+          <label>
+            Client
+            <input id="matter-create-client" type="text" placeholder="Acme Corp" required>
+          </label>
+          <label>
+            Confidentiality
+            <select id="matter-create-confidentiality" required>
+              <option value="attorney-client-privileged">attorney-client-privileged</option>
+              <option value="attorney-work-product">attorney-work-product</option>
+              <option value="confidential">confidential</option>
+              <option value="public">public</option>
+              <option value="__other__">Other…</option>
+            </select>
+            <input id="matter-create-confidentiality-other" class="matter-other-input is-hidden" type="text" placeholder="Enter confidentiality value">
+          </label>
+          <label>
+            Retention
+            <select id="matter-create-retention" required>
+              <option value="follow-firm-policy">follow-firm-policy</option>
+              <option value="litigation-hold">litigation-hold</option>
+              <option value="closed-retention">closed-retention</option>
+              <option value="permanent">permanent</option>
+              <option value="__other__">Other…</option>
+            </select>
+            <input id="matter-create-retention-other" class="matter-other-input is-hidden" type="text" placeholder="Enter retention value">
+          </label>
+          <label>
+            Opened date (optional)
+            <input id="matter-create-opened-date" type="date">
+          </label>
+          <label>
+            Jurisdiction (optional)
+            <input id="matter-create-jurisdiction" type="text" placeholder="SDNY / Delaware">
+          </label>
+          <label>
+            Practice area (optional)
+            <input id="matter-create-practice-area" type="text" placeholder="Commercial litigation">
+          </label>
+          <label>
+            Team (optional)
+            <input id="matter-create-team" type="text" placeholder="Lead Counsel, Associate">
+            <span class="matters-field-hint">Separate names with commas.</span>
+          </label>
+          <label>
+            Adversaries (optional)
+            <input id="matter-create-adversaries" type="text" placeholder="Foo LLC, Bar Inc">
+            <span class="matters-field-hint">Separate names with commas.</span>
+          </label>
+        </div>
+        <div class="matters-create-actions">
+          <button class="btn-ext" id="matters-review-btn" type="button">Review Conflicts</button>
+          <button class="btn-ext activate" id="matters-create-btn" type="submit" disabled>Create &amp; Activate</button>
+          <button class="btn-ext" id="matter-create-cancel-btn" type="button">Cancel</button>
+        </div>
+        <div class="matters-create-review" id="matters-create-review">
+          <div class="matters-create-review-status" id="matters-create-review-status">
+            Run conflict review before creating this matter.
+          </div>
+          <div class="matters-create-review-hits" id="matters-create-review-hits"></div>
+          <div class="matters-create-clearance-controls is-hidden" id="matters-create-clearance-controls">
+            <label>
+              Conflict decision
+              <select id="matter-create-conflict-decision">
+                <option value="clear">Clear</option>
+                <option value="waived">Waive</option>
+                <option value="declined">Decline / Escalate</option>
+              </select>
+            </label>
+            <label>
+              Decision note
+              <textarea id="matter-create-conflict-note" rows="3" placeholder="Required for waived or declined decisions"></textarea>
+            </label>
+          </div>
+        </div>
+      </form>
     </div>
   </div>
 

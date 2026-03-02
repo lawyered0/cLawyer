@@ -15,6 +15,11 @@ let jobListRefreshTimer = null;
 const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
 let lastBackupId = null;
+const PRIMARY_TABS = ['chat', 'matters', 'memory', 'jobs'];
+const OVERFLOW_TABS = ['routines', 'extensions', 'skills', 'settings'];
+const SHORTCUT_TABS = PRIMARY_TABS.concat(OVERFLOW_TABS);
+let currentSettingsSection = 'general';
+let matterCreateModalLastFocus = null;
 
 function byId(id) {
   return document.getElementById(id);
@@ -147,9 +152,10 @@ bindClick('auth-connect-btn', authenticate);
 
 (function bindStaticUiEvents() {
   bindClick('matter-badge', function() { switchTab('matters'); });
+  bindClick('chat-active-matter-banner', function() { switchTab('matters'); });
+  bindClick('tab-overflow-trigger', toggleTabOverflowMenu);
   bindClick('thread-new-btn', createNewThread);
   bindClick('thread-toggle-btn', toggleThreadSidebar);
-  bindClick('assistant-thread', switchToAssistant);
   bindClick('send-btn', sendMessage);
   bindClick('memory-edit-btn', startMemoryEdit);
   bindClick('memory-upload-btn', triggerMemoryUpload);
@@ -165,7 +171,13 @@ bindClick('auth-connect-btn', authenticate);
   bindClick('backups-create-btn', createBackup);
   bindClick('backups-verify-btn', verifyLastBackup);
   bindClick('backups-restore-btn', triggerBackupRestoreInput);
+  bindClick('settings-section-general-btn', function() { openSettingsSection('general'); });
+  bindClick('settings-section-logs-btn', function() { openSettingsSection('logs'); });
+  bindClick('matters-new-btn', openMatterCreateModal);
+  bindClick('matter-create-modal-close', closeMatterCreateModal);
+  bindClick('matter-create-cancel-btn', closeMatterCreateModal);
   bindClick('matters-clear-btn', clearActiveMatter);
+  bindClick('matters-conflict-clear-btn', clearMatterConflictCheck);
   bindClick('legal-audit-refresh-btn', function() { loadLegalAudit(0); });
   bindClick('legal-audit-prev-btn', function() {
     var next = Math.max(0, legalAuditOffset - legalAuditLimit);
@@ -196,10 +208,18 @@ bindClick('auth-connect-btn', authenticate);
   bindChange('matter-create-conflict-decision', function() {
     syncMatterCreateActionState();
   });
+  bindChange('matter-create-confidentiality', syncMatterSelectOtherFields);
+  bindChange('matter-create-retention', syncMatterSelectOtherFields);
   var conflictNote = byId('matter-create-conflict-note');
   if (conflictNote) {
     conflictNote.addEventListener('input', function() {
       syncMatterCreateActionState();
+    });
+  }
+  var matterCreateModal = byId('matter-create-modal');
+  if (matterCreateModal) {
+    matterCreateModal.addEventListener('click', function(e) {
+      if (e.target === matterCreateModal) closeMatterCreateModal();
     });
   }
   var mattersConflictForm = byId('matters-conflict-form');
@@ -267,6 +287,15 @@ bindClick('auth-connect-btn', authenticate);
     if (isNaN(idx) || !legalAuditEvents[idx]) return;
     renderLegalAuditDetail(legalAuditEvents[idx]);
   });
+  document.addEventListener('click', handleDocumentClickForMenus);
+  document.addEventListener('keydown', function(event) {
+    if (event.key === 'Escape') {
+      closeTabOverflowMenu();
+    }
+  });
+  window.addEventListener('resize', positionTabOverflowMenu);
+  window.addEventListener('scroll', positionTabOverflowMenu, true);
+  syncMatterSelectOtherFields();
 })();
 
 // --- API helper ---
@@ -1151,27 +1180,28 @@ function removeScrollSpinner() {
 
 function loadThreads() {
   apiFetch('/api/chat/threads').then((data) => {
-    // Pinned assistant thread
-    if (data.assistant_thread) {
-      assistantThreadId = data.assistant_thread.id;
-      const el = document.getElementById('assistant-thread');
-      const isActive = currentThreadId === assistantThreadId;
-      el.className = 'assistant-item' + (isActive ? ' active' : '');
-      const meta = document.getElementById('assistant-meta');
-      const count = data.assistant_thread.turn_count || 0;
-      meta.textContent = count > 0 ? count + ' turns' : '';
-    }
-
-    // Regular threads
+    assistantThreadId = data && data.assistant_thread ? data.assistant_thread.id : null;
     const list = document.getElementById('thread-list');
     list.innerHTML = '';
+    const entries = [];
+    if (data.assistant_thread) entries.push(data.assistant_thread);
     const threads = data.threads || [];
     for (const thread of threads) {
+      entries.push(thread);
+    }
+
+    for (const thread of entries) {
       const item = document.createElement('div');
       item.className = 'thread-item' + (thread.id === currentThreadId ? ' active' : '');
+      if (thread.id === assistantThreadId) {
+        item.classList.add('thread-item-assistant');
+      }
       const label = document.createElement('span');
       label.className = 'thread-label';
-      label.textContent = thread.title || thread.id.substring(0, 8);
+      const labelText = thread.id === assistantThreadId
+        ? 'Assistant'
+        : (thread.title || thread.id.substring(0, 8));
+      label.textContent = labelText;
       label.title = thread.title ? thread.title + ' (' + thread.id + ')' : thread.id;
       item.appendChild(label);
       const meta = document.createElement('span');
@@ -1184,7 +1214,7 @@ function loadThreads() {
 
     // Default to assistant thread on first load if no thread selected
     if (!currentThreadId && assistantThreadId) {
-      switchToAssistant();
+      switchThread(assistantThreadId);
     }
 
     // Enable chat input once a thread is available
@@ -1192,16 +1222,6 @@ function loadThreads() {
       enableChatInput();
     }
   }).catch(() => {});
-}
-
-function switchToAssistant() {
-  if (!assistantThreadId) return;
-  finalizeActivityGroup();
-  currentThreadId = assistantThreadId;
-  hasMore = false;
-  oldestTimestamp = null;
-  loadHistory();
-  loadThreads();
 }
 
 function switchThread(threadId) {
@@ -1271,33 +1291,117 @@ function autoResizeTextarea(el) {
 
 // --- Tabs ---
 
-document.querySelectorAll('.tab-bar button[data-tab]').forEach((btn) => {
+document.querySelectorAll('.tab-bar [data-tab]').forEach((btn) => {
   btn.addEventListener('click', () => {
     const tab = btn.getAttribute('data-tab');
-    switchTab(tab);
+    const settingsSection = btn.getAttribute('data-settings-section');
+    switchTab(tab, settingsSection ? { settingsSection: settingsSection } : null);
   });
 });
 
-function switchTab(tab) {
+function closeTabOverflowMenu() {
+  var menu = byId('tab-overflow-menu');
+  if (!menu) return;
+  menu.classList.add('is-hidden');
+  menu.classList.remove('floating');
+  menu.style.left = '';
+  menu.style.top = '';
+}
+
+function toggleTabOverflowMenu(event) {
+  if (event) event.preventDefault();
+  var menu = byId('tab-overflow-menu');
+  if (!menu) return;
+  var wasHidden = menu.classList.contains('is-hidden');
+  menu.classList.toggle('is-hidden');
+  if (wasHidden) {
+    positionTabOverflowMenu();
+  } else {
+    closeTabOverflowMenu();
+  }
+}
+
+function positionTabOverflowMenu() {
+  var menu = byId('tab-overflow-menu');
+  var trigger = byId('tab-overflow-trigger');
+  if (!menu || !trigger || menu.classList.contains('is-hidden')) return;
+  menu.classList.add('floating');
+  var triggerRect = trigger.getBoundingClientRect();
+  var menuWidth = Math.max(200, Math.min(menu.offsetWidth || 200, window.innerWidth - 16));
+  var left = Math.max(8, Math.min(triggerRect.right - menuWidth, window.innerWidth - menuWidth - 8));
+  var top = Math.max(8, Math.min(triggerRect.bottom + 6, window.innerHeight - menu.offsetHeight - 8));
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
+}
+
+function handleDocumentClickForMenus(event) {
+  var overflow = byId('tab-overflow');
+  var menu = byId('tab-overflow-menu');
+  if (overflow && menu && !menu.classList.contains('is-hidden') && !overflow.contains(event.target)) {
+    closeTabOverflowMenu();
+  }
+}
+
+function openSettingsSection(section) {
+  var next = section === 'logs' ? 'logs' : 'general';
+  currentSettingsSection = next;
+  var generalBtn = byId('settings-section-general-btn');
+  var logsBtn = byId('settings-section-logs-btn');
+  var generalSection = byId('settings-section-general');
+  var logsSection = byId('settings-section-logs');
+
+  if (generalBtn) generalBtn.classList.toggle('active', next === 'general');
+  if (logsBtn) logsBtn.classList.toggle('active', next === 'logs');
+  if (generalSection) generalSection.classList.toggle('active', next === 'general');
+  if (logsSection) logsSection.classList.toggle('active', next === 'logs');
+
+  if (next === 'general') {
+    loadSettings();
+    return;
+  }
+  applyLogFilters();
+  loadLegalAudit(0);
+}
+
+function switchTab(tab, options) {
+  if (!tab) return;
   currentTab = tab;
-  document.querySelectorAll('.tab-bar button[data-tab]').forEach((b) => {
+
+  var settingsSection = options && options.settingsSection
+    ? options.settingsSection
+    : currentSettingsSection;
+
+  document.querySelectorAll('.tab-bar > button[data-tab]').forEach((b) => {
     b.classList.toggle('active', b.getAttribute('data-tab') === tab);
   });
+  document.querySelectorAll('#tab-overflow-menu button[data-tab]').forEach((b) => {
+    var buttonTab = b.getAttribute('data-tab');
+    var buttonSection = b.getAttribute('data-settings-section') || 'general';
+    var active = buttonTab === tab;
+    if (tab === 'settings') {
+      active = active && buttonSection === settingsSection;
+    }
+    b.classList.toggle('active', active);
+  });
+
+  var overflowTrigger = byId('tab-overflow-trigger');
+  if (overflowTrigger) {
+    overflowTrigger.classList.toggle('active', OVERFLOW_TABS.indexOf(tab) !== -1);
+  }
+
   document.querySelectorAll('.tab-panel').forEach((p) => {
     p.classList.toggle('active', p.id === 'tab-' + tab);
   });
 
+  closeTabOverflowMenu();
+
   if (tab === 'memory') loadMemoryTree();
   if (tab === 'jobs') loadJobs();
   if (tab === 'routines') loadRoutines();
-  if (tab === 'logs') {
-    applyLogFilters();
-    loadLegalAudit(0);
-  }
   if (tab === 'extensions') loadExtensions();
   if (tab === 'skills') loadSkills();
   if (tab === 'matters') loadMatters();
-  if (tab === 'settings') loadSettings();
+  if (tab === 'settings') openSettingsSection(settingsSection);
 }
 
 // --- Memory (filesystem tree) ---
@@ -2426,9 +2530,9 @@ function loadJobs() {
     container.innerHTML =
       '<div class="jobs-summary" id="jobs-summary"></div>'
       + '<table class="jobs-table" id="jobs-table"><thead><tr>'
-      + '<th>ID</th><th>Title</th><th>Status</th><th>Created</th><th>Actions</th>'
+      + '<th>ID</th><th>Title</th><th>Source</th><th>Status</th><th>Created</th><th>Actions</th>'
       + '</tr></thead><tbody id="jobs-tbody"></tbody></table>'
-      + '<div class="empty-state" id="jobs-empty" style="display:none">No jobs found</div>';
+      + '<div class="empty-state" id="jobs-empty" style="display:none">No jobs found. Send a message in Chat to start a job.</div>';
   }
 
   Promise.all([
@@ -2485,6 +2589,7 @@ function renderJobsList(jobs) {
     return '<tr class="job-row" data-job-id="' + escapedId + '">'
       + '<td title="' + escapedId + '">' + shortId + '</td>'
       + '<td>' + escapeHtml(job.title) + '</td>'
+      + '<td>' + escapeHtml(job.source || '-') + '</td>'
       + '<td><span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span></td>'
       + '<td>' + formatDate(job.created_at) + '</td>'
       + '<td>' + actionBtns + '</td>'
@@ -3784,12 +3889,30 @@ document.addEventListener('keydown', (e) => {
   const tag = (e.target.tagName || '').toLowerCase();
   const inInput = tag === 'input' || tag === 'textarea';
 
-  // Mod+1-8: switch tabs
+  if (isMatterCreateModalOpen()) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeMatterCreateModal();
+      return;
+    }
+    if (e.key === 'Tab') {
+      trapMatterCreateModalFocus(e);
+      return;
+    }
+  }
+
+  // Mod+1-8: switch tabs (primary then overflow)
   if (mod && e.key >= '1' && e.key <= '8') {
     e.preventDefault();
-    const tabs = ['chat', 'memory', 'jobs', 'routines', 'extensions', 'skills', 'settings', 'matters'];
     const idx = parseInt(e.key) - 1;
-    if (tabs[idx]) switchTab(tabs[idx]);
+    if (SHORTCUT_TABS[idx]) switchTab(SHORTCUT_TABS[idx]);
+    return;
+  }
+
+  // Mod+9: open Settings -> Logs & Audit subsection
+  if (mod && e.key === '9') {
+    e.preventDefault();
+    switchTab('settings', { settingsSection: 'logs' });
     return;
   }
 
@@ -3886,15 +4009,46 @@ function parseCsvList(raw) {
     .filter(function(v) { return !!v; });
 }
 
+function getMatterSelectValue(selectId, otherInputId) {
+  var select = byId(selectId);
+  if (!select) return '';
+  var value = (select.value || '').trim();
+  if (value !== '__other__') return value;
+  var other = byId(otherInputId);
+  return other ? other.value.trim() : '';
+}
+
+function syncMatterSelectOtherFields() {
+  var confidentiality = byId('matter-create-confidentiality');
+  var confidentialityOther = byId('matter-create-confidentiality-other');
+  var retention = byId('matter-create-retention');
+  var retentionOther = byId('matter-create-retention-other');
+
+  if (confidentiality && confidentialityOther) {
+    var showConfOther = confidentiality.value === '__other__';
+    confidentialityOther.classList.toggle('is-hidden', !showConfOther);
+    confidentialityOther.required = showConfOther;
+  }
+
+  if (retention && retentionOther) {
+    var showRetentionOther = retention.value === '__other__';
+    retentionOther.classList.toggle('is-hidden', !showRetentionOther);
+    retentionOther.required = showRetentionOther;
+  }
+}
+
 function readMatterCreateFormValues() {
+  var openedDate = byId('matter-create-opened-date')
+    ? byId('matter-create-opened-date').value.trim()
+    : (byId('matter-create-opened-at') ? byId('matter-create-opened-at').value.trim() : '');
   return {
     matter_id: byId('matter-create-id') ? byId('matter-create-id').value.trim() : '',
     client: byId('matter-create-client') ? byId('matter-create-client').value.trim() : '',
-    confidentiality: byId('matter-create-confidentiality') ? byId('matter-create-confidentiality').value.trim() : '',
-    retention: byId('matter-create-retention') ? byId('matter-create-retention').value.trim() : '',
+    confidentiality: getMatterSelectValue('matter-create-confidentiality', 'matter-create-confidentiality-other'),
+    retention: getMatterSelectValue('matter-create-retention', 'matter-create-retention-other'),
     jurisdiction: byId('matter-create-jurisdiction') ? byId('matter-create-jurisdiction').value.trim() : '',
     practice_area: byId('matter-create-practice-area') ? byId('matter-create-practice-area').value.trim() : '',
-    opened_at: byId('matter-create-opened-at') ? byId('matter-create-opened-at').value.trim() : '',
+    opened_date: openedDate,
     team: parseCsvList(byId('matter-create-team') ? byId('matter-create-team').value : ''),
     adversaries: parseCsvList(byId('matter-create-adversaries') ? byId('matter-create-adversaries').value : ''),
   };
@@ -3904,7 +4058,7 @@ function validateMatterCreateForm(formData) {
   if (!formData.matter_id || !formData.client || !formData.confidentiality || !formData.retention) {
     return 'Matter ID, client, confidentiality, and retention are required.';
   }
-  if (formData.opened_at && !/^\d{4}-\d{2}-\d{2}$/.test(formData.opened_at)) {
+  if (formData.opened_date && !/^\d{4}-\d{2}-\d{2}$/.test(formData.opened_date)) {
     return 'Opened date must use YYYY-MM-DD.';
   }
   return null;
@@ -3918,10 +4072,92 @@ function matterCreateFormSignature(formData) {
     retention: formData.retention,
     jurisdiction: formData.jurisdiction,
     practice_area: formData.practice_area,
-    opened_at: formData.opened_at,
+    opened_date: formData.opened_date,
     team: formData.team,
     adversaries: formData.adversaries,
   });
+}
+
+function openMatterCreateModal() {
+  var modal = byId('matter-create-modal');
+  if (!modal) return;
+  matterCreateModalLastFocus = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
+  var form = byId('matters-create-form');
+  if (form) form.reset();
+  resetMatterCreateReview('Run conflict review before creating this matter.', null);
+  modal.classList.remove('is-hidden');
+  syncMatterSelectOtherFields();
+  syncMatterCreateActionState();
+  var focusTarget = byId('matter-create-id');
+  if (focusTarget && typeof focusTarget.focus === 'function') {
+    requestAnimationFrame(function() {
+      focusTarget.focus();
+    });
+  }
+}
+
+function closeMatterCreateModal() {
+  var modal = byId('matter-create-modal');
+  if (!modal) return;
+  if (matterCreateBusy || matterCreateReviewBusy) return;
+  modal.classList.add('is-hidden');
+  var returnFocus = matterCreateModalLastFocus;
+  if (!returnFocus || !document.contains(returnFocus)) {
+    returnFocus = byId('matters-new-btn');
+  }
+  if (returnFocus && typeof returnFocus.focus === 'function') {
+    returnFocus.focus();
+  }
+  matterCreateModalLastFocus = null;
+}
+
+function isMatterCreateModalOpen() {
+  var modal = byId('matter-create-modal');
+  return !!(modal && !modal.classList.contains('is-hidden'));
+}
+
+function getFocusableElements(container) {
+  if (!container) return [];
+  var focusableSelector = [
+    'a[href]',
+    'button:not([disabled])',
+    'input:not([disabled])',
+    'select:not([disabled])',
+    'textarea:not([disabled])',
+    '[tabindex]:not([tabindex="-1"])',
+  ].join(', ');
+  return Array.prototype.slice.call(container.querySelectorAll(focusableSelector))
+    .filter(function(el) {
+      return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+    });
+}
+
+function trapMatterCreateModalFocus(event) {
+  var modal = byId('matter-create-modal');
+  if (!modal || modal.classList.contains('is-hidden')) return;
+  var dialog = modal.querySelector('.configure-modal');
+  var focusables = getFocusableElements(dialog);
+  if (!focusables.length) {
+    event.preventDefault();
+    if (dialog && typeof dialog.focus === 'function') dialog.focus();
+    return;
+  }
+  var first = focusables[0];
+  var last = focusables[focusables.length - 1];
+  var active = document.activeElement;
+  if (event.shiftKey) {
+    if (active === first || !dialog.contains(active)) {
+      event.preventDefault();
+      last.focus();
+    }
+    return;
+  }
+  if (active === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function parseErrorPayload(err) {
@@ -4006,9 +4242,9 @@ function syncMatterCreateActionState() {
   }
 
   if (controls) {
-    controls.style.display = (matterCreateReviewState.status === 'reviewed' && matterCreateReviewState.matched)
-      ? 'grid'
-      : 'none';
+    var showControls = (matterCreateReviewState.status === 'reviewed' && matterCreateReviewState.matched);
+    controls.classList.toggle('is-hidden', !showControls);
+    controls.style.display = showControls ? 'grid' : 'none';
   }
   if (noteInput) {
     noteInput.required = matterCreateReviewState.matched && decisionNeedsNote(decision);
@@ -4114,6 +4350,11 @@ function normalizeMatterClient(client) {
   return normalized || 'Unspecified client';
 }
 
+function getMatterOpenedDate(matter) {
+  if (!matter) return '';
+  return matter.opened_date || matter.opened_at || '';
+}
+
 function buildGroupedMatters() {
   var groups = {};
   for (var i = 0; i < mattersCache.length; i++) {
@@ -4162,8 +4403,9 @@ function renderMatterCardHtml(matter, index) {
   if (matter.practice_area) {
     html += '<div class="matter-card-row"><span class="matter-card-label">Practice area</span><span>' + escapeHtml(matter.practice_area) + '</span></div>';
   }
-  if (matter.opened_at) {
-    html += '<div class="matter-card-row"><span class="matter-card-label">Opened</span><span>' + escapeHtml(matter.opened_at) + '</span></div>';
+  var openedDate = getMatterOpenedDate(matter);
+  if (openedDate) {
+    html += '<div class="matter-card-row"><span class="matter-card-label">Opened</span><span>' + escapeHtml(openedDate) + '</span></div>';
   }
   html += '<div class="matter-card-actions">';
   if (!isActive) {
@@ -4232,7 +4474,8 @@ function renderMatterDetail() {
     if (selectedMatter.retention) metadataRows.push({ label: 'Retention', value: selectedMatter.retention });
     if (selectedMatter.jurisdiction) metadataRows.push({ label: 'Jurisdiction', value: selectedMatter.jurisdiction });
     if (selectedMatter.practice_area) metadataRows.push({ label: 'Practice area', value: selectedMatter.practice_area });
-    if (selectedMatter.opened_at) metadataRows.push({ label: 'Opened', value: selectedMatter.opened_at });
+    var selectedOpenedDate = getMatterOpenedDate(selectedMatter);
+    if (selectedOpenedDate) metadataRows.push({ label: 'Opened', value: selectedOpenedDate });
     if (selectedMatter.team && selectedMatter.team.length) {
       metadataRows.push({ label: 'Team', value: selectedMatter.team.join(', ') });
     }
@@ -4495,6 +4738,14 @@ function runMatterConflictCheck() {
   });
 }
 
+function clearMatterConflictCheck() {
+  if (!confirm('Clear conflict check input and results?')) return;
+  var text = byId('matters-conflict-text');
+  var result = byId('matters-conflict-result');
+  if (text) text.value = '';
+  if (result) result.textContent = '';
+}
+
 /**
  * Load (or reload) the Matters tab: fetches list and active matter in
  * parallel, then renders the panel and updates the badge.
@@ -4527,7 +4778,7 @@ function loadMatters() {
   }).catch(function (err) {
     if (!isCurrentRequest('matters', requestVersion)) return;
     var list = document.getElementById('matters-list');
-    if (list) list.innerHTML = '<div class="empty-state" style="color:var(--error)">Failed to load matters: ' + escapeHtml(err.message) + '</div>';
+    if (list) list.innerHTML = '<div class="empty-state error-state">Failed to load matters: ' + escapeHtml(err.message) + '</div>';
     renderMatterDetailPlaceholder('Failed to load matters.');
   });
 }
@@ -4535,14 +4786,34 @@ function loadMatters() {
 /** Update the compact matter badge in the tab bar. */
 function updateMatterBadge() {
   var badge = document.getElementById('matter-badge');
-  var label = document.getElementById('matter-badge-label');
-  if (!badge || !label) return;
-  if (activeMatterId) {
-    label.textContent = activeMatterId;
-    badge.style.display = 'flex';
-  } else {
-    badge.style.display = 'none';
+  var badgeLabel = document.getElementById('matter-badge-label');
+  var chatBanner = document.getElementById('chat-active-matter-banner');
+  var chatLabel = document.getElementById('chat-active-matter-label');
+  if (!badge || !badgeLabel || !chatBanner || !chatLabel) return;
+
+  if (!activeMatterId) {
+    badge.classList.add('is-hidden');
+    chatBanner.classList.add('is-hidden');
+    return;
   }
+
+  var activeMatter = null;
+  for (var i = 0; i < mattersCache.length; i++) {
+    if (mattersCache[i] && mattersCache[i].id === activeMatterId) {
+      activeMatter = mattersCache[i];
+      break;
+    }
+  }
+
+  var badgeText = activeMatterId;
+  if (activeMatter && activeMatter.client) {
+    badgeText += ' · ' + activeMatter.client;
+  }
+
+  badgeLabel.textContent = badgeText;
+  chatLabel.textContent = badgeText;
+  badge.classList.remove('is-hidden');
+  chatBanner.classList.remove('is-hidden');
 }
 
 /** Render the matters list and active-bar inside the Matters tab panel. */
@@ -4553,13 +4824,13 @@ function renderMatters() {
   var activeName = document.getElementById('matters-active-name');
   var clearBtn = document.getElementById('matters-clear-btn');
   if (activeName) activeName.textContent = activeMatterId || 'None';
-  if (clearBtn) clearBtn.style.display = activeMatterId ? 'inline-block' : 'none';
+  if (clearBtn) clearBtn.classList.toggle('is-hidden', !activeMatterId);
 
   var list = document.getElementById('matters-list');
   if (!list) return;
 
   if (mattersCache.length === 0) {
-    list.innerHTML = '<div class="empty-state">No matters found yet. Use the Create Matter form above to start one.</div>';
+    list.innerHTML = '<div class="empty-state">No matters found yet. Use + New Matter to start one.</div>';
     return;
   }
 
@@ -4642,7 +4913,7 @@ function createMatterFromForm() {
   };
   if (formData.jurisdiction) body.jurisdiction = formData.jurisdiction;
   if (formData.practice_area) body.practice_area = formData.practice_area;
-  if (formData.opened_at) body.opened_at = formData.opened_at;
+  if (formData.opened_date) body.opened_date = formData.opened_date;
   if (matterCreateReviewState.matched) {
     body.conflict_decision = getMatterCreateDecision();
     var note = getMatterCreateDecisionNote();
@@ -4659,7 +4930,9 @@ function createMatterFromForm() {
     selectedMatterId = createdId;
     var form = byId('matters-create-form');
     if (form) form.reset();
+    syncMatterSelectOtherFields();
     resetMatterCreateReview('Run conflict review before creating this matter.', null);
+    closeMatterCreateModal();
     showToast('Matter created and activated: ' + createdId, 'success');
     loadMatters();
   }).catch(function(err) {
@@ -4726,6 +4999,7 @@ function selectMatter(id) {
 
 /** Clear the active matter selection. */
 function clearActiveMatter() {
+  if (!confirm('Clear active matter?')) return;
   apiFetch('/api/matters/active', {
     method: 'POST',
     body: { matter_id: null },
