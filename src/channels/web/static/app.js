@@ -1463,7 +1463,7 @@ function renderTree() {
   const container = document.getElementById('memory-tree');
   container.innerHTML = '';
   if (!memoryTreeState || memoryTreeState.length === 0) {
-    container.innerHTML = '<div class="tree-item" style="color:var(--text-secondary)">No files in workspace</div>';
+    container.innerHTML = '<div class="tree-item">No files in workspace</div>';
     return;
   }
   renderNodes(memoryTreeState, container, 0);
@@ -1680,7 +1680,7 @@ function searchMemory(query) {
     const tree = document.getElementById('memory-tree');
     tree.innerHTML = '';
     if (data.results.length === 0) {
-      tree.innerHTML = '<div class="tree-item" style="color:var(--text-secondary)">No results</div>';
+      tree.innerHTML = '<div class="tree-item">No results</div>';
       return;
     }
     for (const result of data.results) {
@@ -1906,7 +1906,7 @@ function loadLegalAudit(offset) {
     legalAuditNextOffset = null;
     legalAuditTotal = 0;
     if (list) {
-      list.innerHTML = '<div class="empty-state" style="color:var(--error)">Failed to load legal audit: ' + escapeHtml(err.message) + '</div>';
+      list.innerHTML = '<div class="empty-state error-state">Failed to load legal audit: ' + escapeHtml(err.message) + '</div>';
     }
     var pageMeta = byId('legal-audit-page-meta');
     if (pageMeta) pageMeta.textContent = '';
@@ -2532,7 +2532,7 @@ function loadJobs() {
       + '<table class="jobs-table" id="jobs-table"><thead><tr>'
       + '<th>ID</th><th>Title</th><th>Source</th><th>Status</th><th>Created</th><th>Actions</th>'
       + '</tr></thead><tbody id="jobs-tbody"></tbody></table>'
-      + '<div class="empty-state" id="jobs-empty" style="display:none">No jobs found. Send a message in Chat to start a job.</div>';
+      + '<div class="empty-state is-hidden" id="jobs-empty">No jobs found. Send a message in Chat to start a job.</div>';
   }
 
   Promise.all([
@@ -2788,7 +2788,7 @@ function renderJobFiles(container, job) {
   }).catch(() => {
     const treeContainer = document.querySelector('.job-files-tree');
     if (treeContainer) {
-      treeContainer.innerHTML = '<div class="tree-item" style="color:var(--text-secondary)">No project files</div>';
+      treeContainer.innerHTML = '<div class="tree-item">No project files</div>';
     }
   });
 }
@@ -2798,7 +2798,7 @@ function renderJobFilesTree() {
   if (!treeContainer) return;
   treeContainer.innerHTML = '';
   if (!jobFilesTreeState || jobFilesTreeState.length === 0) {
-    treeContainer.innerHTML = '<div class="tree-item" style="color:var(--text-secondary)">No files in workspace</div>';
+    treeContainer.innerHTML = '<div class="tree-item">No files in workspace</div>';
     return;
   }
   renderJobFileNodes(jobFilesTreeState, treeContainer, 0);
