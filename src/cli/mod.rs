@@ -4,6 +4,7 @@
 //! - Running the agent (`run`)
 //! - Interactive onboarding wizard (`onboard`)
 //! - Managing configuration (`config list`, `config get`, `config set`)
+//! - Backup and restore (`backup create`, `backup verify`, `backup restore`)
 //! - Managing WASM tools (`tool install`, `tool list`, `tool remove`)
 //! - Managing MCP servers (`mcp add`, `mcp auth`, `mcp list`, `mcp test`)
 //! - Querying workspace memory (`memory search`, `memory read`, `memory write`)
@@ -11,6 +12,7 @@
 //! - Active health diagnostics (`doctor`)
 //! - Checking system health (`status`)
 
+mod backup;
 mod completion;
 mod config;
 mod doctor;
@@ -23,6 +25,7 @@ mod service;
 pub mod status;
 mod tool;
 
+pub use backup::{BackupCommand, run_backup_command};
 pub use completion::Completion;
 pub use config::{ConfigCommand, run_config_command};
 pub use doctor::run_doctor_command;
@@ -109,6 +112,10 @@ pub enum Command {
     /// Manage configuration settings
     #[command(subcommand)]
     Config(ConfigCommand),
+
+    /// Backup, restore, and retrieval export operations
+    #[command(subcommand)]
+    Backup(BackupCommand),
 
     /// Manage WASM tools
     #[command(subcommand)]

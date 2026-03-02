@@ -285,6 +285,20 @@
             <div class="empty-state">Loading…</div>
           </div>
         </div>
+        <div class="extensions-section">
+          <div class="section-header-row">
+            <h3>Backups</h3>
+            <div class="section-header-actions">
+              <button class="btn-ext" id="backups-create-btn">Create Backup</button>
+              <button class="btn-ext" id="backups-verify-btn">Verify Backup</button>
+              <button class="btn-ext" id="backups-restore-btn">Restore Backup</button>
+              <input type="file" id="backups-restore-file" accept=".clawyerbak,.json" style="display:none">
+            </div>
+          </div>
+          <div id="backups-last-result" class="backups-result">
+            <div class="empty-state">No backup actions yet.</div>
+          </div>
+        </div>
       </div>
     </div>
 

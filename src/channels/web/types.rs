@@ -758,6 +758,61 @@ pub struct LegalAuditListResponse {
     pub next_offset: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BackupCreateRequest {
+    #[serde(default)]
+    pub include_ai_packets: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackupArtifactInfo {
+    pub id: String,
+    pub path: String,
+    pub created_at: String,
+    pub size_bytes: usize,
+    pub encrypted: bool,
+    pub plaintext_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackupCreateResponse {
+    pub artifact: BackupArtifactInfo,
+    pub warnings: Vec<String>,
+    pub manifest: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BackupVerifyRequest {
+    pub backup_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackupVerifyResponse {
+    pub valid: bool,
+    pub warnings: Vec<String>,
+    pub manifest: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BackupRestoreRequest {
+    #[serde(default)]
+    pub apply: bool,
+    #[serde(default)]
+    pub protect_identity_files: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackupRestoreResponse {
+    pub valid: bool,
+    pub dry_run: bool,
+    pub applied: bool,
+    pub restored_settings: usize,
+    pub restored_workspace_files: usize,
+    pub skipped_workspace_files: usize,
+    pub warnings: Vec<String>,
+    pub manifest: serde_json::Value,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MatterDocumentInfo {
     pub id: Option<String>,
@@ -801,6 +856,21 @@ pub struct MatterTemplateApplyRequest {
 pub struct MatterTemplateApplyResponse {
     pub path: String,
     pub status: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MatterRetrievalExportRequest {
+    #[serde(default)]
+    pub unredacted: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterRetrievalExportResponse {
+    pub matter_id: String,
+    pub output_dir: String,
+    pub redacted: bool,
+    pub files: Vec<String>,
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
