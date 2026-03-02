@@ -58,6 +58,44 @@ fn thread_compaction_scope(
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ThreadCompactionSnapshot {
+    updated_at: chrono::DateTime<chrono::Utc>,
+    turn_count: usize,
+    state: ThreadState,
+}
+
+impl ThreadCompactionSnapshot {
+    fn capture(thread: &crate::agent::session::Thread) -> Self {
+        Self {
+            updated_at: thread.updated_at,
+            turn_count: thread.turns.len(),
+            state: thread.state,
+        }
+    }
+}
+
+fn can_apply_compaction_update(
+    thread: &crate::agent::session::Thread,
+    snapshot: &ThreadCompactionSnapshot,
+) -> bool {
+    thread.updated_at == snapshot.updated_at
+        && thread.turns.len() == snapshot.turn_count
+        && thread.state == snapshot.state
+}
+
+fn apply_compaction_if_unchanged(
+    thread: &mut crate::agent::session::Thread,
+    snapshot: &ThreadCompactionSnapshot,
+    compacted_thread: crate::agent::session::Thread,
+) -> bool {
+    if !can_apply_compaction_update(thread, snapshot) {
+        return false;
+    }
+    *thread = compacted_thread;
+    true
+}
+
 fn conversation_matter_mismatch_message(bound: &str, active: &str) -> String {
     format!(
         "Thread is bound to matter '{}'. Start a new thread to work in matter '{}'.",
@@ -448,62 +486,84 @@ impl Agent {
         // Natural language goes through the agentic loop
         // Job tools (create_job, list_jobs, etc.) are in the tool registry
 
-        // Auto-compact if needed BEFORE adding new turn
-        {
-            let mut sess = session.lock().await;
+        // Auto-compact if needed BEFORE adding new turn, without holding
+        // the session lock across async compaction work.
+        let auto_compaction_job = {
+            let sess = session.lock().await;
             let thread = sess
                 .threads
-                .get_mut(&thread_id)
+                .get(&thread_id)
                 .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
             let messages = thread.messages();
-            if let Some(strategy) = self.context_monitor.suggest_compaction(&messages) {
-                let pct = self.context_monitor.usage_percent(&messages);
-                tracing::info!("Context at {:.1}% capacity, auto-compacting", pct);
-
-                // Notify the user that compaction is happening
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::Status(format!(
-                            "Context at {:.0}% capacity, compacting...",
-                            pct
-                        )),
-                        &message.metadata,
-                    )
-                    .await;
-
-                let compactor = ContextCompactor::new(self.llm().clone(), self.safety().clone());
-                let scope = thread_compaction_scope(thread, &effective_legal_config);
-                if let Err(e) = compactor
-                    .compact(
-                        thread,
+            self.context_monitor
+                .suggest_compaction(&messages)
+                .map(|strategy| {
+                    let pct = self.context_monitor.usage_percent(&messages);
+                    (
                         strategy,
-                        self.workspace().map(|w| w.as_ref()),
-                        scope.as_ref(),
+                        pct,
+                        thread_compaction_scope(thread, &effective_legal_config),
+                        ThreadCompactionSnapshot::capture(thread),
+                        thread.clone(),
                     )
-                    .await
-                {
+                })
+        };
+
+        if let Some((strategy, pct, scope, snapshot, mut compacted_thread)) = auto_compaction_job {
+            tracing::info!("Context at {:.1}% capacity, auto-compacting", pct);
+
+            let _ = self
+                .channels
+                .send_status(
+                    &message.channel,
+                    StatusUpdate::Status(format!("Context at {:.0}% capacity, compacting...", pct)),
+                    &message.metadata,
+                )
+                .await;
+
+            let compactor = ContextCompactor::new(self.llm().clone(), self.safety().clone());
+            match compactor
+                .compact(
+                    &mut compacted_thread,
+                    strategy,
+                    self.workspace().map(|w| w.as_ref()),
+                    scope.as_ref(),
+                )
+                .await
+            {
+                Ok(_) => {
+                    let mut sess = session.lock().await;
+                    if let Some(thread) = sess.threads.get_mut(&thread_id)
+                        && !apply_compaction_if_unchanged(thread, &snapshot, compacted_thread)
+                    {
+                        tracing::debug!(
+                            "Skipping auto-compaction apply for thread {}: thread changed",
+                            thread_id
+                        );
+                    }
+                }
+                Err(e) => {
                     tracing::warn!("Auto-compaction failed: {}", e);
                 }
             }
         }
 
         // Create checkpoint before turn
-        let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
-        {
+        let (checkpoint_turn, checkpoint_messages) = {
             let sess = session.lock().await;
             let thread = sess
                 .threads
                 .get(&thread_id)
                 .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
+            (thread.turn_number(), thread.messages())
+        };
+        let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
+        {
             let mut mgr = undo_mgr.lock().await;
             mgr.checkpoint(
-                thread.turn_number(),
-                thread.messages(),
-                format!("Before turn {}", thread.turn_number()),
+                checkpoint_turn,
+                checkpoint_messages,
+                format!("Before turn {}", checkpoint_turn),
             );
         }
 
@@ -710,29 +770,34 @@ impl Agent {
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
+        let (current_turn, current_messages) = {
+            let sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            (thread.turn_number(), thread.messages())
+        };
+
         let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
-        let mut mgr = undo_mgr.lock().await;
-
-        if !mgr.can_undo() {
-            return Ok(SubmissionResult::ok_with_message("Nothing to undo."));
-        }
-
-        let mut sess = session.lock().await;
-        let thread = sess
-            .threads
-            .get_mut(&thread_id)
-            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
-        // Save current state to redo, get previous checkpoint
-        let current_messages = thread.messages();
-        let current_turn = thread.turn_number();
-
-        if let Some(checkpoint) = mgr.undo(current_turn, current_messages) {
-            // Extract values before consuming the reference
-            let turn_number = checkpoint.turn_number;
-            let messages = checkpoint.messages.clone();
+        let (checkpoint, undo_count) = {
+            let mut mgr = undo_mgr.lock().await;
+            if !mgr.can_undo() {
+                return Ok(SubmissionResult::ok_with_message("Nothing to undo."));
+            }
+            let checkpoint = mgr.undo(current_turn, current_messages);
             let undo_count = mgr.undo_count();
-            // Restore thread from checkpoint
+            (checkpoint, undo_count)
+        };
+
+        if let Some(checkpoint) = checkpoint {
+            let turn_number = checkpoint.turn_number;
+            let messages = checkpoint.messages;
+            let mut sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get_mut(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
             thread.restore_from_messages(messages);
             Ok(SubmissionResult::ok_with_message(format!(
                 "Undone to turn {}. {} undo(s) remaining.",
@@ -748,27 +813,36 @@ impl Agent {
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
+        let (current_turn, current_messages) = {
+            let sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            (thread.turn_number(), thread.messages())
+        };
+
         let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
-        let mut mgr = undo_mgr.lock().await;
+        let checkpoint = {
+            let mut mgr = undo_mgr.lock().await;
+            if !mgr.can_redo() {
+                return Ok(SubmissionResult::ok_with_message("Nothing to redo."));
+            }
+            mgr.redo(current_turn, current_messages)
+        };
 
-        if !mgr.can_redo() {
-            return Ok(SubmissionResult::ok_with_message("Nothing to redo."));
-        }
-
-        let mut sess = session.lock().await;
-        let thread = sess
-            .threads
-            .get_mut(&thread_id)
-            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
-        let current_messages = thread.messages();
-        let current_turn = thread.turn_number();
-
-        if let Some(checkpoint) = mgr.redo(current_turn, current_messages) {
-            thread.restore_from_messages(checkpoint.messages);
+        if let Some(checkpoint) = checkpoint {
+            let turn_number = checkpoint.turn_number;
+            let messages = checkpoint.messages;
+            let mut sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get_mut(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            thread.restore_from_messages(messages);
             Ok(SubmissionResult::ok_with_message(format!(
                 "Redone to turn {}.",
-                checkpoint.turn_number
+                turn_number
             )))
         } else {
             Ok(SubmissionResult::error("Redo failed."))
@@ -800,26 +874,33 @@ impl Agent {
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
-        let mut sess = session.lock().await;
-        let thread = sess
-            .threads
-            .get_mut(&thread_id)
-            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
-        let messages = thread.messages();
-        let usage = self.context_monitor.usage_percent(&messages);
-        let strategy = self
-            .context_monitor
-            .suggest_compaction(&messages)
-            .unwrap_or(
-                crate::agent::context_monitor::CompactionStrategy::Summarize { keep_recent: 5 },
-            );
+        let (usage, strategy, scope, snapshot, mut compacted_thread) = {
+            let sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            let messages = thread.messages();
+            let usage = self.context_monitor.usage_percent(&messages);
+            let strategy = self
+                .context_monitor
+                .suggest_compaction(&messages)
+                .unwrap_or(
+                    crate::agent::context_monitor::CompactionStrategy::Summarize { keep_recent: 5 },
+                );
+            (
+                usage,
+                strategy,
+                thread_compaction_scope(thread, self.base_legal_config()),
+                ThreadCompactionSnapshot::capture(thread),
+                thread.clone(),
+            )
+        };
 
         let compactor = ContextCompactor::new(self.llm().clone(), self.safety().clone());
-        let scope = thread_compaction_scope(thread, self.base_legal_config());
         match compactor
             .compact(
-                thread,
+                &mut compacted_thread,
                 strategy,
                 self.workspace().map(|w| w.as_ref()),
                 scope.as_ref(),
@@ -827,6 +908,20 @@ impl Agent {
             .await
         {
             Ok(result) => {
+                let apply_result = {
+                    let mut sess = session.lock().await;
+                    let thread = sess.threads.get_mut(&thread_id).ok_or_else(|| {
+                        Error::from(crate::error::JobError::NotFound { id: thread_id })
+                    })?;
+                    apply_compaction_if_unchanged(thread, &snapshot, compacted_thread)
+                };
+
+                if !apply_result {
+                    return Ok(SubmissionResult::ok_with_message(
+                        "Compaction result skipped because the thread changed during compaction.",
+                    ));
+                }
+
                 let mut msg = format!(
                     "Compacted: {} turns removed, {} → {} tokens (was {:.1}% full)",
                     result.turns_removed, result.tokens_before, result.tokens_after, usage
@@ -845,13 +940,15 @@ impl Agent {
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
-        let mut sess = session.lock().await;
-        let thread = sess
-            .threads
-            .get_mut(&thread_id)
-            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-        thread.turns.clear();
-        thread.state = ThreadState::Idle;
+        {
+            let mut sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get_mut(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            thread.turns.clear();
+            thread.state = ThreadState::Idle;
+        }
 
         // Clear undo history too
         let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
@@ -1708,22 +1805,281 @@ impl Agent {
         thread_id: Uuid,
         checkpoint_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
-        let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
-        let mut mgr = undo_mgr.lock().await;
+        {
+            let sess = session.lock().await;
+            let _ = sess
+                .threads
+                .get(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+        }
 
-        if let Some(checkpoint) = mgr.restore(checkpoint_id) {
+        let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
+        let checkpoint = {
+            let mut mgr = undo_mgr.lock().await;
+            mgr.restore(checkpoint_id)
+        };
+
+        if let Some(checkpoint) = checkpoint {
+            let description = checkpoint.description;
+            let messages = checkpoint.messages;
             let mut sess = session.lock().await;
             let thread = sess
                 .threads
                 .get_mut(&thread_id)
                 .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-            thread.restore_from_messages(checkpoint.messages);
+            thread.restore_from_messages(messages);
             Ok(SubmissionResult::ok_with_message(format!(
                 "Resumed from checkpoint: {}",
-                checkpoint.description
+                description
             )))
         } else {
             Ok(SubmissionResult::error("Checkpoint not found."))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use rust_decimal::Decimal;
+    use tokio::sync::Mutex;
+
+    use super::{ThreadCompactionSnapshot, apply_compaction_if_unchanged};
+    use crate::agent::agent_loop::{Agent, AgentDeps};
+    use crate::agent::cost_guard::{CostGuard, CostGuardConfig};
+    use crate::agent::session::{Session, Thread};
+    use crate::agent::submission::SubmissionResult;
+    use crate::channels::ChannelManager;
+    use crate::config::{AgentConfig, SafetyConfig, SkillsConfig};
+    use crate::context::ContextManager;
+    use crate::llm::{
+        ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, Role,
+        ToolCompletionRequest, ToolCompletionResponse,
+    };
+    use crate::safety::SafetyLayer;
+    use crate::tools::ToolRegistry;
+
+    struct StaticLlmProvider;
+
+    #[async_trait]
+    impl LlmProvider for StaticLlmProvider {
+        fn model_name(&self) -> &str {
+            "static-thread-ops-test"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::LlmError> {
+            Ok(CompletionResponse {
+                content: "ok".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+            Ok(ToolCompletionResponse {
+                content: Some("ok".to_string()),
+                tool_calls: vec![],
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+            })
+        }
+    }
+
+    fn make_test_agent() -> Agent {
+        let legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        let deps = AgentDeps {
+            store: None,
+            llm: Arc::new(StaticLlmProvider),
+            cheap_llm: None,
+            safety: Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled: true,
+            })),
+            tools: Arc::new(ToolRegistry::new()),
+            workspace: None,
+            extension_manager: None,
+            skill_registry: None,
+            skill_catalog: None,
+            skills_config: SkillsConfig::default(),
+            legal_config: legal,
+            hooks: Arc::new(crate::hooks::HookRegistry::new()),
+            cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
+        };
+
+        Agent::new(
+            AgentConfig {
+                name: "thread-ops-test-agent".to_string(),
+                max_parallel_jobs: 1,
+                job_timeout: Duration::from_secs(30),
+                stuck_threshold: Duration::from_secs(60),
+                repair_check_interval: Duration::from_secs(30),
+                max_repair_attempts: 1,
+                use_planning: false,
+                session_idle_timeout: Duration::from_secs(300),
+                allow_local_tools: false,
+                max_cost_per_day_cents: None,
+                max_actions_per_hour: None,
+                max_tool_iterations: 25,
+                auto_approve_tools: false,
+            },
+            deps,
+            Arc::new(ChannelManager::new()),
+            None,
+            None,
+            None,
+            Some(Arc::new(ContextManager::new(1))),
+            None,
+        )
+    }
+
+    fn seeded_thread(session_id: uuid::Uuid) -> Thread {
+        let mut thread = Thread::new(session_id);
+        thread.start_turn("turn-1");
+        thread.complete_turn("resp-1");
+        thread.start_turn("turn-2");
+        thread.complete_turn("resp-2");
+        thread
+    }
+
+    fn message_signature(messages: &[ChatMessage]) -> Vec<(Role, String)> {
+        messages
+            .iter()
+            .map(|message| (message.role, message.content.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn compaction_apply_skips_when_thread_changed() {
+        let mut thread = seeded_thread(uuid::Uuid::new_v4());
+        let snapshot = ThreadCompactionSnapshot::capture(&thread);
+        let mut compacted_thread = thread.clone();
+        compacted_thread.truncate_turns(1);
+
+        thread.start_turn("late-turn");
+        thread.complete_turn("late-resp");
+        let turns_after_change = thread.turns.len();
+
+        let applied = apply_compaction_if_unchanged(&mut thread, &snapshot, compacted_thread);
+        assert!(!applied);
+        assert_eq!(thread.turns.len(), turns_after_change);
+    }
+
+    #[test]
+    fn compaction_apply_updates_when_thread_unchanged() {
+        let mut thread = seeded_thread(uuid::Uuid::new_v4());
+        let snapshot = ThreadCompactionSnapshot::capture(&thread);
+        let mut compacted_thread = thread.clone();
+        compacted_thread.truncate_turns(1);
+
+        let applied = apply_compaction_if_unchanged(&mut thread, &snapshot, compacted_thread);
+        assert!(applied);
+        assert_eq!(thread.turns.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn undo_redo_and_resume_restore_expected_thread_states() {
+        let agent = make_test_agent();
+        let session = Arc::new(Mutex::new(Session::new("user-thread-ops")));
+
+        let (thread_id, checkpoint_messages) = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("turn-1");
+            thread.complete_turn("resp-1");
+            let checkpoint_messages = thread.messages();
+            thread.start_turn("turn-2");
+            thread.complete_turn("resp-2");
+            (thread.id, checkpoint_messages)
+        };
+
+        let undo_mgr = agent.session_manager.get_undo_manager(thread_id).await;
+        {
+            let mut mgr = undo_mgr.lock().await;
+            mgr.checkpoint(2, checkpoint_messages.clone(), "Before turn 2");
+        };
+
+        let undo_result = agent
+            .process_undo(Arc::clone(&session), thread_id)
+            .await
+            .expect("undo should succeed");
+        assert!(matches!(undo_result, SubmissionResult::Ok { .. }));
+        {
+            let sess = session.lock().await;
+            let thread = sess.threads.get(&thread_id).expect("thread must exist");
+            assert_eq!(
+                message_signature(&thread.messages()),
+                message_signature(&checkpoint_messages)
+            );
+        }
+
+        let redo_result = agent
+            .process_redo(Arc::clone(&session), thread_id)
+            .await
+            .expect("redo should succeed");
+        assert!(matches!(redo_result, SubmissionResult::Ok { .. }));
+        {
+            let sess = session.lock().await;
+            let thread = sess.threads.get(&thread_id).expect("thread must exist");
+            assert_eq!(thread.turns.len(), 2);
+        }
+
+        let resume_target_messages = {
+            let mut sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get_mut(&thread_id)
+                .expect("thread should exist for resume setup");
+            let resume_target_messages = thread.messages();
+            let resume_turn = thread.turn_number();
+
+            let mut mgr = undo_mgr.lock().await;
+            mgr.checkpoint(
+                resume_turn,
+                resume_target_messages.clone(),
+                "Resume target checkpoint",
+            );
+
+            thread.start_turn("turn-3");
+            thread.complete_turn("resp-3");
+            assert_eq!(thread.turns.len(), 3);
+            resume_target_messages
+        };
+
+        let resume_checkpoint_id = {
+            let mgr = undo_mgr.lock().await;
+            mgr.list_checkpoints()
+                .last()
+                .expect("resume checkpoint should exist")
+                .id
+        };
+
+        let resume_result = agent
+            .process_resume(Arc::clone(&session), thread_id, resume_checkpoint_id)
+            .await
+            .expect("resume should succeed");
+        assert!(matches!(resume_result, SubmissionResult::Ok { .. }));
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).expect("thread must exist");
+        assert_eq!(
+            message_signature(&thread.messages()),
+            message_signature(&resume_target_messages)
+        );
     }
 }
