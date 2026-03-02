@@ -590,12 +590,7 @@ async fn load_active_matter_for_chat(state: &GatewayState) -> Option<String> {
         }
     }?;
     let raw = value.as_str()?;
-    let sanitized = crate::legal::policy::sanitize_matter_id(raw);
-    if sanitized.is_empty() {
-        None
-    } else {
-        Some(sanitized)
-    }
+    crate::legal::policy::sanitize_optional_matter_id(raw)
 }
 
 async fn build_chat_message_metadata(
@@ -617,14 +612,6 @@ async fn build_chat_message_metadata(
             .unwrap_or(serde_json::Value::Null),
     );
     serde_json::Value::Object(metadata)
-}
-
-fn thread_matter_id_from_metadata(metadata: &serde_json::Value) -> Option<String> {
-    metadata
-        .get("matter_id")
-        .and_then(|value| value.as_str())
-        .map(crate::legal::policy::sanitize_matter_id)
-        .filter(|value| !value.is_empty())
 }
 
 async fn chat_send_handler(
@@ -1060,8 +1047,7 @@ async fn chat_threads_handler(
     let matter_filter = query
         .matter_id
         .as_deref()
-        .map(crate::legal::policy::sanitize_matter_id)
-        .filter(|value| !value.is_empty());
+        .and_then(crate::legal::policy::sanitize_optional_matter_id);
     if query.matter_id.as_deref().is_some() && matter_filter.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1075,7 +1061,10 @@ async fn chat_threads_handler(
     ))?;
 
     let session = session_manager.get_or_create_session(&state.user_id).await;
-    let sess = session.lock().await;
+    let active_thread = {
+        let sess = session.lock().await;
+        sess.active_thread
+    };
 
     // Try DB first for persistent thread list
     if let Some(ref store) = state.store {
@@ -1101,60 +1090,69 @@ async fn chat_threads_handler(
             store.list_conversations_with_preview(&state.user_id, "gateway", 50)
         };
 
-        if let Ok(summaries) = summaries_result.await {
-            let mut assistant_thread = None;
-            let mut threads = Vec::new();
+        match summaries_result.await {
+            Ok(summaries) => {
+                let mut assistant_thread = None;
+                let mut threads = Vec::new();
 
-            for s in &summaries {
-                let info = ThreadInfo {
-                    id: s.id,
-                    state: "Idle".to_string(),
-                    turn_count: (s.message_count / 2).max(0) as usize,
-                    created_at: s.started_at.to_rfc3339(),
-                    updated_at: s.last_activity.to_rfc3339(),
-                    title: s.title.clone(),
-                    matter_id: s.matter_id.clone(),
-                    thread_type: s.thread_type.clone(),
-                };
+                for summary in summaries {
+                    let info = ThreadInfo {
+                        id: summary.id,
+                        state: "Idle".to_string(),
+                        turn_count: (summary.message_count / 2).max(0) as usize,
+                        created_at: summary.started_at.to_rfc3339(),
+                        updated_at: summary.last_activity.to_rfc3339(),
+                        title: summary.title,
+                        matter_id: summary.matter_id,
+                        thread_type: summary.thread_type,
+                    };
 
-                if assistant_id.is_some_and(|id| s.id == id) {
-                    assistant_thread = Some(info);
-                } else {
-                    threads.push(info);
+                    if assistant_id.is_some_and(|id| summary.id == id) {
+                        assistant_thread = Some(info);
+                    } else {
+                        threads.push(info);
+                    }
                 }
-            }
 
-            // If assistant wasn't in the list (0 messages), synthesize it
-            if assistant_thread.is_none()
-                && let Some(id) = assistant_id
-            {
-                assistant_thread = Some(ThreadInfo {
-                    id,
-                    state: "Idle".to_string(),
-                    turn_count: 0,
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    updated_at: chrono::Utc::now().to_rfc3339(),
-                    title: None,
-                    matter_id: None,
-                    thread_type: Some("assistant".to_string()),
-                });
-            }
+                // If assistant wasn't in the list (0 messages), synthesize it
+                if assistant_thread.is_none()
+                    && let Some(id) = assistant_id
+                {
+                    assistant_thread = Some(ThreadInfo {
+                        id,
+                        state: "Idle".to_string(),
+                        turn_count: 0,
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        updated_at: chrono::Utc::now().to_rfc3339(),
+                        title: None,
+                        matter_id: None,
+                        thread_type: Some("assistant".to_string()),
+                    });
+                }
 
-            return Ok(Json(ThreadListResponse {
-                assistant_thread,
-                threads,
-                active_thread: sess.active_thread,
-            }));
+                return Ok(Json(ThreadListResponse {
+                    assistant_thread,
+                    threads,
+                    active_thread,
+                }));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Falling back to in-memory thread list after DB query error: {}",
+                    err
+                );
+            }
         }
     }
 
     // Fallback: in-memory only (no assistant thread without DB)
+    let sess = session.lock().await;
     let threads: Vec<ThreadInfo> = sess
         .threads
         .values()
         .filter(|thread| {
             if let Some(ref filter) = matter_filter {
-                thread_matter_id_from_metadata(&thread.metadata)
+                crate::legal::policy::matter_id_from_metadata(&thread.metadata)
                     .as_ref()
                     .is_some_and(|matter_id| matter_id == filter)
             } else {
@@ -1168,7 +1166,7 @@ async fn chat_threads_handler(
             created_at: t.created_at.to_rfc3339(),
             updated_at: t.updated_at.to_rfc3339(),
             title: None,
-            matter_id: thread_matter_id_from_metadata(&t.metadata),
+            matter_id: crate::legal::policy::matter_id_from_metadata(&t.metadata),
             thread_type: None,
         })
         .collect();
@@ -1190,18 +1188,26 @@ async fn chat_new_thread_handler(
 
     let active_matter = load_active_matter_for_chat(state.as_ref()).await;
     let session = session_manager.get_or_create_session(&state.user_id).await;
-    let mut sess = session.lock().await;
-    let thread = sess.create_thread();
-    if let Some(ref matter_id) = active_matter {
-        thread.metadata = serde_json::json!({ "matter_id": matter_id });
-    }
-    let thread_id = thread.id;
+    let (thread_id, state_label, turn_count, created_at, updated_at) = {
+        let mut sess = session.lock().await;
+        let thread = sess.create_thread();
+        if let Some(ref matter_id) = active_matter {
+            thread.metadata = serde_json::json!({ "matter_id": matter_id });
+        }
+        (
+            thread.id,
+            format!("{:?}", thread.state),
+            thread.turns.len(),
+            thread.created_at.to_rfc3339(),
+            thread.updated_at.to_rfc3339(),
+        )
+    };
     let info = ThreadInfo {
-        id: thread.id,
-        state: format!("{:?}", thread.state),
-        turn_count: thread.turns.len(),
-        created_at: thread.created_at.to_rfc3339(),
-        updated_at: thread.updated_at.to_rfc3339(),
+        id: thread_id,
+        state: state_label,
+        turn_count,
+        created_at,
+        updated_at,
         title: None,
         matter_id: active_matter.clone(),
         thread_type: Some("thread".to_string()),

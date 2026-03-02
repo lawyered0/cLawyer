@@ -31,19 +31,10 @@ fn approval_requirement_label(requirement: ApprovalRequirement) -> &'static str 
     }
 }
 
-fn thread_matter_id_from_metadata(metadata: &serde_json::Value) -> Option<String> {
-    metadata
-        .get("matter_id")
-        .and_then(|value| value.as_str())
-        .map(crate::legal::policy::sanitize_matter_id)
-        .filter(|value| !value.is_empty())
-}
-
 fn thread_set_matter_id_metadata(thread: &mut crate::agent::session::Thread, matter_id: &str) {
-    let matter_id = crate::legal::policy::sanitize_matter_id(matter_id);
-    if matter_id.is_empty() {
+    let Some(matter_id) = crate::legal::policy::sanitize_optional_matter_id(matter_id) else {
         return;
-    }
+    };
 
     let mut object = thread.metadata.as_object().cloned().unwrap_or_default();
     object.insert(
@@ -60,11 +51,42 @@ fn thread_compaction_scope(
     if !legal.enabled {
         return None;
     }
-    let matter_id = thread_matter_id_from_metadata(&thread.metadata)?;
+    let matter_id = crate::legal::policy::matter_id_from_metadata(&thread.metadata)?;
     Some(MatterCompactionScope {
         matter_root: legal.matter_root.clone(),
         matter_id,
     })
+}
+
+fn conversation_matter_mismatch_message(bound: &str, active: &str) -> String {
+    format!(
+        "Thread is bound to matter '{}'. Start a new thread to work in matter '{}'.",
+        bound, active
+    )
+}
+
+fn audit_conversation_matter_mismatch(thread_id: Uuid, bound: &str, active: &str, source: &str) {
+    crate::legal::audit::inc_blocked_action();
+    crate::legal::audit::record(
+        "conversation_matter_mismatch_blocked",
+        serde_json::json!({
+            "thread_id": thread_id.to_string(),
+            "bound_matter": bound,
+            "requested_matter": active,
+            "source": source,
+        }),
+    );
+}
+
+fn audit_conversation_matter_bound(thread_id: Uuid, active: &str, source: &str) {
+    crate::legal::audit::record(
+        "conversation_matter_bound",
+        serde_json::json!({
+            "thread_id": thread_id.to_string(),
+            "matter_id": active,
+            "source": source,
+        }),
+    );
 }
 
 impl Agent {
@@ -180,8 +202,7 @@ impl Agent {
         let active_matter = legal
             .active_matter
             .as_deref()
-            .map(crate::legal::policy::sanitize_matter_id)
-            .filter(|value| !value.is_empty());
+            .and_then(crate::legal::policy::sanitize_optional_matter_id);
 
         if let Some(store) = self.store() {
             let ensure_result = store
@@ -209,20 +230,8 @@ impl Agent {
 
                         match (bound.as_deref(), active_matter.as_deref()) {
                             (Some(bound), Some(active)) if bound != active => {
-                                crate::legal::audit::inc_blocked_action();
-                                crate::legal::audit::record(
-                                    "conversation_matter_mismatch_blocked",
-                                    serde_json::json!({
-                                        "thread_id": thread_id.to_string(),
-                                        "bound_matter": bound,
-                                        "requested_matter": active,
-                                        "source": "db",
-                                    }),
-                                );
-                                return Err(format!(
-                                    "Thread is bound to matter '{}'. Start a new thread to work in matter '{}'.",
-                                    bound, active
-                                ));
+                                audit_conversation_matter_mismatch(thread_id, bound, active, "db");
+                                return Err(conversation_matter_mismatch_message(bound, active));
                             }
                             (None, Some(active)) => {
                                 store
@@ -244,14 +253,7 @@ impl Agent {
                                         thread_set_matter_id_metadata(thread, active);
                                     }
                                 }
-                                crate::legal::audit::record(
-                                    "conversation_matter_bound",
-                                    serde_json::json!({
-                                        "thread_id": thread_id.to_string(),
-                                        "matter_id": active,
-                                        "source": "db",
-                                    }),
-                                );
+                                audit_conversation_matter_bound(thread_id, active, "db");
                             }
                             _ => {}
                         }
@@ -273,34 +275,15 @@ impl Agent {
         let Some(thread) = sess.threads.get_mut(&thread_id) else {
             return Ok(());
         };
-        let bound = thread_matter_id_from_metadata(&thread.metadata);
+        let bound = crate::legal::policy::matter_id_from_metadata(&thread.metadata);
         match (bound.as_deref(), active_matter.as_deref()) {
             (Some(bound), Some(active)) if bound != active => {
-                crate::legal::audit::inc_blocked_action();
-                crate::legal::audit::record(
-                    "conversation_matter_mismatch_blocked",
-                    serde_json::json!({
-                        "thread_id": thread_id.to_string(),
-                        "bound_matter": bound,
-                        "requested_matter": active,
-                        "source": "memory",
-                    }),
-                );
-                Err(format!(
-                    "Thread is bound to matter '{}'. Start a new thread to work in matter '{}'.",
-                    bound, active
-                ))
+                audit_conversation_matter_mismatch(thread_id, bound, active, "memory");
+                Err(conversation_matter_mismatch_message(bound, active))
             }
             (None, Some(active)) => {
                 thread_set_matter_id_metadata(thread, active);
-                crate::legal::audit::record(
-                    "conversation_matter_bound",
-                    serde_json::json!({
-                        "thread_id": thread_id.to_string(),
-                        "matter_id": active,
-                        "source": "memory",
-                    }),
-                );
+                audit_conversation_matter_bound(thread_id, active, "memory");
                 Ok(())
             }
             _ => Ok(()),
@@ -658,15 +641,13 @@ impl Agent {
         }
     }
 
-    /// Persist the user message to the DB at turn start (before the agentic loop).
-    ///
-    /// This ensures the user message is durable even if the process crashes
-    /// mid-response. Call this right after `thread.start_turn()`.
-    pub(super) async fn persist_user_message(
+    async fn persist_conversation_message(
         &self,
         thread_id: Uuid,
         user_id: &str,
-        user_input: &str,
+        role: &str,
+        content: &str,
+        failure_label: &str,
     ) {
         let store = match self.store() {
             Some(s) => Arc::clone(s),
@@ -682,11 +663,25 @@ impl Agent {
         }
 
         if let Err(e) = store
-            .add_conversation_message(thread_id, "user", user_input)
+            .add_conversation_message(thread_id, role, content)
             .await
         {
-            tracing::warn!("Failed to persist user message: {}", e);
+            tracing::warn!("Failed to persist {}: {}", failure_label, e);
         }
+    }
+
+    /// Persist the user message to the DB at turn start (before the agentic loop).
+    ///
+    /// This ensures the user message is durable even if the process crashes
+    /// mid-response. Call this right after `thread.start_turn()`.
+    pub(super) async fn persist_user_message(
+        &self,
+        thread_id: Uuid,
+        user_id: &str,
+        user_input: &str,
+    ) {
+        self.persist_conversation_message(thread_id, user_id, "user", user_input, "user message")
+            .await;
     }
 
     /// Persist the assistant response to the DB after the agentic loop completes.
@@ -700,25 +695,14 @@ impl Agent {
         user_id: &str,
         response: &str,
     ) {
-        let store = match self.store() {
-            Some(s) => Arc::clone(s),
-            None => return,
-        };
-
-        if let Err(e) = store
-            .ensure_conversation(thread_id, "gateway", user_id, None)
-            .await
-        {
-            tracing::warn!("Failed to ensure conversation {}: {}", thread_id, e);
-            return;
-        }
-
-        if let Err(e) = store
-            .add_conversation_message(thread_id, "assistant", response)
-            .await
-        {
-            tracing::warn!("Failed to persist assistant message: {}", e);
-        }
+        self.persist_conversation_message(
+            thread_id,
+            user_id,
+            "assistant",
+            response,
+            "assistant message",
+        )
+        .await;
     }
 
     pub(super) async fn process_undo(

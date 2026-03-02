@@ -341,6 +341,20 @@ async fn load_curated_prompt_file(
     })
 }
 
+async fn write_if_missing(
+    workspace: &Workspace,
+    path: &str,
+    content: &str,
+) -> Result<(), WorkspaceError> {
+    match workspace.read(path).await {
+        Ok(_) => Ok(()),
+        Err(WorkspaceError::DocumentNotFound { .. }) => {
+            workspace.write(path, content).await.map(|_| ())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Build active matter context fields suitable for inclusion in the legal
 /// system prompt as untrusted data.
 pub async fn load_active_matter_prompt_context(
@@ -369,18 +383,20 @@ pub async fn load_active_matter_prompt_context(
         config.matter_root.trim_matches('/'),
         sanitized_matter_id
     );
-    let mut curated_files = Vec::new();
-    for (name, rel_path) in [
-        ("facts.md", "facts.md"),
-        ("parties.md", "parties.md"),
-        ("strategy.md", "strategy.md"),
-        ("documents.md", "documents.md"),
-    ] {
-        let path = format!("{matter_prefix}/{rel_path}");
-        if let Some(file) = load_curated_prompt_file(workspace, &path, name).await {
-            curated_files.push(file);
-        }
-    }
+    let facts_path = format!("{matter_prefix}/facts.md");
+    let parties_path = format!("{matter_prefix}/parties.md");
+    let strategy_path = format!("{matter_prefix}/strategy.md");
+    let documents_path = format!("{matter_prefix}/documents.md");
+    let (facts, parties, strategy, documents) = tokio::join!(
+        load_curated_prompt_file(workspace, &facts_path, "facts.md"),
+        load_curated_prompt_file(workspace, &parties_path, "parties.md"),
+        load_curated_prompt_file(workspace, &strategy_path, "strategy.md"),
+        load_curated_prompt_file(workspace, &documents_path, "documents.md")
+    );
+    let curated_files = [facts, parties, strategy, documents]
+        .into_iter()
+        .flatten()
+        .collect();
 
     Ok(Some(ActiveMatterPromptContext {
         matter_id,
@@ -441,18 +457,12 @@ pub async fn seed_legal_workspace(
     }
 
     // Seed conflict list template.
-    match workspace.read("conflicts.json").await {
-        Ok(_) => {}
-        Err(WorkspaceError::DocumentNotFound { .. }) => {
-            workspace
-                .write(
-                    "conflicts.json",
-                    "[\n  {\n    \"name\": \"Example Adverse Party\",\n    \"aliases\": [\"Example Co\"]\n  }\n]\n",
-                )
-                .await?;
-        }
-        Err(e) => return Err(e),
-    }
+    write_if_missing(
+        workspace,
+        "conflicts.json",
+        "[\n  {\n    \"name\": \"Example Adverse Party\",\n    \"aliases\": [\"Example Co\"]\n  }\n]\n",
+    )
+    .await?;
 
     let root_seeds = [
         (
@@ -500,13 +510,7 @@ pub async fn seed_legal_workspace(
     ];
 
     for (path, content) in root_seeds {
-        match workspace.read(&path).await {
-            Ok(_) => {}
-            Err(WorkspaceError::DocumentNotFound { .. }) => {
-                workspace.write(&path, &content).await?;
-            }
-            Err(e) => return Err(e),
-        }
+        write_if_missing(workspace, &path, &content).await?;
     }
 
     let matter_id = match config.active_matter.as_deref() {
@@ -609,13 +613,7 @@ pub async fn seed_legal_workspace(
     ];
 
     for (path, content) in seeds {
-        match workspace.read(&path).await {
-            Ok(_) => {}
-            Err(WorkspaceError::DocumentNotFound { .. }) => {
-                workspace.write(&path, &content).await?;
-            }
-            Err(e) => return Err(e),
-        }
+        write_if_missing(workspace, &path, &content).await?;
     }
 
     Ok(())
