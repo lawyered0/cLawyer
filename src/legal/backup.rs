@@ -10,6 +10,7 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, Header};
+use uuid::Uuid;
 
 use crate::db::{
     AppendAuditEventParams, AuditEventQuery, AuditEventRecord, AuditSeverity, ClientRecord,
@@ -33,6 +34,7 @@ const BACKUP_AUDIT_MAX_ROWS: usize = 10_000;
 
 const PROTECTED_IDENTITY_FILES: &[&str] =
     &[paths::IDENTITY, paths::SOUL, paths::AGENTS, paths::USER];
+const ALLOWED_GLOBAL_RESTORE_FILES: &[&str] = &["conflicts.json"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackupError {
@@ -375,6 +377,15 @@ pub async fn restore_backup_file(
                 continue;
             }
 
+            if !is_allowed_restore_path(&normalized_path, &options.matter_root) {
+                skipped_workspace_files += 1;
+                warnings.push(format!(
+                    "skipped path '{}' outside restore scope (matter_root='{}')",
+                    normalized_path, options.matter_root
+                ));
+                continue;
+            }
+
             workspace
                 .write(&normalized_path, &file.content)
                 .await
@@ -552,11 +563,13 @@ pub async fn export_matter_retrieval_packet(
         .map_err(|e| BackupError::Io(e.to_string()))?;
 
     let ts = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let export_suffix = Uuid::new_v4().simple().to_string();
     let out_dir = format!(
-        "{}/{}/exports/retrieval/{}",
+        "{}/{}/exports/retrieval/{}-{}",
         options.matter_root.trim_matches('/'),
         matter_id,
-        ts
+        ts,
+        &export_suffix[..8]
     );
 
     let detector = LeakDetector::new_with_legal_redaction(redaction_cfg);
@@ -952,6 +965,30 @@ fn is_protected_identity_path(path: &str) -> bool {
     PROTECTED_IDENTITY_FILES
         .iter()
         .any(|p| normalized.eq_ignore_ascii_case(p.trim_matches('/')))
+}
+
+fn normalize_matter_root_path(path: &str) -> Option<String> {
+    normalize_restore_path(path)
+}
+
+fn is_path_within_root(path: &str, root: &str) -> bool {
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+fn is_allowed_restore_path(path: &str, matter_root: &str) -> bool {
+    if is_protected_identity_path(path) {
+        return true;
+    }
+    if ALLOWED_GLOBAL_RESTORE_FILES
+        .iter()
+        .any(|allowed| path.eq_ignore_ascii_case(allowed))
+    {
+        return true;
+    }
+    let Some(root) = normalize_matter_root_path(matter_root) else {
+        return false;
+    };
+    is_path_within_root(path, &root)
 }
 
 async fn collect_snapshot(
@@ -1503,13 +1540,22 @@ fn build_csv(headers: &[&str], rows: Vec<Vec<String>>) -> String {
 }
 
 fn csv_escape(value: &str) -> String {
-    let needs_quotes =
-        value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r');
+    let mut normalized = value.to_string();
+    if matches!(
+        normalized.chars().next(),
+        Some('=' | '+' | '-' | '@' | '\t' | '\r')
+    ) {
+        normalized.insert(0, '\'');
+    }
+    let needs_quotes = normalized.contains(',')
+        || normalized.contains('"')
+        || normalized.contains('\n')
+        || normalized.contains('\r');
     if needs_quotes {
-        let escaped = value.replace('"', "\"\"");
+        let escaped = normalized.replace('"', "\"\"");
         format!("\"{}\"", escaped)
     } else {
-        value.to_string()
+        normalized
     }
 }
 
@@ -1699,5 +1745,29 @@ mod tests {
     fn csv_escape_quotes_and_commas() {
         assert_eq!(csv_escape("a,b"), "\"a,b\"");
         assert_eq!(csv_escape("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn csv_escape_prevents_formula_injection() {
+        assert_eq!(csv_escape("=1+1"), "'=1+1");
+        assert_eq!(csv_escape("+SUM(A1:A2)"), "'+SUM(A1:A2)");
+        assert_eq!(csv_escape("-10"), "'-10");
+        assert_eq!(csv_escape("@cmd"), "'@cmd");
+    }
+
+    #[test]
+    fn restore_scope_enforces_matter_root() {
+        assert!(is_allowed_restore_path("matters/demo/note.md", "matters"));
+        assert!(is_allowed_restore_path("conflicts.json", "matters"));
+        assert!(is_allowed_restore_path(paths::IDENTITY, "matters"));
+        assert!(!is_allowed_restore_path("notes/todo.md", "matters"));
+        assert!(!is_allowed_restore_path(
+            "matters/demo/note.md",
+            "client/matters"
+        ));
+        assert!(is_allowed_restore_path(
+            "client/matters/demo/note.md",
+            "client/matters"
+        ));
     }
 }

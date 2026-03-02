@@ -59,7 +59,10 @@ clawyer backup restore --input /path/to/backup.clawyerbak --apply
 Restore apply replays:
 
 - settings
-- workspace files (path safety and protected identity-file guards apply)
+- workspace files under legal restore scope:
+  - configured `legal.matter_root/**`
+  - `conflicts.json`
+  - protected identity files only when identity-file protection is explicitly disabled
 - idempotent legal DB entities: clients, matters, templates
 
 Other legal DB entities are preserved in the backup and currently require manual migration/replay.
