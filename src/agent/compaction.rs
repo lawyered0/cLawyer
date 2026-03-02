@@ -370,6 +370,7 @@ fn workspace_compaction_path(date: &str, scope: Option<&MatterCompactionScope>) 
 mod tests {
     use super::*;
     use crate::agent::session::Thread;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     #[test]
@@ -407,5 +408,79 @@ mod tests {
     fn compaction_path_falls_back_to_daily_without_scope() {
         let path = workspace_compaction_path("2026-03-01", None);
         assert_eq!(path, "daily/2026-03-01.md");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn compaction_writes_to_matter_sessions_path_with_libsql_workspace() {
+        use crate::agent::context_monitor::CompactionStrategy;
+        use crate::config::SafetyConfig;
+        use crate::safety::SafetyLayer;
+        use crate::testing::{StubLlm, test_db};
+        use crate::workspace::Workspace;
+
+        let (db, _tmp) = test_db().await;
+        let workspace = Workspace::new_with_db("test-user", Arc::clone(&db));
+
+        let mut thread = Thread::new(Uuid::new_v4());
+        thread.start_turn("First user turn");
+        thread.complete_turn("First assistant response");
+        thread.start_turn("Second user turn");
+        thread.complete_turn("Second assistant response");
+
+        let compactor = ContextCompactor::new(
+            Arc::new(StubLlm::new("Matter-scoped summary")),
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled: true,
+            })),
+        );
+        let scope = MatterCompactionScope {
+            matter_root: "matters".to_string(),
+            matter_id: "Demo Matter".to_string(),
+        };
+
+        let result = compactor
+            .compact(
+                &mut thread,
+                CompactionStrategy::Summarize { keep_recent: 1 },
+                Some(&workspace),
+                Some(&scope),
+            )
+            .await
+            .expect("compaction should succeed");
+        assert!(
+            result.summary_written,
+            "summary should be written to workspace"
+        );
+
+        let entries = workspace
+            .list("matters/demo-matter/sessions")
+            .await
+            .expect("matter sessions directory should exist");
+        assert!(
+            !entries.is_empty(),
+            "expected at least one sessions artifact under matter scope"
+        );
+        let summary_entry = entries
+            .iter()
+            .find(|entry| !entry.is_directory)
+            .expect("expected a summary file in sessions directory");
+        assert!(
+            summary_entry
+                .path
+                .starts_with("matters/demo-matter/sessions/"),
+            "unexpected summary path: {}",
+            summary_entry.path
+        );
+
+        let summary_file = workspace
+            .read(&summary_entry.path)
+            .await
+            .expect("summary file should be readable");
+        assert!(
+            summary_file.content.contains("Matter-scoped summary"),
+            "summary content should come from compactor output"
+        );
     }
 }
