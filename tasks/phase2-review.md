@@ -67,3 +67,44 @@ calling the DB, so concurrent callers also get a clean failure.
 - Trust balance atomicity confirmed correct (advisory lock + `FOR UPDATE`)
 
 ### Final gate (1691 passed, 0 failed, 1 ignored)
+
+## Simplify Pass — thread_ops.rs + matter.rs
+
+Reviewed at commit `db3f1b35d` (codex/matter-scoped-conversations-v1).
+Focus: isolation enforcement accumulation in `thread_ops.rs`; loader/sanitize/truncate
+behavior in `matter.rs`.
+
+### Findings fixed
+
+**P1 — Lock contention in web chat handlers (`server.rs:1043`, `server.rs:1181`)**
+`chat_threads_handler` and `chat_new_thread_handler` held the session lock across async
+DB calls, increasing contention and latency under concurrent chat traffic.
+Fix: narrowed lock scope; DB work moved outside the critical section.
+
+**P2 — Matter-ID parsing/sanitization duplication (`policy.rs:104`, `policy.rs:115`)**
+Repeated ad-hoc sanitization logic across modules increased drift risk.
+Fix: consolidated into shared helpers in `policy.rs`, reused in all agent and web paths.
+
+**P2 — Redundant control flow in matter-scope enforcement (`thread_ops.rs:191`)**
+Duplicate mismatch/bound audit blocks and duplicated error formatting caused
+branch proliferation.
+Fix: refactored to shared helpers for clearer flow and less branch duplication.
+
+**P3 — Redundant DB message persistence logic (`thread_ops.rs:644`)**
+User/assistant persistence duplicated an ensure-then-insert flow in two call sites.
+Fix: unified via a shared helper.
+
+**P3 — Repeated workspace "write-if-missing" pattern + sequential curated-file reads
+(`matter.rs:344`, `matter.rs:386`)**
+Curated file loads were sequential; the write-if-missing check was copy-pasted.
+Fix: introduced a reusable writer; parallelized 4-file curated-load path via
+`tokio::join!`.
+
+### No new blocking bugs found after this pass in the changed paths.
+
+### Gate (simplify pass)
+| Check | Result |
+|-------|--------|
+| cargo fmt --all -- --check | ✅ |
+| cargo clippy --all-features --all-targets | ✅ 0 warnings |
+| cargo test -- --test-threads=1 | ✅ 1713 passed, 0 failed, 1 ignored |
