@@ -2864,6 +2864,37 @@ impl BillingStore for PgBackend {
         Ok((invoice_record, persisted_items))
     }
 
+    async fn list_invoices(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+    ) -> Result<Vec<InvoiceRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = if let Some(matter_id) = matter_id {
+            conn.query(
+                "SELECT id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at \
+                 FROM invoices \
+                 WHERE user_id = $1 AND matter_id = $2 \
+                 ORDER BY created_at ASC, id ASC",
+                &[&user_id, &matter_id],
+            )
+            .await?
+        } else {
+            conn.query(
+                "SELECT id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at \
+                 FROM invoices \
+                 WHERE user_id = $1 \
+                 ORDER BY created_at ASC, id ASC",
+                &[&user_id],
+            )
+            .await?
+        };
+
+        rows.into_iter()
+            .map(|row| row_to_invoice_record(&row))
+            .collect()
+    }
+
     async fn get_invoice(
         &self,
         user_id: &str,

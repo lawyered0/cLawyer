@@ -14,6 +14,7 @@ let jobEvents = new Map(); // job_id -> Array of events
 let jobListRefreshTimer = null;
 const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
+let lastBackupId = null;
 
 function byId(id) {
   return document.getElementById(id);
@@ -161,6 +162,9 @@ bindClick('auth-connect-btn', authenticate);
   bindClick('mcp-install-btn', addMcpServer);
   bindClick('skill-search-btn', searchClawHub);
   bindClick('skill-install-btn', installSkillFromForm);
+  bindClick('backups-create-btn', createBackup);
+  bindClick('backups-verify-btn', verifyLastBackup);
+  bindClick('backups-restore-btn', triggerBackupRestoreInput);
   bindClick('matters-clear-btn', clearActiveMatter);
   bindClick('legal-audit-refresh-btn', function() { loadLegalAudit(0); });
   bindClick('legal-audit-prev-btn', function() {
@@ -243,6 +247,10 @@ bindClick('auth-connect-btn', authenticate);
     }
     if (action === 'build-filing-package') {
       buildMatterFilingPackage();
+      return;
+    }
+    if (action === 'export-retrieval-packet') {
+      exportMatterRetrievalPacket(false);
     }
   });
   delegate(byId('legal-audit-list'), 'click', 'button[data-audit-index]', function(e, button) {
@@ -4202,6 +4210,7 @@ function renderMatterDetail() {
   html += '<h4>' + escapeHtml(selectedMatterId) + '</h4>';
   html += '<div class="matter-detail-header-actions">';
   html += '<button data-matter-detail-action="open-doc" data-path="' + escapeHtml('matters/' + selectedMatterId + '/matter.yaml') + '">Open matter.yaml</button>';
+  html += '<button data-matter-detail-action="export-retrieval-packet">Export AI Packet</button>';
   html += '<button data-matter-detail-action="build-filing-package">Build Filing Package</button>';
   html += '</div>';
   html += '</div>';
@@ -4390,6 +4399,29 @@ function buildMatterFilingPackage() {
     openMatterDetail(selectedMatterId);
   }).catch(function (err) {
     showToast('Failed to build filing package: ' + err.message, 'error');
+  });
+}
+
+function exportMatterRetrievalPacket(unredacted) {
+  if (!selectedMatterId) return;
+  apiFetch('/api/matters/' + encodeURIComponent(selectedMatterId) + '/exports/retrieval-packet', {
+    method: 'POST',
+    body: { unredacted: !!unredacted },
+  }).then(function(data) {
+    if (!data || !Array.isArray(data.files)) {
+      showToast('Retrieval export created, but response is missing files list.', 'error');
+      return;
+    }
+    showToast('Matter AI packet created (' + data.files.length + ' files)', 'success');
+    if (data.warning) {
+      showToast(data.warning, 'error');
+    }
+    if (data.files.length > 0) {
+      openMatterPathInMemory(data.files[0]);
+    }
+    openMatterDetail(selectedMatterId);
+  }).catch(function(err) {
+    showToast('Failed to export AI packet: ' + err.message, 'error');
   });
 }
 
@@ -5029,6 +5061,119 @@ function importSettings(file) {
   reader.readAsText(file);
 }
 
+function renderBackupResult(lines, tone) {
+  var container = document.getElementById('backups-last-result');
+  if (!container) return;
+  container.textContent = lines.join('\n');
+  container.style.color = tone === 'error' ? 'var(--error)' : 'var(--text-secondary)';
+}
+
+function createBackup() {
+  renderBackupResult(['Creating encrypted backup…'], 'normal');
+  apiFetch('/api/backups/create', {
+    method: 'POST',
+    body: { include_ai_packets: false },
+  }).then(function(data) {
+    var artifact = data && data.artifact ? data.artifact : null;
+    if (!artifact) throw new Error('Backup create response missing artifact');
+    lastBackupId = artifact.id;
+    var lines = [
+      'Backup created',
+      'id: ' + artifact.id,
+      'path: ' + artifact.path,
+      'size: ' + artifact.size_bytes + ' bytes',
+      'sha256: ' + artifact.plaintext_sha256,
+    ];
+    if (Array.isArray(data.warnings) && data.warnings.length) {
+      lines.push('warnings:');
+      for (var i = 0; i < data.warnings.length; i++) {
+        lines.push('- ' + data.warnings[i]);
+      }
+    }
+    renderBackupResult(lines, 'normal');
+    showToast('Backup created: ' + artifact.id, 'success');
+
+    var a = document.createElement('a');
+    a.href = '/api/backups/' + encodeURIComponent(artifact.id) + '/download?token=' + encodeURIComponent(token);
+    a.download = artifact.id + '.clawyerbak';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }).catch(function(err) {
+    renderBackupResult(['Backup creation failed', String(err.message || err)], 'error');
+    showToast('Backup creation failed: ' + err.message, 'error');
+  });
+}
+
+function verifyLastBackup() {
+  if (!lastBackupId) {
+    showToast('Create a backup first or restore one before verify.', 'error');
+    return;
+  }
+  renderBackupResult(['Verifying backup ' + lastBackupId + '…'], 'normal');
+  apiFetch('/api/backups/verify', {
+    method: 'POST',
+    body: { backup_id: lastBackupId },
+  }).then(function(data) {
+    var lines = [
+      'Backup verification: ' + (data.valid ? 'PASS' : 'FAIL'),
+      'backup_id: ' + lastBackupId,
+    ];
+    if (Array.isArray(data.warnings) && data.warnings.length) {
+      lines.push('warnings:');
+      for (var i = 0; i < data.warnings.length; i++) {
+        lines.push('- ' + data.warnings[i]);
+      }
+    }
+    renderBackupResult(lines, data.valid ? 'normal' : 'error');
+    showToast(data.valid ? 'Backup verification passed' : 'Backup verification failed', data.valid ? 'success' : 'error');
+  }).catch(function(err) {
+    renderBackupResult(['Backup verify failed', String(err.message || err)], 'error');
+    showToast('Backup verify failed: ' + err.message, 'error');
+  });
+}
+
+function triggerBackupRestoreInput() {
+  var input = document.getElementById('backups-restore-file');
+  if (!input) return;
+  input.click();
+}
+
+function restoreBackupFromFile(file, apply) {
+  if (!file) return;
+  var mode = apply ? 'apply' : 'dry-run';
+  renderBackupResult(['Running backup restore (' + mode + ') for ' + file.name + '…'], 'normal');
+
+  var form = new FormData();
+  form.append('file', file);
+  form.append('apply', apply ? 'true' : 'false');
+  form.append('protect_identity_files', 'true');
+
+  apiFetch('/api/backups/restore', {
+    method: 'POST',
+    body: form,
+  }).then(function(data) {
+    var lines = [
+      'Backup restore complete',
+      'mode: ' + (data.applied ? 'APPLIED' : 'DRY-RUN'),
+      'restored settings: ' + data.restored_settings,
+      'restored workspace files: ' + data.restored_workspace_files,
+      'skipped workspace files: ' + data.skipped_workspace_files,
+    ];
+    if (Array.isArray(data.warnings) && data.warnings.length) {
+      lines.push('warnings:');
+      for (var i = 0; i < data.warnings.length; i++) {
+        lines.push('- ' + data.warnings[i]);
+      }
+    }
+    renderBackupResult(lines, 'normal');
+    showToast(data.applied ? 'Backup restore applied' : 'Backup restore dry-run complete', 'success');
+  }).catch(function(err) {
+    renderBackupResult(['Backup restore failed', String(err.message || err)], 'error');
+    showToast('Backup restore failed: ' + err.message, 'error');
+  });
+}
+
 // Wire up Settings action buttons after DOM is ready
 document.addEventListener('DOMContentLoaded', function() {
   var addBtn = document.getElementById('settings-add-btn');
@@ -5045,6 +5190,17 @@ document.addEventListener('DOMContentLoaded', function() {
       if (importFile.files && importFile.files[0]) {
         importSettings(importFile.files[0]);
         importFile.value = '';
+      }
+    });
+  }
+
+  var backupRestoreFile = document.getElementById('backups-restore-file');
+  if (backupRestoreFile) {
+    backupRestoreFile.addEventListener('change', function() {
+      if (backupRestoreFile.files && backupRestoreFile.files[0]) {
+        var apply = confirm('Apply restore changes now? Click Cancel to run dry-run only.');
+        restoreBackupFromFile(backupRestoreFile.files[0], apply);
+        backupRestoreFile.value = '';
       }
     });
   }

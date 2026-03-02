@@ -106,6 +106,26 @@ For web-first firm workflows, matter detail now includes:
   - server-hard-gated on conflict hits: `clear`/`waived` can proceed, `declined` blocks creation and records clearance.
 - `POST /api/matters/conflicts/reindex`
   - rebuilds DB conflict graph from `matters/*/matter.yaml` plus workspace `conflicts.json`.
+- `POST /api/matters/{id}/exports/retrieval-packet`
+  - generates matter-local CSV + plain-English retrieval artifacts for AI workflows under `matters/<id>/exports/retrieval/<timestamp>/`.
+
+## Backup and Recovery APIs
+
+- `POST /api/backups/create`
+  - creates encrypted full-system backup bundles.
+- `POST /api/backups/verify`
+  - validates backup integrity and decryptability.
+- `POST /api/backups/restore`
+  - multipart upload restore endpoint; dry-run by default, apply mode explicit.
+- `GET /api/backups/{id}/download`
+  - downloads a stored backup artifact by ID.
+
+CLI parity:
+
+- `clawyer backup create`
+- `clawyer backup verify`
+- `clawyer backup restore`
+- `clawyer backup export-matter`
 
 ## Conflict Check Limits
 

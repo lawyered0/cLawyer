@@ -4004,3 +4004,14 @@ mark {
   display: flex;
   gap: 8px;
 }
+
+.backups-result {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+}

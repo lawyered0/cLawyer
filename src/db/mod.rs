@@ -1574,6 +1574,11 @@ pub trait BillingStore: Send + Sync {
         invoice: &CreateInvoiceParams,
         line_items: &[CreateInvoiceLineItemParams],
     ) -> Result<(InvoiceRecord, Vec<InvoiceLineItemRecord>), DatabaseError>;
+    async fn list_invoices(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+    ) -> Result<Vec<InvoiceRecord>, DatabaseError>;
     async fn get_invoice(
         &self,
         user_id: &str,

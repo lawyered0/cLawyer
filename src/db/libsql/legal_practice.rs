@@ -2322,6 +2322,39 @@ impl BillingStore for LibSqlBackend {
         }
     }
 
+    async fn list_invoices(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+    ) -> Result<Vec<InvoiceRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = if let Some(matter_id) = matter_id {
+            conn.query(
+                "SELECT id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at \
+                 FROM invoices \
+                 WHERE user_id = ?1 AND matter_id = ?2 \
+                 ORDER BY created_at ASC, id ASC",
+                params![user_id, matter_id],
+            )
+            .await?
+        } else {
+            conn.query(
+                "SELECT id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at \
+                 FROM invoices \
+                 WHERE user_id = ?1 \
+                 ORDER BY created_at ASC, id ASC",
+                params![user_id],
+            )
+            .await?
+        };
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row_to_invoice_record(&row)?);
+        }
+        Ok(out)
+    }
+
     async fn get_invoice(
         &self,
         user_id: &str,

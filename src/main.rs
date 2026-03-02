@@ -18,8 +18,8 @@ use clawyer::{
         web::log_layer::LogBroadcaster,
     },
     cli::{
-        Cli, Command, LegalProfileArg, run_mcp_command, run_pairing_command, run_service_command,
-        run_status_command, run_tool_command,
+        Cli, Command, LegalProfileArg, run_backup_command, run_mcp_command, run_pairing_command,
+        run_service_command, run_status_command, run_tool_command,
     },
     config::Config,
     hooks::bootstrap_hooks,
@@ -57,6 +57,10 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Config(config_cmd)) => {
             init_cli_tracing();
             return clawyer::cli::run_config_command(config_cmd.clone()).await;
+        }
+        Some(Command::Backup(backup_cmd)) => {
+            init_cli_tracing();
+            return run_backup_command(backup_cmd.clone()).await;
         }
         Some(Command::Registry(registry_cmd)) => {
             init_cli_tracing();
