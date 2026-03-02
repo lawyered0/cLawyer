@@ -2211,17 +2211,6 @@ async fn backfill_matter_templates_from_workspace(
     let Some(workspace) = state.workspace.as_ref() else {
         return Ok(());
     };
-    let existing = store
-        .list_document_templates(&state.user_id, Some(matter_id))
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    if existing
-        .iter()
-        .any(|template| template.matter_id.as_deref() == Some(matter_id))
-    {
-        return Ok(());
-    }
-
     let matter_root = matter_root_for_gateway(state);
     let templates = list_matter_templates(workspace.as_ref(), &matter_root, matter_id).await?;
     for template in templates {
@@ -2255,14 +2244,6 @@ async fn backfill_matter_documents_from_workspace(
     let Some(workspace) = state.workspace.as_ref() else {
         return Ok(());
     };
-
-    let existing = store
-        .list_matter_documents_db(&state.user_id, matter_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    if !existing.is_empty() {
-        return Ok(());
-    }
 
     let matter_prefix = matter_prefix_for_gateway(state, matter_id);
     let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, false).await?;
@@ -9951,6 +9932,156 @@ opened_at: 2026-02-28
         assert_eq!(resp.templates.len(), 2);
         assert_eq!(resp.templates[0].name, "chronology.md");
         assert_eq!(resp.templates[1].name, "research_memo.md");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_documents_backfill_incrementally_syncs_new_workspace_files() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let Json(initial) = matter_documents_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Query(MatterDocumentsQuery::default()),
+        )
+        .await
+        .expect("initial documents request should succeed");
+        assert!(
+            initial
+                .documents
+                .iter()
+                .any(|doc| doc.path == "matters/demo/notes.md")
+        );
+
+        workspace
+            .write(
+                "matters/demo/discovery/new-evidence.md",
+                "new evidence notes",
+            )
+            .await
+            .expect("seed new workspace document");
+
+        let Json(updated) = matter_documents_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Query(MatterDocumentsQuery::default()),
+        )
+        .await
+        .expect("updated documents request should succeed");
+        assert!(
+            updated
+                .documents
+                .iter()
+                .any(|doc| doc.path == "matters/demo/discovery/new-evidence.md")
+        );
+
+        let linked = db
+            .list_matter_documents_db("test-user", "demo")
+            .await
+            .expect("matter documents query");
+        assert!(
+            linked
+                .iter()
+                .any(|doc| doc.path == "matters/demo/discovery/new-evidence.md")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_templates_backfill_incrementally_syncs_new_workspace_templates() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let Json(initial) =
+            matter_templates_handler(State(Arc::clone(&state)), Path("demo".to_string()))
+                .await
+                .expect("initial templates request should succeed");
+        assert_eq!(initial.templates.len(), 2);
+
+        workspace
+            .write(
+                "matters/demo/templates/witness_outline.md",
+                "# Witness Outline Template\n",
+            )
+            .await
+            .expect("seed new workspace template");
+
+        let Json(updated) =
+            matter_templates_handler(State(Arc::clone(&state)), Path("demo".to_string()))
+                .await
+                .expect("updated templates request should succeed");
+        assert!(
+            updated
+                .templates
+                .iter()
+                .any(|template| template.name == "witness_outline.md")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matters_documents_backfill_does_not_duplicate_initial_versions() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+        let _ = matter_documents_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Query(MatterDocumentsQuery::default()),
+        )
+        .await
+        .expect("first documents request should succeed");
+
+        workspace
+            .write(
+                "matters/demo/discovery/new-evidence.md",
+                "new evidence notes",
+            )
+            .await
+            .expect("seed new workspace document");
+
+        let _ = matter_documents_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Query(MatterDocumentsQuery::default()),
+        )
+        .await
+        .expect("second documents request should succeed");
+
+        let _ = matter_documents_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Query(MatterDocumentsQuery::default()),
+        )
+        .await
+        .expect("third documents request should succeed");
+
+        let docs = db
+            .list_matter_documents_db("test-user", "demo")
+            .await
+            .expect("matter documents query");
+        for doc in docs {
+            let versions = db
+                .list_document_versions("test-user", doc.id)
+                .await
+                .expect("document versions query");
+            assert_eq!(
+                versions.len(),
+                1,
+                "document {} should have exactly one initial version",
+                doc.path
+            );
+        }
     }
 
     #[cfg(feature = "libsql")]
