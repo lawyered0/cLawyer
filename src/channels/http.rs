@@ -252,20 +252,12 @@ async fn process_message(
         None
     };
 
-    // Send message to the channel
-    let tx_guard = state.tx.read().await;
-    if let Some(tx) = tx_guard.as_ref() {
-        if tx.send(msg).await.is_err() {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(WebhookResponse {
-                    message_id: msg_id,
-                    status: "error".to_string(),
-                    response: Some("Channel closed".to_string()),
-                }),
-            );
+    // Clone sender under lock, then release lock before awaiting send.
+    let tx = state.tx.read().await.as_ref().cloned();
+    let Some(tx) = tx else {
+        if wait_for_response {
+            let _ = state.pending_responses.write().await.remove(&msg_id);
         }
-    } else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(WebhookResponse {
@@ -274,8 +266,20 @@ async fn process_message(
                 response: Some("Channel not started".to_string()),
             }),
         );
+    };
+    if tx.send(msg).await.is_err() {
+        if wait_for_response {
+            let _ = state.pending_responses.write().await.remove(&msg_id);
+        }
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(WebhookResponse {
+                message_id: msg_id,
+                status: "error".to_string(),
+                response: Some("Channel closed".to_string()),
+            }),
+        );
     }
-    drop(tx_guard);
 
     // Wait for response if requested
     let response = if let Some(rx) = response_rx {
@@ -289,7 +293,9 @@ async fn process_message(
     };
 
     // Ensure pending response entry is cleaned up on timeout or cancellation
-    let _ = state.pending_responses.write().await.remove(&msg_id);
+    if wait_for_response {
+        let _ = state.pending_responses.write().await.remove(&msg_id);
+    }
 
     (
         StatusCode::OK,
@@ -441,5 +447,27 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wait_for_response_cleanup_on_unstarted_channel() {
+        let channel = test_channel(None);
+        let app = channel.routes();
+
+        let body = serde_json::json!({
+            "content": "hello",
+            "wait_for_response": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhook")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let pending = channel.state.pending_responses.read().await;
+        assert!(pending.is_empty(), "pending responses must be cleaned up");
     }
 }

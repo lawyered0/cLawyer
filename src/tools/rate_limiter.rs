@@ -26,6 +26,8 @@ use crate::tools::tool::ToolRateLimitConfig;
 
 const MINUTE_SECS: u64 = 60;
 const HOUR_SECS: u64 = 3600;
+const STALE_ENTRY_PRUNE_SECS: u64 = HOUR_SECS * 2;
+const RATE_LIMIT_STATE_SOFT_CAP: usize = 4096;
 
 /// Result of a rate limit check.
 #[derive(Debug, Clone)]
@@ -107,6 +109,7 @@ impl WindowState {
 struct ToolRateLimitState {
     minute_window: WindowState,
     hour_window: WindowState,
+    last_seen: Instant,
 }
 
 impl ToolRateLimitState {
@@ -114,6 +117,7 @@ impl ToolRateLimitState {
         Self {
             minute_window: WindowState::new(),
             hour_window: WindowState::new(),
+            last_seen: Instant::now(),
         }
     }
 }
@@ -146,7 +150,11 @@ impl RateLimiter {
         let key = (user_id.to_string(), tool_name.to_string());
 
         let mut state = self.state.write().await;
+        if state.len() > RATE_LIMIT_STATE_SOFT_CAP {
+            state.retain(|_, entry| entry.last_seen.elapsed().as_secs() < STALE_ENTRY_PRUNE_SECS);
+        }
         let tool_state = state.entry(key).or_insert_with(ToolRateLimitState::new);
+        tool_state.last_seen = Instant::now();
 
         // Reset windows if expired.
         tool_state
@@ -383,6 +391,37 @@ mod tests {
 
         let result2 = limiter.check_and_record("user1", "shell", &config).await;
         assert!(result2.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_prunes_stale_entries_after_soft_cap() {
+        let limiter = RateLimiter::new();
+        {
+            let mut state = limiter.state.write().await;
+            for i in 0..(RATE_LIMIT_STATE_SOFT_CAP + 10) {
+                state.insert(
+                    (format!("stale-user-{i}"), "shell".to_string()),
+                    ToolRateLimitState {
+                        minute_window: WindowState::new(),
+                        hour_window: WindowState::new(),
+                        last_seen: Instant::now()
+                            - Duration::from_secs(STALE_ENTRY_PRUNE_SECS + 10),
+                    },
+                );
+            }
+        }
+
+        let config = ToolRateLimitConfig::new(10, 100);
+        let _ = limiter
+            .check_and_record("fresh-user", "shell", &config)
+            .await;
+
+        let state = limiter.state.read().await;
+        assert!(
+            state.len() <= 2,
+            "stale entries should be pruned when state exceeds soft cap"
+        );
+        assert!(state.contains_key(&("fresh-user".to_string(), "shell".to_string())));
     }
 
     #[tokio::test]

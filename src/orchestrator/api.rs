@@ -33,6 +33,35 @@ pub struct PendingPrompt {
     pub done: bool,
 }
 
+/// Maximum queued follow-up prompts per job.
+pub const MAX_QUEUED_PROMPTS_PER_JOB: usize = 128;
+
+/// Add a pending prompt to a job queue with a hard per-job cap.
+pub fn enqueue_pending_prompt(
+    queue: &mut HashMap<Uuid, VecDeque<PendingPrompt>>,
+    job_id: Uuid,
+    prompt: PendingPrompt,
+) -> Result<(), &'static str> {
+    let prompts = queue.entry(job_id).or_default();
+    if prompts.len() >= MAX_QUEUED_PROMPTS_PER_JOB {
+        return Err("Too many queued prompts for this job");
+    }
+    prompts.push_back(prompt);
+    Ok(())
+}
+
+/// Pop the next prompt for a job and remove empty queue entries.
+pub fn pop_pending_prompt(
+    queue: &mut HashMap<Uuid, VecDeque<PendingPrompt>>,
+    job_id: Uuid,
+) -> Option<PendingPrompt> {
+    let prompt = queue.get_mut(&job_id).and_then(VecDeque::pop_front);
+    if queue.get(&job_id).is_some_and(VecDeque::is_empty) {
+        queue.remove(&job_id);
+    }
+    prompt
+}
+
 /// Shared state for the orchestrator API.
 #[derive(Clone)]
 pub struct OrchestratorState {
@@ -239,6 +268,9 @@ async fn report_complete(
         tracing::error!(job_id = %job_id, "Failed to complete job cleanup: {}", e);
     }
 
+    // Cleanup any queued follow-up prompts for finished job containers.
+    state.prompt_queue.lock().await.remove(&job_id);
+
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -355,9 +387,7 @@ async fn get_prompt_handler(
     Path(job_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     let mut queue = state.prompt_queue.lock().await;
-    if let Some(prompts) = queue.get_mut(&job_id)
-        && let Some(prompt) = prompts.pop_front()
-    {
+    if let Some(prompt) = pop_pending_prompt(&mut queue, job_id) {
         return Ok((
             StatusCode::OK,
             Json(serde_json::json!({
@@ -604,6 +634,62 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["content"], "What is the status?");
         assert_eq!(json["done"], false);
+    }
+
+    #[tokio::test]
+    async fn prompt_pop_removes_empty_queue_entry() {
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        let token = state.token_store.create_token(job_id).await;
+        {
+            let mut q = state.prompt_queue.lock().await;
+            q.entry(job_id).or_default().push_back(PendingPrompt {
+                content: "one".to_string(),
+                done: false,
+            });
+        }
+
+        let router = OrchestratorApi::router(state.clone());
+        let req = Request::builder()
+            .uri(format!("/worker/{}/prompt", job_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let q = state.prompt_queue.lock().await;
+        assert!(
+            !q.contains_key(&job_id),
+            "empty queue entry should be removed after pop"
+        );
+    }
+
+    #[test]
+    fn enqueue_pending_prompt_enforces_per_job_cap() {
+        let job_id = Uuid::new_v4();
+        let mut queue = HashMap::<Uuid, VecDeque<PendingPrompt>>::new();
+        for i in 0..MAX_QUEUED_PROMPTS_PER_JOB {
+            let res = enqueue_pending_prompt(
+                &mut queue,
+                job_id,
+                PendingPrompt {
+                    content: format!("prompt-{i}"),
+                    done: false,
+                },
+            );
+            assert!(res.is_ok());
+        }
+
+        let overflow = enqueue_pending_prompt(
+            &mut queue,
+            job_id,
+            PendingPrompt {
+                content: "overflow".to_string(),
+                done: false,
+            },
+        );
+        assert!(overflow.is_err());
     }
 
     // -- Credentials handler tests --

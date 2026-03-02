@@ -6553,7 +6553,8 @@ async fn jobs_prompt_handler(
 
     {
         let mut queue = prompt_queue.lock().await;
-        queue.entry(job_id).or_default().push_back(prompt);
+        crate::orchestrator::api::enqueue_pending_prompt(&mut queue, job_id, prompt)
+            .map_err(|msg| (StatusCode::TOO_MANY_REQUESTS, msg.to_string()))?;
     }
 
     Ok(Json(serde_json::json!({
