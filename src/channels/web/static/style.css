@@ -214,6 +214,7 @@ body {
   top: calc(100% + 6px);
   right: 0;
   min-width: 200px;
+  max-width: calc(100vw - 16px);
   background: var(--bg-secondary);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -223,6 +224,11 @@ body {
   flex-direction: column;
   gap: 2px;
   z-index: 120;
+}
+
+.tab-overflow-menu.floating {
+  position: fixed;
+  right: auto;
 }
 
 .tab-overflow-menu button {
@@ -982,9 +988,16 @@ body {
 }
 
 /* Chat active matter banner */
+.chat-active-matter-slot {
+  min-height: 40px;
+  padding: 0 16px 8px;
+  display: flex;
+  align-items: flex-end;
+}
+
 .chat-active-matter-banner {
-  width: calc(100% - 32px);
-  margin: 0 16px 8px;
+  width: 100%;
+  margin: 0;
   padding: 8px 10px;
   border-radius: var(--radius);
   border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
@@ -3367,6 +3380,13 @@ mark {
     padding: 8px 12px;
     font-size: 13px;
     white-space: nowrap;
+  }
+
+  .tab-overflow-menu.floating {
+    left: 8px !important;
+    right: 8px !important;
+    width: auto;
+    max-width: none;
   }
 
   /* Chat messages: wider */

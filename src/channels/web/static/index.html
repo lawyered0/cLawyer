@@ -79,9 +79,11 @@
       <div class="chat-container">
         <div class="chat-messages" id="chat-messages"></div>
         <div class="chat-status" id="chat-status"></div>
-        <button class="chat-active-matter-banner is-hidden" id="chat-active-matter-banner" type="button" title="Open Matters">
-          Active matter: <span id="chat-active-matter-label"></span>
-        </button>
+        <div class="chat-active-matter-slot">
+          <button class="chat-active-matter-banner is-hidden" id="chat-active-matter-banner" type="button" title="Open Matters">
+            Active matter: <span id="chat-active-matter-label"></span>
+          </button>
+        </div>
         <div class="chat-input">
           <textarea id="chat-input" placeholder="Type a message..." rows="1"></textarea>
           <button id="send-btn" type="button">Send</button>
@@ -369,7 +371,7 @@
   </div>
 
   <div class="configure-overlay is-hidden" id="matter-create-modal">
-    <div class="configure-modal matter-create-modal" role="dialog" aria-modal="true" aria-labelledby="matter-create-modal-title">
+    <div class="configure-modal matter-create-modal" role="dialog" aria-modal="true" aria-labelledby="matter-create-modal-title" tabindex="-1">
       <div class="matter-create-modal-header">
         <h3 id="matter-create-modal-title">Create Matter</h3>
         <button type="button" id="matter-create-modal-close" class="btn-ext">Close</button>
