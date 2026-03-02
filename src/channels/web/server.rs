@@ -862,6 +862,34 @@ struct HistoryQuery {
     before: Option<String>,
 }
 
+const CHAT_HISTORY_DEFAULT_LIMIT: usize = 50;
+const CHAT_HISTORY_MIN_LIMIT: usize = 1;
+const CHAT_HISTORY_MAX_LIMIT: usize = 200;
+
+fn build_turns_from_session_thread(thread: &crate::agent::session::Thread) -> Vec<TurnInfo> {
+    thread
+        .turns
+        .iter()
+        .map(|t| TurnInfo {
+            turn_number: t.turn_number,
+            user_input: t.user_input.clone(),
+            response: t.response.clone(),
+            state: format!("{:?}", t.state),
+            started_at: t.started_at.to_rfc3339(),
+            completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
+            tool_calls: t
+                .tool_calls
+                .iter()
+                .map(|tc| ToolCallInfo {
+                    name: tc.name.clone(),
+                    has_result: tc.result.is_some(),
+                    has_error: tc.error.is_some(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 async fn chat_history_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<HistoryQuery>,
@@ -872,9 +900,14 @@ async fn chat_history_handler(
     ))?;
 
     let session = session_manager.get_or_create_session(&state.user_id).await;
-    let sess = session.lock().await;
+    let limit = query.limit.unwrap_or(CHAT_HISTORY_DEFAULT_LIMIT);
+    if !(CHAT_HISTORY_MIN_LIMIT..=CHAT_HISTORY_MAX_LIMIT).contains(&limit) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'limit' must be between 1 and 200".to_string(),
+        ));
+    }
 
-    let limit = query.limit.unwrap_or(50);
     let before_cursor = query
         .before
         .as_deref()
@@ -890,13 +923,28 @@ async fn chat_history_handler(
         })
         .transpose()?;
 
-    // Find the thread
-    let thread_id = if let Some(ref tid) = query.thread_id {
-        Uuid::parse_str(tid)
-            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid thread_id".to_string()))?
-    } else {
-        sess.active_thread
-            .ok_or((StatusCode::NOT_FOUND, "No active thread".to_string()))?
+    let (thread_id, thread_exists_in_memory, in_memory_turns) = {
+        let sess = session.lock().await;
+        let thread_id = if let Some(ref tid) = query.thread_id {
+            Uuid::parse_str(tid)
+                .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid thread_id".to_string()))?
+        } else {
+            sess.active_thread
+                .ok_or((StatusCode::NOT_FOUND, "No active thread".to_string()))?
+        };
+        let in_memory_turns = if before_cursor.is_none() {
+            sess.threads
+                .get(&thread_id)
+                .filter(|thread| !thread.turns.is_empty())
+                .map(build_turns_from_session_thread)
+        } else {
+            None
+        };
+        (
+            thread_id,
+            sess.threads.contains_key(&thread_id),
+            in_memory_turns,
+        )
     };
 
     // Verify the thread belongs to the authenticated user before returning any data.
@@ -909,7 +957,7 @@ async fn chat_history_handler(
             .conversation_belongs_to_user(thread_id, &state.user_id)
             .await
             .unwrap_or(false);
-        if !owned && !sess.threads.contains_key(&thread_id) {
+        if !owned && !thread_exists_in_memory {
             return Err((StatusCode::NOT_FOUND, "Thread not found".to_string()));
         }
     }
@@ -934,31 +982,7 @@ async fn chat_history_handler(
     }
 
     // Try in-memory first (freshest data for active threads)
-    if let Some(thread) = sess.threads.get(&thread_id)
-        && !thread.turns.is_empty()
-    {
-        let turns: Vec<TurnInfo> = thread
-            .turns
-            .iter()
-            .map(|t| TurnInfo {
-                turn_number: t.turn_number,
-                user_input: t.user_input.clone(),
-                response: t.response.clone(),
-                state: format!("{:?}", t.state),
-                started_at: t.started_at.to_rfc3339(),
-                completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
-                tool_calls: t
-                    .tool_calls
-                    .iter()
-                    .map(|tc| ToolCallInfo {
-                        name: tc.name.clone(),
-                        has_result: tc.result.is_some(),
-                        has_error: tc.error.is_some(),
-                    })
-                    .collect(),
-            })
-            .collect();
-
+    if let Some(turns) = in_memory_turns {
         return Ok(Json(HistoryResponse {
             thread_id,
             turns,
@@ -8343,6 +8367,186 @@ mod tests {
             )
             .await
             .expect("seed notes document");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn chat_history_rejects_limit_zero() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_workspace_and_chat(db, workspace);
+
+        let session_manager = state
+            .session_manager
+            .as_ref()
+            .expect("session manager should exist")
+            .clone();
+        let session = session_manager.get_or_create_session("test-user").await;
+        let thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.id
+        };
+
+        let err = chat_history_handler(
+            State(state),
+            Query(HistoryQuery {
+                thread_id: Some(thread_id.to_string()),
+                limit: Some(0),
+                before: None,
+            }),
+        )
+        .await
+        .expect_err("limit=0 should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("between 1 and 200"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn chat_history_rejects_limit_above_max() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_workspace_and_chat(db, workspace);
+
+        let session_manager = state
+            .session_manager
+            .as_ref()
+            .expect("session manager should exist")
+            .clone();
+        let session = session_manager.get_or_create_session("test-user").await;
+        let thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.id
+        };
+
+        let err = chat_history_handler(
+            State(state),
+            Query(HistoryQuery {
+                thread_id: Some(thread_id.to_string()),
+                limit: Some(201),
+                before: None,
+            }),
+        )
+        .await
+        .expect_err("limit>200 should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("between 1 and 200"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn chat_history_supports_in_memory_and_db_only_threads() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_workspace_and_chat(Arc::clone(&db), workspace);
+
+        let session_manager = state
+            .session_manager
+            .as_ref()
+            .expect("session manager should exist")
+            .clone();
+        let session = session_manager.get_or_create_session("test-user").await;
+        let in_memory_thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("memory prompt");
+            thread.complete_turn("memory response");
+            thread.id
+        };
+
+        let db_only_thread_id = Uuid::new_v4();
+        db.ensure_conversation(db_only_thread_id, "gateway", "test-user", None)
+            .await
+            .expect("ensure db conversation");
+        db.add_conversation_message(db_only_thread_id, "user", "db prompt")
+            .await
+            .expect("seed db user message");
+        db.add_conversation_message(db_only_thread_id, "assistant", "db response")
+            .await
+            .expect("seed db assistant message");
+
+        let Json(in_memory_history) = chat_history_handler(
+            State(Arc::clone(&state)),
+            Query(HistoryQuery {
+                thread_id: None,
+                limit: Some(50),
+                before: None,
+            }),
+        )
+        .await
+        .expect("in-memory history request should succeed");
+        assert_eq!(in_memory_history.thread_id, in_memory_thread_id);
+        assert_eq!(in_memory_history.turns.len(), 1);
+        assert_eq!(in_memory_history.turns[0].user_input, "memory prompt");
+
+        let Json(db_history) = chat_history_handler(
+            State(state),
+            Query(HistoryQuery {
+                thread_id: Some(db_only_thread_id.to_string()),
+                limit: Some(50),
+                before: None,
+            }),
+        )
+        .await
+        .expect("db-only history request should succeed");
+        assert_eq!(db_history.thread_id, db_only_thread_id);
+        assert_eq!(db_history.turns.len(), 1);
+        assert_eq!(db_history.turns[0].user_input, "db prompt");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn chat_history_before_cursor_pagination_unchanged() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        let state = test_gateway_state_with_store_workspace_and_chat(Arc::clone(&db), workspace);
+
+        let thread_id = Uuid::new_v4();
+        db.ensure_conversation(thread_id, "gateway", "test-user", None)
+            .await
+            .expect("ensure db conversation");
+        for turn in 1..=3 {
+            db.add_conversation_message(thread_id, "user", &format!("turn-{turn}"))
+                .await
+                .expect("seed db user message");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            db.add_conversation_message(thread_id, "assistant", &format!("resp-{turn}"))
+                .await
+                .expect("seed db assistant message");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        let Json(first_page) = chat_history_handler(
+            State(Arc::clone(&state)),
+            Query(HistoryQuery {
+                thread_id: Some(thread_id.to_string()),
+                limit: Some(2),
+                before: None,
+            }),
+        )
+        .await
+        .expect("first page should succeed");
+        assert_eq!(first_page.turns.len(), 1);
+        assert_eq!(first_page.turns[0].user_input, "turn-3");
+        let before = first_page
+            .oldest_timestamp
+            .clone()
+            .expect("first page should include oldest timestamp cursor");
+
+        let Json(second_page) = chat_history_handler(
+            State(state),
+            Query(HistoryQuery {
+                thread_id: Some(thread_id.to_string()),
+                limit: Some(2),
+                before: Some(before),
+            }),
+        )
+        .await
+        .expect("second page should succeed");
+        assert_eq!(second_page.turns.len(), 1);
+        assert_eq!(second_page.turns[0].user_input, "turn-2");
     }
 
     #[cfg(feature = "libsql")]
