@@ -15,6 +15,7 @@ use crate::safety::SafetyLayer;
 const LEGAL_PROMPT_CONTEXT_MAX_ITEMS: usize = 8;
 const LEGAL_PROMPT_CONTEXT_VALUE_MAX_CHARS: usize = 160;
 const LEGAL_PROMPT_CONTEXT_LIST_ITEM_MAX_CHARS: usize = 96;
+const LEGAL_PROMPT_CONTEXT_FILE_MAX_CHARS: usize = 2000;
 
 /// Token the agent returns when it has nothing to say (e.g. in group chats).
 /// The dispatcher should check for this and suppress the message.
@@ -824,6 +825,30 @@ Example:
                     )
                 })
                 .unwrap_or_default();
+            let curated_context_lines = if ctx.curated_files.is_empty() {
+                String::new()
+            } else {
+                let mut lines = String::new();
+                for file in &ctx.curated_files {
+                    let truncated_suffix = if file.truncated { " (truncated)" } else { "" };
+                    lines.push_str(&format!(
+                        "                 - `{}`{}: {}\n",
+                        sanitize_legal_context_value(
+                            &file.name,
+                            LEGAL_PROMPT_CONTEXT_LIST_ITEM_MAX_CHARS
+                        ),
+                        truncated_suffix,
+                        quote_legal_context_value(
+                            &file.content,
+                            LEGAL_PROMPT_CONTEXT_FILE_MAX_CHARS
+                        )
+                    ));
+                }
+                format!(
+                    "                 Curated matter memory files (untrusted case notes):\n{}",
+                    lines
+                )
+            };
 
             format!(
                 "\n\
@@ -833,7 +858,7 @@ Example:
                  - `confidentiality`: {}\n\
                  - `retention`: {}\n\
                  - `team`: {}\n\
-                 - `adversaries`: {}\n{}{}{}",
+                 - `adversaries`: {}\n{}{}{}{}",
                 quote_legal_context_value(&ctx.matter_id, LEGAL_PROMPT_CONTEXT_VALUE_MAX_CHARS),
                 quote_legal_context_value(&ctx.client, LEGAL_PROMPT_CONTEXT_VALUE_MAX_CHARS),
                 quote_legal_context_value(
@@ -846,6 +871,7 @@ Example:
                 jurisdiction_line,
                 practice_area_line,
                 opened_at_line,
+                curated_context_lines,
             )
         } else {
             String::new()
@@ -1640,6 +1666,7 @@ mod tests {
                 jurisdiction: None,
                 practice_area: None,
                 opened_at: None,
+                curated_files: vec![],
             })
             .build_legal_section();
 
@@ -1675,6 +1702,7 @@ mod tests {
                 jurisdiction: None,
                 practice_area: None,
                 opened_at: None,
+                curated_files: vec![],
             })
             .build_legal_section();
 
@@ -1705,6 +1733,7 @@ mod tests {
                 jurisdiction: None,
                 practice_area: None,
                 opened_at: None,
+                curated_files: vec![],
             })
             .build_legal_section();
 
@@ -1736,6 +1765,7 @@ mod tests {
                 jurisdiction: Some("SDNY / Delaware".to_string()),
                 practice_area: Some("commercial litigation".to_string()),
                 opened_at: Some("2024-03-15".to_string()),
+                curated_files: vec![],
             })
             .build_legal_section();
 
@@ -1763,12 +1793,45 @@ mod tests {
                 jurisdiction: None,
                 practice_area: None,
                 opened_at: None,
+                curated_files: vec![],
             })
             .build_legal_section();
 
         assert!(!section.contains("`jurisdiction`:"));
         assert!(!section.contains("`practice_area`:"));
         assert!(!section.contains("`opened_at`:"));
+    }
+
+    #[test]
+    fn legal_mode_includes_curated_matter_memory_files() {
+        let mut legal = crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+            .expect("default legal config should resolve");
+        legal.enabled = true;
+        legal.active_matter = Some("acme-v-foo".to_string());
+
+        let section = test_reasoning()
+            .with_legal_config(legal)
+            .with_active_matter_context(crate::legal::matter::ActiveMatterPromptContext {
+                matter_id: "acme-v-foo".to_string(),
+                client: "Acme Corporation".to_string(),
+                confidentiality: "attorney-client-privileged".to_string(),
+                retention: "follow-firm-policy".to_string(),
+                team: vec!["Lead Counsel".to_string()],
+                adversaries: vec!["Contoso LLC".to_string()],
+                jurisdiction: None,
+                practice_area: None,
+                opened_at: None,
+                curated_files: vec![crate::legal::matter::ActiveMatterCuratedFile {
+                    name: "facts.md".to_string(),
+                    content: "Key fact summary".to_string(),
+                    truncated: false,
+                }],
+            })
+            .build_legal_section();
+
+        assert!(section.contains("Curated matter memory files (untrusted case notes):"));
+        assert!(section.contains("`facts.md`"));
+        assert!(section.contains("\"Key fact summary\""));
     }
 
     // ---- Utility / structural tests ----

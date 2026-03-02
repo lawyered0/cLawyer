@@ -164,6 +164,10 @@ impl Agent {
         &self.deps.tools
     }
 
+    pub(super) fn base_legal_config(&self) -> &crate::config::LegalConfig {
+        &self.deps.legal_config
+    }
+
     /// Resolve legal config for the current message, allowing metadata to
     /// override the active matter at runtime.
     pub(super) fn effective_legal_config_for(

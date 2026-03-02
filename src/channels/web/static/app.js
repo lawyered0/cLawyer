@@ -251,6 +251,14 @@ bindClick('auth-connect-btn', authenticate);
     }
     if (action === 'export-retrieval-packet') {
       exportMatterRetrievalPacket(false);
+      return;
+    }
+    if (action === 'open-thread') {
+      var threadId = button.getAttribute('data-thread-id');
+      if (threadId) {
+        switchTab('chat');
+        switchThread(threadId);
+      }
     }
   });
   delegate(byId('legal-audit-list'), 'click', 'button[data-audit-index]', function(e, button) {
@@ -3846,6 +3854,8 @@ var currentMatterTemplates = [];
 var currentMatterDashboard = null;
 /** Last loaded structured deadlines for selected matter. */
 var currentMatterDeadlines = [];
+/** Last loaded conversation threads bound to selected matter. */
+var currentMatterThreads = [];
 /** Persisted key for grouped matters rendering preference. */
 var MATTERS_GROUP_KEY = 'clawyer_matters_group_by_client';
 /** Grouping preference in Matters tab. */
@@ -4315,6 +4325,30 @@ function renderMatterDetail() {
   html += '</div>';
 
   html += '<div class="matter-detail-section">';
+  html += '<h5>Conversations</h5>';
+  if (!currentMatterThreads.length) {
+    html += '<div class="empty-state">No conversations bound to this matter yet.</div>';
+  } else {
+    html += '<div class="matter-item-list">';
+    for (var c = 0; c < currentMatterThreads.length; c++) {
+      var convo = currentMatterThreads[c];
+      var title = convo.title || ((convo.id || '').substring(0, 8));
+      var updated = convo.updated_at ? ('Updated: ' + convo.updated_at) : '';
+      var turns = 'Turns: ' + String(convo.turn_count || 0);
+      var meta = [turns, updated].filter(function(v) { return !!v; }).join(' • ');
+      html += '<div class="matter-item-row">';
+      html += '<div class="matter-item-main">';
+      html += '<span class="matter-item-path">' + escapeHtml(title) + '</span>';
+      html += '<span class="matter-item-meta">' + escapeHtml(meta) + '</span>';
+      html += '</div>';
+      html += '<button data-matter-detail-action="open-thread" data-thread-id="' + escapeHtml(convo.id) + '">Open in Chat</button>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="matter-detail-section">';
   html += '<h5>Templates</h5>';
   if (!currentMatterTemplates.length) {
     html += '<div class="empty-state">No templates found for this matter.</div>';
@@ -4342,6 +4376,7 @@ function openMatterDetail(id) {
   currentMatterTemplates = [];
   currentMatterDashboard = null;
   currentMatterDeadlines = [];
+  currentMatterThreads = [];
   renderMatters();
   renderMatterDetailPlaceholder('Loading detail for ' + id + '…');
 
@@ -4351,16 +4386,19 @@ function openMatterDetail(id) {
     apiFetch('/api/matters/' + encodeURIComponent(id) + '/dashboard'),
     apiFetch('/api/matters/' + encodeURIComponent(id) + '/deadlines'),
     apiFetch('/api/matters/' + encodeURIComponent(id) + '/templates'),
+    apiFetch('/api/chat/threads?matter_id=' + encodeURIComponent(id)),
   ]).then(function (results) {
     if (!isCurrentRequest('matterDetail', requestVersion)) return;
     var docsData = results[0];
     var dashboardData = results[1];
     var deadlinesData = results[2];
     var templatesData = results[3];
+    var threadsData = results[4];
     currentMatterDocuments = (docsData && docsData.documents) ? docsData.documents : [];
     currentMatterDashboard = dashboardData || null;
     currentMatterDeadlines = (deadlinesData && deadlinesData.deadlines) ? deadlinesData.deadlines : [];
     currentMatterTemplates = (templatesData && templatesData.templates) ? templatesData.templates : [];
+    currentMatterThreads = (threadsData && threadsData.threads) ? threadsData.threads : [];
     renderMatterDetail();
     renderMatters();
   }).catch(function (err) {

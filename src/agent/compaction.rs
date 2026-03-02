@@ -31,6 +31,13 @@ pub struct CompactionResult {
     pub summary: Option<String>,
 }
 
+/// Optional matter-bound destination for compaction artifacts.
+#[derive(Debug, Clone)]
+pub struct MatterCompactionScope {
+    pub matter_root: String,
+    pub matter_id: String,
+}
+
 /// Compacts conversation context to stay within limits.
 pub struct ContextCompactor {
     llm: Arc<dyn LlmProvider>,
@@ -49,20 +56,22 @@ impl ContextCompactor {
         thread: &mut Thread,
         strategy: CompactionStrategy,
         workspace: Option<&Workspace>,
+        matter_scope: Option<&MatterCompactionScope>,
     ) -> Result<CompactionResult, Error> {
         let messages = thread.messages();
         let tokens_before = ContextBreakdown::analyze(&messages).total_tokens;
 
         let result = match strategy {
             CompactionStrategy::Summarize { keep_recent } => {
-                self.compact_with_summary(thread, keep_recent, workspace)
+                self.compact_with_summary(thread, keep_recent, workspace, matter_scope)
                     .await?
             }
             CompactionStrategy::Truncate { keep_recent } => {
                 self.compact_truncate(thread, keep_recent)
             }
             CompactionStrategy::MoveToWorkspace => {
-                self.compact_to_workspace(thread, workspace).await?
+                self.compact_to_workspace(thread, workspace, matter_scope)
+                    .await?
             }
         };
 
@@ -84,6 +93,7 @@ impl ContextCompactor {
         thread: &mut Thread,
         keep_recent: usize,
         workspace: Option<&Workspace>,
+        matter_scope: Option<&MatterCompactionScope>,
     ) -> Result<CompactionPartial, Error> {
         if thread.turns.len() <= keep_recent {
             return Ok(CompactionPartial::empty());
@@ -103,11 +113,16 @@ impl ContextCompactor {
         }
 
         // Generate summary
-        let summary = self.generate_summary(&to_summarize).await?;
+        let summary = self
+            .generate_summary(&to_summarize, matter_scope.is_some())
+            .await?;
 
         // Write to workspace if available
         let summary_written = if let Some(ws) = workspace {
-            match self.write_summary_to_workspace(ws, &summary).await {
+            match self
+                .write_summary_to_workspace(ws, &summary, matter_scope)
+                .await
+            {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::warn!(
@@ -149,6 +164,7 @@ impl ContextCompactor {
         &self,
         thread: &mut Thread,
         workspace: Option<&Workspace>,
+        matter_scope: Option<&MatterCompactionScope>,
     ) -> Result<CompactionPartial, Error> {
         let Some(ws) = workspace else {
             // Fall back to truncation if no workspace
@@ -168,7 +184,10 @@ impl ContextCompactor {
         let content = format_turns_for_storage(old_turns);
 
         // Write to workspace
-        let written = match self.write_context_to_workspace(ws, &content).await {
+        let written = match self
+            .write_context_to_workspace(ws, &content, matter_scope)
+            .await
+        {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(
@@ -190,16 +209,36 @@ impl ContextCompactor {
     }
 
     /// Generate a summary of messages using the LLM.
-    async fn generate_summary(&self, messages: &[ChatMessage]) -> Result<String, Error> {
-        let prompt = ChatMessage::system(
-            r#"Summarize the following conversation concisely. Focus on:
+    async fn generate_summary(
+        &self,
+        messages: &[ChatMessage],
+        legal_mode: bool,
+    ) -> Result<String, Error> {
+        let prompt = if legal_mode {
+            ChatMessage::system(
+                r#"Summarize the following legal matter session in markdown.
+
+Use exactly these sections:
+- New Facts Learned
+- Documents Reviewed and Key Points
+- Decisions Made
+- Next Steps
+
+Requirements:
+- Keep statements evidence-grounded and concise.
+- If a section has no support in the transcript, write "insufficient evidence"."#,
+            )
+        } else {
+            ChatMessage::system(
+                r#"Summarize the following conversation concisely. Focus on:
 - Key decisions made
 - Important information exchanged
 - Actions taken
 - Outcomes achieved
 
 Be brief but capture all important details. Use bullet points."#,
-        );
+            )
+        };
 
         let mut request_messages = vec![prompt];
 
@@ -243,17 +282,17 @@ Be brief but capture all important details. Use bullet points."#,
         &self,
         workspace: &Workspace,
         summary: &str,
+        matter_scope: Option<&MatterCompactionScope>,
     ) -> Result<(), Error> {
-        let date = Utc::now().format("%Y-%m-%d");
+        let date = Utc::now().format("%Y-%m-%d").to_string();
         let entry = format!(
             "\n## Context Summary ({})\n\n{}\n",
             Utc::now().format("%H:%M UTC"),
             summary
         );
+        let target = workspace_compaction_path(&date, matter_scope);
 
-        workspace
-            .append(&format!("daily/{}.md", date), &entry)
-            .await?;
+        workspace.append(&target, &entry).await?;
         Ok(())
     }
 
@@ -262,17 +301,17 @@ Be brief but capture all important details. Use bullet points."#,
         &self,
         workspace: &Workspace,
         content: &str,
+        matter_scope: Option<&MatterCompactionScope>,
     ) -> Result<(), Error> {
-        let date = Utc::now().format("%Y-%m-%d");
+        let date = Utc::now().format("%Y-%m-%d").to_string();
         let entry = format!(
             "\n## Archived Context ({})\n\n{}\n",
             Utc::now().format("%H:%M UTC"),
             content
         );
+        let target = workspace_compaction_path(&date, matter_scope);
 
-        workspace
-            .append(&format!("daily/{}.md", date), &entry)
-            .await?;
+        workspace.append(&target, &entry).await?;
         Ok(())
     }
 }
@@ -316,6 +355,17 @@ fn format_turns_for_storage(turns: &[crate::agent::session::Turn]) -> String {
         .join("\n")
 }
 
+fn workspace_compaction_path(date: &str, scope: Option<&MatterCompactionScope>) -> String {
+    if let Some(scope) = scope {
+        let matter_root = scope.matter_root.trim_matches('/');
+        let matter_id = crate::legal::policy::sanitize_matter_id(&scope.matter_id);
+        if !matter_root.is_empty() && !matter_id.is_empty() {
+            return format!("{matter_root}/{matter_id}/sessions/{date}.md");
+        }
+    }
+    format!("daily/{date}.md")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +391,21 @@ mod tests {
         let partial = CompactionPartial::empty();
         assert_eq!(partial.turns_removed, 0);
         assert!(!partial.summary_written);
+    }
+
+    #[test]
+    fn compaction_path_uses_matter_scope_when_available() {
+        let scope = MatterCompactionScope {
+            matter_root: "matters".to_string(),
+            matter_id: "Acme v. Foo".to_string(),
+        };
+        let path = workspace_compaction_path("2026-03-01", Some(&scope));
+        assert_eq!(path, "matters/acme-v--foo/sessions/2026-03-01.md");
+    }
+
+    #[test]
+    fn compaction_path_falls_back_to_daily_without_scope() {
+        let path = workspace_compaction_path("2026-03-01", None);
+        assert_eq!(path, "daily/2026-03-01.md");
     }
 }

@@ -29,10 +29,21 @@
 1. Request enters preflight.
 2. cLawyer checks: active matter (for non-trivial legal requests), conflict list, tool approval policy, and domain allowlist.
 3. When active matter is set and metadata is valid, structured `matter.yaml` fields are injected into legal prompt context (`matter_id`, `client`, `confidentiality`, `retention`, `team`, `adversaries`, optional `jurisdiction`, optional `practice_area`, optional `opened_at`) as untrusted data.
-4. Sensitive tool calls are approval-gated in `max_lockdown`.
-5. Memory/file writes are scoped to `matters/<matter_id>/...` when matter context is required.
-6. Output is scanned for leakage and structured citation-format markers.
-7. Audit events are appended to JSONL with hash-chain links.
+4. cLawyer also injects curated matter memory files when present (`facts.md`, `parties.md`, `strategy.md`, `documents.md`) with strict sanitization/truncation.
+5. Sensitive tool calls are approval-gated in `max_lockdown`.
+6. Memory/file writes are scoped to `matters/<matter_id>/...` when matter context is required.
+7. Output is scanned for leakage and structured citation-format markers.
+8. Audit events are appended to JSONL with hash-chain links.
+
+## Matter-Bound Conversations
+
+- Legal conversations are now bound to one `matter_id` in persistence (`conversations.matter_id`).
+- If a thread is already bound to matter A, using it under matter B is blocked before LLM/tool execution.
+- Legacy conversations with `NULL matter_id` are lazily bound on first legal use with an active matter.
+- New threads created from the web gateway are pre-bound when `legal.active_matter` is set.
+- Compaction for bound conversations writes to `matters/<matter_id>/sessions/YYYY-MM-DD.md` (falls back to `daily/` when unbound).
+
+This prevents cross-matter context bleed by construction.
 
 ## Matter Model
 
@@ -150,6 +161,7 @@ CLI parity:
 
 - Self-repair stuck-job handling is still attempt-count based; time-threshold stuck detection is not implemented yet.
 - Conflict checks do not yet traverse `party_relationships` recursively for affiliate/corporate-family logic.
+- Per-matter encryption-at-rest for workspace files remains a follow-up phase.
 
 ## Bundled Legal Skills
 

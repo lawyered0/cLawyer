@@ -20,7 +20,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | WebSocket control plane | ✅ | ✅ | Gateway with WebSocket + SSE |
 | Single-user system | ✅ | ✅ | |
 | Multi-agent routing | ✅ | ❌ | Workspace isolation per-agent |
-| Session-based messaging | ✅ | ✅ | Per-sender sessions |
+| Session-based messaging | ✅ | ✅ | Per-sender sessions; legal mode now hard-binds conversations to a single matter |
 | Loopback-first networking | ✅ | ✅ | HTTP binds to 0.0.0.0 but can be configured |
 
 ### Owner: _Unassigned_
@@ -179,7 +179,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Session pruning | ✅ | ❌ | Auto cleanup old sessions |
 | Context compaction | ✅ | ✅ | Auto summarization |
 | Post-compaction read audit | ✅ | ❌ | Layer 3: workspace rules appended to summaries |
-| Post-compaction context injection | ✅ | ❌ | Workspace context as system event |
+| Post-compaction context injection | ✅ | 🚧 | Legal mode injects `matter.yaml` + curated matter files (`facts/parties/strategy/documents`); no dedicated system-event pipeline yet |
 | Custom system prompts | ✅ | ✅ | Template variables, safety guardrails |
 | Skills (modular capabilities) | ✅ | ✅ | Prompt-based skills with trust gating, attenuation, activation criteria, catalog, selector |
 | Skill routing blocks | ✅ | 🚧 | ActivationCriteria (keywords, patterns, tags) but no "Use when / Don't use when" blocks |
