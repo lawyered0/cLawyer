@@ -108,3 +108,43 @@ Fix: introduced a reusable writer; parallelized 4-file curated-load path via
 | cargo fmt --all -- --check | ✅ |
 | cargo clippy --all-features --all-targets | ✅ 0 warnings |
 | cargo test -- --test-threads=1 | ✅ 1713 passed, 0 failed, 1 ignored |
+
+## UI — Lawyer-Workflow IA Redesign
+
+Implemented at commit `e4210a1cd` (codex/ui-lawyer-workflow-ia-v1), PR #29.
+Scope: web gateway SPA only — no backend logic changes except `opened_date` field wiring.
+
+### Changes shipped
+
+**Navigation (index.html, app.js, style.css)**
+- Collapsed 9-tab bar to 4 primary tabs (Chat, Matters, Memory, Jobs) + overflow `···` menu
+  for Routines, Extensions, Skills, Settings; Logs moved under Settings
+
+**Matters tab (index.html, app.js, style.css)**
+- Sticky active-matter bar at top of tab
+- Conflict check promoted to a persistent quick-action strip (no longer buried below create form)
+- "Create Matter" converted from permanent form to modal, triggered by `+ New Matter` button
+- `opened_date` field uses `type="date"` (browser picker); Confidentiality/Retention use
+  `<select>` dropdowns with standard defaults and "Other…" escape hatch
+
+**Chat tab (index.html, app.js, style.css)**
+- Active-matter banner above chat input showing matter-id · practice area · jurisdiction
+- Thread sidebar: removed "Assistant" fixed entry and "Conversations" header; single flat list
+- New thread button labeled "New thread" with Ctrl/Cmd+N tooltip
+
+**Backend (types.rs, server.rs, matter.rs, reasoning.rs)**
+- `opened_date` field wired through POST /api/matters, GET /api/matters, matter.yaml,
+  and legal prompt context
+
+**Docs (LEGAL_PROFILE.md)**
+- Schema and behavior updated to match
+
+**Polish (inline-style cleanup)**
+- Inline `style=""` show/hide attributes moved to CSS classes across all panels
+
+### Gate (UI pass)
+| Check | Result |
+|-------|--------|
+| cargo fmt --all -- --check | ✅ |
+| cargo clippy --all-features --all-targets | ✅ 0 warnings |
+| cargo test -- --test-threads=1 | ✅ 1713 passed, 0 failed, 1 ignored |
