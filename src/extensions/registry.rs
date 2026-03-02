@@ -9,6 +9,9 @@ use crate::extensions::{
     AuthHint, ExtensionKind, ExtensionSource, RegistryEntry, ResultSource, SearchResult,
 };
 
+/// Hard cap for in-memory discovered-extension cache.
+const MAX_DISCOVERY_CACHE_ENTRIES: usize = 512;
+
 /// Curated extension registry with fuzzy search.
 pub struct ExtensionRegistry {
     /// Built-in curated entries.
@@ -173,6 +176,10 @@ impl ExtensionRegistry {
                 .any(|e| e.name == entry.name && e.kind == entry.kind)
             {
                 cache.push(entry);
+                if cache.len() > MAX_DISCOVERY_CACHE_ENTRIES {
+                    let overflow = cache.len() - MAX_DISCOVERY_CACHE_ENTRIES;
+                    cache.drain(0..overflow);
+                }
             }
         }
     }
@@ -593,6 +600,33 @@ mod tests {
 
         let results = registry.search("dup").await;
         assert_eq!(results.len(), 1, "Should not duplicate cached entries");
+    }
+
+    #[tokio::test]
+    async fn test_cache_discovered_enforces_capacity() {
+        let registry = ExtensionRegistry::new();
+        let mut discovered = Vec::new();
+        for i in 0..(super::MAX_DISCOVERY_CACHE_ENTRIES + 10) {
+            discovered.push(RegistryEntry {
+                name: format!("cap-{i}"),
+                display_name: format!("Cap {i}"),
+                kind: ExtensionKind::WasmTool,
+                description: "capacity test".to_string(),
+                keywords: vec![],
+                source: ExtensionSource::WasmBuildable {
+                    repo_url: format!("tools-src/cap-{i}"),
+                    build_dir: None,
+                    crate_name: None,
+                },
+                fallback_source: None,
+                auth_hint: AuthHint::None,
+            });
+        }
+
+        registry.cache_discovered(discovered).await;
+        let all = registry.all_entries().await;
+        let discovered_count = all.iter().filter(|e| e.name.starts_with("cap-")).count();
+        assert_eq!(discovered_count, super::MAX_DISCOVERY_CACHE_ENTRIES);
     }
 
     #[tokio::test]

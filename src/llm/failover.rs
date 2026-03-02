@@ -25,6 +25,11 @@ use crate::llm::provider::{
 
 use crate::llm::retry::is_retryable;
 
+/// Maximum number of task-scoped provider bindings retained in memory.
+const MAX_TASK_BINDINGS: usize = 2048;
+/// TTL for task-scoped provider bindings to avoid stale growth.
+const TASK_BINDING_TTL: Duration = Duration::from_secs(300);
+
 /// Configuration for per-provider cooldown behavior.
 ///
 /// When a provider accumulates `failure_threshold` consecutive retryable
@@ -123,7 +128,13 @@ pub struct FailoverProvider {
     /// This allows `effective_model_name()` to report the provider that handled
     /// the *current* request, even when other concurrent requests update
     /// `last_used`.
-    provider_for_task: Mutex<HashMap<tokio::task::Id, usize>>,
+    provider_for_task: Mutex<HashMap<tokio::task::Id, BoundProvider>>,
+}
+
+#[derive(Clone, Copy)]
+struct BoundProvider {
+    provider_idx: usize,
+    bound_at: Instant,
 }
 
 impl FailoverProvider {
@@ -175,11 +186,30 @@ impl FailoverProvider {
 
     /// Bind the selected provider index to the current task.
     fn bind_provider_to_current_task(&self, provider_idx: usize) {
-        let Some(task_id) = Self::current_task_id() else {
-            return;
-        };
         if let Ok(mut guard) = self.provider_for_task.lock() {
-            guard.insert(task_id, provider_idx);
+            let now = Instant::now();
+            guard.retain(|_, bound| now.duration_since(bound.bound_at) < TASK_BINDING_TTL);
+
+            let Some(task_id) = Self::current_task_id() else {
+                return;
+            };
+
+            if guard.len() >= MAX_TASK_BINDINGS
+                && let Some(oldest_task) = guard
+                    .iter()
+                    .min_by_key(|(_, bound)| bound.bound_at)
+                    .map(|(task_id, _)| *task_id)
+            {
+                guard.remove(&oldest_task);
+            }
+
+            guard.insert(
+                task_id,
+                BoundProvider {
+                    provider_idx,
+                    bound_at: now,
+                },
+            );
         }
     }
 
@@ -189,7 +219,7 @@ impl FailoverProvider {
         self.provider_for_task
             .lock()
             .ok()
-            .and_then(|mut guard| guard.remove(&task_id))
+            .and_then(|mut guard| guard.remove(&task_id).map(|bound| bound.provider_idx))
     }
 
     /// Try each provider in sequence until one succeeds or all fail.
@@ -684,6 +714,34 @@ mod tests {
 
         assert_eq!(model_a, "fallback");
         assert_eq!(model_b, "primary");
+    }
+
+    #[tokio::test]
+    async fn bind_provider_prunes_stale_task_bindings() {
+        let p = Arc::new(MockProvider::succeeding("provider-a", "ok"));
+        let failover = FailoverProvider::new(vec![p]).unwrap();
+
+        let old_task_id = tokio::spawn(async { tokio::task::try_id().expect("task id") })
+            .await
+            .unwrap();
+        {
+            let mut guard = failover.provider_for_task.lock().unwrap();
+            guard.insert(
+                old_task_id,
+                BoundProvider {
+                    provider_idx: 0,
+                    bound_at: Instant::now() - TASK_BINDING_TTL - Duration::from_secs(1),
+                },
+            );
+        }
+
+        failover.bind_provider_to_current_task(0);
+
+        let guard = failover.provider_for_task.lock().unwrap();
+        assert!(
+            !guard.contains_key(&old_task_id),
+            "stale task binding should be pruned"
+        );
     }
 
     // Test: list_models aggregates from all providers.

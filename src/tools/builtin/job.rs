@@ -1259,7 +1259,8 @@ impl Tool for JobPromptTool {
 
         {
             let mut queue = self.prompt_queue.lock().await;
-            queue.entry(job_id).or_default().push_back(prompt);
+            crate::orchestrator::api::enqueue_pending_prompt(&mut queue, job_id, prompt)
+                .map_err(|msg| ToolError::ExecutionFailed(msg.to_string()))?;
         }
 
         let result = serde_json::json!({

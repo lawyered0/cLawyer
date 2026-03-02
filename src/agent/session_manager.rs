@@ -4,6 +4,7 @@
 //! for each thread.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
@@ -270,6 +271,7 @@ impl SessionManager {
             .iter()
             .map(|(user_id, _)| user_id.clone())
             .collect();
+        let stale_user_set: HashSet<String> = stale_users.iter().cloned().collect();
 
         if stale_users.is_empty() {
             return 0;
@@ -320,7 +322,7 @@ impl SessionManager {
         // Clean up thread mappings that point to stale sessions
         {
             let mut thread_map = self.thread_map.write().await;
-            thread_map.retain(|key, _| !stale_users.contains(&key.user_id));
+            thread_map.retain(|key, _| !stale_user_set.contains(&key.user_id));
         }
 
         // Clean up undo managers for stale threads
