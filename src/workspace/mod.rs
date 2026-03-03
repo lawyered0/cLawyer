@@ -285,6 +285,34 @@ pub struct Workspace {
     storage: WorkspaceStorage,
     /// Embedding provider for semantic search.
     embeddings: Option<Arc<dyn EmbeddingProvider>>,
+    /// Optional legal matter-file crypto policy.
+    legal_content_policy: Option<LegalContentPolicy>,
+}
+
+/// Legal content policy for matter-scoped workspace encryption.
+#[derive(Clone)]
+pub struct LegalContentPolicy {
+    matter_root: String,
+    exclude_from_search: bool,
+    crypto: Arc<crate::secrets::SecretsCrypto>,
+}
+
+impl LegalContentPolicy {
+    pub fn new(
+        matter_root: impl Into<String>,
+        exclude_from_search: bool,
+        crypto: Arc<crate::secrets::SecretsCrypto>,
+    ) -> Self {
+        Self {
+            matter_root: matter_root.into(),
+            exclude_from_search,
+            crypto,
+        }
+    }
+
+    fn matter_id_for_path(&self, path: &str) -> Option<String> {
+        crate::legal::workspace_crypto::matter_id_for_path(path, &self.matter_root)
+    }
 }
 
 impl Workspace {
@@ -296,6 +324,7 @@ impl Workspace {
             agent_id: None,
             storage: WorkspaceStorage::Repo(Repository::new(pool)),
             embeddings: None,
+            legal_content_policy: None,
         }
     }
 
@@ -308,6 +337,7 @@ impl Workspace {
             agent_id: None,
             storage: WorkspaceStorage::Db(db),
             embeddings: None,
+            legal_content_policy: None,
         }
     }
 
@@ -320,6 +350,12 @@ impl Workspace {
     /// Set the embedding provider for semantic search.
     pub fn with_embeddings(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
         self.embeddings = Some(provider);
+        self
+    }
+
+    /// Configure matter-scoped encryption/decryption for legal workspace files.
+    pub fn with_legal_content_policy(mut self, policy: LegalContentPolicy) -> Self {
+        self.legal_content_policy = Some(policy);
         self
     }
 
@@ -346,6 +382,29 @@ impl Workspace {
     /// ```
     pub async fn read(&self, path: &str) -> Result<MemoryDocument, WorkspaceError> {
         let path = normalize_path(path);
+        let mut doc = self
+            .storage
+            .get_document_by_path(&self.user_id, self.agent_id, &path)
+            .await?;
+
+        if let Some(policy) = self.legal_content_policy.as_ref()
+            && let Some(matter_id) = policy.matter_id_for_path(&path)
+            && let Some(plaintext) = crate::legal::workspace_crypto::decrypt_matter_content(
+                policy.crypto.as_ref(),
+                &matter_id,
+                &doc.content,
+            )
+            .map_err(|e| WorkspaceError::SearchFailed { reason: e })?
+        {
+            doc.content = plaintext;
+        }
+
+        Ok(doc)
+    }
+
+    /// Read the stored content without legal decryption transforms.
+    pub async fn read_stored(&self, path: &str) -> Result<MemoryDocument, WorkspaceError> {
+        let path = normalize_path(path);
         self.storage
             .get_document_by_path(&self.user_id, self.agent_id, &path)
             .await
@@ -362,15 +421,70 @@ impl Workspace {
     /// ```
     pub async fn write(&self, path: &str, content: &str) -> Result<MemoryDocument, WorkspaceError> {
         let path = normalize_path(path);
+        let mut stored_content = content.to_string();
+        let mut skip_index = false;
+        if let Some(policy) = self.legal_content_policy.as_ref()
+            && let Some(matter_id) = policy.matter_id_for_path(&path)
+        {
+            stored_content = crate::legal::workspace_crypto::encrypt_matter_content(
+                policy.crypto.as_ref(),
+                &matter_id,
+                content,
+            )
+            .map_err(|e| WorkspaceError::SearchFailed { reason: e })?;
+            skip_index = policy.exclude_from_search;
+        }
+
+        let doc = self
+            .storage
+            .get_or_create_document_by_path(&self.user_id, self.agent_id, &path)
+            .await?;
+        self.storage
+            .update_document(doc.id, &stored_content)
+            .await?;
+
+        if skip_index {
+            self.storage.delete_chunks(doc.id).await?;
+        } else {
+            self.reindex_document(doc.id).await?;
+        }
+
+        self.read(&path).await
+    }
+
+    /// Write stored content directly without additional encryption transforms.
+    ///
+    /// Used by backup restore to replay archived bytes deterministically.
+    pub async fn write_stored(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> Result<MemoryDocument, WorkspaceError> {
+        let path = normalize_path(path);
         let doc = self
             .storage
             .get_or_create_document_by_path(&self.user_id, self.agent_id, &path)
             .await?;
         self.storage.update_document(doc.id, content).await?;
-        self.reindex_document(doc.id).await?;
 
-        // Return updated doc
-        self.storage.get_document_by_id(doc.id).await
+        let skip_index = self
+            .legal_content_policy
+            .as_ref()
+            .and_then(|policy| {
+                policy
+                    .matter_id_for_path(&path)
+                    .map(|_| policy.exclude_from_search)
+            })
+            .unwrap_or(false)
+            && crate::legal::workspace_crypto::is_encrypted_payload(content);
+
+        if skip_index {
+            self.storage.delete_chunks(doc.id).await?;
+        } else {
+            self.reindex_document(doc.id).await?;
+        }
+
+        self.read_stored(&path).await
     }
 
     /// Append content to a file.

@@ -7,6 +7,8 @@
 use std::sync::Arc;
 
 use clawyer::workspace::{MockEmbeddings, SearchConfig, Workspace, paths};
+use clawyer::{secrets::SecretsCrypto, workspace::LegalContentPolicy};
+use secrecy::SecretString;
 
 fn get_pool() -> deadpool_postgres::Pool {
     let database_url = std::env::var("DATABASE_URL")
@@ -335,6 +337,57 @@ async fn test_workspace_hybrid_search_with_mock_embeddings() {
     assert!(!results.is_empty(), "Should find results");
     // At least one result should be a hybrid match (found by both FTS and vector)
     // or we should have results from either method
+
+    cleanup_user(&pool, user_id).await;
+}
+
+#[tokio::test]
+async fn test_workspace_matter_encryption_roundtrip_and_search_exclusion() {
+    let pool = get_pool();
+    if try_connect(&pool).await.is_none() {
+        return;
+    }
+    let user_id = "test_matter_encryption";
+    cleanup_user(&pool, user_id).await;
+
+    let crypto = Arc::new(
+        SecretsCrypto::new(SecretString::from(
+            "0123456789abcdef0123456789abcdef".to_string(),
+        ))
+        .expect("crypto"),
+    );
+    let workspace = Workspace::new(user_id, pool.clone())
+        .with_legal_content_policy(LegalContentPolicy::new("matters", true, crypto));
+
+    workspace
+        .write("matters/demo/facts.md", "HighlySensitiveFact123")
+        .await
+        .expect("write failed");
+
+    let decrypted = workspace
+        .read("matters/demo/facts.md")
+        .await
+        .expect("read failed");
+    assert_eq!(decrypted.content, "HighlySensitiveFact123");
+
+    let stored = workspace
+        .read_stored("matters/demo/facts.md")
+        .await
+        .expect("stored read failed");
+    assert_ne!(stored.content, "HighlySensitiveFact123");
+    assert!(
+        clawyer::legal::workspace_crypto::is_encrypted_payload(&stored.content),
+        "stored content should be encrypted envelope"
+    );
+
+    let hits = workspace
+        .search("HighlySensitiveFact123", 10)
+        .await
+        .expect("search failed");
+    assert!(
+        hits.is_empty(),
+        "encrypted matter content should be excluded from search index"
+    );
 
     cleanup_user(&pool, user_id).await;
 }

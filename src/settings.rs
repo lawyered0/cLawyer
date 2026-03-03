@@ -660,6 +660,10 @@ pub struct LegalSettings {
     /// Redaction controls for sensitive classes.
     #[serde(default)]
     pub redaction: LegalRedactionSettings,
+
+    /// Matter workspace encryption controls.
+    #[serde(default)]
+    pub encryption: LegalEncryptionSettings,
 }
 
 fn default_legal_jurisdiction() -> String {
@@ -691,6 +695,7 @@ impl Default for LegalSettings {
             network: LegalNetworkSettings::default(),
             audit: LegalAuditSettings::default(),
             redaction: LegalRedactionSettings::default(),
+            encryption: LegalEncryptionSettings::default(),
         }
     }
 }
@@ -766,6 +771,34 @@ impl Default for LegalRedactionSettings {
             phi: true,
             financial: true,
             government_id: true,
+        }
+    }
+}
+
+/// Legal encryption settings for matter-scoped workspace files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegalEncryptionSettings {
+    /// Enable transparent encryption for matter-scoped workspace files.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Restrict encryption scope to the configured matter root.
+    #[serde(default = "default_true")]
+    pub matter_scope_only: bool,
+    /// Exclude encrypted matter files from chunk/embedding search indexes.
+    #[serde(default = "default_true")]
+    pub exclude_from_search: bool,
+    /// In max-lockdown, fail startup if no master key is available.
+    #[serde(default = "default_true")]
+    pub require_master_key_in_max_lockdown: bool,
+}
+
+impl Default for LegalEncryptionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            matter_scope_only: true,
+            exclude_from_search: true,
+            require_master_key_in_max_lockdown: true,
         }
     }
 }

@@ -137,8 +137,27 @@ pub struct BackupRestoreResult {
     pub restored_settings: usize,
     pub restored_workspace_files: usize,
     pub skipped_workspace_files: usize,
+    pub entity_counts: BackupRestoreEntityCounts,
     pub warnings: Vec<String>,
     pub manifest: BackupManifest,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackupRestoreEntityCounts {
+    pub clients: usize,
+    pub matters: usize,
+    pub templates: usize,
+    pub tasks: usize,
+    pub notes: usize,
+    pub deadlines: usize,
+    pub documents: usize,
+    pub document_versions: usize,
+    pub time_entries: usize,
+    pub expense_entries: usize,
+    pub invoices: usize,
+    pub invoice_line_items: usize,
+    pub trust_ledger: usize,
+    pub audit_events: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +219,8 @@ struct LegalBackupSnapshot {
     notes: Vec<MatterNoteRecord>,
     deadlines: Vec<MatterDeadlineRecord>,
     documents: Vec<MatterDocumentRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    document_versions: Vec<crate::db::DocumentVersionRecord>,
     templates: Vec<DocumentTemplateRecord>,
     time_entries: Vec<TimeEntryRecord>,
     expense_entries: Vec<ExpenseEntryRecord>,
@@ -229,6 +250,7 @@ struct WorkspaceBackupSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceFileSnapshot {
     path: String,
+    memory_document_id: Option<String>,
     content: String,
     original_bytes: usize,
     stored_bytes: usize,
@@ -349,12 +371,14 @@ pub async fn restore_backup_file(
     let mut restored_settings = 0usize;
     let mut restored_workspace_files = 0usize;
     let mut skipped_workspace_files = 0usize;
+    let mut entity_counts = BackupRestoreEntityCounts::default();
 
     if options.apply {
         db.set_all_settings(user_id, &snapshot.settings)
             .await
             .map_err(|e| BackupError::Io(e.to_string()))?;
         restored_settings = snapshot.settings.len();
+        let mut memory_doc_id_map: HashMap<uuid::Uuid, uuid::Uuid> = HashMap::new();
 
         for file in &snapshot.workspace.files {
             if file.skipped {
@@ -386,15 +410,26 @@ pub async fn restore_backup_file(
                 continue;
             }
 
-            workspace
-                .write(&normalized_path, &file.content)
-                .await
-                .map_err(|e| BackupError::Io(e.to_string()))?;
+            let restored_doc =
+                if crate::legal::workspace_crypto::is_encrypted_payload(&file.content) {
+                    workspace
+                        .write_stored(&normalized_path, &file.content)
+                        .await
+                        .map_err(|e| BackupError::Io(e.to_string()))?
+                } else {
+                    workspace
+                        .write(&normalized_path, &file.content)
+                        .await
+                        .map_err(|e| BackupError::Io(e.to_string()))?
+                };
+            if let Some(raw_old_id) = file.memory_document_id.as_deref()
+                && let Ok(old_id) = uuid::Uuid::parse_str(raw_old_id)
+            {
+                memory_doc_id_map.insert(old_id, restored_doc.id);
+            }
             restored_workspace_files += 1;
         }
 
-        // Restore only idempotent legal DB entities in v1.
-        // Non-idempotent entities are intentionally skipped and preserved in the archive.
         let mut client_id_map: HashMap<uuid::Uuid, uuid::Uuid> = HashMap::new();
         for client in &snapshot.legal.clients {
             let restored = db
@@ -412,6 +447,7 @@ pub async fn restore_backup_file(
                 .await
                 .map_err(|e| BackupError::Io(e.to_string()))?;
             client_id_map.insert(client.id, restored.id);
+            entity_counts.clients += 1;
         }
 
         for matter in &snapshot.legal.matters {
@@ -439,6 +475,7 @@ pub async fn restore_backup_file(
             )
             .await
             .map_err(|e| BackupError::Io(e.to_string()))?;
+            entity_counts.matters += 1;
         }
 
         for template in &snapshot.legal.templates {
@@ -453,12 +490,116 @@ pub async fn restore_backup_file(
             )
             .await
             .map_err(|e| BackupError::Io(e.to_string()))?;
+            entity_counts.templates += 1;
         }
 
-        warnings.push(
-            "restore apply currently replays settings/workspace/clients/matters/templates; other legal tables remain preserved in backup for manual migration"
-                .to_string(),
-        );
+        for row in &snapshot.legal.tasks {
+            match db.upsert_matter_task_record(row).await {
+                Ok(_) => entity_counts.tasks += 1,
+                Err(e) => warnings.push(format!(
+                    "failed to restore task {} (matter={}): {}",
+                    row.id, row.matter_id, e
+                )),
+            }
+        }
+
+        for row in &snapshot.legal.notes {
+            match db.upsert_matter_note_record(row).await {
+                Ok(_) => entity_counts.notes += 1,
+                Err(e) => warnings.push(format!(
+                    "failed to restore note {} (matter={}): {}",
+                    row.id, row.matter_id, e
+                )),
+            }
+        }
+
+        for row in &snapshot.legal.deadlines {
+            match db.upsert_matter_deadline_record(row).await {
+                Ok(_) => entity_counts.deadlines += 1,
+                Err(e) => warnings.push(format!(
+                    "failed to restore deadline {} (matter={}): {}",
+                    row.id, row.matter_id, e
+                )),
+            }
+        }
+
+        for row in &snapshot.legal.documents {
+            let mut adjusted = row.clone();
+            if let Some(mapped) = memory_doc_id_map.get(&row.memory_document_id).copied() {
+                adjusted.memory_document_id = mapped;
+            }
+            match db.upsert_matter_document_record(&adjusted).await {
+                Ok(_) => entity_counts.documents += 1,
+                Err(e) => warnings.push(format!(
+                    "failed to restore document {} (matter={} path='{}'): {}",
+                    row.id, row.matter_id, row.path, e
+                )),
+            }
+        }
+
+        for row in &snapshot.legal.document_versions {
+            let mut adjusted = row.clone();
+            if let Some(mapped) = memory_doc_id_map.get(&row.memory_document_id).copied() {
+                adjusted.memory_document_id = mapped;
+            }
+            match db.upsert_document_version_record(&adjusted).await {
+                Ok(_) => entity_counts.document_versions += 1,
+                Err(e) => warnings.push(format!(
+                    "failed to restore document version {}: {}",
+                    row.id, e
+                )),
+            }
+        }
+
+        for row in &snapshot.legal.time_entries {
+            match db.upsert_time_entry_record(row).await {
+                Ok(_) => entity_counts.time_entries += 1,
+                Err(e) => warnings.push(format!("failed to restore time entry {}: {}", row.id, e)),
+            }
+        }
+
+        for row in &snapshot.legal.expense_entries {
+            match db.upsert_expense_entry_record(row).await {
+                Ok(_) => entity_counts.expense_entries += 1,
+                Err(e) => {
+                    warnings.push(format!("failed to restore expense entry {}: {}", row.id, e))
+                }
+            }
+        }
+
+        for row in &snapshot.legal.invoices {
+            match db.upsert_invoice_record(row).await {
+                Ok(_) => entity_counts.invoices += 1,
+                Err(e) => warnings.push(format!("failed to restore invoice {}: {}", row.id, e)),
+            }
+        }
+
+        for row in &snapshot.legal.invoice_line_items {
+            match db.upsert_invoice_line_item_record(row).await {
+                Ok(_) => entity_counts.invoice_line_items += 1,
+                Err(e) => warnings.push(format!(
+                    "failed to restore invoice line item {}: {}",
+                    row.id, e
+                )),
+            }
+        }
+
+        for row in &snapshot.legal.trust_ledger {
+            match db.upsert_trust_ledger_entry_record(row).await {
+                Ok(_) => entity_counts.trust_ledger += 1,
+                Err(e) => warnings.push(format!(
+                    "failed to restore trust ledger entry {}: {}",
+                    row.id, e
+                )),
+            }
+        }
+
+        for row in &snapshot.legal.audit_events {
+            match db.upsert_audit_event_record(row).await {
+                Ok(_) => entity_counts.audit_events += 1,
+                Err(e) => warnings.push(format!("failed to restore audit event {}: {}", row.id, e)),
+            }
+        }
 
         let _ = db
             .append_audit_event(
@@ -473,6 +614,7 @@ pub async fn restore_backup_file(
                         "restored_settings": restored_settings,
                         "restored_workspace_files": restored_workspace_files,
                         "skipped_workspace_files": skipped_workspace_files,
+                        "entity_counts": entity_counts.clone(),
                     }),
                 },
             )
@@ -486,6 +628,7 @@ pub async fn restore_backup_file(
         restored_settings,
         restored_workspace_files,
         skipped_workspace_files,
+        entity_counts,
         warnings,
         manifest,
     })
@@ -1019,6 +1162,7 @@ async fn collect_snapshot(
     let mut notes = Vec::new();
     let mut deadlines = Vec::new();
     let mut documents = Vec::new();
+    let mut document_versions = Vec::new();
     let mut templates = Vec::new();
     let mut time_entries = Vec::new();
     let mut expense_entries = Vec::new();
@@ -1056,6 +1200,14 @@ async fn collect_snapshot(
             .await
             .map_err(|e| BackupError::Io(e.to_string()))?;
         matter_docs.sort_by(|a, b| a.id.cmp(&b.id));
+        for doc in &matter_docs {
+            let mut versions = db
+                .list_document_versions(user_id, doc.id)
+                .await
+                .map_err(|e| BackupError::Io(e.to_string()))?;
+            versions.sort_by(|a, b| a.id.cmp(&b.id));
+            document_versions.extend(versions);
+        }
         documents.extend(matter_docs);
 
         let mut matter_templates = db
@@ -1160,7 +1312,7 @@ async fn collect_snapshot(
     let mut skipped_files = 0usize;
 
     for path in all_paths {
-        let doc = match workspace.read(&path).await {
+        let doc = match workspace.read_stored(&path).await {
             Ok(doc) => doc,
             Err(WorkspaceError::DocumentNotFound { .. }) => continue,
             Err(err) => {
@@ -1177,6 +1329,7 @@ async fn collect_snapshot(
             skipped_files += 1;
             files.push(WorkspaceFileSnapshot {
                 path: path.clone(),
+                memory_document_id: Some(doc.id.to_string()),
                 content: String::new(),
                 original_bytes,
                 stored_bytes: 0,
@@ -1211,6 +1364,7 @@ async fn collect_snapshot(
 
         files.push(WorkspaceFileSnapshot {
             path,
+            memory_document_id: Some(doc.id.to_string()),
             content: stored_content.clone(),
             original_bytes,
             stored_bytes,
@@ -1278,6 +1432,7 @@ async fn collect_snapshot(
             notes,
             deadlines,
             documents,
+            document_versions,
             templates,
             time_entries,
             expense_entries,
@@ -1659,6 +1814,7 @@ fn build_matter_brief(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serialize;
 
     #[test]
     fn backup_manifest_checksum_is_deterministic() {
@@ -1673,6 +1829,7 @@ mod tests {
                 notes: vec![],
                 deadlines: vec![],
                 documents: vec![],
+                document_versions: vec![],
                 templates: vec![],
                 time_entries: vec![],
                 expense_entries: vec![],
@@ -1712,6 +1869,7 @@ mod tests {
                 notes: vec![],
                 deadlines: vec![],
                 documents: vec![],
+                document_versions: vec![],
                 templates: vec![],
                 time_entries: vec![],
                 expense_entries: vec![],
@@ -1739,6 +1897,111 @@ mod tests {
         let plaintext = crypto.decrypt(&ciphertext, &salt).expect("decrypt");
         let decoded = BASE64.decode(plaintext.expose()).expect("b64 decode");
         assert_eq!(decoded, archive);
+    }
+
+    #[test]
+    fn legacy_snapshot_without_document_versions_is_still_valid() {
+        #[derive(Serialize)]
+        struct LegacyLegalBackupSnapshot {
+            clients: Vec<ClientRecord>,
+            matters: Vec<MatterRecord>,
+            tasks: Vec<MatterTaskRecord>,
+            notes: Vec<MatterNoteRecord>,
+            deadlines: Vec<MatterDeadlineRecord>,
+            documents: Vec<MatterDocumentRecord>,
+            templates: Vec<DocumentTemplateRecord>,
+            time_entries: Vec<TimeEntryRecord>,
+            expense_entries: Vec<ExpenseEntryRecord>,
+            time_summaries: Vec<MatterTimeSummaryRecord>,
+            trust_ledger: Vec<TrustLedgerEntryRecord>,
+            invoices: Vec<InvoiceRecord>,
+            invoice_line_items: Vec<InvoiceLineItemRecord>,
+            audit_events: Vec<AuditEventRecord>,
+            conflict_graph_summary: serde_json::Value,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyBackupSnapshot {
+            created_at: String,
+            user_id: String,
+            settings: HashMap<String, serde_json::Value>,
+            legal: LegacyLegalBackupSnapshot,
+            workspace: WorkspaceBackupSnapshot,
+            ai_packets: Vec<AiPacketPreview>,
+        }
+
+        let legacy = LegacyBackupSnapshot {
+            created_at: "2026-03-01T00:00:00Z".to_string(),
+            user_id: "u".to_string(),
+            settings: HashMap::from([(String::from("a"), serde_json::json!(1))]),
+            legal: LegacyLegalBackupSnapshot {
+                clients: vec![],
+                matters: vec![],
+                tasks: vec![],
+                notes: vec![],
+                deadlines: vec![],
+                documents: vec![],
+                templates: vec![],
+                time_entries: vec![],
+                expense_entries: vec![],
+                time_summaries: vec![],
+                trust_ledger: vec![],
+                invoices: vec![],
+                invoice_line_items: vec![],
+                audit_events: vec![],
+                conflict_graph_summary: serde_json::json!({"present": false}),
+            },
+            workspace: WorkspaceBackupSnapshot {
+                files: vec![],
+                total_original_bytes: 0,
+                total_stored_bytes: 0,
+                truncated_files: 0,
+                skipped_files: 0,
+            },
+            ai_packets: vec![],
+        };
+
+        let legacy_json = serde_json::to_vec(&legacy).expect("serialize legacy snapshot");
+        let snapshot: BackupSnapshot =
+            serde_json::from_slice(&legacy_json).expect("deserialize legacy snapshot");
+        assert!(
+            snapshot.legal.document_versions.is_empty(),
+            "legacy snapshots should default missing document_versions to empty"
+        );
+
+        let mut checksums = BTreeMap::new();
+        checksums.insert(
+            "settings".to_string(),
+            checksum_json(&legacy.settings).expect("settings checksum"),
+        );
+        checksums.insert(
+            "legal".to_string(),
+            checksum_json(&legacy.legal).expect("legacy legal checksum"),
+        );
+        checksums.insert(
+            "workspace".to_string(),
+            checksum_json(&legacy.workspace).expect("workspace checksum"),
+        );
+        checksums.insert(
+            "ai_packets".to_string(),
+            checksum_json(&legacy.ai_packets).expect("ai packets checksum"),
+        );
+
+        let manifest = BackupManifest {
+            format_version: BACKUP_FORMAT_VERSION,
+            schema_version: BACKUP_SCHEMA_VERSION,
+            app_version: "test".to_string(),
+            created_at: legacy.created_at,
+            user_id: legacy.user_id,
+            encrypted: true,
+            hash_algorithm: "sha256".to_string(),
+            section_checksums: checksums,
+            notes: vec![],
+        };
+
+        let mut warnings = Vec::new();
+        validate_manifest_checksums(&manifest, &snapshot, &mut warnings)
+            .expect("legacy checksum should validate with defaulted document_versions");
     }
 
     #[test]
