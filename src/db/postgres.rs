@@ -3205,6 +3205,415 @@ impl AuditEventStore for PgBackend {
     }
 }
 
+// ==================== LegalRestoreStore ====================
+
+#[async_trait]
+impl crate::db::LegalRestoreStore for PgBackend {
+    async fn upsert_matter_task_record(&self, row: &MatterTaskRecord) -> Result<(), DatabaseError> {
+        let blocked_by = serde_json::to_value(
+            row.blocked_by
+                .iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO matter_tasks \
+             (id, user_id, matter_id, title, description, status, assignee, due_at, blocked_by, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+             ON CONFLICT (id) DO UPDATE SET \
+                user_id = EXCLUDED.user_id, \
+                matter_id = EXCLUDED.matter_id, \
+                title = EXCLUDED.title, \
+                description = EXCLUDED.description, \
+                status = EXCLUDED.status, \
+                assignee = EXCLUDED.assignee, \
+                due_at = EXCLUDED.due_at, \
+                blocked_by = EXCLUDED.blocked_by, \
+                created_at = EXCLUDED.created_at, \
+                updated_at = EXCLUDED.updated_at",
+            &[
+                &row.id,
+                &row.user_id,
+                &row.matter_id,
+                &row.title,
+                &row.description,
+                &row.status.as_str(),
+                &row.assignee,
+                &row.due_at,
+                &blocked_by,
+                &row.created_at,
+                &row.updated_at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_matter_note_record(&self, row: &MatterNoteRecord) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO matter_notes \
+             (id, user_id, matter_id, author, body, pinned, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+             ON CONFLICT (id) DO UPDATE SET \
+                user_id = EXCLUDED.user_id, \
+                matter_id = EXCLUDED.matter_id, \
+                author = EXCLUDED.author, \
+                body = EXCLUDED.body, \
+                pinned = EXCLUDED.pinned, \
+                created_at = EXCLUDED.created_at, \
+                updated_at = EXCLUDED.updated_at",
+            &[
+                &row.id,
+                &row.user_id,
+                &row.matter_id,
+                &row.author,
+                &row.body,
+                &row.pinned,
+                &row.created_at,
+                &row.updated_at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_matter_deadline_record(
+        &self,
+        row: &MatterDeadlineRecord,
+    ) -> Result<(), DatabaseError> {
+        let reminder_days = serde_json::to_value(&row.reminder_days)
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO matter_deadlines \
+             (id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+             ON CONFLICT (id) DO UPDATE SET \
+                user_id = EXCLUDED.user_id, \
+                matter_id = EXCLUDED.matter_id, \
+                title = EXCLUDED.title, \
+                deadline_type = EXCLUDED.deadline_type, \
+                due_at = EXCLUDED.due_at, \
+                completed_at = EXCLUDED.completed_at, \
+                reminder_days = EXCLUDED.reminder_days, \
+                rule_ref = EXCLUDED.rule_ref, \
+                computed_from = EXCLUDED.computed_from, \
+                task_id = EXCLUDED.task_id, \
+                created_at = EXCLUDED.created_at, \
+                updated_at = EXCLUDED.updated_at",
+            &[
+                &row.id,
+                &row.user_id,
+                &row.matter_id,
+                &row.title,
+                &row.deadline_type.as_str(),
+                &row.due_at,
+                &row.completed_at,
+                &reminder_days,
+                &row.rule_ref,
+                &row.computed_from,
+                &row.task_id,
+                &row.created_at,
+                &row.updated_at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_matter_document_record(
+        &self,
+        row: &MatterDocumentRecord,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO matter_documents \
+             (id, user_id, matter_id, memory_document_id, display_name, category, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+             ON CONFLICT (id) DO UPDATE SET \
+                user_id = EXCLUDED.user_id, \
+                matter_id = EXCLUDED.matter_id, \
+                memory_document_id = EXCLUDED.memory_document_id, \
+                display_name = EXCLUDED.display_name, \
+                category = EXCLUDED.category, \
+                created_at = EXCLUDED.created_at, \
+                updated_at = EXCLUDED.updated_at",
+            &[
+                &row.id,
+                &row.user_id,
+                &row.matter_id,
+                &row.memory_document_id,
+                &row.display_name,
+                &row.category.as_str(),
+                &row.created_at,
+                &row.updated_at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_document_version_record(
+        &self,
+        row: &DocumentVersionRecord,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO document_versions \
+             (id, user_id, matter_document_id, version_number, label, memory_document_id, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+             ON CONFLICT (id) DO UPDATE SET \
+                user_id = EXCLUDED.user_id, \
+                matter_document_id = EXCLUDED.matter_document_id, \
+                version_number = EXCLUDED.version_number, \
+                label = EXCLUDED.label, \
+                memory_document_id = EXCLUDED.memory_document_id, \
+                created_at = EXCLUDED.created_at, \
+                updated_at = EXCLUDED.updated_at",
+            &[
+                &row.id,
+                &row.user_id,
+                &row.matter_document_id,
+                &row.version_number,
+                &row.label,
+                &row.memory_document_id,
+                &row.created_at,
+                &row.updated_at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_time_entry_record(&self, row: &TimeEntryRecord) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO time_entries \
+             (id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
+             ON CONFLICT (id) DO UPDATE SET \
+                user_id = EXCLUDED.user_id, \
+                matter_id = EXCLUDED.matter_id, \
+                timekeeper = EXCLUDED.timekeeper, \
+                description = EXCLUDED.description, \
+                hours = EXCLUDED.hours, \
+                hourly_rate = EXCLUDED.hourly_rate, \
+                entry_date = EXCLUDED.entry_date, \
+                billable = EXCLUDED.billable, \
+                billed_invoice_id = EXCLUDED.billed_invoice_id, \
+                created_at = EXCLUDED.created_at, \
+                updated_at = EXCLUDED.updated_at",
+            &[
+                &row.id,
+                &row.user_id,
+                &row.matter_id,
+                &row.timekeeper,
+                &row.description,
+                &row.hours,
+                &row.hourly_rate,
+                &row.entry_date,
+                &row.billable,
+                &row.billed_invoice_id,
+                &row.created_at,
+                &row.updated_at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_expense_entry_record(
+        &self,
+        row: &ExpenseEntryRecord,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO expense_entries \
+             (id, user_id, matter_id, submitted_by, description, amount, category, entry_date, receipt_path, billable, billed_invoice_id, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+             ON CONFLICT (id) DO UPDATE SET \
+                user_id = EXCLUDED.user_id, \
+                matter_id = EXCLUDED.matter_id, \
+                submitted_by = EXCLUDED.submitted_by, \
+                description = EXCLUDED.description, \
+                amount = EXCLUDED.amount, \
+                category = EXCLUDED.category, \
+                entry_date = EXCLUDED.entry_date, \
+                receipt_path = EXCLUDED.receipt_path, \
+                billable = EXCLUDED.billable, \
+                billed_invoice_id = EXCLUDED.billed_invoice_id, \
+                created_at = EXCLUDED.created_at, \
+                updated_at = EXCLUDED.updated_at",
+            &[
+                &row.id,
+                &row.user_id,
+                &row.matter_id,
+                &row.submitted_by,
+                &row.description,
+                &row.amount,
+                &row.category.as_str(),
+                &row.entry_date,
+                &row.receipt_path,
+                &row.billable,
+                &row.billed_invoice_id,
+                &row.created_at,
+                &row.updated_at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_invoice_record(&self, row: &InvoiceRecord) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO invoices \
+             (id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
+             ON CONFLICT (id) DO UPDATE SET \
+                user_id = EXCLUDED.user_id, \
+                matter_id = EXCLUDED.matter_id, \
+                invoice_number = EXCLUDED.invoice_number, \
+                status = EXCLUDED.status, \
+                issued_date = EXCLUDED.issued_date, \
+                due_date = EXCLUDED.due_date, \
+                subtotal = EXCLUDED.subtotal, \
+                tax = EXCLUDED.tax, \
+                total = EXCLUDED.total, \
+                paid_amount = EXCLUDED.paid_amount, \
+                notes = EXCLUDED.notes, \
+                created_at = EXCLUDED.created_at, \
+                updated_at = EXCLUDED.updated_at",
+            &[
+                &row.id,
+                &row.user_id,
+                &row.matter_id,
+                &row.invoice_number,
+                &row.status.as_str(),
+                &row.issued_date,
+                &row.due_date,
+                &row.subtotal,
+                &row.tax,
+                &row.total,
+                &row.paid_amount,
+                &row.notes,
+                &row.created_at,
+                &row.updated_at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_invoice_line_item_record(
+        &self,
+        row: &InvoiceLineItemRecord,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO invoice_line_items \
+             (id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
+             ON CONFLICT (id) DO UPDATE SET \
+                user_id = EXCLUDED.user_id, \
+                invoice_id = EXCLUDED.invoice_id, \
+                description = EXCLUDED.description, \
+                quantity = EXCLUDED.quantity, \
+                unit_price = EXCLUDED.unit_price, \
+                amount = EXCLUDED.amount, \
+                time_entry_id = EXCLUDED.time_entry_id, \
+                expense_entry_id = EXCLUDED.expense_entry_id, \
+                sort_order = EXCLUDED.sort_order, \
+                created_at = EXCLUDED.created_at, \
+                updated_at = EXCLUDED.updated_at",
+            &[
+                &row.id,
+                &row.user_id,
+                &row.invoice_id,
+                &row.description,
+                &row.quantity,
+                &row.unit_price,
+                &row.amount,
+                &row.time_entry_id,
+                &row.expense_entry_id,
+                &row.sort_order,
+                &row.created_at,
+                &row.updated_at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_trust_ledger_entry_record(
+        &self,
+        row: &TrustLedgerEntryRecord,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO trust_ledger \
+             (id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+             ON CONFLICT (id) DO UPDATE SET \
+                user_id = EXCLUDED.user_id, \
+                matter_id = EXCLUDED.matter_id, \
+                entry_type = EXCLUDED.entry_type, \
+                amount = EXCLUDED.amount, \
+                balance_after = EXCLUDED.balance_after, \
+                description = EXCLUDED.description, \
+                invoice_id = EXCLUDED.invoice_id, \
+                recorded_by = EXCLUDED.recorded_by, \
+                created_at = EXCLUDED.created_at",
+            &[
+                &row.id,
+                &row.user_id,
+                &row.matter_id,
+                &row.entry_type.as_str(),
+                &row.amount,
+                &row.balance_after,
+                &row.description,
+                &row.invoice_id,
+                &row.recorded_by,
+                &row.created_at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_audit_event_record(&self, row: &AuditEventRecord) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO audit_events \
+             (id, user_id, event_type, actor, matter_id, severity, details, created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+             ON CONFLICT (id) DO UPDATE SET \
+                user_id = EXCLUDED.user_id, \
+                event_type = EXCLUDED.event_type, \
+                actor = EXCLUDED.actor, \
+                matter_id = EXCLUDED.matter_id, \
+                severity = EXCLUDED.severity, \
+                details = EXCLUDED.details, \
+                created_at = EXCLUDED.created_at",
+            &[
+                &row.id,
+                &row.user_id,
+                &row.event_type,
+                &row.actor,
+                &row.matter_id,
+                &row.severity.as_str(),
+                &row.details,
+                &row.created_at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+}
+
 // ==================== SettingsStore ====================
 
 #[async_trait]

@@ -1660,6 +1660,39 @@ pub trait AuditEventStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait LegalRestoreStore: Send + Sync {
+    async fn upsert_matter_task_record(&self, row: &MatterTaskRecord) -> Result<(), DatabaseError>;
+    async fn upsert_matter_note_record(&self, row: &MatterNoteRecord) -> Result<(), DatabaseError>;
+    async fn upsert_matter_deadline_record(
+        &self,
+        row: &MatterDeadlineRecord,
+    ) -> Result<(), DatabaseError>;
+    async fn upsert_matter_document_record(
+        &self,
+        row: &MatterDocumentRecord,
+    ) -> Result<(), DatabaseError>;
+    async fn upsert_document_version_record(
+        &self,
+        row: &DocumentVersionRecord,
+    ) -> Result<(), DatabaseError>;
+    async fn upsert_time_entry_record(&self, row: &TimeEntryRecord) -> Result<(), DatabaseError>;
+    async fn upsert_expense_entry_record(
+        &self,
+        row: &ExpenseEntryRecord,
+    ) -> Result<(), DatabaseError>;
+    async fn upsert_invoice_record(&self, row: &InvoiceRecord) -> Result<(), DatabaseError>;
+    async fn upsert_invoice_line_item_record(
+        &self,
+        row: &InvoiceLineItemRecord,
+    ) -> Result<(), DatabaseError>;
+    async fn upsert_trust_ledger_entry_record(
+        &self,
+        row: &TrustLedgerEntryRecord,
+    ) -> Result<(), DatabaseError>;
+    async fn upsert_audit_event_record(&self, row: &AuditEventRecord) -> Result<(), DatabaseError>;
+}
+
+#[async_trait]
 pub trait SettingsStore: Send + Sync {
     async fn get_setting(
         &self,
@@ -1781,6 +1814,7 @@ pub trait Database:
     + TimeExpenseStore
     + BillingStore
     + AuditEventStore
+    + LegalRestoreStore
     + SettingsStore
     + WorkspaceStore
     + Send
