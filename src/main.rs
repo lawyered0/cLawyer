@@ -325,7 +325,9 @@ async fn main() -> anyhow::Result<()> {
         Arc<WasmChannelRouter>,
     )> = None;
 
-    // Create CLI channel
+    // Create CLI channel.
+    // Single-message mode intentionally bypasses interactive REPL gating
+    // (`--headless`/`--no-repl`) because it sends one message then exits.
     let repl_channel = if let Some(ref msg) = cli.message {
         Some(ReplChannel::with_message(msg.clone()))
     } else if should_enable_repl_channel(&cli, config.channels.cli.enabled) {
@@ -691,7 +693,7 @@ fn should_run_startup_onboarding(cli: &Cli) -> bool {
 }
 
 fn should_enable_repl_channel(cli: &Cli, cli_enabled: bool) -> bool {
-    cli.message.is_some() || (cli_enabled && !cli.no_repl && !cli.headless)
+    cli_enabled && !cli.no_repl && !cli.headless && !cli.no_db
 }
 
 /// Initialize tracing for worker/bridge processes (info level).
@@ -1147,7 +1149,11 @@ mod tests {
         cli.headless = true;
         assert!(!should_enable_repl_channel(&cli, true));
 
+        cli.headless = false;
+        cli.no_db = true;
+        assert!(!should_enable_repl_channel(&cli, true));
+
         let cli_with_message = Cli::parse_from(["clawyer", "--message", "ping", "run"]);
-        assert!(should_enable_repl_channel(&cli_with_message, false));
+        assert!(!should_enable_repl_channel(&cli_with_message, false));
     }
 }
