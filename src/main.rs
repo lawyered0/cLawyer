@@ -693,7 +693,7 @@ fn should_run_startup_onboarding(cli: &Cli) -> bool {
 }
 
 fn should_enable_repl_channel(cli: &Cli, cli_enabled: bool) -> bool {
-    cli_enabled && !cli.no_repl && !cli.headless && !cli.no_db
+    cli.message.is_none() && cli_enabled && !cli.no_repl && !cli.headless && !cli.no_db
 }
 
 /// Initialize tracing for worker/bridge processes (info level).
@@ -1154,6 +1154,7 @@ mod tests {
         assert!(!should_enable_repl_channel(&cli, true));
 
         let cli_with_message = Cli::parse_from(["clawyer", "--message", "ping", "run"]);
+        assert!(!should_enable_repl_channel(&cli_with_message, true));
         assert!(!should_enable_repl_channel(&cli_with_message, false));
     }
 }
