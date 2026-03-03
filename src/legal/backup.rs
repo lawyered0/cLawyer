@@ -219,6 +219,7 @@ struct LegalBackupSnapshot {
     notes: Vec<MatterNoteRecord>,
     deadlines: Vec<MatterDeadlineRecord>,
     documents: Vec<MatterDocumentRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     document_versions: Vec<crate::db::DocumentVersionRecord>,
     templates: Vec<DocumentTemplateRecord>,
     time_entries: Vec<TimeEntryRecord>,
@@ -1813,6 +1814,7 @@ fn build_matter_brief(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serialize;
 
     #[test]
     fn backup_manifest_checksum_is_deterministic() {
@@ -1895,6 +1897,111 @@ mod tests {
         let plaintext = crypto.decrypt(&ciphertext, &salt).expect("decrypt");
         let decoded = BASE64.decode(plaintext.expose()).expect("b64 decode");
         assert_eq!(decoded, archive);
+    }
+
+    #[test]
+    fn legacy_snapshot_without_document_versions_is_still_valid() {
+        #[derive(Serialize)]
+        struct LegacyLegalBackupSnapshot {
+            clients: Vec<ClientRecord>,
+            matters: Vec<MatterRecord>,
+            tasks: Vec<MatterTaskRecord>,
+            notes: Vec<MatterNoteRecord>,
+            deadlines: Vec<MatterDeadlineRecord>,
+            documents: Vec<MatterDocumentRecord>,
+            templates: Vec<DocumentTemplateRecord>,
+            time_entries: Vec<TimeEntryRecord>,
+            expense_entries: Vec<ExpenseEntryRecord>,
+            time_summaries: Vec<MatterTimeSummaryRecord>,
+            trust_ledger: Vec<TrustLedgerEntryRecord>,
+            invoices: Vec<InvoiceRecord>,
+            invoice_line_items: Vec<InvoiceLineItemRecord>,
+            audit_events: Vec<AuditEventRecord>,
+            conflict_graph_summary: serde_json::Value,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyBackupSnapshot {
+            created_at: String,
+            user_id: String,
+            settings: HashMap<String, serde_json::Value>,
+            legal: LegacyLegalBackupSnapshot,
+            workspace: WorkspaceBackupSnapshot,
+            ai_packets: Vec<AiPacketPreview>,
+        }
+
+        let legacy = LegacyBackupSnapshot {
+            created_at: "2026-03-01T00:00:00Z".to_string(),
+            user_id: "u".to_string(),
+            settings: HashMap::from([(String::from("a"), serde_json::json!(1))]),
+            legal: LegacyLegalBackupSnapshot {
+                clients: vec![],
+                matters: vec![],
+                tasks: vec![],
+                notes: vec![],
+                deadlines: vec![],
+                documents: vec![],
+                templates: vec![],
+                time_entries: vec![],
+                expense_entries: vec![],
+                time_summaries: vec![],
+                trust_ledger: vec![],
+                invoices: vec![],
+                invoice_line_items: vec![],
+                audit_events: vec![],
+                conflict_graph_summary: serde_json::json!({"present": false}),
+            },
+            workspace: WorkspaceBackupSnapshot {
+                files: vec![],
+                total_original_bytes: 0,
+                total_stored_bytes: 0,
+                truncated_files: 0,
+                skipped_files: 0,
+            },
+            ai_packets: vec![],
+        };
+
+        let legacy_json = serde_json::to_vec(&legacy).expect("serialize legacy snapshot");
+        let snapshot: BackupSnapshot =
+            serde_json::from_slice(&legacy_json).expect("deserialize legacy snapshot");
+        assert!(
+            snapshot.legal.document_versions.is_empty(),
+            "legacy snapshots should default missing document_versions to empty"
+        );
+
+        let mut checksums = BTreeMap::new();
+        checksums.insert(
+            "settings".to_string(),
+            checksum_json(&legacy.settings).expect("settings checksum"),
+        );
+        checksums.insert(
+            "legal".to_string(),
+            checksum_json(&legacy.legal).expect("legacy legal checksum"),
+        );
+        checksums.insert(
+            "workspace".to_string(),
+            checksum_json(&legacy.workspace).expect("workspace checksum"),
+        );
+        checksums.insert(
+            "ai_packets".to_string(),
+            checksum_json(&legacy.ai_packets).expect("ai packets checksum"),
+        );
+
+        let manifest = BackupManifest {
+            format_version: BACKUP_FORMAT_VERSION,
+            schema_version: BACKUP_SCHEMA_VERSION,
+            app_version: "test".to_string(),
+            created_at: legacy.created_at,
+            user_id: legacy.user_id,
+            encrypted: true,
+            hash_algorithm: "sha256".to_string(),
+            section_checksums: checksums,
+            notes: vec![],
+        };
+
+        let mut warnings = Vec::new();
+        validate_manifest_checksums(&manifest, &snapshot, &mut warnings)
+            .expect("legacy checksum should validate with defaulted document_versions");
     }
 
     #[test]
