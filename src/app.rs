@@ -361,11 +361,43 @@ impl AppBuilder {
             );
         }
 
+        if self.config.legal.enabled
+            && self.config.legal.encryption.enabled
+            && self.config.legal.hardening == crate::config::LegalHardeningProfile::MaxLockdown
+            && self
+                .config
+                .legal
+                .encryption
+                .require_master_key_in_max_lockdown
+            && self.config.secrets.master_key().is_none()
+        {
+            anyhow::bail!(
+                "LEGAL_ENCRYPTION_ENABLED requires SECRETS_MASTER_KEY (or keychain-backed key) in max_lockdown mode"
+            );
+        }
+
         // Register memory tools if database is available
         let workspace = if let Some(ref db) = self.db {
             let mut ws = Workspace::new_with_db("default", db.clone());
             if let Some(ref emb) = embeddings {
                 ws = ws.with_embeddings(emb.clone());
+            }
+            if self.config.legal.enabled && self.config.legal.encryption.enabled {
+                if let Some(master_key) = self.config.secrets.master_key().cloned() {
+                    let crypto = Arc::new(
+                        crate::secrets::SecretsCrypto::new(master_key)
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+                    );
+                    ws = ws.with_legal_content_policy(crate::workspace::LegalContentPolicy::new(
+                        self.config.legal.matter_root.clone(),
+                        self.config.legal.encryption.exclude_from_search,
+                        crypto,
+                    ));
+                } else {
+                    tracing::warn!(
+                        "LEGAL_ENCRYPTION_ENABLED is set but no master key was resolved; matter file encryption is disabled for this process"
+                    );
+                }
             }
             let ws = Arc::new(ws);
             tools.register_memory_tools(Arc::clone(&ws));

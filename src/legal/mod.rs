@@ -7,3 +7,4 @@ pub mod calendar;
 pub mod docgen;
 pub mod matter;
 pub mod policy;
+pub mod workspace_crypto;

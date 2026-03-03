@@ -60,6 +60,12 @@ fn legal_config_for_tests() -> clawyer::config::LegalConfig {
             financial: true,
             government_id: true,
         },
+        encryption: clawyer::config::LegalEncryptionConfig {
+            enabled: true,
+            matter_scope_only: true,
+            exclude_from_search: true,
+            require_master_key_in_max_lockdown: true,
+        },
     }
 }
 

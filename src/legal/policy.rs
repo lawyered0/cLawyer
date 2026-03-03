@@ -187,7 +187,7 @@ mod tests {
             active_matter: Some("demo-matter".to_string()),
             privilege_guard: true,
             conflict_check_enabled: true,
-            conflict_file_fallback_enabled: true,
+            conflict_file_fallback_enabled: false,
             conflict_reindex_on_startup: false,
             network: LegalNetworkConfig {
                 deny_by_default: true,
@@ -203,6 +203,12 @@ mod tests {
                 phi: true,
                 financial: true,
                 government_id: true,
+            },
+            encryption: crate::config::LegalEncryptionConfig {
+                enabled: true,
+                matter_scope_only: true,
+                exclude_from_search: true,
+                require_master_key_in_max_lockdown: true,
             },
         }
     }

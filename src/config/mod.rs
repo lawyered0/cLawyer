@@ -38,7 +38,8 @@ pub use self::embeddings::EmbeddingsConfig;
 pub use self::heartbeat::HeartbeatConfig;
 pub use self::hygiene::HygieneConfig;
 pub use self::legal::{
-    LegalAuditConfig, LegalConfig, LegalHardeningProfile, LegalNetworkConfig, LegalRedactionConfig,
+    LegalAuditConfig, LegalConfig, LegalEncryptionConfig, LegalHardeningProfile,
+    LegalNetworkConfig, LegalRedactionConfig,
 };
 pub use self::llm::{
     AnthropicDirectConfig, LlmBackend, LlmConfig, NearAiConfig, OllamaConfig,

@@ -55,6 +55,15 @@ pub struct LegalRedactionConfig {
     pub government_id: bool,
 }
 
+/// Legal matter-file encryption controls.
+#[derive(Debug, Clone)]
+pub struct LegalEncryptionConfig {
+    pub enabled: bool,
+    pub matter_scope_only: bool,
+    pub exclude_from_search: bool,
+    pub require_master_key_in_max_lockdown: bool,
+}
+
 /// Legal workflow profile and policy controls.
 #[derive(Debug, Clone)]
 pub struct LegalConfig {
@@ -72,6 +81,7 @@ pub struct LegalConfig {
     pub network: LegalNetworkConfig,
     pub audit: LegalAuditConfig,
     pub redaction: LegalRedactionConfig,
+    pub encryption: LegalEncryptionConfig,
 }
 
 fn parse_domains_csv(raw: &str) -> Vec<String> {
@@ -283,6 +293,21 @@ impl LegalConfig {
                     settings.legal.redaction.government_id,
                 )?,
             },
+            encryption: LegalEncryptionConfig {
+                enabled: parse_bool_env(
+                    "LEGAL_ENCRYPTION_ENABLED",
+                    settings.legal.encryption.enabled,
+                )?,
+                matter_scope_only: settings.legal.encryption.matter_scope_only,
+                exclude_from_search: parse_bool_env(
+                    "LEGAL_ENCRYPTION_EXCLUDE_FROM_SEARCH",
+                    settings.legal.encryption.exclude_from_search,
+                )?,
+                require_master_key_in_max_lockdown: parse_bool_env(
+                    "LEGAL_ENCRYPTION_REQUIRE_MASTER_KEY_IN_MAX_LOCKDOWN",
+                    settings.legal.encryption.require_master_key_in_max_lockdown,
+                )?,
+            },
         })
     }
 }
@@ -310,6 +335,10 @@ mod tests {
         assert!(config.network.deny_by_default);
         assert!(config.audit.enabled);
         assert!(config.audit.hash_chain);
+        assert!(config.encryption.enabled);
+        assert!(config.encryption.matter_scope_only);
+        assert!(config.encryption.exclude_from_search);
+        assert!(config.encryption.require_master_key_in_max_lockdown);
     }
 
     #[test]
