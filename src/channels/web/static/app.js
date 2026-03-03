@@ -5396,6 +5396,7 @@ function submitMatterActionForm() {
     if (matterActionModalType === 'deposit') showToast('Trust deposit recorded', 'success');
 
     var actionType = matterActionModalType;
+    setMatterActionModalBusy(false);
     closeMatterActionModal();
     if (actionType === 'task' || actionType === 'note') {
       currentMatterDetailSection = 'work';
