@@ -1,14 +1,8 @@
-//! Interactive setup wizard for IronClaw.
+//! Interactive setup wizard for cLawyer.
 //!
 //! Provides a guided setup experience for:
-//! 1. Database connection
-//! 2. Security (secrets master key)
-//! 3. Inference provider selection
-//! 4. Model selection
-//! 5. Embeddings
-//! 6. Channel configuration (HTTP, Telegram, etc.)
-//! 7. Extensions (tool installation from registry)
-//! 8. Heartbeat (background tasks)
+//! - Quickstart mode (lawyer-first defaults)
+//! - Advanced mode (full technical setup)
 //!
 //! # Example
 //!
@@ -33,4 +27,4 @@ pub use prompts::{
     print_success, secret_input, select_many, select_one,
 };
 #[cfg(any(feature = "postgres", feature = "libsql"))]
-pub use wizard::{SetupConfig, SetupWizard};
+pub use wizard::{SetupConfig, SetupMode, SetupWizard};

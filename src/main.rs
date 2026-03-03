@@ -33,7 +33,7 @@ use clawyer::{
 };
 
 #[cfg(any(feature = "postgres", feature = "libsql"))]
-use clawyer::setup::{SetupConfig, SetupWizard};
+use clawyer::setup::{SetupConfig, SetupMode, SetupWizard};
 
 /// Initialize tracing for simple CLI commands (warn level, no fancy layers).
 fn init_cli_tracing() {
@@ -118,22 +118,32 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Onboard {
             skip_auth,
             channels_only,
+            quickstart,
+            advanced,
         }) => {
             let _ = dotenvy::dotenv();
             clawyer::bootstrap::load_ironclaw_env();
 
             #[cfg(any(feature = "postgres", feature = "libsql"))]
             {
+                let mode = if *quickstart {
+                    SetupMode::Quickstart
+                } else if *advanced {
+                    SetupMode::Advanced
+                } else {
+                    SetupMode::Auto
+                };
                 let config = SetupConfig {
                     skip_auth: *skip_auth,
                     channels_only: *channels_only,
+                    mode,
                 };
                 let mut wizard = SetupWizard::with_config(config);
                 wizard.run().await?;
             }
             #[cfg(not(any(feature = "postgres", feature = "libsql")))]
             {
-                let _ = (skip_auth, channels_only);
+                let _ = (skip_auth, channels_only, quickstart, advanced);
                 eprintln!("Onboarding wizard requires the 'postgres' or 'libsql' feature.");
             }
             return Ok(());

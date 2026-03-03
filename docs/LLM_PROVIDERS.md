@@ -167,6 +167,13 @@ Instead of editing `.env` manually, run the onboarding wizard:
 clawyer onboard
 ```
 
+Quickstart/advanced options:
+
+```bash
+clawyer onboard --quickstart   # lawyer-focused defaults
+clawyer onboard --advanced     # full technical flow
+```
+
 Select **"OpenAI-compatible"** for OpenRouter, Together AI, Fireworks, vLLM, LiteLLM,
 or LM Studio. You will be prompted for the base URL and (optionally) an API key.
 The model name is configured in the following step.
