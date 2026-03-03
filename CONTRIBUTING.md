@@ -78,7 +78,7 @@ RUST_LOG=ironclaw=debug cargo run
 RUST_LOG=ironclaw::agent=debug cargo run
 ```
 
-The web gateway starts at `http://127.0.0.1:3001` by default (`GATEWAY_PORT`).
+The web gateway starts at `http://127.0.0.1:3000` by default (`GATEWAY_PORT`).
 
 ---
 
