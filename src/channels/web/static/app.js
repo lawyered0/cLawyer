@@ -20,6 +20,8 @@ const OVERFLOW_TABS = ['routines', 'extensions', 'skills', 'settings'];
 const SHORTCUT_TABS = PRIMARY_TABS.concat(OVERFLOW_TABS);
 let currentSettingsSection = 'general';
 let matterCreateModalLastFocus = null;
+let complianceStatusCache = null;
+let complianceExpanded = false;
 
 function byId(id) {
   return document.getElementById(id);
@@ -64,6 +66,7 @@ const requestVersions = {
   matterDetailFinance: 0,
   legalAudit: 0,
   settings: 0,
+  complianceStatus: 0,
   extensions: 0,
   skills: 0,
   gatewayStatus: 0,
@@ -175,6 +178,9 @@ bindClick('auth-connect-btn', authenticate);
   bindClick('backups-restore-btn', triggerBackupRestoreInput);
   bindClick('settings-section-general-btn', function() { openSettingsSection('general'); });
   bindClick('settings-section-logs-btn', function() { openSettingsSection('logs'); });
+  bindClick('settings-compliance-refresh-btn', loadComplianceStatus);
+  bindClick('settings-compliance-letter-btn', generateComplianceLetter);
+  bindClick('settings-compliance-toggle', toggleComplianceBreakdown);
   bindClick('matters-new-btn', openMatterCreateModal);
   bindClick('matter-create-modal-close', closeMatterCreateModal);
   bindClick('matter-create-cancel-btn', closeMatterCreateModal);
@@ -1405,6 +1411,7 @@ function openSettingsSection(section) {
 
   if (next === 'general') {
     loadSettings();
+    loadComplianceStatus();
     return;
   }
   applyLogFilters();
@@ -5892,6 +5899,214 @@ function formatDate(isoString) {
 }
 
 // --- Settings ---
+
+function complianceStateClass(state) {
+  var normalized = (state || 'partial').toLowerCase();
+  if (normalized === 'compliant') return 'state-compliant';
+  if (normalized === 'needs_review') return 'state-needs-review';
+  return 'state-partial';
+}
+
+function complianceStateLabel(state) {
+  var normalized = (state || 'partial').toLowerCase();
+  if (normalized === 'compliant') return 'Compliant';
+  if (normalized === 'needs_review') return 'Needs Review';
+  return 'Partial';
+}
+
+function setComplianceExpanded(expanded) {
+  complianceExpanded = !!expanded;
+  var breakdown = byId('settings-compliance-breakdown');
+  var caret = byId('settings-compliance-caret');
+  if (!breakdown) return;
+  breakdown.classList.toggle('is-hidden', !complianceExpanded);
+  if (caret) caret.textContent = complianceExpanded ? '▴' : '▾';
+}
+
+function renderComplianceBreakdown(data) {
+  var container = byId('settings-compliance-breakdown');
+  if (!container || !data) return;
+  var sections = [
+    { key: 'govern', label: 'Govern' },
+    { key: 'map', label: 'Map' },
+    { key: 'measure', label: 'Measure' },
+    { key: 'manage', label: 'Manage' },
+  ];
+
+  var html = '';
+  for (var i = 0; i < sections.length; i++) {
+    var section = sections[i];
+    var value = data[section.key] || {};
+    var checks = Array.isArray(value.checks) ? value.checks : [];
+    var sectionStateClass = complianceStateClass(value.status);
+    html += '<div class="compliance-function">';
+    html += '<div class="compliance-function-header">';
+    html += '<span>' + section.label + '</span>';
+    html += '<span class="compliance-state-badge ' + sectionStateClass + '">'
+      + complianceStateLabel(value.status)
+      + '</span>';
+    html += '</div>';
+    if (!checks.length) {
+      html += '<div class="empty-state">No checks returned.</div>';
+    } else {
+      html += '<ul class="compliance-check-list">';
+      for (var j = 0; j < checks.length; j++) {
+        var check = checks[j] || {};
+        var checkStateClass = complianceStateClass(check.status);
+        html += '<li class="compliance-check-item ' + checkStateClass + '">';
+        html += '<div class="compliance-check-title">' + escapeHtml(check.label || check.id || 'Check') + '</div>';
+        html += '<div class="compliance-check-detail">' + escapeHtml(check.detail || '') + '</div>';
+        html += '</li>';
+      }
+      html += '</ul>';
+    }
+    html += '</div>';
+  }
+
+  var gaps = Array.isArray(data.data_gaps) ? data.data_gaps : [];
+  if (gaps.length) {
+    html += '<div class="compliance-data-gaps"><strong>Data gaps:</strong><ul>';
+    for (var k = 0; k < gaps.length; k++) {
+      html += '<li>' + escapeHtml(gaps[k]) + '</li>';
+    }
+    html += '</ul></div>';
+  }
+
+  container.innerHTML = html;
+}
+
+function renderComplianceStatus(data) {
+  var dot = byId('settings-compliance-dot');
+  var label = byId('settings-compliance-label');
+  var meta = byId('settings-compliance-meta');
+  if (!dot || !label || !meta) return;
+
+  var overallState = data && data.overall ? data.overall : 'partial';
+  var dotClass = complianceStateClass(overallState);
+  dot.className = 'dot ' + dotClass;
+  label.textContent = 'NIST AI RMF: ' + complianceStateLabel(overallState);
+
+  var metrics = (data && data.metrics) || {};
+  var classified = metrics.matters_classified != null ? metrics.matters_classified : 0;
+  var total = metrics.matters_total != null ? metrics.matters_total : 0;
+  var tools = metrics.tools_total != null ? metrics.tools_total : 0;
+  var audit = metrics.audit_events_total == null ? 'unavailable' : String(metrics.audit_events_total);
+  meta.textContent = 'Matters classified: ' + classified + '/' + total + ' · Tools: ' + tools + ' · Audit events: ' + audit;
+
+  if (complianceExpanded) {
+    renderComplianceBreakdown(data);
+    setComplianceExpanded(true);
+  } else {
+    setComplianceExpanded(false);
+  }
+}
+
+function loadComplianceStatus() {
+  var requestVersion = beginRequest('complianceStatus');
+  var label = byId('settings-compliance-label');
+  var meta = byId('settings-compliance-meta');
+  if (label) label.textContent = 'Loading compliance status…';
+  if (meta) meta.textContent = '';
+
+  apiFetch('/api/compliance/status').then(function(data) {
+    if (!isCurrentRequest('complianceStatus', requestVersion)) return;
+    complianceStatusCache = data;
+    renderComplianceStatus(data);
+  }).catch(function(err) {
+    if (!isCurrentRequest('complianceStatus', requestVersion)) return;
+    complianceStatusCache = null;
+    var dot = byId('settings-compliance-dot');
+    if (dot) dot.className = 'dot state-needs-review';
+    if (label) label.textContent = 'Compliance status unavailable';
+    if (meta) meta.textContent = err.message;
+    setComplianceExpanded(false);
+    var breakdown = byId('settings-compliance-breakdown');
+    if (breakdown) breakdown.innerHTML = '<div class="empty-state">Unable to load compliance checks.</div>';
+  });
+}
+
+function toggleComplianceBreakdown() {
+  if (!complianceStatusCache) {
+    loadComplianceStatus();
+    return;
+  }
+  setComplianceExpanded(!complianceExpanded);
+  if (complianceExpanded) {
+    renderComplianceBreakdown(complianceStatusCache);
+  }
+}
+
+function closeComplianceLetterModal() {
+  var existing = byId('compliance-letter-modal-overlay');
+  if (existing) existing.remove();
+}
+
+function openComplianceLetterModal(response) {
+  closeComplianceLetterModal();
+  var overlay = document.createElement('div');
+  overlay.className = 'configure-overlay';
+  overlay.id = 'compliance-letter-modal-overlay';
+  overlay.addEventListener('click', function(e) {
+    if (e.target === overlay) closeComplianceLetterModal();
+  });
+
+  var modal = document.createElement('div');
+  modal.className = 'configure-modal';
+
+  var title = document.createElement('h3');
+  title.textContent = 'Compliance Letter';
+  modal.appendChild(title);
+
+  var meta = document.createElement('div');
+  meta.className = 'compliance-status-meta';
+  meta.textContent = 'Framework: ' + (response.framework || 'nist') + ' · Model: ' + (response.model || 'unknown');
+  modal.appendChild(meta);
+
+  var body = document.createElement('div');
+  body.className = 'compliance-letter-body';
+  body.innerHTML = renderMarkdown(response.markdown || '');
+  modal.appendChild(body);
+
+  var actions = document.createElement('div');
+  actions.className = 'configure-actions';
+
+  var copyBtn = document.createElement('button');
+  copyBtn.className = 'btn-ext';
+  copyBtn.textContent = 'Copy';
+  copyBtn.addEventListener('click', function() {
+    navigator.clipboard.writeText(response.markdown || '').then(function() {
+      showToast('Compliance letter copied', 'success');
+    }).catch(function() {
+      showToast('Failed to copy compliance letter', 'error');
+    });
+  });
+  actions.appendChild(copyBtn);
+
+  var closeBtn = document.createElement('button');
+  closeBtn.className = 'btn-ext activate';
+  closeBtn.textContent = 'Close';
+  closeBtn.addEventListener('click', closeComplianceLetterModal);
+  actions.appendChild(closeBtn);
+
+  modal.appendChild(actions);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+}
+
+function generateComplianceLetter() {
+  var firmName = prompt('Firm name for the attestation letter (optional):', '') || '';
+  apiFetch('/api/compliance/letter', {
+    method: 'POST',
+    body: {
+      framework: 'nist',
+      firm_name: firmName.trim() || null,
+    },
+  }).then(function(response) {
+    openComplianceLetterModal(response);
+  }).catch(function(err) {
+    showToast('Compliance letter failed: ' + err.message, 'error');
+  });
+}
 
 function loadSettings() {
   var requestVersion = beginRequest('settings');

@@ -278,6 +278,26 @@
                 <div class="empty-state">No backup actions yet.</div>
               </div>
             </div>
+            <div class="extensions-section">
+              <div class="section-header-row">
+                <h3>Compliance</h3>
+                <div class="section-header-actions">
+                  <button class="btn-ext" id="settings-compliance-refresh-btn">Refresh</button>
+                  <button class="btn-ext" id="settings-compliance-letter-btn">Generate Compliance Letter</button>
+                </div>
+              </div>
+              <div id="settings-compliance-status" class="compliance-status-card">
+                <button type="button" id="settings-compliance-toggle" class="compliance-status-toggle">
+                  <span class="dot state-partial" id="settings-compliance-dot"></span>
+                  <span id="settings-compliance-label">Loading…</span>
+                  <span class="compliance-expand-caret" id="settings-compliance-caret">▾</span>
+                </button>
+                <div class="compliance-status-meta" id="settings-compliance-meta"></div>
+              </div>
+              <div id="settings-compliance-breakdown" class="compliance-breakdown is-hidden">
+                <div class="empty-state">Compliance checks will appear here.</div>
+              </div>
+            </div>
           </div>
         </div>
 

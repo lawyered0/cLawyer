@@ -494,6 +494,7 @@ mod tests {
             cost_guard: None,
             startup_time: std::time::Instant::now(),
             legal_config: None,
+            runtime_facts: crate::compliance::ComplianceRuntimeFacts::default(),
         }
     }
 }

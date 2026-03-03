@@ -49,6 +49,7 @@ use crate::db::{
     UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams,
 };
 use crate::extensions::ExtensionManager;
+use crate::llm::{ChatMessage, CompletionRequest};
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::tools::ToolRegistry;
 use crate::workspace::{Workspace, paths};
@@ -173,6 +174,8 @@ pub struct GatewayState {
     pub startup_time: std::time::Instant,
     /// Legal config for legal-policy-aware web endpoints.
     pub legal_config: Option<crate::config::LegalConfig>,
+    /// Snapshot of runtime facts used for compliance scoring.
+    pub runtime_facts: crate::compliance::ComplianceRuntimeFacts,
 }
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
@@ -350,6 +353,8 @@ pub async fn start_server(
             post(matters_conflicts_reindex_handler),
         )
         .route("/api/legal/audit", get(legal_audit_list_handler))
+        .route("/api/compliance/status", get(compliance_status_handler))
+        .route("/api/compliance/letter", post(compliance_letter_handler))
         .route("/api/legal/court-rules", get(legal_court_rules_handler))
         // Jobs
         .route("/api/jobs", get(jobs_list_handler))
@@ -6285,6 +6290,363 @@ async fn legal_audit_list_handler(
     }))
 }
 
+fn compliance_status_level(level: crate::compliance::ComplianceState) -> ComplianceStatusLevel {
+    match level {
+        crate::compliance::ComplianceState::Compliant => ComplianceStatusLevel::Compliant,
+        crate::compliance::ComplianceState::Partial => ComplianceStatusLevel::Partial,
+        crate::compliance::ComplianceState::NeedsReview => ComplianceStatusLevel::NeedsReview,
+    }
+}
+
+fn compliance_function_to_response(
+    function: &crate::compliance::ComplianceFunction,
+) -> ComplianceFunctionStatus {
+    ComplianceFunctionStatus {
+        status: compliance_status_level(function.status),
+        checks: function
+            .checks
+            .iter()
+            .map(|check| ComplianceCheckResult {
+                id: check.id.to_string(),
+                label: check.label.to_string(),
+                status: compliance_status_level(check.status),
+                detail: check.detail.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn normalize_compliance_framework(raw: Option<&str>) -> Result<String, (StatusCode, String)> {
+    let framework = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("nist")
+        .to_ascii_lowercase();
+    match framework.as_str() {
+        "nist" | "colorado-sb205" | "eu-ai-act" => Ok(framework),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "'framework' must be one of: nist, colorado-sb205, eu-ai-act".to_string(),
+        )),
+    }
+}
+
+fn is_matter_classified(metadata: &crate::legal::matter::MatterMetadata) -> bool {
+    !metadata.confidentiality.trim().is_empty() && !metadata.retention.trim().is_empty()
+}
+
+async fn collect_compliance_matter_metrics(state: &GatewayState) -> (usize, usize, Vec<String>) {
+    let mut data_gaps = Vec::new();
+    let matter_root = matter_root_for_gateway(state);
+
+    if let Some(store) = state.store.as_ref() {
+        match store.list_matters_db(&state.user_id).await {
+            Ok(rows) => {
+                let total = rows.len();
+                let mut classified = 0usize;
+                if let Some(workspace) = state.workspace.as_ref() {
+                    for row in rows {
+                        if let Some(metadata) = read_workspace_matter_metadata_optional(
+                            Some(workspace),
+                            &matter_root,
+                            &row.matter_id,
+                        )
+                        .await
+                            && is_matter_classified(&metadata)
+                        {
+                            classified += 1;
+                        }
+                    }
+                } else {
+                    data_gaps.push(
+                        "Workspace unavailable; matter classification coverage may be understated."
+                            .to_string(),
+                    );
+                }
+                return (total, classified, data_gaps);
+            }
+            Err(err) => {
+                data_gaps.push(format!(
+                    "Failed to list matters from database; falling back to workspace scan: {err}"
+                ));
+            }
+        }
+    }
+
+    let Some(workspace) = state.workspace.as_ref() else {
+        data_gaps.push(
+            "Matter metrics unavailable: both database and workspace are unavailable.".to_string(),
+        );
+        return (0, 0, data_gaps);
+    };
+
+    let entries = match list_matters_root_entries(workspace.list(&matter_root).await) {
+        Ok(entries) => entries,
+        Err((_status, message)) => {
+            data_gaps.push(format!(
+                "Failed to list matter root '{}': {}",
+                matter_root, message
+            ));
+            return (0, 0, data_gaps);
+        }
+    };
+
+    let mut total = 0usize;
+    let mut classified = 0usize;
+    for entry in entries.into_iter().filter(|entry| entry.is_directory) {
+        let matter_id = entry.path.rsplit('/').next().unwrap_or("");
+        if matter_id.is_empty() || matter_id == "_template" {
+            continue;
+        }
+        total += 1;
+        if let Some(metadata) =
+            read_workspace_matter_metadata_optional(Some(workspace), &matter_root, matter_id).await
+            && is_matter_classified(&metadata)
+        {
+            classified += 1;
+        }
+    }
+
+    (total, classified, data_gaps)
+}
+
+async fn collect_compliance_tool_count(state: &GatewayState) -> (usize, Vec<String>) {
+    let mut data_gaps = Vec::new();
+    let count = if let Some(registry) = state.tool_registry.as_ref() {
+        registry.tool_definitions().await.len()
+    } else {
+        data_gaps.push("Tool registry unavailable; inventory count reported as 0.".to_string());
+        0
+    };
+    (count, data_gaps)
+}
+
+async fn collect_compliance_audit_metrics(
+    state: &GatewayState,
+) -> (
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Vec<String>,
+) {
+    let mut data_gaps = Vec::new();
+    let Some(store) = state.store.as_ref() else {
+        data_gaps.push("Audit metrics unavailable because database is not configured.".to_string());
+        return (None, None, None, None, data_gaps);
+    };
+
+    let base_query = DbAuditEventQuery::default();
+    let total = match store.count_audit_events(&state.user_id, &base_query).await {
+        Ok(value) => Some(value),
+        Err(err) => {
+            data_gaps.push(format!("Failed to read audit event count: {err}"));
+            None
+        }
+    };
+
+    let severity_count = |severity: AuditSeverity| DbAuditEventQuery {
+        severity: Some(severity),
+        ..DbAuditEventQuery::default()
+    };
+
+    let info_count = match store
+        .count_audit_events(&state.user_id, &severity_count(AuditSeverity::Info))
+        .await
+    {
+        Ok(value) => Some(value),
+        Err(err) => {
+            data_gaps.push(format!("Failed to read info audit count: {err}"));
+            None
+        }
+    };
+
+    let warn_count = match store
+        .count_audit_events(&state.user_id, &severity_count(AuditSeverity::Warn))
+        .await
+    {
+        Ok(value) => Some(value),
+        Err(err) => {
+            data_gaps.push(format!("Failed to read warn audit count: {err}"));
+            None
+        }
+    };
+
+    let critical_count = match store
+        .count_audit_events(&state.user_id, &severity_count(AuditSeverity::Critical))
+        .await
+    {
+        Ok(value) => Some(value),
+        Err(err) => {
+            data_gaps.push(format!("Failed to read critical audit count: {err}"));
+            None
+        }
+    };
+
+    (total, info_count, warn_count, critical_count, data_gaps)
+}
+
+async fn build_compliance_status(
+    state: &GatewayState,
+    legal: &crate::config::LegalConfig,
+) -> crate::compliance::ComplianceStatus {
+    let (matters_total, matters_classified, matter_gaps) =
+        collect_compliance_matter_metrics(state).await;
+    let (tools_total, tool_gaps) = collect_compliance_tool_count(state).await;
+    let (audit_events_total, audit_info_count, audit_warn_count, audit_critical_count, audit_gaps) =
+        collect_compliance_audit_metrics(state).await;
+
+    let mut data_gaps = Vec::new();
+    data_gaps.extend(matter_gaps);
+    data_gaps.extend(tool_gaps);
+    data_gaps.extend(audit_gaps);
+
+    let inputs = crate::compliance::ComplianceInputs {
+        audit_enabled: legal.audit.enabled,
+        audit_hash_chain: legal.audit.hash_chain,
+        hardening_max_lockdown: legal.hardening
+            == crate::config::LegalHardeningProfile::MaxLockdown,
+        conflict_check_enabled: legal.conflict_check_enabled,
+        conflict_file_fallback_enabled: legal.conflict_file_fallback_enabled,
+        privilege_guard_enabled: legal.privilege_guard,
+        network_deny_by_default: legal.network.deny_by_default,
+        redaction_pii: legal.redaction.pii,
+        redaction_phi: legal.redaction.phi,
+        redaction_financial: legal.redaction.financial,
+        matters_total,
+        matters_classified,
+        tools_total,
+        audit_events_total,
+        audit_info_count,
+        audit_warn_count,
+        audit_critical_count,
+        runtime: state.runtime_facts.clone(),
+        data_gaps,
+    };
+    crate::compliance::evaluate_nist_rmf(&inputs)
+}
+
+async fn compliance_status_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<ComplianceStatusResponse>, (StatusCode, String)> {
+    let legal = legal_config_for_gateway(state.as_ref());
+    let status = build_compliance_status(state.as_ref(), &legal).await;
+    let generated_at = Utc::now().to_rfc3339();
+
+    let response = ComplianceStatusResponse {
+        overall: compliance_status_level(status.overall),
+        govern: compliance_function_to_response(&status.govern),
+        map: compliance_function_to_response(&status.map),
+        measure: compliance_function_to_response(&status.measure),
+        manage: compliance_function_to_response(&status.manage),
+        metrics: ComplianceMetrics {
+            matters_total: status.metrics.matters_total,
+            matters_classified: status.metrics.matters_classified,
+            tools_total: status.metrics.tools_total,
+            audit_events_total: status.metrics.audit_events_total,
+            audit_info_count: status.metrics.audit_info_count,
+            audit_warn_count: status.metrics.audit_warn_count,
+            audit_critical_count: status.metrics.audit_critical_count,
+            safety_policy_rule_count: state.runtime_facts.safety_policy_rule_count,
+            safety_leak_pattern_count: state.runtime_facts.safety_leak_pattern_count,
+        },
+        data_gaps: status.data_gaps.clone(),
+        generated_at: generated_at.clone(),
+    };
+
+    record_legal_audit_event(
+        state.as_ref(),
+        "compliance_status_viewed",
+        "gateway",
+        legal.active_matter.as_deref(),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "overall": response.overall,
+            "generated_at": generated_at,
+            "data_gap_count": response.data_gaps.len(),
+        }),
+    )
+    .await;
+
+    Ok(Json(response))
+}
+
+async fn compliance_letter_handler(
+    State(state): State<Arc<GatewayState>>,
+    body: Option<Json<ComplianceLetterRequest>>,
+) -> Result<Json<ComplianceLetterResponse>, (StatusCode, String)> {
+    let req = body.map(|Json(value)| value).unwrap_or_default();
+    let framework = normalize_compliance_framework(req.framework.as_deref())?;
+    let legal = legal_config_for_gateway(state.as_ref());
+    let status = build_compliance_status(state.as_ref(), &legal).await;
+    let llm = state.llm_provider.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "LLM provider is not available".to_string(),
+    ))?;
+    let model = llm.active_model_name();
+    let generated_at = Utc::now().to_rfc3339();
+    let prompt = crate::compliance::build_attestation_prompt(
+        &framework,
+        req.firm_name.as_deref(),
+        &generated_at,
+        &legal,
+        &status,
+        &model,
+    );
+
+    let request = CompletionRequest::new(vec![
+        ChatMessage::system(
+            "You write factual operational attestation letters from provided runtime evidence only.",
+        ),
+        ChatMessage::user(prompt),
+    ])
+    .with_temperature(0.1)
+    .with_max_tokens(1800);
+
+    let completion = llm.complete(request).await.map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to generate compliance letter: {}", err),
+        )
+    })?;
+    let base_markdown = completion.content.trim();
+    if base_markdown.is_empty() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "LLM returned an empty compliance letter".to_string(),
+        ));
+    }
+
+    let markdown = format!(
+        "{base_markdown}\n\n---\n\n*Disclaimer: Configuration summary only; not legal advice.*\n"
+    );
+    let overall = compliance_status_level(status.overall);
+
+    record_legal_audit_event(
+        state.as_ref(),
+        "compliance_letter_generated",
+        "gateway",
+        legal.active_matter.as_deref(),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "framework": framework,
+            "model": model,
+            "overall": overall,
+            "firm_name": req.firm_name,
+            "generated_at": generated_at,
+        }),
+    )
+    .await;
+
+    Ok(Json(ComplianceLetterResponse {
+        framework,
+        model,
+        generated_at,
+        overall,
+        markdown,
+    }))
+}
+
 // --- Jobs handlers ---
 
 async fn jobs_list_handler(
@@ -8174,7 +8536,86 @@ struct GatewayStatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
     use regex::Regex;
+
+    struct TestLlmProvider {
+        model: String,
+        content: String,
+    }
+
+    #[async_trait]
+    impl crate::llm::LlmProvider for TestLlmProvider {
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<crate::llm::CompletionResponse, crate::error::LlmError> {
+            Ok(crate::llm::CompletionResponse {
+                content: self.content.clone(),
+                input_tokens: 12,
+                output_tokens: 34,
+                finish_reason: crate::llm::FinishReason::Stop,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: crate::llm::ToolCompletionRequest,
+        ) -> Result<crate::llm::ToolCompletionResponse, crate::error::LlmError> {
+            Ok(crate::llm::ToolCompletionResponse {
+                content: Some(self.content.clone()),
+                tool_calls: Vec::new(),
+                input_tokens: 12,
+                output_tokens: 34,
+                finish_reason: crate::llm::FinishReason::Stop,
+            })
+        }
+    }
+
+    fn minimal_test_gateway_state(
+        llm_provider: Option<Arc<dyn crate::llm::LlmProvider>>,
+    ) -> Arc<GatewayState> {
+        Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: SseManager::new(),
+            workspace: None,
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: None,
+            job_manager: None,
+            prompt_queue: None,
+            user_id: "test-user".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: Some(Arc::new(
+                crate::channels::web::ws::WsConnectionTracker::new(),
+            )),
+            llm_provider,
+            skill_registry: None,
+            skill_catalog: None,
+            chat_rate_limiter: RateLimiter::new(30, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            startup_time: std::time::Instant::now(),
+            legal_config: Some(
+                crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+                    .expect("default legal config"),
+            ),
+            runtime_facts: crate::compliance::ComplianceRuntimeFacts::default(),
+        })
+    }
 
     fn assert_no_inline_event_handlers(asset_name: &str, content: &str) {
         let patterns = ["onclick=", "onchange=", "oninput="];
@@ -8315,6 +8756,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_index_html_contains_compliance_section_markers() {
+        let index = include_str!("static/index.html");
+        assert!(
+            index.contains("settings-compliance-status"),
+            "index.html is missing compliance status container marker"
+        );
+        assert!(
+            index.contains("settings-compliance-letter-btn"),
+            "index.html is missing compliance letter button marker"
+        );
+    }
+
+    #[test]
+    fn test_app_js_contains_compliance_api_calls() {
+        let app_js = include_str!("static/app.js");
+        assert!(
+            app_js.contains("/api/compliance/status"),
+            "app.js missing compliance status API call"
+        );
+        assert!(
+            app_js.contains("/api/compliance/letter"),
+            "app.js missing compliance letter API call"
+        );
+    }
+
+    #[tokio::test]
+    async fn compliance_status_handler_returns_ok_without_db() {
+        let state = minimal_test_gateway_state(None);
+        let Json(response) = compliance_status_handler(State(state))
+            .await
+            .expect("status response");
+        assert_eq!(response.overall, ComplianceStatusLevel::NeedsReview);
+        assert!(
+            response
+                .data_gaps
+                .iter()
+                .any(|gap| gap.to_ascii_lowercase().contains("database")),
+            "expected data_gaps to include a database-unavailable note"
+        );
+    }
+
+    #[tokio::test]
+    async fn compliance_letter_handler_rejects_invalid_framework() {
+        let state = minimal_test_gateway_state(None);
+        let err = compliance_letter_handler(
+            State(state),
+            Some(Json(ComplianceLetterRequest {
+                framework: Some("invalid-framework".to_string()),
+                firm_name: None,
+            })),
+        )
+        .await
+        .expect_err("invalid framework should fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn compliance_letter_handler_requires_llm_provider() {
+        let state = minimal_test_gateway_state(None);
+        let err = compliance_letter_handler(
+            State(state),
+            Some(Json(ComplianceLetterRequest {
+                framework: Some("nist".to_string()),
+                firm_name: Some("Example LLP".to_string()),
+            })),
+        )
+        .await
+        .expect_err("missing llm should fail");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn compliance_letter_handler_appends_disclaimer() {
+        let llm = Arc::new(TestLlmProvider {
+            model: "test-model".to_string(),
+            content: "# Attestation\nThis is factual output.".to_string(),
+        });
+        let state = minimal_test_gateway_state(Some(llm));
+        let Json(response) = compliance_letter_handler(
+            State(state),
+            Some(Json(ComplianceLetterRequest {
+                framework: Some("nist".to_string()),
+                firm_name: Some("Example LLP".to_string()),
+            })),
+        )
+        .await
+        .expect("letter response");
+        assert_eq!(response.framework, "nist");
+        assert!(
+            response
+                .markdown
+                .contains("Configuration summary only; not legal advice.")
+        );
+    }
+
     #[cfg(feature = "libsql")]
     fn test_legal_config() -> crate::config::LegalConfig {
         crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
@@ -8352,6 +8889,7 @@ mod tests {
             cost_guard: None,
             startup_time: std::time::Instant::now(),
             legal_config: Some(legal_config),
+            runtime_facts: crate::compliance::ComplianceRuntimeFacts::default(),
         })
     }
 
@@ -8393,6 +8931,7 @@ mod tests {
             cost_guard: None,
             startup_time: std::time::Instant::now(),
             legal_config: Some(test_legal_config()),
+            runtime_facts: crate::compliance::ComplianceRuntimeFacts::default(),
         })
     }
 
@@ -10917,6 +11456,7 @@ opened_at: 2026-02-28
             cost_guard: None,
             startup_time: std::time::Instant::now(),
             legal_config: Some(test_legal_config()),
+            runtime_facts: crate::compliance::ComplianceRuntimeFacts::default(),
         });
 
         let err = matter_invoices_list_handler(
