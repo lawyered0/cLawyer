@@ -363,7 +363,7 @@
             <div class="empty-state">Loading matters…</div>
           </div>
           <aside class="matter-detail-panel" id="matter-detail-panel">
-            <div class="empty-state">Select a matter to view documents and templates.</div>
+            <div class="empty-state">Select a matter to view Overview, Work, and Finance details.</div>
           </aside>
         </div>
       </div>
@@ -455,6 +455,23 @@
               <textarea id="matter-create-conflict-note" rows="3" placeholder="Required for waived or declined decisions"></textarea>
             </label>
           </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="configure-overlay is-hidden" id="matter-action-modal">
+    <div class="configure-modal matter-action-modal" role="dialog" aria-modal="true" aria-labelledby="matter-action-modal-title" tabindex="-1">
+      <div class="matter-create-modal-header">
+        <h3 id="matter-action-modal-title">Matter Action</h3>
+        <button type="button" id="matter-action-modal-close" class="btn-ext">Close</button>
+      </div>
+      <form id="matter-action-form" class="matter-action-form" autocomplete="off">
+        <div id="matter-action-form-body" class="matter-action-form-body"></div>
+        <div id="matter-action-form-error" class="matter-action-form-error is-hidden"></div>
+        <div class="matters-create-actions">
+          <button class="btn-ext activate" id="matter-action-submit-btn" type="submit">Save</button>
+          <button class="btn-ext" id="matter-action-cancel-btn" type="button">Cancel</button>
         </div>
       </form>
     </div>

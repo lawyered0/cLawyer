@@ -60,6 +60,8 @@ const requestVersions = {
   routineDetail: 0,
   matters: 0,
   matterDetail: 0,
+  matterDetailWork: 0,
+  matterDetailFinance: 0,
   legalAudit: 0,
   settings: 0,
   extensions: 0,
@@ -176,6 +178,8 @@ bindClick('auth-connect-btn', authenticate);
   bindClick('matters-new-btn', openMatterCreateModal);
   bindClick('matter-create-modal-close', closeMatterCreateModal);
   bindClick('matter-create-cancel-btn', closeMatterCreateModal);
+  bindClick('matter-action-modal-close', closeMatterActionModal);
+  bindClick('matter-action-cancel-btn', closeMatterActionModal);
   bindClick('matters-clear-btn', clearActiveMatter);
   bindClick('matters-conflict-clear-btn', clearMatterConflictCheck);
   bindClick('legal-audit-refresh-btn', function() { loadLegalAudit(0); });
@@ -220,6 +224,19 @@ bindClick('auth-connect-btn', authenticate);
   if (matterCreateModal) {
     matterCreateModal.addEventListener('click', function(e) {
       if (e.target === matterCreateModal) closeMatterCreateModal();
+    });
+  }
+  var matterActionModal = byId('matter-action-modal');
+  if (matterActionModal) {
+    matterActionModal.addEventListener('click', function(e) {
+      if (e.target === matterActionModal) closeMatterActionModal();
+    });
+  }
+  var matterActionForm = byId('matter-action-form');
+  if (matterActionForm) {
+    matterActionForm.addEventListener('submit', function(e) {
+      e.preventDefault();
+      submitMatterActionForm();
     });
   }
   var mattersConflictForm = byId('matters-conflict-form');
@@ -279,7 +296,38 @@ bindClick('auth-connect-btn', authenticate);
         switchTab('chat');
         switchThread(threadId);
       }
+      return;
     }
+    if (action === 'create-task') {
+      openMatterActionModal('task');
+      return;
+    }
+    if (action === 'create-note') {
+      openMatterActionModal('note');
+      return;
+    }
+    if (action === 'create-time-entry') {
+      openMatterActionModal('time');
+      return;
+    }
+    if (action === 'create-expense-entry') {
+      openMatterActionModal('expense');
+      return;
+    }
+    if (action === 'record-trust-deposit') {
+      openMatterActionModal('deposit');
+      return;
+    }
+    if (action === 'open-invoice') {
+      var invoiceId = button.getAttribute('data-invoice-id');
+      if (invoiceId) openMatterInvoiceDetail(invoiceId);
+    }
+  });
+  delegate(byId('matter-detail-panel'), 'click', 'button[data-matter-detail-section]', function(e, button) {
+    e.preventDefault();
+    var section = button.getAttribute('data-matter-detail-section');
+    if (!section) return;
+    setMatterDetailSection(section);
   });
   delegate(byId('legal-audit-list'), 'click', 'button[data-audit-index]', function(e, button) {
     e.preventDefault();
@@ -3901,6 +3949,18 @@ document.addEventListener('keydown', (e) => {
     }
   }
 
+  if (isMatterActionModalOpen()) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeMatterActionModal();
+      return;
+    }
+    if (e.key === 'Tab') {
+      trapMatterActionModalFocus(e);
+      return;
+    }
+  }
+
   // Mod+1-8: switch tabs (primary then overflow)
   if (mod && e.key >= '1' && e.key <= '8') {
     e.preventDefault();
@@ -3979,6 +4039,27 @@ var currentMatterDashboard = null;
 var currentMatterDeadlines = [];
 /** Last loaded conversation threads bound to selected matter. */
 var currentMatterThreads = [];
+/** Currently selected subsection in the matter detail panel. */
+var currentMatterDetailSection = 'overview';
+/** Last loaded work data for selected matter. */
+var currentMatterWork = {
+  loaded: false,
+  loading: false,
+  error: '',
+  tasks: [],
+  notes: [],
+  timeEntries: [],
+  expenseEntries: [],
+};
+/** Last loaded finance data for selected matter. */
+var currentMatterFinance = {
+  loaded: false,
+  loading: false,
+  error: '',
+  timeSummary: null,
+  trustLedger: null,
+  invoices: [],
+};
 /** Persisted key for grouped matters rendering preference. */
 var MATTERS_GROUP_KEY = 'clawyer_matters_group_by_client';
 /** Grouping preference in Matters tab. */
@@ -4000,6 +4081,42 @@ var matterCreateReviewState = {
 /** Busy flags for create/review actions. */
 var matterCreateBusy = false;
 var matterCreateReviewBusy = false;
+/** Last focused element before opening the detail quick-action modal. */
+var matterActionModalLastFocus = null;
+/** Active quick-action modal type (task|note|time|expense|deposit). */
+var matterActionModalType = null;
+/** Busy state for matter quick-action modal submit. */
+var matterActionModalBusy = false;
+
+function createEmptyMatterWorkState() {
+  return {
+    loaded: false,
+    loading: false,
+    error: '',
+    tasks: [],
+    notes: [],
+    timeEntries: [],
+    expenseEntries: [],
+  };
+}
+
+function createEmptyMatterFinanceState() {
+  return {
+    loaded: false,
+    loading: false,
+    error: '',
+    timeSummary: null,
+    trustLedger: null,
+    invoices: [],
+  };
+}
+
+function todayIsoDate() {
+  var now = new Date();
+  var month = String(now.getMonth() + 1).padStart(2, '0');
+  var day = String(now.getDate()).padStart(2, '0');
+  return now.getFullYear() + '-' + month + '-' + day;
+}
 
 function parseCsvList(raw) {
   if (!raw) return [];
@@ -4442,30 +4559,14 @@ function renderMatterDetailPlaceholder(message) {
   panel.innerHTML = '<div class="empty-state">' + escapeHtml(message) + '</div>';
 }
 
-function renderMatterDetail() {
-  var panel = byId('matter-detail-panel');
-  if (!panel) return;
-  if (!selectedMatterId) {
-    renderMatterDetailPlaceholder('Select a matter to view workflow scorecard, deadlines, documents, and templates.');
-    return;
-  }
+function renderMatterSectionToggle(section, label) {
+  var activeClass = currentMatterDetailSection === section ? ' is-active' : '';
+  return '<button class="btn-ext matter-detail-tab' + activeClass
+    + '" data-matter-detail-section="' + escapeHtml(section) + '">' + escapeHtml(label) + '</button>';
+}
 
-  var selectedMatter = null;
-  for (var m = 0; m < mattersCache.length; m++) {
-    if (mattersCache[m] && mattersCache[m].id === selectedMatterId) {
-      selectedMatter = mattersCache[m];
-      break;
-    }
-  }
-
-  var html = '<div class="matter-detail-header">';
-  html += '<h4>' + escapeHtml(selectedMatterId) + '</h4>';
-  html += '<div class="matter-detail-header-actions">';
-  html += '<button data-matter-detail-action="open-doc" data-path="' + escapeHtml('matters/' + selectedMatterId + '/matter.yaml') + '">Open matter.yaml</button>';
-  html += '<button data-matter-detail-action="export-retrieval-packet">Export AI Packet</button>';
-  html += '<button data-matter-detail-action="build-filing-package">Build Filing Package</button>';
-  html += '</div>';
-  html += '</div>';
+function renderMatterDetailOverview(selectedMatter) {
+  var html = '';
 
   if (selectedMatter) {
     var metadataRows = [];
@@ -4578,11 +4679,11 @@ function renderMatterDetail() {
       var title = convo.title || ((convo.id || '').substring(0, 8));
       var updated = convo.updated_at ? ('Updated: ' + convo.updated_at) : '';
       var turns = 'Turns: ' + String(convo.turn_count || 0);
-      var meta = [turns, updated].filter(function(v) { return !!v; }).join(' • ');
+      var convoMeta = [turns, updated].filter(function(v) { return !!v; }).join(' • ');
       html += '<div class="matter-item-row">';
       html += '<div class="matter-item-main">';
       html += '<span class="matter-item-path">' + escapeHtml(title) + '</span>';
-      html += '<span class="matter-item-meta">' + escapeHtml(meta) + '</span>';
+      html += '<span class="matter-item-meta">' + escapeHtml(convoMeta) + '</span>';
       html += '</div>';
       html += '<button data-matter-detail-action="open-thread" data-thread-id="' + escapeHtml(convo.id) + '">Open in Chat</button>';
       html += '</div>';
@@ -4608,18 +4709,343 @@ function renderMatterDetail() {
     html += '</div>';
   }
   html += '</div>';
+  return html;
+}
+
+function renderMatterDetailWork() {
+  var html = '<div class="matter-detail-section">';
+  html += '<h5>Capture Work</h5>';
+  html += '<div class="matter-detail-inline-actions">';
+  html += '<button class="btn-ext" data-matter-detail-action="create-task">+ Task</button>';
+  html += '<button class="btn-ext" data-matter-detail-action="create-note">+ Note</button>';
+  html += '<button class="btn-ext" data-matter-detail-action="create-time-entry">+ Time</button>';
+  html += '<button class="btn-ext" data-matter-detail-action="create-expense-entry">+ Expense</button>';
+  html += '</div>';
+  html += '</div>';
+
+  if (currentMatterWork.loading && !currentMatterWork.loaded) {
+    return html + '<div class="empty-state">Loading matter work data…</div>';
+  }
+  if (currentMatterWork.error && !currentMatterWork.loaded) {
+    return html + '<div class="empty-state error-state">Failed to load work data: '
+      + escapeHtml(currentMatterWork.error) + '</div>';
+  }
+  if (!currentMatterWork.loaded) {
+    return html + '<div class="empty-state">Open Work to view tasks, notes, time, and expenses.</div>';
+  }
+
+  html += '<div class="matter-detail-section">';
+  html += '<h5>Tasks</h5>';
+  if (!currentMatterWork.tasks.length) {
+    html += '<div class="empty-state">No tasks yet.</div>';
+  } else {
+    html += '<div class="matter-item-list">';
+    for (var t = 0; t < currentMatterWork.tasks.length; t++) {
+      var task = currentMatterWork.tasks[t];
+      var taskMeta = 'Status: ' + String(task.status || 'todo');
+      if (task.assignee) taskMeta += ' • Assignee: ' + task.assignee;
+      if (task.due_at) taskMeta += ' • Due: ' + task.due_at;
+      html += '<div class="matter-item-row">';
+      html += '<div class="matter-item-main">';
+      html += '<span class="matter-item-path">' + escapeHtml(task.title || '') + '</span>';
+      html += '<span class="matter-item-meta">' + escapeHtml(taskMeta) + '</span>';
+      html += '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="matter-detail-section">';
+  html += '<h5>Notes</h5>';
+  if (!currentMatterWork.notes.length) {
+    html += '<div class="empty-state">No notes yet.</div>';
+  } else {
+    html += '<div class="matter-item-list">';
+    for (var n = 0; n < currentMatterWork.notes.length; n++) {
+      var note = currentMatterWork.notes[n];
+      var noteMeta = 'Author: ' + String(note.author || 'unknown');
+      if (note.pinned) noteMeta += ' • Pinned';
+      var preview = String(note.body || '').replace(/\s+/g, ' ').trim();
+      if (preview.length > 160) preview = preview.substring(0, 157) + '...';
+      html += '<div class="matter-item-row">';
+      html += '<div class="matter-item-main">';
+      html += '<span class="matter-item-path">' + escapeHtml(preview || '(empty note)') + '</span>';
+      html += '<span class="matter-item-meta">' + escapeHtml(noteMeta) + '</span>';
+      html += '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="matter-detail-section">';
+  html += '<h5>Time Entries</h5>';
+  if (!currentMatterWork.timeEntries.length) {
+    html += '<div class="empty-state">No time entries yet.</div>';
+  } else {
+    html += '<div class="matter-item-list">';
+    for (var ti = 0; ti < currentMatterWork.timeEntries.length; ti++) {
+      var time = currentMatterWork.timeEntries[ti];
+      var timeMeta = String(time.hours || '0') + 'h • ' + String(time.timekeeper || '');
+      if (time.entry_date) timeMeta += ' • ' + time.entry_date;
+      if (time.billable) timeMeta += ' • billable';
+      html += '<div class="matter-item-row">';
+      html += '<div class="matter-item-main">';
+      html += '<span class="matter-item-path">' + escapeHtml(time.description || '') + '</span>';
+      html += '<span class="matter-item-meta">' + escapeHtml(timeMeta) + '</span>';
+      html += '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="matter-detail-section">';
+  html += '<h5>Expenses</h5>';
+  if (!currentMatterWork.expenseEntries.length) {
+    html += '<div class="empty-state">No expense entries yet.</div>';
+  } else {
+    html += '<div class="matter-item-list">';
+    for (var e = 0; e < currentMatterWork.expenseEntries.length; e++) {
+      var expense = currentMatterWork.expenseEntries[e];
+      var expenseMeta = '$' + String(expense.amount || '0') + ' • ' + String(expense.category || '');
+      if (expense.entry_date) expenseMeta += ' • ' + expense.entry_date;
+      if (expense.billable) expenseMeta += ' • billable';
+      html += '<div class="matter-item-row">';
+      html += '<div class="matter-item-main">';
+      html += '<span class="matter-item-path">' + escapeHtml(expense.description || '') + '</span>';
+      html += '<span class="matter-item-meta">' + escapeHtml(expenseMeta) + '</span>';
+      html += '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  return html;
+}
+
+function renderMatterDetailFinance() {
+  var html = '<div class="matter-detail-section">';
+  html += '<h5>Finance Actions</h5>';
+  html += '<div class="matter-detail-inline-actions">';
+  html += '<button class="btn-ext" data-matter-detail-action="record-trust-deposit">Record Trust Deposit</button>';
+  html += '</div>';
+  html += '</div>';
+
+  if (currentMatterFinance.loading && !currentMatterFinance.loaded) {
+    return html + '<div class="empty-state">Loading finance data…</div>';
+  }
+  if (currentMatterFinance.error && !currentMatterFinance.loaded) {
+    return html + '<div class="empty-state error-state">Failed to load finance data: '
+      + escapeHtml(currentMatterFinance.error) + '</div>';
+  }
+  if (!currentMatterFinance.loaded) {
+    return html + '<div class="empty-state">Open Finance to view time summary, trust ledger, and invoices.</div>';
+  }
+
+  html += '<div class="matter-detail-section">';
+  html += '<h5>Time Summary</h5>';
+  if (!currentMatterFinance.timeSummary) {
+    html += '<div class="empty-state">No time summary available.</div>';
+  } else {
+    var summary = currentMatterFinance.timeSummary;
+    html += '<div class="matter-scorecard-grid">';
+    html += '<div class="matter-scorecard-card"><span class="label">Total Hours</span><span class="value">' + escapeHtml(String(summary.total_hours || '0')) + '</span></div>';
+    html += '<div class="matter-scorecard-card"><span class="label">Billable Hours</span><span class="value">' + escapeHtml(String(summary.billable_hours || '0')) + '</span></div>';
+    html += '<div class="matter-scorecard-card"><span class="label">Unbilled Hours</span><span class="value">' + escapeHtml(String(summary.unbilled_hours || '0')) + '</span></div>';
+    html += '<div class="matter-scorecard-card"><span class="label">Total Expenses</span><span class="value">' + escapeHtml(String(summary.total_expenses || '0')) + '</span></div>';
+    html += '<div class="matter-scorecard-card"><span class="label">Billable Expenses</span><span class="value">' + escapeHtml(String(summary.billable_expenses || '0')) + '</span></div>';
+    html += '<div class="matter-scorecard-card"><span class="label">Unbilled Expenses</span><span class="value">' + escapeHtml(String(summary.unbilled_expenses || '0')) + '</span></div>';
+    html += '</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="matter-detail-section">';
+  html += '<h5>Trust Ledger</h5>';
+  if (!currentMatterFinance.trustLedger) {
+    html += '<div class="empty-state">No trust ledger available.</div>';
+  } else {
+    html += '<div class="matter-finance-balance">Current balance: $'
+      + escapeHtml(String(currentMatterFinance.trustLedger.balance || '0')) + '</div>';
+    if (!currentMatterFinance.trustLedger.entries || !currentMatterFinance.trustLedger.entries.length) {
+      html += '<div class="empty-state">No trust entries yet.</div>';
+    } else {
+      html += '<div class="matter-item-list">';
+      for (var tl = 0; tl < currentMatterFinance.trustLedger.entries.length; tl++) {
+        var entry = currentMatterFinance.trustLedger.entries[tl];
+        var trustMeta = String(entry.entry_type || '') + ' • $' + String(entry.amount || '0');
+        if (entry.recorded_by) trustMeta += ' • ' + entry.recorded_by;
+        html += '<div class="matter-item-row">';
+        html += '<div class="matter-item-main">';
+        html += '<span class="matter-item-path">' + escapeHtml(entry.description || '') + '</span>';
+        html += '<span class="matter-item-meta">' + escapeHtml(trustMeta) + '</span>';
+        html += '</div>';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+  }
+  html += '</div>';
+
+  html += '<div class="matter-detail-section">';
+  html += '<h5>Invoices</h5>';
+  if (!currentMatterFinance.invoices.length) {
+    html += '<div class="empty-state">No invoices saved yet.</div>';
+  } else {
+    html += '<div class="matter-item-list">';
+    for (var iv = 0; iv < currentMatterFinance.invoices.length; iv++) {
+      var invoice = currentMatterFinance.invoices[iv];
+      var invoiceMeta = 'Status: ' + String(invoice.status || 'draft') + ' • Total: $' + String(invoice.total || '0');
+      if (invoice.due_date) invoiceMeta += ' • Due: ' + invoice.due_date;
+      html += '<div class="matter-item-row">';
+      html += '<div class="matter-item-main">';
+      html += '<span class="matter-item-path">' + escapeHtml(invoice.invoice_number || invoice.id || '') + '</span>';
+      html += '<span class="matter-item-meta">' + escapeHtml(invoiceMeta) + '</span>';
+      html += '</div>';
+      html += '<button data-matter-detail-action="open-invoice" data-invoice-id="' + escapeHtml(invoice.id) + '">View</button>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  return html;
+}
+
+function renderMatterDetail() {
+  var panel = byId('matter-detail-panel');
+  if (!panel) return;
+  if (!selectedMatterId) {
+    renderMatterDetailPlaceholder('Select a matter to view Overview, Work, and Finance details.');
+    return;
+  }
+
+  var selectedMatter = null;
+  for (var m = 0; m < mattersCache.length; m++) {
+    if (mattersCache[m] && mattersCache[m].id === selectedMatterId) {
+      selectedMatter = mattersCache[m];
+      break;
+    }
+  }
+
+  var html = '<div class="matter-detail-header">';
+  html += '<h4>' + escapeHtml(selectedMatterId) + '</h4>';
+  html += '<div class="matter-detail-header-actions">';
+  html += '<button data-matter-detail-action="open-doc" data-path="' + escapeHtml('matters/' + selectedMatterId + '/matter.yaml') + '">Open matter.yaml</button>';
+  html += '<button data-matter-detail-action="export-retrieval-packet">Export AI Packet</button>';
+  html += '<button data-matter-detail-action="build-filing-package">Build Filing Package</button>';
+  html += '</div>';
+  html += '</div>';
+
+  html += '<div class="matter-detail-tabs">';
+  html += renderMatterSectionToggle('overview', 'Overview');
+  html += renderMatterSectionToggle('work', 'Work');
+  html += renderMatterSectionToggle('finance', 'Finance');
+  html += '</div>';
+
+  if (currentMatterDetailSection === 'work') {
+    html += renderMatterDetailWork();
+  } else if (currentMatterDetailSection === 'finance') {
+    html += renderMatterDetailFinance();
+  } else {
+    html += renderMatterDetailOverview(selectedMatter);
+  }
 
   panel.innerHTML = html;
+}
+
+function setMatterDetailSection(section) {
+  if (!selectedMatterId) return;
+  if (section !== 'overview' && section !== 'work' && section !== 'finance') return;
+  if (currentMatterDetailSection === section) return;
+  currentMatterDetailSection = section;
+  renderMatterDetail();
+  if (section === 'work') {
+    loadMatterWorkDataIfNeeded(false);
+    return;
+  }
+  if (section === 'finance') {
+    loadMatterFinanceDataIfNeeded(false);
+  }
+}
+
+function loadMatterWorkDataIfNeeded(force) {
+  if (!selectedMatterId) return Promise.resolve();
+  if (!force && (currentMatterWork.loaded || currentMatterWork.loading)) return Promise.resolve();
+  var matterId = selectedMatterId;
+  currentMatterWork.loading = true;
+  currentMatterWork.error = '';
+  if (currentMatterDetailSection === 'work') renderMatterDetail();
+  var requestVersion = beginRequest('matterDetailWork');
+  return Promise.all([
+    apiFetch('/api/matters/' + encodeURIComponent(matterId) + '/tasks'),
+    apiFetch('/api/matters/' + encodeURIComponent(matterId) + '/notes'),
+    apiFetch('/api/matters/' + encodeURIComponent(matterId) + '/time'),
+    apiFetch('/api/matters/' + encodeURIComponent(matterId) + '/expenses'),
+  ]).then(function(results) {
+    if (!isCurrentRequest('matterDetailWork', requestVersion)) return;
+    if (selectedMatterId !== matterId) return;
+    currentMatterWork.loaded = true;
+    currentMatterWork.loading = false;
+    currentMatterWork.error = '';
+    currentMatterWork.tasks = (results[0] && results[0].tasks) ? results[0].tasks : [];
+    currentMatterWork.notes = (results[1] && results[1].notes) ? results[1].notes : [];
+    currentMatterWork.timeEntries = (results[2] && results[2].entries) ? results[2].entries : [];
+    currentMatterWork.expenseEntries = (results[3] && results[3].entries) ? results[3].entries : [];
+    if (currentMatterDetailSection === 'work') renderMatterDetail();
+  }).catch(function(err) {
+    if (!isCurrentRequest('matterDetailWork', requestVersion)) return;
+    if (selectedMatterId !== matterId) return;
+    currentMatterWork.loading = false;
+    currentMatterWork.error = err.message;
+    if (currentMatterDetailSection === 'work') renderMatterDetail();
+  });
+}
+
+function loadMatterFinanceDataIfNeeded(force) {
+  if (!selectedMatterId) return Promise.resolve();
+  if (!force && (currentMatterFinance.loaded || currentMatterFinance.loading)) return Promise.resolve();
+  var matterId = selectedMatterId;
+  currentMatterFinance.loading = true;
+  currentMatterFinance.error = '';
+  if (currentMatterDetailSection === 'finance') renderMatterDetail();
+  var requestVersion = beginRequest('matterDetailFinance');
+  return Promise.all([
+    apiFetch('/api/matters/' + encodeURIComponent(matterId) + '/time-summary'),
+    apiFetch('/api/matters/' + encodeURIComponent(matterId) + '/trust/ledger'),
+    apiFetch('/api/matters/' + encodeURIComponent(matterId) + '/invoices?limit=25'),
+  ]).then(function(results) {
+    if (!isCurrentRequest('matterDetailFinance', requestVersion)) return;
+    if (selectedMatterId !== matterId) return;
+    currentMatterFinance.loaded = true;
+    currentMatterFinance.loading = false;
+    currentMatterFinance.error = '';
+    currentMatterFinance.timeSummary = results[0] || null;
+    currentMatterFinance.trustLedger = results[1] || null;
+    currentMatterFinance.invoices = (results[2] && results[2].invoices) ? results[2].invoices : [];
+    if (currentMatterDetailSection === 'finance') renderMatterDetail();
+  }).catch(function(err) {
+    if (!isCurrentRequest('matterDetailFinance', requestVersion)) return;
+    if (selectedMatterId !== matterId) return;
+    currentMatterFinance.loading = false;
+    currentMatterFinance.error = err.message;
+    if (currentMatterDetailSection === 'finance') renderMatterDetail();
+  });
 }
 
 function openMatterDetail(id) {
   if (!id) return;
   selectedMatterId = id;
+  currentMatterDetailSection = 'overview';
   currentMatterDocuments = [];
   currentMatterTemplates = [];
   currentMatterDashboard = null;
   currentMatterDeadlines = [];
   currentMatterThreads = [];
+  currentMatterWork = createEmptyMatterWorkState();
+  currentMatterFinance = createEmptyMatterFinanceState();
   renderMatters();
   renderMatterDetailPlaceholder('Loading detail for ' + id + '…');
 
@@ -4632,6 +5058,7 @@ function openMatterDetail(id) {
     apiFetch('/api/chat/threads?matter_id=' + encodeURIComponent(id)),
   ]).then(function (results) {
     if (!isCurrentRequest('matterDetail', requestVersion)) return;
+    if (selectedMatterId !== id) return;
     var docsData = results[0];
     var dashboardData = results[1];
     var deadlinesData = results[2];
@@ -4706,6 +5133,360 @@ function exportMatterRetrievalPacket(unredacted) {
   });
 }
 
+function actionInputValue(id) {
+  var el = byId(id);
+  return el ? el.value.trim() : '';
+}
+
+function isMatterActionModalOpen() {
+  var modal = byId('matter-action-modal');
+  return !!(modal && !modal.classList.contains('is-hidden'));
+}
+
+function trapMatterActionModalFocus(event) {
+  var modal = byId('matter-action-modal');
+  if (!modal || modal.classList.contains('is-hidden')) return;
+  var dialog = modal.querySelector('.configure-modal');
+  var focusables = getFocusableElements(dialog);
+  if (!focusables.length) {
+    event.preventDefault();
+    if (dialog && typeof dialog.focus === 'function') dialog.focus();
+    return;
+  }
+  var first = focusables[0];
+  var last = focusables[focusables.length - 1];
+  var active = document.activeElement;
+  if (event.shiftKey) {
+    if (active === first || !dialog.contains(active)) {
+      event.preventDefault();
+      last.focus();
+    }
+    return;
+  }
+  if (active === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function setMatterActionError(message) {
+  var error = byId('matter-action-form-error');
+  if (!error) return;
+  if (!message) {
+    error.textContent = '';
+    error.classList.add('is-hidden');
+    return;
+  }
+  error.textContent = message;
+  error.classList.remove('is-hidden');
+}
+
+function setMatterActionModalBusy(isBusy) {
+  matterActionModalBusy = isBusy;
+  var form = byId('matter-action-form');
+  if (!form) return;
+  var fields = form.querySelectorAll('input, textarea, select, button');
+  for (var i = 0; i < fields.length; i++) {
+    fields[i].disabled = isBusy;
+  }
+  var submit = byId('matter-action-submit-btn');
+  if (submit) submit.textContent = isBusy ? 'Saving…' : 'Save';
+}
+
+function actionSelectChecked(id) {
+  var el = byId(id);
+  return !!(el && el.checked);
+}
+
+function actionBodyForType(type) {
+  if (type === 'task') {
+    var title = actionInputValue('matter-action-task-title');
+    if (!title) return { error: 'Task title is required.' };
+    var taskBody = {
+      title: title,
+      status: actionInputValue('matter-action-task-status') || 'todo',
+    };
+    var description = actionInputValue('matter-action-task-description');
+    if (description) taskBody.description = description;
+    var assignee = actionInputValue('matter-action-task-assignee');
+    if (assignee) taskBody.assignee = assignee;
+    var dueAtRaw = actionInputValue('matter-action-task-due-at');
+    if (dueAtRaw) {
+      var dueAt = new Date(dueAtRaw);
+      if (isNaN(dueAt.getTime())) return { error: 'Due date must be valid.' };
+      taskBody.due_at = dueAt.toISOString();
+    }
+    return { path: '/tasks', body: taskBody };
+  }
+  if (type === 'note') {
+    var author = actionInputValue('matter-action-note-author');
+    var noteBody = actionInputValue('matter-action-note-body');
+    if (!author || !noteBody) return { error: 'Author and note body are required.' };
+    return {
+      path: '/notes',
+      body: {
+        author: author,
+        body: noteBody,
+        pinned: actionSelectChecked('matter-action-note-pinned'),
+      },
+    };
+  }
+  if (type === 'time') {
+    var timekeeper = actionInputValue('matter-action-timekeeper');
+    var timeDescription = actionInputValue('matter-action-time-description');
+    var hours = actionInputValue('matter-action-time-hours');
+    var timeDate = actionInputValue('matter-action-time-date');
+    if (!timekeeper || !timeDescription || !hours || !timeDate) {
+      return { error: 'Timekeeper, description, hours, and date are required.' };
+    }
+    var timeBody = {
+      timekeeper: timekeeper,
+      description: timeDescription,
+      hours: hours,
+      entry_date: timeDate,
+      billable: actionSelectChecked('matter-action-time-billable'),
+    };
+    var hourlyRate = actionInputValue('matter-action-time-rate');
+    if (hourlyRate) timeBody.hourly_rate = hourlyRate;
+    return { path: '/time', body: timeBody };
+  }
+  if (type === 'expense') {
+    var submittedBy = actionInputValue('matter-action-expense-submitted-by');
+    var expenseDescription = actionInputValue('matter-action-expense-description');
+    var amount = actionInputValue('matter-action-expense-amount');
+    var category = actionInputValue('matter-action-expense-category');
+    var expenseDate = actionInputValue('matter-action-expense-date');
+    if (!submittedBy || !expenseDescription || !amount || !category || !expenseDate) {
+      return { error: 'Submitted by, description, amount, category, and date are required.' };
+    }
+    var expenseBody = {
+      submitted_by: submittedBy,
+      description: expenseDescription,
+      amount: amount,
+      category: category,
+      entry_date: expenseDate,
+      billable: actionSelectChecked('matter-action-expense-billable'),
+    };
+    var receiptPath = actionInputValue('matter-action-expense-receipt');
+    if (receiptPath) expenseBody.receipt_path = receiptPath;
+    return { path: '/expenses', body: expenseBody };
+  }
+  if (type === 'deposit') {
+    var depositAmount = actionInputValue('matter-action-deposit-amount');
+    var recordedBy = actionInputValue('matter-action-deposit-recorded-by');
+    if (!depositAmount || !recordedBy) {
+      return { error: 'Amount and recorded by are required.' };
+    }
+    var depositBody = {
+      amount: depositAmount,
+      recorded_by: recordedBy,
+    };
+    var depositDescription = actionInputValue('matter-action-deposit-description');
+    if (depositDescription) depositBody.description = depositDescription;
+    return { path: '/trust/deposit', body: depositBody };
+  }
+  return { error: 'Unsupported matter action type.' };
+}
+
+function openMatterActionModal(type) {
+  if (!selectedMatterId) return;
+  var modal = byId('matter-action-modal');
+  var formBody = byId('matter-action-form-body');
+  var title = byId('matter-action-modal-title');
+  var submit = byId('matter-action-submit-btn');
+  if (!modal || !formBody || !title || !submit) return;
+
+  var html = '';
+  var heading = '';
+  if (type === 'task') {
+    heading = 'Add Task';
+    html += '<label>Title<input id="matter-action-task-title" type="text" required></label>';
+    html += '<label>Description<textarea id="matter-action-task-description" rows="4"></textarea></label>';
+    html += '<label>Status<select id="matter-action-task-status"><option value="todo">todo</option><option value="in_progress">in_progress</option><option value="blocked">blocked</option><option value="done">done</option><option value="cancelled">cancelled</option></select></label>';
+    html += '<label>Assignee (optional)<input id="matter-action-task-assignee" type="text"></label>';
+    html += '<label>Due at (optional)<input id="matter-action-task-due-at" type="datetime-local"></label>';
+  } else if (type === 'note') {
+    heading = 'Add Note';
+    html += '<label>Author<input id="matter-action-note-author" type="text" value="Attorney" required></label>';
+    html += '<label>Note<textarea id="matter-action-note-body" rows="6" required></textarea></label>';
+    html += '<label class="matter-action-checkbox"><input id="matter-action-note-pinned" type="checkbox"> Pin note</label>';
+  } else if (type === 'time') {
+    heading = 'Add Time Entry';
+    html += '<label>Timekeeper<input id="matter-action-timekeeper" type="text" value="Attorney" required></label>';
+    html += '<label>Description<input id="matter-action-time-description" type="text" required></label>';
+    html += '<label>Hours<input id="matter-action-time-hours" type="number" min="0" step="0.1" required></label>';
+    html += '<label>Hourly rate (optional)<input id="matter-action-time-rate" type="number" min="0" step="0.01"></label>';
+    html += '<label>Entry date<input id="matter-action-time-date" type="date" value="' + todayIsoDate() + '" required></label>';
+    html += '<label class="matter-action-checkbox"><input id="matter-action-time-billable" type="checkbox" checked> Billable</label>';
+  } else if (type === 'expense') {
+    heading = 'Add Expense Entry';
+    html += '<label>Submitted by<input id="matter-action-expense-submitted-by" type="text" value="Attorney" required></label>';
+    html += '<label>Description<input id="matter-action-expense-description" type="text" required></label>';
+    html += '<label>Amount<input id="matter-action-expense-amount" type="number" min="0" step="0.01" required></label>';
+    html += '<label>Category<select id="matter-action-expense-category"><option value="filing_fee">filing_fee</option><option value="travel">travel</option><option value="postage">postage</option><option value="expert">expert</option><option value="copying">copying</option><option value="court_reporter">court_reporter</option><option value="other" selected>other</option></select></label>';
+    html += '<label>Entry date<input id="matter-action-expense-date" type="date" value="' + todayIsoDate() + '" required></label>';
+    html += '<label>Receipt path (optional)<input id="matter-action-expense-receipt" type="text" placeholder="matters/' + escapeHtml(selectedMatterId) + '/receipts/..."></label>';
+    html += '<label class="matter-action-checkbox"><input id="matter-action-expense-billable" type="checkbox" checked> Billable</label>';
+  } else if (type === 'deposit') {
+    heading = 'Record Trust Deposit';
+    html += '<label>Amount<input id="matter-action-deposit-amount" type="number" min="0" step="0.01" required></label>';
+    html += '<label>Recorded by<input id="matter-action-deposit-recorded-by" type="text" value="Attorney" required></label>';
+    html += '<label>Description (optional)<input id="matter-action-deposit-description" type="text" value="Trust deposit"></label>';
+  } else {
+    return;
+  }
+
+  matterActionModalType = type;
+  matterActionModalLastFocus = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
+  title.textContent = heading;
+  submit.textContent = 'Save';
+  formBody.innerHTML = html;
+  setMatterActionError('');
+  setMatterActionModalBusy(false);
+  modal.classList.remove('is-hidden');
+
+  var firstInput = formBody.querySelector('input, textarea, select');
+  if (firstInput && typeof firstInput.focus === 'function') {
+    requestAnimationFrame(function() { firstInput.focus(); });
+  }
+}
+
+function closeMatterActionModal() {
+  var modal = byId('matter-action-modal');
+  if (!modal || matterActionModalBusy) return;
+  modal.classList.add('is-hidden');
+  matterActionModalType = null;
+  setMatterActionError('');
+  var returnFocus = matterActionModalLastFocus;
+  if (!returnFocus || !document.contains(returnFocus)) {
+    returnFocus = byId('matter-detail-panel');
+  }
+  if (returnFocus && typeof returnFocus.focus === 'function') {
+    returnFocus.focus();
+  }
+  matterActionModalLastFocus = null;
+}
+
+function submitMatterActionForm() {
+  if (!selectedMatterId || !matterActionModalType || matterActionModalBusy) return;
+  var payload = actionBodyForType(matterActionModalType);
+  if (payload.error) {
+    setMatterActionError(payload.error);
+    return;
+  }
+  setMatterActionError('');
+  setMatterActionModalBusy(true);
+  apiFetch('/api/matters/' + encodeURIComponent(selectedMatterId) + payload.path, {
+    method: 'POST',
+    body: payload.body,
+  }).then(function() {
+    if (matterActionModalType === 'task') showToast('Task created', 'success');
+    if (matterActionModalType === 'note') showToast('Note created', 'success');
+    if (matterActionModalType === 'time') showToast('Time entry created', 'success');
+    if (matterActionModalType === 'expense') showToast('Expense entry created', 'success');
+    if (matterActionModalType === 'deposit') showToast('Trust deposit recorded', 'success');
+
+    var actionType = matterActionModalType;
+    closeMatterActionModal();
+    if (actionType === 'task' || actionType === 'note') {
+      currentMatterDetailSection = 'work';
+      renderMatterDetail();
+      loadMatterWorkDataIfNeeded(true);
+      return;
+    }
+    if (actionType === 'time' || actionType === 'expense') {
+      currentMatterDetailSection = 'work';
+      renderMatterDetail();
+      loadMatterWorkDataIfNeeded(true);
+      loadMatterFinanceDataIfNeeded(true);
+      return;
+    }
+    if (actionType === 'deposit') {
+      currentMatterDetailSection = 'finance';
+      renderMatterDetail();
+      loadMatterFinanceDataIfNeeded(true);
+    }
+  }).catch(function(err) {
+    var payloadErr = parseErrorPayload(err);
+    setMatterActionError(payloadErr && payloadErr.error ? payloadErr.error : err.message);
+  }).finally(function() {
+    setMatterActionModalBusy(false);
+  });
+}
+
+function closeMatterInvoiceDetailModal() {
+  var existing = byId('matter-invoice-detail-overlay');
+  if (existing) existing.remove();
+}
+
+function openMatterInvoiceDetail(invoiceId) {
+  apiFetch('/api/invoices/' + encodeURIComponent(invoiceId)).then(function(data) {
+    closeMatterInvoiceDetailModal();
+    var overlay = document.createElement('div');
+    overlay.className = 'configure-overlay';
+    overlay.id = 'matter-invoice-detail-overlay';
+
+    var modal = document.createElement('div');
+    modal.className = 'configure-modal matter-invoice-detail-modal';
+
+    var header = document.createElement('div');
+    header.className = 'matter-create-modal-header';
+    var title = document.createElement('h3');
+    var invoice = data && data.invoice ? data.invoice : null;
+    title.textContent = invoice ? ('Invoice ' + (invoice.invoice_number || invoice.id || '')) : 'Invoice Detail';
+    var closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'btn-ext';
+    closeBtn.textContent = 'Close';
+    closeBtn.addEventListener('click', closeMatterInvoiceDetailModal);
+    header.appendChild(title);
+    header.appendChild(closeBtn);
+    modal.appendChild(header);
+
+    var body = document.createElement('div');
+    body.className = 'matter-invoice-detail-body';
+    var html = '';
+    if (!invoice) {
+      html = '<div class="empty-state">Invoice details unavailable.</div>';
+    } else {
+      html += '<div class="matter-meta-grid">';
+      html += '<div class="matter-meta-item"><span class="matter-meta-label">Status</span><span class="matter-meta-value">' + escapeHtml(invoice.status || '') + '</span></div>';
+      html += '<div class="matter-meta-item"><span class="matter-meta-label">Total</span><span class="matter-meta-value">$' + escapeHtml(invoice.total || '0') + '</span></div>';
+      html += '<div class="matter-meta-item"><span class="matter-meta-label">Paid</span><span class="matter-meta-value">$' + escapeHtml(invoice.paid_amount || '0') + '</span></div>';
+      html += '<div class="matter-meta-item"><span class="matter-meta-label">Due</span><span class="matter-meta-value">' + escapeHtml(invoice.due_date || 'N/A') + '</span></div>';
+      html += '</div>';
+      var items = data && data.line_items ? data.line_items : [];
+      html += '<div class="matter-detail-section"><h5>Line Items</h5>';
+      if (!items.length) {
+        html += '<div class="empty-state">No line items.</div>';
+      } else {
+        html += '<div class="matter-item-list">';
+        for (var i = 0; i < items.length; i++) {
+          var item = items[i];
+          var itemMeta = String(item.quantity || '0') + ' × $' + String(item.unit_price || '0') + ' = $' + String(item.amount || '0');
+          html += '<div class="matter-item-row"><div class="matter-item-main">';
+          html += '<span class="matter-item-path">' + escapeHtml(item.description || '') + '</span>';
+          html += '<span class="matter-item-meta">' + escapeHtml(itemMeta) + '</span>';
+          html += '</div></div>';
+        }
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+    body.innerHTML = html;
+    modal.appendChild(body);
+    overlay.appendChild(modal);
+    overlay.addEventListener('click', function(e) {
+      if (e.target === overlay) closeMatterInvoiceDetailModal();
+    });
+    document.body.appendChild(overlay);
+  }).catch(function(err) {
+    showToast('Failed to load invoice detail: ' + err.message, 'error');
+  });
+}
+
 function runMatterConflictCheck() {
   var text = byId('matters-conflict-text') ? byId('matters-conflict-text').value.trim() : '';
   var matterSelect = byId('matters-conflict-matter');
@@ -4763,17 +5544,21 @@ function loadMatters() {
     activeMatterId = (activeData && activeData.matter_id) ? activeData.matter_id : null;
     if (selectedMatterId && !mattersCache.some(function(m) { return m.id === selectedMatterId; })) {
       selectedMatterId = null;
+      currentMatterDetailSection = 'overview';
       currentMatterDocuments = [];
       currentMatterTemplates = [];
       currentMatterDashboard = null;
       currentMatterDeadlines = [];
+      currentMatterThreads = [];
+      currentMatterWork = createEmptyMatterWorkState();
+      currentMatterFinance = createEmptyMatterFinanceState();
     }
     renderMatters();
     updateMatterBadge();
     if (selectedMatterId) {
       openMatterDetail(selectedMatterId);
     } else {
-      renderMatterDetailPlaceholder('Select a matter to view workflow scorecard, deadlines, documents, and templates.');
+      renderMatterDetailPlaceholder('Select a matter to view Overview, Work, and Finance details.');
     }
   }).catch(function (err) {
     if (!isCurrentRequest('matters', requestVersion)) return;

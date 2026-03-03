@@ -638,6 +638,12 @@ pub struct TrustLedgerResponse {
     pub entries: Vec<TrustLedgerEntryInfo>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct MatterInvoicesResponse {
+    pub matter_id: String,
+    pub invoices: Vec<InvoiceInfo>,
+}
+
 /// Response for `GET /api/matters/active`.
 #[derive(Debug, Serialize)]
 pub struct ActiveMatterResponse {

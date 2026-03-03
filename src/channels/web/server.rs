@@ -283,6 +283,10 @@ pub async fn start_server(
             "/api/matters/{id}/time-summary",
             get(matter_time_summary_handler),
         )
+        .route(
+            "/api/matters/{id}/invoices",
+            get(matter_invoices_list_handler),
+        )
         .route("/api/invoices/draft", post(invoices_draft_handler))
         .route("/api/invoices", post(invoices_save_handler))
         .route("/api/invoices/{id}", get(invoices_get_handler))
@@ -1543,6 +1547,10 @@ const MAX_DEADLINE_REMINDERS: usize = 16;
 const MAX_DEADLINE_REMINDER_DAYS: i32 = 3650;
 /// Maximum allowed body text length for `/api/matters/conflicts/check`.
 const MAX_CONFLICT_CHECK_TEXT_LEN: usize = 32 * 1024;
+/// Default invoice rows returned by `/api/matters/{id}/invoices`.
+const MATTER_INVOICES_DEFAULT_LIMIT: usize = 25;
+/// Maximum invoice rows returned by `/api/matters/{id}/invoices`.
+const MATTER_INVOICES_MAX_LIMIT: usize = 100;
 
 /// Identity files that must not be overwritten through web memory-write APIs.
 const PROTECTED_IDENTITY_FILES: &[&str] =
@@ -1759,6 +1767,11 @@ async fn record_legal_audit_event(
 #[derive(Debug, Default, Deserialize)]
 struct MatterDocumentsQuery {
     include_templates: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MatterInvoicesQuery {
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3397,6 +3410,51 @@ async fn matter_time_summary_handler(
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     Ok(Json(matter_time_summary_to_response(summary)))
+}
+
+async fn matter_invoices_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Query(query): Query<MatterInvoicesQuery>,
+) -> Result<Json<MatterInvoicesResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = sanitize_matter_id_for_route(&id)?;
+    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+
+    let limit = query.limit.unwrap_or(MATTER_INVOICES_DEFAULT_LIMIT);
+    if limit == 0 || limit > MATTER_INVOICES_MAX_LIMIT {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'limit' must be between 1 and {}",
+                MATTER_INVOICES_MAX_LIMIT
+            ),
+        ));
+    }
+
+    let mut invoices = store
+        .list_invoices(&state.user_id, Some(&matter_id))
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    // Normalize newest-first ordering for the web detail panel regardless of backend ordering.
+    invoices.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+
+    Ok(Json(MatterInvoicesResponse {
+        matter_id,
+        invoices: invoices
+            .into_iter()
+            .take(limit)
+            .map(invoice_record_to_info)
+            .collect(),
+    }))
 }
 
 async fn invoices_draft_handler(
@@ -10733,6 +10791,142 @@ opened_at: 2026-02-28
             }))
             .expect("missing matter root should be treated as empty");
         assert!(entries.is_empty());
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_invoices_list_returns_recent_limited_rows() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+        let store = state.store.as_ref().expect("store should exist");
+
+        for idx in 1..=3 {
+            let invoice_number = format!("INV-LIST-{idx:03}");
+            let params = crate::db::CreateInvoiceParams {
+                matter_id: "demo".to_string(),
+                invoice_number,
+                status: crate::db::InvoiceStatus::Draft,
+                issued_date: None,
+                due_date: None,
+                subtotal: rust_decimal::Decimal::ZERO,
+                tax: rust_decimal::Decimal::ZERO,
+                total: rust_decimal::Decimal::ZERO,
+                paid_amount: rust_decimal::Decimal::ZERO,
+                notes: Some("List test".to_string()),
+            };
+            store
+                .save_invoice_draft(&state.user_id, &params, &[])
+                .await
+                .expect("save invoice draft");
+        }
+
+        let Json(resp) = matter_invoices_list_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Query(MatterInvoicesQuery { limit: Some(2) }),
+        )
+        .await
+        .expect("matter invoices should load");
+
+        assert_eq!(resp.matter_id, "demo");
+        assert_eq!(resp.invoices.len(), 2);
+        let invoice_numbers: std::collections::HashSet<&str> = resp
+            .invoices
+            .iter()
+            .map(|invoice| invoice.invoice_number.as_str())
+            .collect();
+        assert_eq!(invoice_numbers.len(), 2);
+        assert!(invoice_numbers.is_subset(&std::collections::HashSet::from([
+            "INV-LIST-001",
+            "INV-LIST-002",
+            "INV-LIST-003",
+        ])));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_invoices_list_rejects_invalid_limit_values() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+
+        let err = matter_invoices_list_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Query(MatterInvoicesQuery { limit: Some(0) }),
+        )
+        .await
+        .expect_err("limit=0 should fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let err = matter_invoices_list_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Query(MatterInvoicesQuery { limit: Some(101) }),
+        )
+        .await
+        .expect_err("limit above max should fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn matter_invoices_list_blocks_non_owner_access() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+
+        let other_state = Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: SseManager::new(),
+            workspace: Some(Arc::clone(&workspace)),
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: Some(Arc::clone(&db)),
+            job_manager: None,
+            prompt_queue: None,
+            user_id: "other-user".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: Some(Arc::new(
+                crate::channels::web::ws::WsConnectionTracker::new(),
+            )),
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            chat_rate_limiter: RateLimiter::new(30, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            startup_time: std::time::Instant::now(),
+            legal_config: Some(test_legal_config()),
+        });
+
+        let err = matter_invoices_list_handler(
+            State(other_state),
+            Path("demo".to_string()),
+            Query(MatterInvoicesQuery { limit: Some(10) }),
+        )
+        .await
+        .expect_err("non-owner should not access matter invoices");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 
     #[cfg(feature = "libsql")]

@@ -3941,6 +3941,18 @@ mark {
   font-family: var(--font-mono);
 }
 
+.matter-detail-tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.matter-detail-tab.is-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
 .matter-detail-section h5 {
   margin: 0 0 8px;
   font-size: 12px;
@@ -4077,6 +4089,70 @@ mark {
   color: var(--text);
   cursor: pointer;
   font-size: 11px;
+}
+
+.matter-detail-inline-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.matter-finance-balance {
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.matter-action-modal {
+  max-width: 560px;
+}
+
+.matter-action-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.matter-action-form-body {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+
+.matter-action-form-body label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.matter-action-form-body input,
+.matter-action-form-body textarea,
+.matter-action-form-body select {
+  width: 100%;
+}
+
+.matter-action-form-error {
+  font-size: 12px;
+  color: var(--error);
+}
+
+.matter-action-checkbox {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 8px !important;
+  color: var(--text-primary) !important;
+}
+
+.matter-invoice-detail-modal {
+  max-width: 760px;
+}
+
+.matter-invoice-detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 @media (max-width: 900px) {
