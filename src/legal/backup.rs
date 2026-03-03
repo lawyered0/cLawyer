@@ -250,6 +250,7 @@ struct WorkspaceBackupSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceFileSnapshot {
     path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     memory_document_id: Option<String>,
     content: String,
     original_bytes: usize,
@@ -379,6 +380,7 @@ pub async fn restore_backup_file(
             .map_err(|e| BackupError::Io(e.to_string()))?;
         restored_settings = snapshot.settings.len();
         let mut memory_doc_id_map: HashMap<uuid::Uuid, uuid::Uuid> = HashMap::new();
+        let mut restored_doc_id_by_path: HashMap<String, uuid::Uuid> = HashMap::new();
 
         for file in &snapshot.workspace.files {
             if file.skipped {
@@ -427,8 +429,15 @@ pub async fn restore_backup_file(
             {
                 memory_doc_id_map.insert(old_id, restored_doc.id);
             }
+            restored_doc_id_by_path.insert(normalized_path.clone(), restored_doc.id);
             restored_workspace_files += 1;
         }
+
+        apply_legacy_memory_doc_path_fallback(
+            &mut memory_doc_id_map,
+            &restored_doc_id_by_path,
+            &snapshot.legal.documents,
+        );
 
         let mut client_id_map: HashMap<uuid::Uuid, uuid::Uuid> = HashMap::new();
         for client in &snapshot.legal.clients {
@@ -1100,6 +1109,26 @@ fn normalize_restore_path(path: &str) -> Option<String> {
         None
     } else {
         Some(parts.join("/"))
+    }
+}
+
+fn apply_legacy_memory_doc_path_fallback(
+    memory_doc_id_map: &mut HashMap<Uuid, Uuid>,
+    restored_doc_id_by_path: &HashMap<String, Uuid>,
+    documents: &[MatterDocumentRecord],
+) {
+    for row in documents {
+        if memory_doc_id_map.contains_key(&row.memory_document_id) {
+            continue;
+        }
+        let normalized_path = normalize_restore_path(&row.path)
+            .or_else(|| normalize_restore_path(row.path.trim_start_matches('/')));
+        let Some(normalized_path) = normalized_path else {
+            continue;
+        };
+        if let Some(mapped_id) = restored_doc_id_by_path.get(&normalized_path).copied() {
+            memory_doc_id_map.insert(row.memory_document_id, mapped_id);
+        }
     }
 }
 
@@ -2002,6 +2031,169 @@ mod tests {
         let mut warnings = Vec::new();
         validate_manifest_checksums(&manifest, &snapshot, &mut warnings)
             .expect("legacy checksum should validate with defaulted document_versions");
+    }
+
+    #[test]
+    fn legacy_workspace_snapshot_without_memory_document_id_is_still_valid() {
+        #[derive(Serialize)]
+        struct LegacyWorkspaceFileSnapshot {
+            path: String,
+            content: String,
+            original_bytes: usize,
+            stored_bytes: usize,
+            truncated: bool,
+            skipped: bool,
+            sha256: String,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyWorkspaceBackupSnapshot {
+            files: Vec<LegacyWorkspaceFileSnapshot>,
+            total_original_bytes: usize,
+            total_stored_bytes: usize,
+            truncated_files: usize,
+            skipped_files: usize,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyLegalBackupSnapshot {
+            clients: Vec<ClientRecord>,
+            matters: Vec<MatterRecord>,
+            tasks: Vec<MatterTaskRecord>,
+            notes: Vec<MatterNoteRecord>,
+            deadlines: Vec<MatterDeadlineRecord>,
+            documents: Vec<MatterDocumentRecord>,
+            templates: Vec<DocumentTemplateRecord>,
+            time_entries: Vec<TimeEntryRecord>,
+            expense_entries: Vec<ExpenseEntryRecord>,
+            time_summaries: Vec<MatterTimeSummaryRecord>,
+            trust_ledger: Vec<TrustLedgerEntryRecord>,
+            invoices: Vec<InvoiceRecord>,
+            invoice_line_items: Vec<InvoiceLineItemRecord>,
+            audit_events: Vec<AuditEventRecord>,
+            conflict_graph_summary: serde_json::Value,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyBackupSnapshot {
+            created_at: String,
+            user_id: String,
+            settings: HashMap<String, serde_json::Value>,
+            legal: LegacyLegalBackupSnapshot,
+            workspace: LegacyWorkspaceBackupSnapshot,
+            ai_packets: Vec<AiPacketPreview>,
+        }
+
+        let file_content = "legacy content";
+        let legacy_workspace = LegacyWorkspaceBackupSnapshot {
+            files: vec![LegacyWorkspaceFileSnapshot {
+                path: "matters/demo/facts.md".to_string(),
+                content: file_content.to_string(),
+                original_bytes: file_content.len(),
+                stored_bytes: file_content.len(),
+                truncated: false,
+                skipped: false,
+                sha256: sha256_hex(file_content.as_bytes()),
+            }],
+            total_original_bytes: file_content.len(),
+            total_stored_bytes: file_content.len(),
+            truncated_files: 0,
+            skipped_files: 0,
+        };
+
+        let legacy = LegacyBackupSnapshot {
+            created_at: "2026-03-01T00:00:00Z".to_string(),
+            user_id: "u".to_string(),
+            settings: HashMap::new(),
+            legal: LegacyLegalBackupSnapshot {
+                clients: vec![],
+                matters: vec![],
+                tasks: vec![],
+                notes: vec![],
+                deadlines: vec![],
+                documents: vec![],
+                templates: vec![],
+                time_entries: vec![],
+                expense_entries: vec![],
+                time_summaries: vec![],
+                trust_ledger: vec![],
+                invoices: vec![],
+                invoice_line_items: vec![],
+                audit_events: vec![],
+                conflict_graph_summary: serde_json::json!({"present": false}),
+            },
+            workspace: legacy_workspace,
+            ai_packets: vec![],
+        };
+
+        let legacy_json = serde_json::to_vec(&legacy).expect("serialize legacy snapshot");
+        let snapshot: BackupSnapshot =
+            serde_json::from_slice(&legacy_json).expect("deserialize legacy snapshot");
+
+        assert_eq!(snapshot.workspace.files.len(), 1);
+        assert!(
+            snapshot.workspace.files[0].memory_document_id.is_none(),
+            "legacy snapshots should default missing workspace memory_document_id to None"
+        );
+
+        let mut checksums = BTreeMap::new();
+        checksums.insert(
+            "settings".to_string(),
+            checksum_json(&legacy.settings).expect("settings checksum"),
+        );
+        checksums.insert(
+            "legal".to_string(),
+            checksum_json(&legacy.legal).expect("legal checksum"),
+        );
+        checksums.insert(
+            "workspace".to_string(),
+            checksum_json(&legacy.workspace).expect("workspace checksum"),
+        );
+        checksums.insert(
+            "ai_packets".to_string(),
+            checksum_json(&legacy.ai_packets).expect("ai packets checksum"),
+        );
+
+        let manifest = BackupManifest {
+            format_version: BACKUP_FORMAT_VERSION,
+            schema_version: BACKUP_SCHEMA_VERSION,
+            app_version: "test".to_string(),
+            created_at: legacy.created_at,
+            user_id: legacy.user_id,
+            encrypted: true,
+            hash_algorithm: "sha256".to_string(),
+            section_checksums: checksums,
+            notes: vec![],
+        };
+
+        let mut warnings = Vec::new();
+        validate_manifest_checksums(&manifest, &snapshot, &mut warnings)
+            .expect("legacy checksum should validate with defaulted memory_document_id");
+    }
+
+    #[test]
+    fn legacy_restore_fallback_maps_document_memory_ids_by_path() {
+        let old_memory_doc_id = Uuid::new_v4();
+        let new_memory_doc_id = Uuid::new_v4();
+        let mut id_map = HashMap::new();
+        let restored_doc_id_by_path =
+            HashMap::from([("matters/demo/facts.md".to_string(), new_memory_doc_id)]);
+        let now = Utc::now();
+        let docs = vec![MatterDocumentRecord {
+            id: Uuid::new_v4(),
+            user_id: "u".to_string(),
+            matter_id: "demo".to_string(),
+            memory_document_id: old_memory_doc_id,
+            path: "/matters/demo/facts.md".to_string(),
+            display_name: "facts.md".to_string(),
+            category: crate::db::MatterDocumentCategory::Internal,
+            created_at: now,
+            updated_at: now,
+        }];
+
+        apply_legacy_memory_doc_path_fallback(&mut id_map, &restored_doc_id_by_path, &docs);
+
+        assert_eq!(id_map.get(&old_memory_doc_id), Some(&new_memory_doc_id));
     }
 
     #[test]

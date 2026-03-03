@@ -493,19 +493,19 @@ impl Workspace {
     /// Adds a newline separator between existing and new content.
     pub async fn append(&self, path: &str, content: &str) -> Result<(), WorkspaceError> {
         let path = normalize_path(path);
-        let doc = self
-            .storage
-            .get_or_create_document_by_path(&self.user_id, self.agent_id, &path)
-            .await?;
-
-        let new_content = if doc.content.is_empty() {
-            content.to_string()
-        } else {
-            format!("{}\n{}", doc.content, content)
+        let current = match self.read(&path).await {
+            Ok(doc) => doc.content,
+            Err(WorkspaceError::DocumentNotFound { .. }) => String::new(),
+            Err(err) => return Err(err),
         };
 
-        self.storage.update_document(doc.id, &new_content).await?;
-        self.reindex_document(doc.id).await?;
+        let new_content = if current.is_empty() {
+            content.to_string()
+        } else {
+            format!("{current}\n{content}")
+        };
+
+        self.write(&path, &new_content).await?;
         Ok(())
     }
 

@@ -393,6 +393,55 @@ async fn test_workspace_matter_encryption_roundtrip_and_search_exclusion() {
 }
 
 #[tokio::test]
+async fn test_workspace_matter_encryption_append_preserves_envelope() {
+    let pool = get_pool();
+    if try_connect(&pool).await.is_none() {
+        return;
+    }
+    let user_id = "test_matter_encryption_append";
+    cleanup_user(&pool, user_id).await;
+
+    let crypto = Arc::new(
+        SecretsCrypto::new(SecretString::from(
+            "0123456789abcdef0123456789abcdef".to_string(),
+        ))
+        .expect("crypto"),
+    );
+    let workspace = Workspace::new(user_id, pool.clone())
+        .with_legal_content_policy(LegalContentPolicy::new("matters", true, crypto));
+
+    workspace
+        .write("matters/demo/strategy.md", "First line")
+        .await
+        .expect("initial write failed");
+    workspace
+        .append("matters/demo/strategy.md", "Second line")
+        .await
+        .expect("append failed");
+
+    let decrypted = workspace
+        .read("matters/demo/strategy.md")
+        .await
+        .expect("read failed");
+    assert_eq!(decrypted.content, "First line\nSecond line");
+
+    let stored = workspace
+        .read_stored("matters/demo/strategy.md")
+        .await
+        .expect("stored read failed");
+    assert!(
+        clawyer::legal::workspace_crypto::is_encrypted_payload(&stored.content),
+        "stored content should remain encrypted after append"
+    );
+    assert!(
+        !stored.content.contains("Second line"),
+        "plaintext should not be stored for encrypted matter files"
+    );
+
+    cleanup_user(&pool, user_id).await;
+}
+
+#[tokio::test]
 async fn test_workspace_list_all() {
     let pool = get_pool();
     if try_connect(&pool).await.is_none() {
