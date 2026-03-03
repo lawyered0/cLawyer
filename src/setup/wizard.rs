@@ -1,22 +1,15 @@
 //! Main setup wizard orchestration.
 //!
-//! The wizard guides users through:
-//! 1. Database connection
-//! 2. Security (secrets master key)
-//! 3. Inference provider (NEAR AI, Anthropic, OpenAI, Ollama, OpenAI-compatible)
-//! 4. Model selection
-//! 5. Embeddings
-//! 6. Channel configuration
-//! 7. Extensions (tool installation from registry)
-//! 8. Docker sandbox
-//! 9. Heartbeat (background tasks)
-//! 10. Legal workflow profile
+//! Supports two onboarding modes:
+//! - Quickstart: 4-step lawyer-first flow with secure defaults.
+//! - Advanced: full technical setup flow (database, provider, channels, sandbox, legal profile).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[cfg(feature = "postgres")]
 use deadpool_postgres::{Config as PoolConfig, Runtime};
+use rand::Rng as _;
 use secrecy::{ExposeSecret, SecretString};
 #[cfg(feature = "postgres")]
 use tokio_postgres::NoTls;
@@ -71,10 +64,23 @@ impl From<crate::setup::channels::ChannelSetupError> for SetupError {
 /// Setup wizard configuration.
 #[derive(Debug, Clone, Default)]
 pub struct SetupConfig {
+    /// Onboarding mode selection.
+    pub mode: SetupMode,
     /// Skip authentication step (use existing session).
     pub skip_auth: bool,
     /// Only reconfigure channels.
     pub channels_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SetupMode {
+    /// Prompt user to choose mode at wizard start.
+    #[default]
+    Auto,
+    /// Simplified lawyer-first setup.
+    Quickstart,
+    /// Full technical setup flow.
+    Advanced,
 }
 
 /// Interactive setup wizard for cLawyer.
@@ -92,6 +98,14 @@ pub struct SetupWizard {
     secrets_crypto: Option<Arc<SecretsCrypto>>,
     /// Cached API key from provider setup (used by model fetcher without env mutation).
     llm_api_key: Option<SecretString>,
+    /// Optional gateway enabled flag to persist into bootstrap env.
+    bootstrap_gateway_enabled: Option<bool>,
+    /// Optional gateway auth token to persist into bootstrap env.
+    bootstrap_gateway_auth_token: Option<String>,
+    /// Optional CLI channel enabled override for bootstrap env.
+    bootstrap_cli_enabled: Option<bool>,
+    /// Optional WASM channels enabled override for bootstrap env.
+    bootstrap_wasm_channels_enabled: Option<bool>,
 }
 
 impl SetupWizard {
@@ -107,6 +121,10 @@ impl SetupWizard {
             db_backend: None,
             secrets_crypto: None,
             llm_api_key: None,
+            bootstrap_gateway_enabled: None,
+            bootstrap_gateway_auth_token: None,
+            bootstrap_cli_enabled: None,
+            bootstrap_wasm_channels_enabled: None,
         }
     }
 
@@ -122,6 +140,10 @@ impl SetupWizard {
             db_backend: None,
             secrets_crypto: None,
             llm_api_key: None,
+            bootstrap_gateway_enabled: None,
+            bootstrap_gateway_auth_token: None,
+            bootstrap_cli_enabled: None,
+            bootstrap_wasm_channels_enabled: None,
         }
     }
 
@@ -147,75 +169,133 @@ impl SetupWizard {
             print_step(1, 1, "Channel Configuration");
             self.step_channels().await?;
         } else {
-            let total_steps = 10;
-
-            // Step 1: Database
-            print_step(1, total_steps, "Database Connection");
-            self.step_database().await?;
-
-            // After establishing a DB connection, load any previously saved
-            // settings so we recover progress from prior partial runs.
-            // We must load BEFORE persisting, otherwise persist_after_step()
-            // would overwrite prior settings with defaults.
-            // Save Step 1 choices first so they aren't clobbered by stale
-            // DB values (merge_from only applies non-default fields).
-            let step1_settings = self.settings.clone();
-            self.try_load_existing_settings().await;
-            self.settings.merge_from(&step1_settings);
-
-            self.persist_after_step().await;
-
-            // Step 2: Security
-            print_step(2, total_steps, "Security");
-            self.step_security().await?;
-            self.persist_after_step().await;
-
-            // Step 3: Inference provider selection (unless skipped)
-            if !self.config.skip_auth {
-                print_step(3, total_steps, "Inference Provider");
-                self.step_inference_provider().await?;
-            } else {
-                print_info("Skipping inference provider setup (using existing config)");
+            match self.resolve_setup_mode()? {
+                SetupMode::Quickstart => self.run_quickstart_flow().await?,
+                SetupMode::Advanced => self.run_advanced_flow().await?,
+                SetupMode::Auto => unreachable!("Auto mode must be resolved"),
             }
-            self.persist_after_step().await;
-
-            // Step 4: Model selection
-            print_step(4, total_steps, "Model Selection");
-            self.step_model_selection().await?;
-            self.persist_after_step().await;
-
-            // Step 5: Embeddings
-            print_step(5, total_steps, "Embeddings (Semantic Search)");
-            self.step_embeddings()?;
-            self.persist_after_step().await;
-
-            // Step 6: Channel configuration
-            print_step(6, total_steps, "Channel Configuration");
-            self.step_channels().await?;
-            self.persist_after_step().await;
-
-            // Step 7: Extensions (tools)
-            print_step(7, total_steps, "Extensions");
-            self.step_extensions().await?;
-
-            // Step 8: Docker Sandbox
-            print_step(8, total_steps, "Docker Sandbox");
-            self.step_docker_sandbox().await?;
-            self.persist_after_step().await;
-
-            // Step 9: Heartbeat
-            print_step(9, total_steps, "Background Tasks");
-            self.step_heartbeat()?;
-            self.persist_after_step().await;
-
-            // Step 10: Legal profile
-            print_step(10, total_steps, "Legal Workflow Profile");
-            self.step_legal_profile()?;
-            self.persist_after_step().await;
         }
 
         // Save settings and print summary
         self.save_and_summarize().await?;
+
+        Ok(())
+    }
+
+    fn resolve_setup_mode(&self) -> Result<SetupMode, SetupError> {
+        match self.config.mode {
+            SetupMode::Quickstart => Ok(SetupMode::Quickstart),
+            SetupMode::Advanced => Ok(SetupMode::Advanced),
+            SetupMode::Auto => {
+                print_info("Choose onboarding mode:");
+                let choice = select_one(
+                    "Mode:",
+                    &[
+                        "Quickstart (recommended) - lawyer-focused defaults",
+                        "Advanced - full technical setup",
+                    ],
+                )
+                .map_err(SetupError::Io)?;
+                Ok(if choice == 0 {
+                    SetupMode::Quickstart
+                } else {
+                    SetupMode::Advanced
+                })
+            }
+        }
+    }
+
+    async fn run_advanced_flow(&mut self) -> Result<(), SetupError> {
+        let total_steps = 10;
+
+        // Step 1: Database
+        print_step(1, total_steps, "Database Connection");
+        self.step_database().await?;
+
+        // After establishing a DB connection, load any previously saved
+        // settings so we recover progress from prior partial runs.
+        // We must load BEFORE persisting, otherwise persist_after_step()
+        // would overwrite prior settings with defaults.
+        // Save Step 1 choices first so they aren't clobbered by stale
+        // DB values (merge_from only applies non-default fields).
+        let step1_settings = self.settings.clone();
+        self.try_load_existing_settings().await;
+        self.settings.merge_from(&step1_settings);
+
+        self.persist_after_step().await;
+
+        // Step 2: Security
+        print_step(2, total_steps, "Security");
+        self.step_security().await?;
+        self.persist_after_step().await;
+
+        // Step 3: Inference provider selection (unless skipped)
+        if !self.config.skip_auth {
+            print_step(3, total_steps, "Inference Provider");
+            self.step_inference_provider().await?;
+        } else {
+            print_info("Skipping inference provider setup (using existing config)");
+        }
+        self.persist_after_step().await;
+
+        // Step 4: Model selection
+        print_step(4, total_steps, "Model Selection");
+        self.step_model_selection().await?;
+        self.persist_after_step().await;
+
+        // Step 5: Embeddings
+        print_step(5, total_steps, "Embeddings (Semantic Search)");
+        self.step_embeddings()?;
+        self.persist_after_step().await;
+
+        // Step 6: Channel configuration
+        print_step(6, total_steps, "Channel Configuration");
+        self.step_channels().await?;
+        self.persist_after_step().await;
+
+        // Step 7: Extensions (tools)
+        print_step(7, total_steps, "Extensions");
+        self.step_extensions().await?;
+
+        // Step 8: Docker Sandbox
+        print_step(8, total_steps, "Docker Sandbox");
+        self.step_docker_sandbox().await?;
+        self.persist_after_step().await;
+
+        // Step 9: Heartbeat
+        print_step(9, total_steps, "Background Tasks");
+        self.step_heartbeat()?;
+        self.persist_after_step().await;
+
+        // Step 10: Legal profile
+        print_step(10, total_steps, "Legal Workflow Profile");
+        self.step_legal_profile()?;
+        self.persist_after_step().await;
+
+        Ok(())
+    }
+
+    async fn run_quickstart_flow(&mut self) -> Result<(), SetupError> {
+        let total_steps = 4;
+
+        print_step(1, total_steps, "Data Storage");
+        self.quickstart_step_data_storage().await?;
+        let step1_settings = self.settings.clone();
+        self.try_load_existing_settings().await;
+        self.settings.merge_from(&step1_settings);
+        self.persist_after_step().await;
+
+        print_step(2, total_steps, "Model Provider");
+        self.quickstart_step_model_provider().await?;
+        self.persist_after_step().await;
+
+        print_step(3, total_steps, "Web Access");
+        self.quickstart_step_web_access()?;
+        self.persist_after_step().await;
+
+        print_step(4, total_steps, "Legal Defaults");
+        self.quickstart_step_legal_defaults()?;
+        self.persist_after_step().await;
 
         Ok(())
     }
@@ -311,6 +391,208 @@ impl SetupWizard {
         }
 
         Ok(())
+    }
+
+    /// Quickstart Step 1: choose practical local storage defaults.
+    async fn quickstart_step_data_storage(&mut self) -> Result<(), SetupError> {
+        print_info("Quickstart configures storage with safe defaults for daily legal work.");
+        println!();
+
+        #[cfg(all(feature = "postgres", feature = "libsql"))]
+        {
+            let choice = select_one(
+                "Choose data storage:",
+                &[
+                    "Local embedded database (recommended)",
+                    "PostgreSQL (advanced deployment)",
+                ],
+            )
+            .map_err(SetupError::Io)?;
+
+            if choice == 0 {
+                return self.quickstart_step_database_libsql_local().await;
+            }
+            return self.step_database_postgres().await;
+        }
+
+        #[cfg(all(feature = "libsql", not(feature = "postgres")))]
+        {
+            return self.quickstart_step_database_libsql_local().await;
+        }
+
+        #[cfg(all(feature = "postgres", not(feature = "libsql")))]
+        {
+            print_info("libSQL support is not compiled in this build; using PostgreSQL setup.");
+            return self.step_database_postgres().await;
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    async fn quickstart_step_database_libsql_local(&mut self) -> Result<(), SetupError> {
+        self.settings.database_backend = Some("libsql".to_string());
+        self.settings.database_url = None;
+        self.settings.libsql_url = None;
+
+        let default_path = crate::config::default_libsql_path()
+            .to_string_lossy()
+            .to_string();
+        let path = std::env::var("LIBSQL_PATH")
+            .ok()
+            .or_else(|| self.settings.libsql_path.clone())
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or(default_path);
+
+        self.test_database_connection_libsql(&path, None, None)
+            .await?;
+        self.run_migrations_libsql().await?;
+        self.settings.libsql_path = Some(path.clone());
+
+        print_success(&format!("Using local embedded database at {}", path));
+        Ok(())
+    }
+
+    /// Quickstart Step 2: minimal provider setup for lawyers.
+    async fn quickstart_step_model_provider(&mut self) -> Result<(), SetupError> {
+        print_info("Choose your model provider.");
+        print_info("You can switch providers later with `clawyer onboard --advanced`.");
+        println!();
+
+        let choice = select_one(
+            "Provider:",
+            &[
+                "NEAR AI (recommended)",
+                "OpenAI-compatible endpoint",
+                "Ollama (local models)",
+            ],
+        )
+        .map_err(SetupError::Io)?;
+
+        match choice {
+            0 => {
+                self.settings.llm_backend = Some("nearai".to_string());
+                if self.config.skip_auth {
+                    print_info("Skipping NEAR AI authentication (using existing session/config).");
+                } else {
+                    self.setup_nearai().await?;
+                }
+                if self.settings.selected_model.is_none() {
+                    self.settings.selected_model = Some("zai-org/GLM-latest".to_string());
+                }
+            }
+            1 => {
+                if self.config.skip_auth {
+                    self.settings.llm_backend = Some("openai_compatible".to_string());
+                    let default_url = self
+                        .settings
+                        .openai_compatible_base_url
+                        .clone()
+                        .unwrap_or_else(|| "http://localhost:8000/v1".to_string());
+                    let url = optional_input(
+                        "Endpoint base URL",
+                        Some(&format!("default: {}", default_url)),
+                    )
+                    .map_err(SetupError::Io)?
+                    .unwrap_or(default_url);
+                    self.settings.openai_compatible_base_url = Some(url);
+                } else {
+                    self.setup_openai_compatible().await?;
+                }
+
+                let default_model = self
+                    .settings
+                    .selected_model
+                    .clone()
+                    .unwrap_or_else(|| "gpt-4.1-mini".to_string());
+                let model =
+                    optional_input("Model ID", Some(&format!("default: {}", default_model)))
+                        .map_err(SetupError::Io)?
+                        .unwrap_or(default_model);
+                self.settings.selected_model = Some(model);
+            }
+            2 => {
+                self.setup_ollama()?;
+                let default_model = self
+                    .settings
+                    .selected_model
+                    .clone()
+                    .unwrap_or_else(|| "llama3".to_string());
+                let model = optional_input(
+                    "Ollama model name",
+                    Some(&format!("default: {}", default_model)),
+                )
+                .map_err(SetupError::Io)?
+                .unwrap_or(default_model);
+                self.settings.selected_model = Some(model);
+            }
+            _ => unreachable!("select_one guarantees bounded choice"),
+        }
+
+        print_success("Provider configured");
+        Ok(())
+    }
+
+    /// Quickstart Step 3: secure web-first defaults.
+    fn quickstart_step_web_access(&mut self) -> Result<(), SetupError> {
+        self.bootstrap_gateway_enabled = Some(true);
+        self.bootstrap_cli_enabled = Some(true);
+        self.bootstrap_wasm_channels_enabled = Some(false);
+
+        let token = std::env::var("GATEWAY_AUTH_TOKEN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(generate_hex_token_32_bytes);
+        self.bootstrap_gateway_auth_token = Some(token.clone());
+
+        self.settings.channels.http_enabled = false;
+        self.settings.channels.http_port = None;
+        self.settings.channels.http_host = None;
+        self.settings.channels.signal_enabled = false;
+        self.settings.channels.signal_http_url = None;
+        self.settings.channels.signal_account = None;
+        self.settings.channels.signal_allow_from = None;
+        self.settings.channels.signal_allow_from_groups = None;
+        self.settings.channels.signal_dm_policy = None;
+        self.settings.channels.signal_group_policy = None;
+        self.settings.channels.signal_group_allow_from = None;
+        self.settings.channels.wasm_channels.clear();
+        self.settings.channels.wasm_channels_enabled = false;
+
+        let masked_token = mask_api_key(&token);
+        print_success(&format!(
+            "Web gateway enabled with bearer auth token ({})",
+            masked_token
+        ));
+        print_info("Non-essential channels disabled by default (HTTP, Signal, WASM channels).");
+        Ok(())
+    }
+
+    /// Quickstart Step 4: apply strict legal defaults with a simple confirmation.
+    fn quickstart_step_legal_defaults(&mut self) -> Result<(), SetupError> {
+        print_info("Apply recommended legal defaults?");
+        print_info("This enables matter-scoped, max-lockdown behavior by default.");
+        if confirm("Use recommended legal defaults?", true).map_err(SetupError::Io)? {
+            self.apply_quickstart_legal_defaults();
+            print_success("Legal defaults applied");
+            return Ok(());
+        }
+
+        self.step_legal_profile()
+    }
+
+    fn apply_quickstart_legal_defaults(&mut self) {
+        self.settings.legal.enabled = true;
+        self.settings.legal.jurisdiction = "us-general".to_string();
+        self.settings.legal.hardening = "max_lockdown".to_string();
+        self.settings.legal.matter_root = "matters".to_string();
+        self.settings.legal.network.deny_by_default = true;
+        self.settings.legal.network.allowed_domains.clear();
+        self.settings.legal.audit.enabled = true;
+        self.settings.legal.audit.path = "logs/legal_audit.jsonl".to_string();
+        self.settings.legal.audit.hash_chain = true;
+        self.settings.legal.require_matter_context = true;
+        self.settings.legal.citation_required = true;
+        self.settings.legal.privilege_guard = true;
+        self.settings.legal.conflict_check_enabled = true;
     }
 
     /// Step 1: Database connection.
@@ -2146,6 +2428,36 @@ impl SetupWizard {
             env_vars.push(("SIGNAL_GROUP_ALLOW_FROM", group_allow_from.clone()));
         }
 
+        let gateway_enabled = self
+            .bootstrap_gateway_enabled
+            .or_else(|| parse_env_bool("GATEWAY_ENABLED"));
+        if let Some(enabled) = gateway_enabled {
+            env_vars.push(("GATEWAY_ENABLED", enabled.to_string()));
+        }
+
+        let gateway_auth_token = self
+            .bootstrap_gateway_auth_token
+            .clone()
+            .or_else(|| std::env::var("GATEWAY_AUTH_TOKEN").ok())
+            .filter(|v| !v.trim().is_empty());
+        if let Some(token) = gateway_auth_token {
+            env_vars.push(("GATEWAY_AUTH_TOKEN", token));
+        }
+
+        let cli_enabled = self
+            .bootstrap_cli_enabled
+            .or_else(|| parse_env_bool("CLI_ENABLED"));
+        if let Some(enabled) = cli_enabled {
+            env_vars.push(("CLI_ENABLED", enabled.to_string()));
+        }
+
+        let wasm_channels_enabled = self
+            .bootstrap_wasm_channels_enabled
+            .or_else(|| parse_env_bool("WASM_CHANNELS_ENABLED"));
+        if let Some(enabled) = wasm_channels_enabled {
+            env_vars.push(("WASM_CHANNELS_ENABLED", enabled.to_string()));
+        }
+
         if !env_vars.is_empty() {
             let pairs: Vec<(&str, &str)> = env_vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
             crate::bootstrap::save_bootstrap_env(&pairs).map_err(|e| {
@@ -2830,6 +3142,23 @@ fn capitalize_first(s: &str) -> String {
     }
 }
 
+fn parse_env_bool(key: &str) -> Option<bool> {
+    std::env::var(key).ok().map(|v| {
+        let value = v.trim().to_ascii_lowercase();
+        value == "1" || value == "true" || value == "yes" || value == "on"
+    })
+}
+
+fn generate_hex_token_32_bytes() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill(&mut bytes);
+    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 #[cfg(test)]
 async fn install_missing_bundled_channels(
     channels_dir: &std::path::Path,
@@ -3022,6 +3351,7 @@ mod tests {
     #[test]
     fn test_wizard_creation() {
         let wizard = SetupWizard::new();
+        assert_eq!(wizard.config.mode, SetupMode::Auto);
         assert!(!wizard.config.skip_auth);
         assert!(!wizard.config.channels_only);
     }
@@ -3029,11 +3359,52 @@ mod tests {
     #[test]
     fn test_wizard_with_config() {
         let config = SetupConfig {
+            mode: SetupMode::Quickstart,
             skip_auth: true,
             channels_only: false,
         };
         let wizard = SetupWizard::with_config(config);
+        assert_eq!(wizard.config.mode, SetupMode::Quickstart);
         assert!(wizard.config.skip_auth);
+    }
+
+    #[test]
+    fn test_apply_quickstart_legal_defaults_sets_locked_values() {
+        let mut wizard = SetupWizard::new();
+        wizard.apply_quickstart_legal_defaults();
+
+        assert!(wizard.settings.legal.enabled);
+        assert_eq!(wizard.settings.legal.jurisdiction, "us-general");
+        assert_eq!(wizard.settings.legal.hardening, "max_lockdown");
+        assert_eq!(wizard.settings.legal.matter_root, "matters");
+        assert!(wizard.settings.legal.network.deny_by_default);
+        assert!(wizard.settings.legal.network.allowed_domains.is_empty());
+        assert!(wizard.settings.legal.audit.enabled);
+        assert_eq!(wizard.settings.legal.audit.path, "logs/legal_audit.jsonl");
+        assert!(wizard.settings.legal.audit.hash_chain);
+        assert!(wizard.settings.legal.require_matter_context);
+        assert!(wizard.settings.legal.citation_required);
+        assert!(wizard.settings.legal.privilege_guard);
+        assert!(wizard.settings.legal.conflict_check_enabled);
+    }
+
+    #[test]
+    fn test_generate_hex_token_32_bytes_format() {
+        let token = generate_hex_token_32_bytes();
+        assert_eq!(token.len(), 64);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_parse_env_bool_variants() {
+        let _guard = EnvGuard::set("CLAWYER_TEST_BOOL", "true");
+        assert_eq!(parse_env_bool("CLAWYER_TEST_BOOL"), Some(true));
+
+        let _guard = EnvGuard::set("CLAWYER_TEST_BOOL", "0");
+        assert_eq!(parse_env_bool("CLAWYER_TEST_BOOL"), Some(false));
+
+        let _guard = EnvGuard::clear("CLAWYER_TEST_BOOL");
+        assert_eq!(parse_env_bool("CLAWYER_TEST_BOOL"), None);
     }
 
     #[test]
@@ -3207,6 +3578,14 @@ mod tests {
     }
 
     impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+
         fn clear(key: &'static str) -> Self {
             let original = std::env::var(key).ok();
             unsafe {

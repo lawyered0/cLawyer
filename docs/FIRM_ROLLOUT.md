@@ -6,7 +6,7 @@ This rollout is designed for one firm deployment per host (single tenant).
 
 ```bash
 cargo build --release
-./target/release/clawyer onboard
+./target/release/clawyer onboard --quickstart
 ```
 
 During onboarding, keep:
@@ -58,4 +58,3 @@ If suspicious behavior occurs:
 3. Export current settings (`clawyer config list`).
 4. Rotate secrets and remove untrusted installed skills.
 5. Re-run with strict `--legal-profile max-lockdown`.
-

@@ -115,6 +115,14 @@ pub enum Command {
         /// Reconfigure channels only
         #[arg(long)]
         channels_only: bool,
+
+        /// Use the lawyer-focused quickstart onboarding flow.
+        #[arg(long, conflicts_with = "advanced")]
+        quickstart: bool,
+
+        /// Use the full advanced onboarding flow.
+        #[arg(long, conflicts_with = "quickstart")]
+        advanced: bool,
     },
 
     /// Manage configuration settings
@@ -235,5 +243,29 @@ mod tests {
         let cli = Cli::parse_from(["clawyer", "--headless", "--no-repl", "run"]);
         assert!(cli.headless);
         assert!(cli.no_repl);
+    }
+
+    #[test]
+    fn test_parse_onboard_quickstart_flag() {
+        let cli = Cli::parse_from(["clawyer", "onboard", "--quickstart"]);
+        match cli.command {
+            Some(Command::Onboard { quickstart, .. }) => assert!(quickstart),
+            _ => panic!("expected onboard command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_onboard_advanced_flag() {
+        let cli = Cli::parse_from(["clawyer", "onboard", "--advanced"]);
+        match cli.command {
+            Some(Command::Onboard { advanced, .. }) => assert!(advanced),
+            _ => panic!("expected onboard command"),
+        }
+    }
+
+    #[test]
+    fn test_onboard_quickstart_and_advanced_are_mutually_exclusive() {
+        let parsed = Cli::try_parse_from(["clawyer", "onboard", "--quickstart", "--advanced"]);
+        assert!(parsed.is_err(), "expected clap arg conflict error");
     }
 }

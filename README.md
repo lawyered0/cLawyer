@@ -153,10 +153,15 @@ Run the setup wizard to configure cLawyer:
 clawyer onboard
 ```
 
-The wizard handles database connection, NEAR AI authentication (via browser OAuth),
-and secrets encryption (using your system keychain). Settings are persisted in the
-connected database; bootstrap variables (e.g. `DATABASE_URL`, `LLM_BACKEND`) are
-written to `~/.clawyer/.env` so they are available before the database connects.
+The wizard now supports two modes:
+
+- `clawyer onboard --quickstart` (recommended): lawyer-focused defaults
+- `clawyer onboard --advanced`: full technical setup flow
+
+If no mode flag is passed, `clawyer onboard` prompts once and defaults to quickstart.
+Settings are persisted in the connected database; bootstrap variables
+(e.g. `DATABASE_URL`, `LLM_BACKEND`) are written to `~/.clawyer/.env` so they are
+available before the database connects.
 
 ### Alternative LLM Providers
 
@@ -285,7 +290,13 @@ External content passes through multiple security layers:
 ## Usage
 
 ```bash
-# First-time setup (configures database, auth, etc.)
+# First-time setup (recommended quickstart mode)
+clawyer onboard --quickstart
+
+# Full technical setup flow
+clawyer onboard --advanced
+
+# Prompt for mode (defaults to quickstart)
 clawyer onboard
 
 # Start interactive REPL
