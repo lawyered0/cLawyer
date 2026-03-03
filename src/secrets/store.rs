@@ -792,6 +792,7 @@ mod tests {
     use std::sync::Arc;
 
     use secrecy::SecretString;
+    use tempfile::tempdir;
 
     use crate::secrets::crypto::SecretsCrypto;
     use crate::secrets::store::SecretsStore;
@@ -956,5 +957,36 @@ mod tests {
 
         assert_eq!(v1.expose(), "user1_value");
         assert_eq!(v2.expose(), "user2_value");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_libsql_secrets_store_roundtrip() {
+        use crate::db::{Database, libsql::LibSqlBackend};
+
+        let tmp = tempdir().expect("tempdir");
+        let db_path = tmp.path().join("secrets.db");
+        let backend = LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("create local libsql backend");
+        backend.run_migrations().await.expect("run migrations");
+
+        let key = "0123456789abcdef0123456789abcdef";
+        let crypto = Arc::new(SecretsCrypto::new(SecretString::from(key.to_string())).unwrap());
+        let store = crate::secrets::store::LibSqlSecretsStore::new(backend.shared_db(), crypto);
+
+        store
+            .create(
+                "user1",
+                CreateSecretParams::new("openai_key", "sk-libsql-roundtrip"),
+            )
+            .await
+            .expect("create secret");
+
+        let decrypted = store
+            .get_decrypted("user1", "openai_key")
+            .await
+            .expect("decrypt secret");
+        assert_eq!(decrypted.expose(), "sk-libsql-roundtrip");
     }
 }
