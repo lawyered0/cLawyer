@@ -11738,6 +11738,127 @@ opened_at: 2026-02-28
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn matter_detail_work_and_finance_endpoints_return_expected_data() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+        seed_valid_matter(workspace.as_ref(), "demo").await;
+        let state =
+            test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+        ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+            .await
+            .expect("sync matter row");
+
+        let _ = matter_tasks_create_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Json(CreateMatterTaskRequest {
+                title: "Draft chronology".to_string(),
+                description: Some("Capture filing timeline".to_string()),
+                status: Some("todo".to_string()),
+                assignee: Some("Paralegal".to_string()),
+                due_at: None,
+                blocked_by: Vec::new(),
+            }),
+        )
+        .await
+        .expect("create task");
+
+        let _ = matter_notes_create_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Json(CreateMatterNoteRequest {
+                author: "Lead".to_string(),
+                body: "Initial intake complete".to_string(),
+                pinned: true,
+            }),
+        )
+        .await
+        .expect("create note");
+
+        let _ = matter_time_create_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Json(CreateTimeEntryRequest {
+                timekeeper: "Lead".to_string(),
+                description: "Case strategy review".to_string(),
+                hours: "1.25".to_string(),
+                hourly_rate: Some("300".to_string()),
+                entry_date: "2026-04-12".to_string(),
+                billable: Some(true),
+            }),
+        )
+        .await
+        .expect("create time entry");
+
+        let _ = matter_expenses_create_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Json(CreateExpenseEntryRequest {
+                submitted_by: "Lead".to_string(),
+                description: "Filing courier".to_string(),
+                amount: "45.00".to_string(),
+                category: "other".to_string(),
+                entry_date: "2026-04-12".to_string(),
+                receipt_path: None,
+                billable: Some(true),
+            }),
+        )
+        .await
+        .expect("create expense entry");
+
+        let _ = matter_trust_deposit_handler(
+            State(Arc::clone(&state)),
+            Path("demo".to_string()),
+            Json(TrustDepositRequest {
+                amount: "500.00".to_string(),
+                recorded_by: "Lead".to_string(),
+                description: Some("Initial retainer".to_string()),
+            }),
+        )
+        .await
+        .expect("create trust deposit");
+
+        let Json(tasks) = matter_tasks_list_handler(State(Arc::clone(&state)), Path("demo".into()))
+            .await
+            .expect("list tasks");
+        assert_eq!(tasks.tasks.len(), 1);
+
+        let Json(notes) = matter_notes_list_handler(State(Arc::clone(&state)), Path("demo".into()))
+            .await
+            .expect("list notes");
+        assert_eq!(notes.notes.len(), 1);
+
+        let Json(time_entries) =
+            matter_time_list_handler(State(Arc::clone(&state)), Path("demo".into()))
+                .await
+                .expect("list time entries");
+        assert_eq!(time_entries.entries.len(), 1);
+
+        let Json(expense_entries) =
+            matter_expenses_list_handler(State(Arc::clone(&state)), Path("demo".into()))
+                .await
+                .expect("list expense entries");
+        assert_eq!(expense_entries.entries.len(), 1);
+
+        let Json(summary) =
+            matter_time_summary_handler(State(Arc::clone(&state)), Path("demo".into()))
+                .await
+                .expect("time summary");
+        let total_hours = summary
+            .total_hours
+            .parse::<rust_decimal::Decimal>()
+            .expect("hours decimal");
+        assert_eq!(total_hours, rust_decimal::Decimal::new(125, 2));
+
+        let Json(ledger) = matter_trust_ledger_handler(State(state), Path("demo".into()))
+            .await
+            .expect("trust ledger");
+        assert_eq!(ledger.matter_id, "demo");
+        assert_eq!(ledger.entries.len(), 1);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     async fn memory_write_handler_invalidates_conflict_cache() {
         crate::legal::matter::reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;

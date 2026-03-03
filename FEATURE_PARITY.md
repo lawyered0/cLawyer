@@ -314,9 +314,9 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 | Feature | OpenClaw | IronClaw | Notes |
 |---------|----------|----------|-------|
-| Vector memory | ✅ | ✅ | pgvector |
+| Vector memory | ✅ | ✅ | PostgreSQL pgvector + libSQL vector index (runtime capability-dependent) |
 | Session-based memory | ✅ | ✅ | |
-| Hybrid search (BM25 + vector) | ✅ | ✅ | RRF algorithm |
+| Hybrid search (BM25 + vector) | ✅ | ✅ | RRF algorithm; libSQL gracefully falls back to FTS-only when vector runtime is unavailable |
 | Temporal decay (hybrid search) | ✅ | ❌ | Opt-in time-based scoring factor |
 | MMR re-ranking | ✅ | ❌ | Maximal marginal relevance for result diversity |
 | LLM-based query expansion | ✅ | ❌ | Expand FTS queries via LLM |

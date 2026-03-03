@@ -1,6 +1,7 @@
 //! Workspace-related WorkspaceStore implementation for LibSqlBackend.
 
 use std::collections::HashMap;
+use std::sync::Once;
 
 use async_trait::async_trait;
 use libsql::params;
@@ -18,6 +19,8 @@ use crate::workspace::{
 };
 
 use chrono::Utc;
+
+static VECTOR_FALLBACK_WARN_ONCE: Once = Once::new();
 
 #[async_trait]
 impl WorkspaceStore for LibSqlBackend {
@@ -560,7 +563,7 @@ impl WorkspaceStore for LibSqlBackend {
                     .join(",")
             );
 
-            let mut rows = conn
+            let vector_rows = conn
                 .query(
                     r#"
                     SELECT c.id, c.document_id, c.content
@@ -571,19 +574,39 @@ impl WorkspaceStore for LibSqlBackend {
                     "#,
                     params![vector_json, pre_limit, user_id, agent_id_str.as_deref()],
                 )
-                .await
-                .map_err(|e| WorkspaceError::SearchFailed {
-                    reason: format!("Vector query failed: {}", e),
-                })?;
+                .await;
+
+            let mut rows = match vector_rows {
+                Ok(rows) => rows,
+                Err(e) => {
+                    let reason = format!("Vector query failed: {}", e);
+                    let supports_fts_fallback = config.use_fts;
+                    if supports_fts_fallback && is_vector_runtime_unavailable_error(&reason) {
+                        warn_vector_fallback_once(&reason);
+                        return Ok(reciprocal_rank_fusion(fts_results, Vec::new(), config));
+                    }
+                    return Err(WorkspaceError::SearchFailed { reason });
+                }
+            };
 
             let mut results = Vec::new();
-            while let Some(row) = rows
-                .next()
-                .await
-                .map_err(|e| WorkspaceError::SearchFailed {
-                    reason: format!("Vector row fetch failed: {}", e),
-                })?
-            {
+            loop {
+                let next_row = rows.next().await;
+                let row_opt = match next_row {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        let reason = format!("Vector row fetch failed: {}", e);
+                        let supports_fts_fallback = config.use_fts;
+                        if supports_fts_fallback && is_vector_runtime_unavailable_error(&reason) {
+                            warn_vector_fallback_once(&reason);
+                            return Ok(reciprocal_rank_fusion(fts_results, Vec::new(), config));
+                        }
+                        return Err(WorkspaceError::SearchFailed { reason });
+                    }
+                };
+                let Some(row) = row_opt else {
+                    break;
+                };
                 results.push(RankedResult {
                     chunk_id: get_text(&row, 0).parse().unwrap_or_default(),
                     document_id: get_text(&row, 1).parse().unwrap_or_default(),
@@ -603,5 +626,94 @@ impl WorkspaceStore for LibSqlBackend {
         }
 
         Ok(reciprocal_rank_fusion(fts_results, vector_results, config))
+    }
+}
+
+fn is_vector_runtime_unavailable_error(reason: &str) -> bool {
+    let normalized = reason.to_ascii_lowercase();
+    normalized.contains("vector_top_k")
+        || normalized.contains("no such function")
+        || normalized.contains("no such module")
+        || normalized.contains("no such table")
+        || normalized.contains("idx_memory_chunks_embedding")
+        || normalized.contains("vector index")
+}
+
+fn warn_vector_fallback_once(reason: &str) {
+    VECTOR_FALLBACK_WARN_ONCE.call_once(|| {
+        tracing::warn!(
+            reason = %reason,
+            "libSQL vector search unavailable; using FTS-only fallback. \
+Enable vector support (libsql_vector_idx + idx_memory_chunks_embedding) to restore hybrid search."
+        );
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Database, WorkspaceStore};
+    use crate::workspace::SearchConfig;
+    use tempfile::tempdir;
+
+    #[test]
+    fn vector_unavailable_error_classifier_matches_expected_patterns() {
+        assert!(is_vector_runtime_unavailable_error(
+            "Vector query failed: no such function: vector_top_k"
+        ));
+        assert!(is_vector_runtime_unavailable_error(
+            "Vector query failed: no such table: idx_memory_chunks_embedding"
+        ));
+        assert!(!is_vector_runtime_unavailable_error(
+            "Vector query failed: malformed JSON"
+        ));
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_falls_back_to_fts_when_vector_index_missing() {
+        let tmp = tempdir().expect("tempdir");
+        let db_path = tmp.path().join("workspace.db");
+        let backend = LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("local libsql backend");
+        backend.run_migrations().await.expect("run migrations");
+
+        let user_id = "u1";
+        let document = backend
+            .get_or_create_document_by_path(user_id, None, "matters/demo/notes.md")
+            .await
+            .expect("create doc");
+        backend
+            .delete_chunks(document.id)
+            .await
+            .expect("clear chunks");
+        backend
+            .insert_chunk(document.id, 0, "Alpha conflict note", None)
+            .await
+            .expect("insert chunk");
+
+        let conn = backend.connect().await.expect("connect");
+        conn.execute("DROP INDEX IF EXISTS idx_memory_chunks_embedding", ())
+            .await
+            .expect("drop vector index");
+
+        let config = SearchConfig {
+            use_fts: true,
+            use_vector: true,
+            pre_fusion_limit: 10,
+            limit: 10,
+            rrf_k: 60,
+            min_score: 0.0,
+        };
+
+        let embedding = vec![0.1; 1536];
+        let results = backend
+            .hybrid_search(user_id, None, "Alpha", Some(&embedding), &config)
+            .await
+            .expect("fts fallback should keep search working");
+        assert!(
+            !results.is_empty(),
+            "expected at least one FTS result when vector path is unavailable"
+        );
     }
 }
