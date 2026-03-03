@@ -64,6 +64,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_db: bool,
 
+    /// Disable the interactive REPL channel.
+    #[arg(long, global = true)]
+    pub no_repl: bool,
+
+    /// Run in daemon-friendly mode (disable REPL and onboarding prompts).
+    #[arg(long, global = true)]
+    pub headless: bool,
+
     /// Single message mode - send one message and exit
     #[arg(short, long, global = true)]
     pub message: Option<String>,
@@ -206,5 +214,26 @@ mod tests {
             cmd.get_version().unwrap_or("unknown"),
             env!("CARGO_PKG_VERSION")
         );
+    }
+
+    #[test]
+    fn test_parse_no_repl_flag() {
+        let cli = Cli::parse_from(["clawyer", "--no-repl", "run"]);
+        assert!(cli.no_repl);
+        assert!(!cli.headless);
+    }
+
+    #[test]
+    fn test_parse_headless_flag() {
+        let cli = Cli::parse_from(["clawyer", "--headless", "run"]);
+        assert!(cli.headless);
+        assert!(!cli.no_repl);
+    }
+
+    #[test]
+    fn test_parse_headless_and_no_repl_flags() {
+        let cli = Cli::parse_from(["clawyer", "--headless", "--no-repl", "run"]);
+        assert!(cli.headless);
+        assert!(cli.no_repl);
     }
 }

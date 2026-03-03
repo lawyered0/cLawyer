@@ -152,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Enhanced first-run detection
     #[cfg(any(feature = "postgres", feature = "libsql"))]
-    if !cli.no_onboard
+    if should_run_startup_onboarding(&cli)
         && let Some(reason) = check_onboard_needed()
     {
         println!("Onboarding needed: {}", reason);
@@ -163,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load initial config from env + disk + optional TOML (before DB is available)
     let toml_path = cli.config.as_deref();
-    let mut config = match Config::from_env_with_toml(toml_path).await {
+    let mut config = match Config::from_env_with_toml_for_startup(toml_path, cli.no_db).await {
         Ok(c) => c,
         Err(clawyer::error::ConfigError::MissingRequired { key, hint }) => {
             eprintln!("Configuration error: Missing required setting '{}'", key);
@@ -328,7 +328,7 @@ async fn main() -> anyhow::Result<()> {
     // Create CLI channel
     let repl_channel = if let Some(ref msg) = cli.message {
         Some(ReplChannel::with_message(msg.clone()))
-    } else if config.channels.cli.enabled {
+    } else if should_enable_repl_channel(&cli, config.channels.cli.enabled) {
         let repl = ReplChannel::new();
         repl.suppress_banner();
         Some(repl)
@@ -684,6 +684,14 @@ fn apply_cli_legal_overrides(cli: &Cli, config: &mut Config) {
         }
         config.legal.network.allowed_domains = merged;
     }
+}
+
+fn should_run_startup_onboarding(cli: &Cli) -> bool {
+    !cli.no_onboard && !cli.no_db && !cli.headless
+}
+
+fn should_enable_repl_channel(cli: &Cli, cli_enabled: bool) -> bool {
+    cli.message.is_some() || (cli_enabled && !cli.no_repl && !cli.headless)
 }
 
 /// Initialize tracing for worker/bridge processes (info level).
@@ -1103,4 +1111,43 @@ async fn inject_channel_credentials(
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_onboarding_respects_headless_and_no_db() {
+        let mut cli = Cli::parse_from(["clawyer", "run"]);
+        assert!(should_run_startup_onboarding(&cli));
+
+        cli.no_onboard = true;
+        assert!(!should_run_startup_onboarding(&cli));
+
+        cli.no_onboard = false;
+        cli.no_db = true;
+        assert!(!should_run_startup_onboarding(&cli));
+
+        cli.no_db = false;
+        cli.headless = true;
+        assert!(!should_run_startup_onboarding(&cli));
+    }
+
+    #[test]
+    fn repl_enable_matrix_matches_runtime_policy() {
+        let mut cli = Cli::parse_from(["clawyer", "run"]);
+        assert!(should_enable_repl_channel(&cli, true));
+        assert!(!should_enable_repl_channel(&cli, false));
+
+        cli.no_repl = true;
+        assert!(!should_enable_repl_channel(&cli, true));
+
+        cli.no_repl = false;
+        cli.headless = true;
+        assert!(!should_enable_repl_channel(&cli, true));
+
+        let cli_with_message = Cli::parse_from(["clawyer", "--message", "ping", "run"]);
+        assert!(should_enable_repl_channel(&cli_with_message, false));
+    }
 }

@@ -82,6 +82,11 @@ pub struct Config {
     pub observability: crate::observability::ObservabilityConfig,
 }
 
+#[derive(Clone, Copy)]
+struct BuildOptions {
+    skip_db_validation: bool,
+}
+
 impl Config {
     /// Load configuration from environment variables and the database.
     ///
@@ -134,6 +139,16 @@ impl Config {
     pub async fn from_env_with_toml(
         toml_path: Option<&std::path::Path>,
     ) -> Result<Self, ConfigError> {
+        Self::from_env_with_toml_for_startup(toml_path, false).await
+    }
+
+    /// Load from env for startup with optional DB validation bypass.
+    ///
+    /// `skip_db_validation` should only be true for `--no-db` startup mode.
+    pub async fn from_env_with_toml_for_startup(
+        toml_path: Option<&std::path::Path>,
+        skip_db_validation: bool,
+    ) -> Result<Self, ConfigError> {
         let _ = dotenvy::dotenv();
         crate::bootstrap::load_ironclaw_env();
         let mut settings = Settings::load();
@@ -141,7 +156,7 @@ impl Config {
         // Overlay TOML config file (values win over JSON settings)
         Self::apply_toml_overlay(&mut settings, toml_path)?;
 
-        Self::build(&settings).await
+        Self::build_with_options(&settings, BuildOptions { skip_db_validation }).await
     }
 
     /// Load and merge a TOML config file into settings.
@@ -186,8 +201,26 @@ impl Config {
 
     /// Build config from settings (shared by from_env and from_db).
     async fn build(settings: &Settings) -> Result<Self, ConfigError> {
+        Self::build_with_options(
+            settings,
+            BuildOptions {
+                skip_db_validation: false,
+            },
+        )
+        .await
+    }
+
+    async fn build_with_options(
+        settings: &Settings,
+        options: BuildOptions,
+    ) -> Result<Self, ConfigError> {
+        let database = if options.skip_db_validation {
+            DatabaseConfig::resolve_for_startup(true)?
+        } else {
+            DatabaseConfig::resolve()?
+        };
         Ok(Self {
-            database: DatabaseConfig::resolve()?,
+            database,
             llm: LlmConfig::resolve(settings)?,
             embeddings: EmbeddingsConfig::resolve(settings)?,
             tunnel: TunnelConfig::resolve(settings)?,
