@@ -63,9 +63,23 @@ Restore apply replays:
   - configured `legal.matter_root/**`
   - `conflicts.json`
   - protected identity files only when identity-file protection is explicitly disabled
-- idempotent legal DB entities: clients, matters, templates
+- idempotent legal DB entities:
+  - clients
+  - matters
+  - templates
+  - tasks
+  - notes
+  - deadlines
+  - matter documents
+  - document versions
+  - time entries
+  - expense entries
+  - trust ledger entries
+  - invoices
+  - invoice line items
+  - audit events
 
-Other legal DB entities are preserved in the backup and currently require manual migration/replay.
+Restore apply returns per-entity restored/skipped counters for auditability.
 
 ## Rotation and storage
 
@@ -76,6 +90,5 @@ Other legal DB entities are preserved in the backup and currently require manual
 
 ## Known limitations
 
-- Full automatic restore for every legal table is not implemented in v1.
 - Citation/source truth validation is out of scope for backup verification.
 - Conflict graph data is backed up via conflict summary snapshots and workspace sources.
