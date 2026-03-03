@@ -1,7 +1,7 @@
 //! Main setup wizard orchestration.
 //!
 //! Supports two onboarding modes:
-//! - Quickstart: 4-step lawyer-first flow with secure defaults.
+//! - Quickstart: 5-step lawyer-first flow with secure defaults.
 //! - Advanced: full technical setup flow (database, provider, channels, sandbox, legal profile).
 
 use std::collections::{HashMap, HashSet};
@@ -276,7 +276,7 @@ impl SetupWizard {
     }
 
     async fn run_quickstart_flow(&mut self) -> Result<(), SetupError> {
-        let total_steps = 4;
+        let total_steps = 5;
 
         print_step(1, total_steps, "Data Storage");
         self.quickstart_step_data_storage().await?;
@@ -285,15 +285,19 @@ impl SetupWizard {
         self.settings.merge_from(&step1_settings);
         self.persist_after_step().await;
 
-        print_step(2, total_steps, "Model Provider");
+        print_step(2, total_steps, "Security");
+        self.step_security().await?;
+        self.persist_after_step().await;
+
+        print_step(3, total_steps, "Model Provider");
         self.quickstart_step_model_provider().await?;
         self.persist_after_step().await;
 
-        print_step(3, total_steps, "Web Access");
+        print_step(4, total_steps, "Web Access");
         self.quickstart_step_web_access()?;
         self.persist_after_step().await;
 
-        print_step(4, total_steps, "Legal Defaults");
+        print_step(5, total_steps, "Legal Defaults");
         self.quickstart_step_legal_defaults()?;
         self.persist_after_step().await;
 
@@ -451,7 +455,7 @@ impl SetupWizard {
         Ok(())
     }
 
-    /// Quickstart Step 2: minimal provider setup for lawyers.
+    /// Quickstart Step 3: minimal provider setup for lawyers.
     async fn quickstart_step_model_provider(&mut self) -> Result<(), SetupError> {
         print_info("Choose your model provider.");
         print_info("You can switch providers later with `clawyer onboard --advanced`.");
@@ -531,7 +535,7 @@ impl SetupWizard {
         Ok(())
     }
 
-    /// Quickstart Step 3: secure web-first defaults.
+    /// Quickstart Step 4: secure web-first defaults.
     fn quickstart_step_web_access(&mut self) -> Result<(), SetupError> {
         self.bootstrap_gateway_enabled = Some(true);
         self.bootstrap_cli_enabled = Some(true);
@@ -566,7 +570,7 @@ impl SetupWizard {
         Ok(())
     }
 
-    /// Quickstart Step 4: apply strict legal defaults with a simple confirmation.
+    /// Quickstart Step 5: apply strict legal defaults with a simple confirmation.
     fn quickstart_step_legal_defaults(&mut self) -> Result<(), SetupError> {
         print_info("Apply recommended legal defaults?");
         print_info("This enables matter-scoped, max-lockdown behavior by default.");
