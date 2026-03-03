@@ -7,18 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-03-03
+
+### Added
+
+- NIST AI RMF compliance panel: `GET /api/compliance/status` and `POST /api/compliance/letter` endpoints with live config introspection across Govern/Map/Measure/Manage functions
+- Compliance status light and Generate Compliance Letter button in Settings UI
+- `--headless` flag: daemon-friendly startup mode that disables REPL and skips onboarding prompts
+- `--no-repl` flag: suppress interactive REPL channel independently of headless mode
+- Service templates (launchd/systemd) updated to use `--headless --no-onboard` by default
+
 ### Fixed
 
-- sync web-selected `legal.active_matter` into per-message runtime legal checks and approval gating (no restart required)
-- surface `POST /api/matters` duplicate-precheck storage/list failures as `500` instead of treating them as empty results
+- `--no-db` flag now bypasses `DATABASE_URL` config validation at startup; previously required a dummy value to start
+- `--no-db` now also suppresses interactive REPL creation to prevent silent exit in headless contexts
+- Matter quick-action modal no longer leaves button in busy/spinner state after successful save
+- Onboarding quickstart wizard now runs Security step before Model Provider step
+- Compliance scoring: removed duplicate `hardening_max_lockdown` check across Govern and Manage functions; Manage now scores privilege guard independently
+- Compliance letter generation replaced `window.prompt()` firm-name input with inline modal form
 
-## [0.11.1](https://github.com/nearai/ironclaw/compare/v0.11.0...v0.11.1) - 2026-02-23
+### Changed
+
+- Quickstart onboarding flow reordered: Data Storage → Security → Model Provider → Web Access → Legal Defaults (5 steps, was 4)
+- Matter-scoped conversations: all chat threads now require an active matter context; cross-matter bleed prevented at the session layer
+- Lawyer-first tab ordering: Chat, Matters, Memory, Jobs promoted to primary bar; Routines, Extensions, Skills, Settings, Logs moved to overflow menu
+- Encrypted backup and AI retrieval export: workspace backup now produces an encrypted archive; retrieval packets support AI-assisted extraction from backup history
+- Gateway default port documented as 3000 throughout (was incorrectly listed as 3001 in some docs)
+
+## [0.11.1](https://github.com/lawyered0/cLawyer/compare/v0.11.0...v0.11.1) - 2026-02-23
 
 ### Other
 
 - Ignore out-of-date generated CI so custom release.yml jobs are allowed
 
-## [0.11.0](https://github.com/nearai/ironclaw/compare/v0.10.0...v0.11.0) - 2026-02-23
+## [0.11.0](https://github.com/lawyered0/cLawyer/compare/v0.10.0...v0.11.0) - 2026-02-23
 
 ### Fixed
 
@@ -29,7 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(README)* Adding badges to readme ([#316](https://github.com/nearai/ironclaw/pull/316))
 - Feat/completion ([#240](https://github.com/nearai/ironclaw/pull/240))
 
-## [0.10.0](https://github.com/nearai/ironclaw/compare/v0.9.0...v0.10.0) - 2026-02-22
+## [0.10.0](https://github.com/lawyered0/cLawyer/compare/v0.9.0...v0.10.0) - 2026-02-22
 
 ### Added
 
@@ -66,7 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - speed up startup from ~15s to ~2s ([#280](https://github.com/nearai/ironclaw/pull/280))
 - consolidate tool approval into single param-aware method ([#274](https://github.com/nearai/ironclaw/pull/274))
 
-## [0.9.0](https://github.com/nearai/ironclaw/compare/v0.8.0...v0.9.0) - 2026-02-21
+## [0.9.0](https://github.com/lawyered0/cLawyer/compare/v0.8.0...v0.9.0) - 2026-02-21
 
 ### Added
 
@@ -77,7 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add X-Accel-Buffering header to SSE endpoints ([#277](https://github.com/nearai/ironclaw/pull/277))
 
-## [0.8.0](https://github.com/nearai/ironclaw/compare/ironclaw-v0.7.0...ironclaw-v0.8.0) - 2026-02-20
+## [0.8.0](https://github.com/lawyered0/cLawyer/compare/ironclaw-v0.7.0...ironclaw-v0.8.0) - 2026-02-20
 
 ### Added
 
@@ -100,7 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add automated PR labeling system ([#253](https://github.com/nearai/ironclaw/pull/253))
 - update CLAUDE.md for recently merged features ([#183](https://github.com/nearai/ironclaw/pull/183))
 
-## [0.7.0](https://github.com/nearai/ironclaw/compare/ironclaw-v0.6.0...ironclaw-v0.7.0) - 2026-02-19
+## [0.7.0](https://github.com/lawyered0/cLawyer/compare/ironclaw-v0.6.0...ironclaw-v0.7.0) - 2026-02-19
 
 ### Added
 
@@ -129,7 +151,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed multi-tool approval resume flow by preserving and replaying deferred tool calls so all prior `tool_use` IDs receive matching `tool_result` messages.
 - Fixed REPL quit/exit handling to route shutdown through the agent loop for graceful termination.
 
-## [0.6.0](https://github.com/nearai/ironclaw/compare/ironclaw-v0.5.0...ironclaw-v0.6.0) - 2026-02-19
+## [0.6.0](https://github.com/lawyered0/cLawyer/compare/ironclaw-v0.5.0...ironclaw-v0.6.0) - 2026-02-19
 
 ### Added
 
@@ -162,13 +184,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fix rustfmt formatting from PR #137
 - add .env.example examples for Ollama and OpenAI-compatible ([#110](https://github.com/nearai/ironclaw/pull/110))
 
-## [0.5.0](https://github.com/nearai/ironclaw/compare/v0.4.0...v0.5.0) - 2026-02-17
+## [0.5.0](https://github.com/lawyered0/cLawyer/compare/v0.4.0...v0.5.0) - 2026-02-17
 
 ### Added
 
 - add cooldown management to FailoverProvider ([#114](https://github.com/nearai/ironclaw/pull/114))
 
-## [0.4.0](https://github.com/nearai/ironclaw/compare/v0.3.0...v0.4.0) - 2026-02-17
+## [0.4.0](https://github.com/lawyered0/cLawyer/compare/v0.3.0...v0.4.0) - 2026-02-17
 
 ### Added
 
@@ -180,13 +202,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - remove accidentally committed .sidecar and .todos directories ([#123](https://github.com/nearai/ironclaw/pull/123))
 
-## [0.3.0](https://github.com/nearai/ironclaw/compare/v0.2.0...v0.3.0) - 2026-02-17
+## [0.3.0](https://github.com/lawyered0/cLawyer/compare/v0.2.0...v0.3.0) - 2026-02-17
 
 ### Added
 
 - direct api key and cheap model ([#116](https://github.com/nearai/ironclaw/pull/116))
 
-## [0.2.0](https://github.com/nearai/ironclaw/compare/v0.1.3...v0.2.0) - 2026-02-16
+## [0.2.0](https://github.com/lawyered0/cLawyer/compare/v0.1.3...v0.2.0) - 2026-02-16
 
 ### Added
 
@@ -217,21 +239,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add OpenAI-compatible HTTP API (/v1/chat/completions, /v1/models)   ([#31](https://github.com/nearai/ironclaw/pull/31))
 
 
-## [0.1.3](https://github.com/nearai/ironclaw/compare/v0.1.2...v0.1.3) - 2026-02-12
+## [0.1.3](https://github.com/lawyered0/cLawyer/compare/v0.1.2...v0.1.3) - 2026-02-12
 
 ### Other
 
 - Enabled builds caching during CI/CD
 - Disabled npm publishing as the name is already taken
 
-## [0.1.2](https://github.com/nearai/ironclaw/compare/v0.1.1...v0.1.2) - 2026-02-12
+## [0.1.2](https://github.com/lawyered0/cLawyer/compare/v0.1.1...v0.1.2) - 2026-02-12
 
 ### Other
 
 - Added Installation instructions for the pre-built binaries
 - Disabled Windows ARM64 builds as auto-updater [provided by cargo-dist] does not support this platform yet and it is not a common platform for us to support
 
-## [0.1.1](https://github.com/nearai/ironclaw/compare/v0.1.0...v0.1.1) - 2026-02-12
+## [0.1.1](https://github.com/lawyered0/cLawyer/compare/v0.1.0...v0.1.1) - 2026-02-12
 
 ### Other
 

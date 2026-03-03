@@ -23,7 +23,7 @@
 - **Persistent memory**: Workspace with hybrid search (FTS + vector via RRF)
 - **Prompt injection defense**: Sanitizer, validator, policy rules, leak detection, shell env scrubbing
 - **Multi-provider LLM**: NEAR AI, OpenAI, Anthropic, Ollama, OpenAI-compatible, Tinfoil private inference
-- **Setup wizard**: 7-step interactive onboarding for first-run configuration
+- **Setup wizard**: 8-step interactive onboarding for first-run configuration
 - **Heartbeat system**: Proactive periodic execution with checklist
 
 ## Build & Test
@@ -211,7 +211,7 @@ src/
 │
 ├── setup/              # Onboarding wizard (spec: src/setup/README.md)
 │   ├── mod.rs          # Entry point, check_onboard_needed()
-│   ├── wizard.rs       # 7-step interactive wizard
+│   ├── wizard.rs       # 8-step interactive wizard
 │   ├── channels.rs     # Channel setup helpers
 │   └── prompts.rs      # Terminal prompts (select, confirm, secret)
 │
@@ -223,6 +223,8 @@ src/
 │   ├── gating.rs       # Requirement checks (bins, env, config)
 │   ├── parser.rs       # SKILL.md frontmatter + markdown parser
 │   └── catalog.rs      # ClawHub registry client
+│
+└── compliance/         # NIST AI RMF scoring engine and attestation letter prompts
 │
 └── history/            # Persistence
     ├── store.rs        # PostgreSQL repositories
@@ -330,6 +332,10 @@ Dead code behind the wrong `#[cfg]` gate will only show up when building with a 
 - If you fixed a pattern bug, `grep` for other instances of that pattern across `src/`
 
 ## Configuration
+
+CLI runtime flags:
+- `--no-repl`      Disable the interactive REPL channel (useful when running alongside web gateway)
+- `--headless`     Daemon-friendly mode: disables REPL and skips onboarding prompts. Used by service templates.
 
 Environment variables (see `.env.example`):
 ```bash

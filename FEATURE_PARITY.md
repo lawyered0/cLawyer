@@ -136,7 +136,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | `run` (agent) | ✅ | ✅ | - | Default command |
 | `tool install/list/remove` | ✅ | ✅ | - | WASM tools |
 | `gateway start/stop` | ✅ | ❌ | P2 | |
-| `onboard` (wizard) | ✅ | ✅ | - | Interactive setup |
+| `onboard` (wizard) | ✅ | ✅ | - | 8-step interactive wizard |
 | `tui` | ✅ | ✅ | - | Ratatui TUI |
 | `config` | ✅ | ✅ | - | Read/write config |
 | `channels` | ✅ | ❌ | P2 | Channel management |
