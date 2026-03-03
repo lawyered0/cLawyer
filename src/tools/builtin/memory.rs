@@ -719,6 +719,7 @@ mod libsql_tests {
         legal.active_matter = None;
         legal.enabled = true;
         legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = true;
 
         let first = detect_conflict(workspace.as_ref(), &legal, "Issue with Alpha Corp").await;
         assert_eq!(first.as_deref(), Some("Alpha Corp"));

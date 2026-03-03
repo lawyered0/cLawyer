@@ -10,12 +10,16 @@
 - `legal.require_matter_context = true`
 - `legal.citation_required = true`
 - `legal.matter_root = "matters"`
-- `legal.conflict_file_fallback_enabled = true`
+- `legal.conflict_file_fallback_enabled = false`
 - `legal.conflict_reindex_on_startup = true`
 - `legal.network.deny_by_default = true`
 - `legal.audit.enabled = true`
 - `legal.audit.path = "logs/legal_audit.jsonl"`
 - `legal.audit.hash_chain = true`
+- `legal.encryption.enabled = true`
+- `legal.encryption.matter_scope_only = true`
+- `legal.encryption.exclude_from_search = true`
+- `legal.encryption.require_master_key_in_max_lockdown = true`
 
 ## CLI Controls
 
@@ -34,6 +38,14 @@
 6. Memory/file writes are scoped to `matters/<matter_id>/...` when matter context is required.
 7. Output is scanned for leakage and structured citation-format markers.
 8. Audit events are appended to JSONL with hash-chain links.
+
+## Matter Encryption at Rest
+
+- Files under `legal.matter_root/**` are transparently encrypted at rest when legal encryption is enabled.
+- Non-matter workspace files keep normal plaintext behavior.
+- Encrypted matter files are excluded from plaintext chunk/embedding indexing by design.
+- In `max_lockdown`, startup fails fast when encryption is enabled but no master key is available.
+- Legacy plaintext matter files are read-compatible and migrate lazily on next write.
 
 ## Matter-Bound Conversations
 
@@ -131,6 +143,7 @@ For web-first firm workflows, matter detail now includes:
   - validates backup integrity and decryptability.
 - `POST /api/backups/restore`
   - multipart upload restore endpoint; dry-run by default, apply mode explicit.
+  - apply mode replays full legal DB entities with idempotent upsert semantics.
 - `GET /api/backups/{id}/download`
   - downloads a stored backup artifact by ID.
 
@@ -144,7 +157,8 @@ CLI parity:
 ## Conflict Check Limits
 
 - Intake conflict checks use a DB-backed party graph (`parties`, `party_aliases`, `matter_parties`) with exact+alias+fuzzy matching.
-- Chat conflict checks are DB-first. Fallback to workspace-global `conflicts.json` is controlled by `legal.conflict_file_fallback_enabled`.
+- Chat conflict checks are DB-authoritative by default.
+- Workspace-global `conflicts.json` fallback is available only when `legal.conflict_file_fallback_enabled = true`.
 - Startup can auto-reindex DB conflict graph from workspace (`legal.conflict_reindex_on_startup = true`).
 - Existing `POST /api/matters/conflicts/check` remains for compatibility and now uses the same DB-first path plus fallback.
 - Matching remains normalized/boundary-aware and heuristic; short aliases are intentionally ignored to reduce false positives.
@@ -164,7 +178,7 @@ CLI parity:
 
 - Self-repair stuck-job handling is still attempt-count based; time-threshold stuck detection is not implemented yet.
 - Conflict checks do not yet traverse `party_relationships` recursively for affiliate/corporate-family logic.
-- Per-matter encryption-at-rest for workspace files remains a follow-up phase.
+- Per-matter key rotation / re-key workflows are not implemented yet.
 
 ## Bundled Legal Skills
 

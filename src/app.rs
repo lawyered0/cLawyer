@@ -807,10 +807,9 @@ impl AppBuilder {
                     Err(e) => {
                         if !startup_legal.conflict_file_fallback_enabled {
                             tracing::error!(
-                                "Conflict graph startup reindex failed in DB-authoritative mode: {}; enabling file fallback for this process",
+                                "Conflict graph startup reindex failed in DB-authoritative mode: {}; file fallback remains disabled",
                                 e
                             );
-                            self.config.legal.conflict_file_fallback_enabled = true;
                         } else {
                             tracing::warn!("Conflict graph startup reindex failed: {}", e);
                         }

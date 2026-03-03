@@ -339,12 +339,12 @@ pub fn evaluate_nist_rmf(inputs: &ComplianceInputs) -> ComplianceStatus {
             },
         ),
         check(
-            "conflict_fallback_enabled",
-            "Conflict fallback enabled",
+            "db_authoritative_conflicts",
+            "DB-authoritative conflict checks",
             if inputs.conflict_file_fallback_enabled {
-                ComplianceState::Compliant
-            } else {
                 ComplianceState::Partial
+            } else {
+                ComplianceState::Compliant
             },
             format!(
                 "legal.conflict_file_fallback_enabled={}",
@@ -542,7 +542,7 @@ mod tests {
             audit_hash_chain: true,
             hardening_max_lockdown: true,
             conflict_check_enabled: true,
-            conflict_file_fallback_enabled: true,
+            conflict_file_fallback_enabled: false,
             privilege_guard_enabled: true,
             network_deny_by_default: true,
             redaction_pii: true,

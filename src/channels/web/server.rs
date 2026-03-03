@@ -6087,6 +6087,7 @@ async fn matters_conflicts_check_handler(
 
     legal.active_matter = effective_matter_id.clone();
     let db_available = state.store.is_some();
+    let mut db_check_failed = false;
     let db_hits = if let Some(store) = state.store.as_ref() {
         match store
             .find_conflict_hits_for_text(text, legal.active_matter.as_deref(), 50)
@@ -6094,6 +6095,7 @@ async fn matters_conflicts_check_handler(
         {
             Ok(hits) => hits,
             Err(err) => {
+                db_check_failed = true;
                 tracing::warn!(
                     "DB text conflict check failed, falling back to workspace cache: {err}"
                 );
@@ -6105,6 +6107,11 @@ async fn matters_conflicts_check_handler(
     };
     let conflict = if let Some(first_hit) = db_hits.first() {
         Some(first_hit.party.clone())
+    } else if db_check_failed && !legal.conflict_file_fallback_enabled {
+        Some(
+            "Conflict check unavailable: database query failed and file fallback is disabled."
+                .to_string(),
+        )
     } else if db_available && !legal.conflict_file_fallback_enabled {
         None
     } else {
@@ -8511,6 +8518,7 @@ async fn backups_restore_handler(
             "restored_settings": report.restored_settings,
             "restored_workspace_files": report.restored_workspace_files,
             "skipped_workspace_files": report.skipped_workspace_files,
+            "entity_counts": report.entity_counts,
             "warning_count": report.warnings.len(),
         }),
     )
@@ -8523,6 +8531,7 @@ async fn backups_restore_handler(
         restored_settings: report.restored_settings,
         restored_workspace_files: report.restored_workspace_files,
         skipped_workspace_files: report.skipped_workspace_files,
+        entity_counts: serde_json::to_value(report.entity_counts).unwrap_or_default(),
         warnings: report.warnings,
         manifest: serde_json::to_value(report.manifest).unwrap_or_default(),
     }))
@@ -9976,6 +9985,7 @@ mod tests {
         legal.enabled = true;
         legal.require_matter_context = false;
         legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = true;
         let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
 
         let Json(resp) = matters_conflict_check_handler(
@@ -10362,6 +10372,7 @@ opened_at: 2026-02-28
         legal.enabled = true;
         legal.require_matter_context = false;
         legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = true;
         let state = test_gateway_state_with_store_workspace_and_legal(db, workspace, legal);
 
         let Json(resp) = matters_conflicts_check_handler(
@@ -12484,6 +12495,7 @@ opened_at: 2026-02-28
         legal.active_matter = None;
         legal.enabled = true;
         legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = true;
 
         let first =
             crate::legal::matter::detect_conflict(workspace.as_ref(), &legal, "Alpha Holdings")

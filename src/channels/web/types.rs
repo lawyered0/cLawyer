@@ -892,6 +892,7 @@ pub struct BackupRestoreResponse {
     pub restored_settings: usize,
     pub restored_workspace_files: usize,
     pub skipped_workspace_files: usize,
+    pub entity_counts: serde_json::Value,
     pub warnings: Vec<String>,
     pub manifest: serde_json::Value,
 }

@@ -1410,6 +1410,12 @@ pub async fn detect_conflict_with_store(
         return None;
     }
     let db_available = store.is_some();
+    if !db_available && !config.conflict_file_fallback_enabled {
+        return Some(
+            "Conflict check unavailable: database-backed conflict graph is required and file fallback is disabled."
+                .to_string(),
+        );
+    }
     if let Some(conflict) = detect_conflict_from_db(store, config, message).await {
         return Some(conflict);
     }
@@ -1639,6 +1645,7 @@ mod cache_tests {
         legal.active_matter = None;
         legal.enabled = true;
         legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = true;
 
         let first = detect_conflict(workspace.as_ref(), &legal, "Representing Example Co").await;
         assert_eq!(first.as_deref(), Some("Example Co"));
@@ -1742,7 +1749,7 @@ mod cache_tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
-    async fn detect_conflict_without_store_still_uses_file_fallback() {
+    async fn detect_conflict_without_store_blocks_when_file_fallback_disabled() {
         let _guard = CACHE_TEST_LOCK.lock().await;
         reset_conflict_cache_for_tests();
         let (db, _tmp) = crate::testing::test_db().await;
@@ -1768,7 +1775,12 @@ mod cache_tests {
             "Discussing Fallback Party strategy",
         )
         .await;
-        assert_eq!(hit.as_deref(), Some("Fallback Party"));
+        assert!(
+            hit.as_deref()
+                .is_some_and(|msg| msg.contains("Conflict check unavailable")),
+            "expected explicit DB-authoritative degraded message, got: {:?}",
+            hit
+        );
     }
 
     #[cfg(feature = "libsql")]
@@ -1807,6 +1819,7 @@ retention: follow-firm-policy
         legal.enabled = true;
         legal.active_matter = Some("demo".to_string());
         legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = true;
 
         let hit = detect_conflict(
             workspace.as_ref(),
@@ -1836,6 +1849,7 @@ retention: follow-firm-policy
             LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
         legal.enabled = true;
         legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = true;
 
         let first = detect_conflict(workspace.as_ref(), &legal, "No listed parties here").await;
         assert_eq!(first, None);
@@ -1887,6 +1901,7 @@ retention: follow-firm-policy
         legal.enabled = true;
         legal.active_matter = Some("demo".to_string());
         legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = true;
 
         let hit = detect_conflict(
             workspace.as_ref(),
@@ -1930,6 +1945,7 @@ retention: follow-firm-policy
         legal.enabled = true;
         legal.active_matter = Some("smith-v-acme-corp".to_string());
         legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = true;
 
         let hit =
             detect_conflict(workspace.as_ref(), &legal, "General project planning note").await;
@@ -1972,6 +1988,7 @@ opened_date: 2026-02-28
             LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
         legal.enabled = true;
         legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = true;
 
         let report = reindex_conflict_graph(workspace.as_ref(), &db, &legal)
             .await
@@ -2067,6 +2084,7 @@ retention: follow-firm-policy
             LegalConfig::resolve(&Settings::default()).expect("default legal config resolves");
         legal.enabled = true;
         legal.conflict_check_enabled = true;
+        legal.conflict_file_fallback_enabled = true;
 
         let _reindex_lock_guard = CONFLICT_REINDEX_LOCK.lock().await;
         let hit = tokio::time::timeout(

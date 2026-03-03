@@ -330,7 +330,7 @@ mod tests {
         assert!(config.require_matter_context);
         assert!(config.citation_required);
         assert_eq!(config.matter_root, "matters");
-        assert!(config.conflict_file_fallback_enabled);
+        assert!(!config.conflict_file_fallback_enabled);
         assert!(config.conflict_reindex_on_startup);
         assert!(config.network.deny_by_default);
         assert!(config.audit.enabled);
