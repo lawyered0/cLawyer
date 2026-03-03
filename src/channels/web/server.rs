@@ -6428,12 +6428,13 @@ async fn collect_compliance_audit_metrics(
     Option<usize>,
     Option<usize>,
     Option<usize>,
+    Option<usize>,
     Vec<String>,
 ) {
     let mut data_gaps = Vec::new();
     let Some(store) = state.store.as_ref() else {
         data_gaps.push("Audit metrics unavailable because database is not configured.".to_string());
-        return (None, None, None, None, data_gaps);
+        return (None, None, None, None, None, data_gaps);
     };
 
     let base_query = DbAuditEventQuery::default();
@@ -6483,7 +6484,59 @@ async fn collect_compliance_audit_metrics(
         }
     };
 
-    (total, info_count, warn_count, critical_count, data_gaps)
+    let approval_required_count = match store
+        .count_audit_events(
+            &state.user_id,
+            &DbAuditEventQuery {
+                event_type: Some("approval_required".to_string()),
+                ..DbAuditEventQuery::default()
+            },
+        )
+        .await
+    {
+        Ok(value) => Some(value),
+        Err(err) => {
+            data_gaps.push(format!(
+                "Failed to read approval-required audit count: {err}"
+            ));
+            None
+        }
+    };
+
+    let approval_decision_count = match store
+        .count_audit_events(
+            &state.user_id,
+            &DbAuditEventQuery {
+                event_type: Some("approval_decision".to_string()),
+                ..DbAuditEventQuery::default()
+            },
+        )
+        .await
+    {
+        Ok(value) => Some(value),
+        Err(err) => {
+            data_gaps.push(format!(
+                "Failed to read approval-decision audit count: {err}"
+            ));
+            None
+        }
+    };
+
+    let approval_events_total = match (approval_required_count, approval_decision_count) {
+        (Some(required), Some(decision)) => Some(required + decision),
+        (Some(required), None) => Some(required),
+        (None, Some(decision)) => Some(decision),
+        (None, None) => None,
+    };
+
+    (
+        total,
+        approval_events_total,
+        info_count,
+        warn_count,
+        critical_count,
+        data_gaps,
+    )
 }
 
 async fn build_compliance_status(
@@ -6493,8 +6546,14 @@ async fn build_compliance_status(
     let (matters_total, matters_classified, matter_gaps) =
         collect_compliance_matter_metrics(state).await;
     let (tools_total, tool_gaps) = collect_compliance_tool_count(state).await;
-    let (audit_events_total, audit_info_count, audit_warn_count, audit_critical_count, audit_gaps) =
-        collect_compliance_audit_metrics(state).await;
+    let (
+        audit_events_total,
+        approval_events_total,
+        audit_info_count,
+        audit_warn_count,
+        audit_critical_count,
+        audit_gaps,
+    ) = collect_compliance_audit_metrics(state).await;
 
     let mut data_gaps = Vec::new();
     data_gaps.extend(matter_gaps);
@@ -6517,6 +6576,7 @@ async fn build_compliance_status(
         matters_classified,
         tools_total,
         audit_events_total,
+        approval_events_total,
         audit_info_count,
         audit_warn_count,
         audit_critical_count,

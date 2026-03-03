@@ -115,6 +115,7 @@ pub struct ComplianceInputs {
     pub matters_classified: usize,
     pub tools_total: usize,
     pub audit_events_total: Option<usize>,
+    pub approval_events_total: Option<usize>,
     pub audit_info_count: Option<usize>,
     pub audit_warn_count: Option<usize>,
     pub audit_critical_count: Option<usize>,
@@ -324,17 +325,17 @@ pub fn evaluate_nist_rmf(inputs: &ComplianceInputs) -> ComplianceStatus {
             format!("legal.privilege_guard={}", inputs.privilege_guard_enabled),
         ),
         check(
-            "max_lockdown_active",
-            "Max-lockdown profile active",
-            if inputs.hardening_max_lockdown {
+            "approval_activity_observed",
+            "Approval activity observed",
+            if inputs.approval_events_total.is_some_and(|count| count > 0) {
                 ComplianceState::Compliant
             } else {
-                ComplianceState::NeedsReview
+                ComplianceState::Partial
             },
-            if inputs.hardening_max_lockdown {
-                "legal.hardening=max_lockdown".to_string()
-            } else {
-                "legal.hardening is not max_lockdown".to_string()
+            match inputs.approval_events_total {
+                Some(count) => format!("approval_events_logged={count}"),
+                None => "Approval event count unavailable (database unavailable or read error)"
+                    .to_string(),
             },
         ),
         check(
@@ -551,6 +552,7 @@ mod tests {
             matters_classified: 2,
             tools_total: 3,
             audit_events_total: Some(5),
+            approval_events_total: Some(2),
             audit_info_count: Some(4),
             audit_warn_count: Some(1),
             audit_critical_count: Some(0),
@@ -566,12 +568,20 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_nist_marks_non_lockdown_manage_as_needs_review() {
+    fn evaluate_nist_marks_non_lockdown_govern_as_needs_review() {
         let mut inputs = base_inputs();
         inputs.hardening_max_lockdown = false;
         let result = evaluate_nist_rmf(&inputs);
-        assert_eq!(result.manage.status, ComplianceState::NeedsReview);
+        assert_eq!(result.govern.status, ComplianceState::NeedsReview);
         assert_eq!(result.overall, ComplianceState::NeedsReview);
+    }
+
+    #[test]
+    fn evaluate_nist_marks_missing_approval_activity_as_partial_manage() {
+        let mut inputs = base_inputs();
+        inputs.approval_events_total = Some(0);
+        let result = evaluate_nist_rmf(&inputs);
+        assert_eq!(result.manage.status, ComplianceState::Partial);
     }
 
     #[test]

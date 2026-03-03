@@ -6041,6 +6041,109 @@ function closeComplianceLetterModal() {
   if (existing) existing.remove();
 }
 
+function openComplianceLetterRequestModal() {
+  closeComplianceLetterModal();
+  var overlay = document.createElement('div');
+  overlay.className = 'configure-overlay';
+  overlay.id = 'compliance-letter-modal-overlay';
+  overlay.addEventListener('click', function(e) {
+    if (e.target === overlay) closeComplianceLetterModal();
+  });
+
+  var modal = document.createElement('div');
+  modal.className = 'configure-modal';
+
+  var title = document.createElement('h3');
+  title.textContent = 'Generate Compliance Letter';
+  modal.appendChild(title);
+
+  var form = document.createElement('form');
+  form.className = 'configure-form';
+
+  var frameworkField = document.createElement('div');
+  frameworkField.className = 'configure-field';
+  var frameworkLabel = document.createElement('label');
+  frameworkLabel.textContent = 'Framework';
+  frameworkLabel.setAttribute('for', 'compliance-letter-framework');
+  frameworkField.appendChild(frameworkLabel);
+  var frameworkRow = document.createElement('div');
+  frameworkRow.className = 'configure-input-row';
+  var frameworkSelect = document.createElement('select');
+  frameworkSelect.id = 'compliance-letter-framework';
+  [
+    { value: 'nist', label: 'NIST AI RMF' },
+    { value: 'colorado-sb205', label: 'Colorado SB205' },
+    { value: 'eu-ai-act', label: 'EU AI Act' },
+  ].forEach(function(optionDef) {
+    var option = document.createElement('option');
+    option.value = optionDef.value;
+    option.textContent = optionDef.label;
+    frameworkSelect.appendChild(option);
+  });
+  frameworkRow.appendChild(frameworkSelect);
+  frameworkField.appendChild(frameworkRow);
+  form.appendChild(frameworkField);
+
+  var firmField = document.createElement('div');
+  firmField.className = 'configure-field';
+  var firmLabel = document.createElement('label');
+  firmLabel.textContent = 'Firm name (optional)';
+  firmLabel.setAttribute('for', 'compliance-letter-firm');
+  firmField.appendChild(firmLabel);
+  var firmRow = document.createElement('div');
+  firmRow.className = 'configure-input-row';
+  var firmInput = document.createElement('input');
+  firmInput.id = 'compliance-letter-firm';
+  firmInput.type = 'text';
+  firmInput.placeholder = 'Acme Law LLP';
+  firmRow.appendChild(firmInput);
+  firmField.appendChild(firmRow);
+  form.appendChild(firmField);
+
+  var actions = document.createElement('div');
+  actions.className = 'configure-actions';
+
+  var cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.className = 'btn-ext';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', closeComplianceLetterModal);
+  actions.appendChild(cancelBtn);
+
+  var generateBtn = document.createElement('button');
+  generateBtn.type = 'submit';
+  generateBtn.className = 'btn-ext activate';
+  generateBtn.textContent = 'Generate';
+  actions.appendChild(generateBtn);
+
+  form.appendChild(actions);
+  modal.appendChild(form);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+  firmInput.focus();
+
+  form.addEventListener('submit', function(e) {
+    e.preventDefault();
+    var payload = {
+      framework: frameworkSelect.value || 'nist',
+      firm_name: firmInput.value.trim() || null,
+    };
+    generateBtn.disabled = true;
+    generateBtn.textContent = 'Generating…';
+
+    apiFetch('/api/compliance/letter', {
+      method: 'POST',
+      body: payload,
+    }).then(function(response) {
+      openComplianceLetterModal(response);
+    }).catch(function(err) {
+      showToast('Compliance letter failed: ' + err.message, 'error');
+      generateBtn.disabled = false;
+      generateBtn.textContent = 'Generate';
+    });
+  });
+}
+
 function openComplianceLetterModal(response) {
   closeComplianceLetterModal();
   var overlay = document.createElement('div');
@@ -6094,18 +6197,7 @@ function openComplianceLetterModal(response) {
 }
 
 function generateComplianceLetter() {
-  var firmName = prompt('Firm name for the attestation letter (optional):', '') || '';
-  apiFetch('/api/compliance/letter', {
-    method: 'POST',
-    body: {
-      framework: 'nist',
-      firm_name: firmName.trim() || null,
-    },
-  }).then(function(response) {
-    openComplianceLetterModal(response);
-  }).catch(function(err) {
-    showToast('Compliance letter failed: ' + err.message, 'error');
-  });
+  openComplianceLetterRequestModal();
 }
 
 function loadSettings() {
