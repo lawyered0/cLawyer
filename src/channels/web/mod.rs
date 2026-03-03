@@ -94,6 +94,7 @@ impl GatewayChannel {
             cost_guard: None,
             startup_time: std::time::Instant::now(),
             legal_config: None,
+            runtime_facts: crate::compliance::ComplianceRuntimeFacts::default(),
         });
 
         Self {
@@ -128,6 +129,7 @@ impl GatewayChannel {
             cost_guard: self.state.cost_guard.clone(),
             startup_time: self.state.startup_time,
             legal_config: self.state.legal_config.clone(),
+            runtime_facts: self.state.runtime_facts.clone(),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -230,6 +232,12 @@ impl GatewayChannel {
     /// Inject legal config for web legal-policy endpoints.
     pub fn with_legal_config(mut self, legal_config: LegalConfig) -> Self {
         self.rebuild_state(|s| s.legal_config = Some(legal_config));
+        self
+    }
+
+    /// Inject runtime facts for compliance scoring surfaces.
+    pub fn with_runtime_facts(mut self, facts: crate::compliance::ComplianceRuntimeFacts) -> Self {
+        self.rebuild_state(|s| s.runtime_facts = facts);
         self
     }
 

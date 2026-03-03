@@ -494,9 +494,17 @@ async fn main() -> anyhow::Result<()> {
 
     let mut gateway_url: Option<String> = None;
     if let Some(ref gw_config) = config.channels.gateway {
+        let runtime_facts = clawyer::compliance::ComplianceRuntimeFacts {
+            llm_backend: config.llm.backend.to_string(),
+            auth_token_required: true,
+            safety_injection_enabled: components.safety.injection_check_enabled(),
+            safety_policy_rule_count: components.safety.policy_rule_count(),
+            safety_leak_pattern_count: components.safety.leak_pattern_count(),
+        };
         let mut gw =
             GatewayChannel::new(gw_config.clone()).with_llm_provider(Arc::clone(&components.llm));
         gw = gw.with_legal_config(config.legal.clone());
+        gw = gw.with_runtime_facts(runtime_facts);
         if let Some(ref ws) = components.workspace {
             gw = gw.with_workspace(Arc::clone(ws));
         }

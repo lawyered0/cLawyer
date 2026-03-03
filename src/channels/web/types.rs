@@ -773,6 +773,74 @@ pub struct LegalAuditListResponse {
     pub next_offset: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceStatusLevel {
+    Compliant,
+    Partial,
+    NeedsReview,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ComplianceCheckResult {
+    pub id: String,
+    pub label: String,
+    pub status: ComplianceStatusLevel,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ComplianceFunctionStatus {
+    pub status: ComplianceStatusLevel,
+    pub checks: Vec<ComplianceCheckResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ComplianceMetrics {
+    pub matters_total: usize,
+    pub matters_classified: usize,
+    pub tools_total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_events_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_info_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_warn_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_critical_count: Option<usize>,
+    pub safety_policy_rule_count: usize,
+    pub safety_leak_pattern_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ComplianceStatusResponse {
+    pub overall: ComplianceStatusLevel,
+    pub govern: ComplianceFunctionStatus,
+    pub map: ComplianceFunctionStatus,
+    pub measure: ComplianceFunctionStatus,
+    pub manage: ComplianceFunctionStatus,
+    pub metrics: ComplianceMetrics,
+    pub data_gaps: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ComplianceLetterRequest {
+    #[serde(default)]
+    pub framework: Option<String>,
+    #[serde(default)]
+    pub firm_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ComplianceLetterResponse {
+    pub framework: String,
+    pub model: String,
+    pub generated_at: String,
+    pub overall: ComplianceStatusLevel,
+    pub markdown: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct BackupCreateRequest {
     #[serde(default)]

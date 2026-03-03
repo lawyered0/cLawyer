@@ -111,6 +111,7 @@ async fn start_test_server_with_store_overrides(
         cost_guard: None,
         startup_time: std::time::Instant::now(),
         legal_config,
+        runtime_facts: clawyer::compliance::ComplianceRuntimeFacts::default(),
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

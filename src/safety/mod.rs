@@ -190,6 +190,21 @@ impl SafetyLayer {
     pub fn policy(&self) -> &Policy {
         &self.policy
     }
+
+    /// Whether injection checks are enabled in safety config.
+    pub fn injection_check_enabled(&self) -> bool {
+        self.config.injection_check_enabled
+    }
+
+    /// Number of active leak-detection patterns.
+    pub fn leak_pattern_count(&self) -> usize {
+        self.leak_detector.pattern_count()
+    }
+
+    /// Number of active safety policy rules.
+    pub fn policy_rule_count(&self) -> usize {
+        self.policy.rules().len()
+    }
 }
 
 /// Wrap external, untrusted content with a security notice for the LLM.
