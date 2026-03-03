@@ -60,6 +60,18 @@ pub struct DatabaseConfig {
 
 impl DatabaseConfig {
     pub(crate) fn resolve() -> Result<Self, ConfigError> {
+        Self::resolve_internal(false)
+    }
+
+    /// Resolve database config for early startup.
+    ///
+    /// When `skip_db_validation` is true (used with `--no-db`), missing
+    /// `DATABASE_URL` is tolerated because no DB connection will be created.
+    pub(crate) fn resolve_for_startup(skip_db_validation: bool) -> Result<Self, ConfigError> {
+        Self::resolve_internal(skip_db_validation)
+    }
+
+    fn resolve_internal(skip_db_validation: bool) -> Result<Self, ConfigError> {
         let backend: DatabaseBackend = if let Some(b) = optional_env("DATABASE_BACKEND")? {
             b.parse().map_err(|e| ConfigError::InvalidValue {
                 key: "DATABASE_BACKEND".to_string(),
@@ -74,7 +86,7 @@ impl DatabaseConfig {
         // DATABASE_URL is loaded from ~/.clawyer/.env via dotenvy early in startup.
         let url = optional_env("DATABASE_URL")?
             .or_else(|| {
-                if backend == DatabaseBackend::LibSql {
+                if backend == DatabaseBackend::LibSql || skip_db_validation {
                     Some("unused://libsql".to_string())
                 } else {
                     None
@@ -127,4 +139,79 @@ pub fn default_libsql_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".clawyer")
         .join("clawyer.db")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::helpers::ENV_MUTEX;
+
+    struct EnvGuard {
+        key: &'static str,
+        value: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: guarded by ENV_MUTEX in tests.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key,
+                value: previous,
+            }
+        }
+
+        fn clear(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: guarded by ENV_MUTEX in tests.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self {
+                key,
+                value: previous,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: guarded by ENV_MUTEX in tests.
+            unsafe {
+                if let Some(ref val) = self.value {
+                    std::env::set_var(self.key, val);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_strict_requires_database_url_for_postgres() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        let _db_url = EnvGuard::clear("DATABASE_URL");
+        let _backend = EnvGuard::set("DATABASE_BACKEND", "postgres");
+
+        let err = DatabaseConfig::resolve().expect_err("strict resolve should fail");
+        match err {
+            ConfigError::MissingRequired { key, .. } => assert_eq!(key, "DATABASE_URL"),
+            other => panic!("expected MissingRequired(DATABASE_URL), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_startup_allows_missing_database_url_when_skipping_validation() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        let _db_url = EnvGuard::clear("DATABASE_URL");
+        let _backend = EnvGuard::set("DATABASE_BACKEND", "postgres");
+
+        let cfg = DatabaseConfig::resolve_for_startup(true)
+            .expect("startup resolve should tolerate missing DATABASE_URL");
+        assert_eq!(cfg.backend, DatabaseBackend::Postgres);
+        assert_eq!(cfg.url(), "unused://libsql");
+    }
 }

@@ -4,7 +4,7 @@
 //! - **macOS**: launchd plist at `~/Library/LaunchAgents/com.clawyer.daemon.plist`
 //! - **Linux**: systemd user unit at `~/.config/systemd/user/clawyer.service`
 //!
-//! The installed service runs `clawyer run` (the default agent mode) and is
+//! The installed service runs `clawyer run --headless --no-onboard` and is
 //! configured to restart automatically on failure.
 
 use std::path::PathBuf;
@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 
 const SERVICE_LABEL: &str = "com.clawyer.daemon";
 const SYSTEMD_UNIT: &str = "clawyer.service";
+const SERVICE_RUN_ARGS: &[&str] = &["run", "--headless", "--no-onboard"];
 
 // ── Public dispatch ─────────────────────────────────────────────
 
@@ -63,34 +64,7 @@ fn install_macos() -> Result<()> {
     let stdout = logs_dir.join("daemon.stdout.log");
     let stderr = logs_dir.join("daemon.stderr.log");
 
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{exe}</string>
-    <string>run</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>{stdout}</string>
-  <key>StandardErrorPath</key>
-  <string>{stderr}</string>
-</dict>
-</plist>
-"#,
-        label = SERVICE_LABEL,
-        exe = xml_escape(&exe.display().to_string()),
-        stdout = xml_escape(&stdout.display().to_string()),
-        stderr = xml_escape(&stderr.display().to_string()),
-    );
+    let plist = render_macos_plist(&exe, &stdout, &stderr);
 
     std::fs::write(&file, plist)?;
     println!("Installed launchd service: {}", file.display());
@@ -105,21 +79,7 @@ fn install_linux() -> Result<()> {
     }
 
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
-    let unit = format!(
-        "[Unit]\n\
-         Description=cLawyer daemon\n\
-         After=network.target\n\
-         \n\
-         [Service]\n\
-         Type=simple\n\
-         ExecStart=\"{exe}\" run\n\
-         Restart=always\n\
-         RestartSec=3\n\
-         \n\
-         [Install]\n\
-         WantedBy=default.target\n",
-        exe = exe.display(),
-    );
+    let unit = render_linux_unit(&exe);
 
     std::fs::write(&file, unit)?;
     run_checked(Command::new("systemctl").args(["--user", "daemon-reload"])).ok();
@@ -283,6 +243,65 @@ fn xml_escape(raw: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn render_macos_plist(
+    exe: &std::path::Path,
+    stdout: &std::path::Path,
+    stderr: &std::path::Path,
+) -> String {
+    let args = SERVICE_RUN_ARGS
+        .iter()
+        .map(|arg| format!("    <string>{}</string>\n", xml_escape(arg)))
+        .collect::<String>();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe}</string>
+{args}  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{stdout}</string>
+  <key>StandardErrorPath</key>
+  <string>{stderr}</string>
+</dict>
+</plist>
+"#,
+        label = SERVICE_LABEL,
+        exe = xml_escape(&exe.display().to_string()),
+        stdout = xml_escape(&stdout.display().to_string()),
+        stderr = xml_escape(&stderr.display().to_string()),
+        args = args,
+    )
+}
+
+fn render_linux_unit(exe: &std::path::Path) -> String {
+    let args = SERVICE_RUN_ARGS.join(" ");
+    format!(
+        "[Unit]\n\
+         Description=cLawyer daemon\n\
+         After=network.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart=\"{exe}\" {args}\n\
+         Restart=always\n\
+         RestartSec=3\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        exe = exe.display(),
+        args = args
+    )
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -353,5 +372,23 @@ mod tests {
         let path = clawyer_logs_dir().unwrap();
         let s = path.to_string_lossy();
         assert!(s.ends_with(".clawyer/logs"), "unexpected path: {s}");
+    }
+
+    #[test]
+    fn linux_unit_contains_headless_no_onboard_args() {
+        let unit = render_linux_unit(std::path::Path::new("/usr/local/bin/clawyer"));
+        assert!(unit.contains("ExecStart=\"/usr/local/bin/clawyer\" run --headless --no-onboard"));
+    }
+
+    #[test]
+    fn macos_plist_contains_headless_no_onboard_args() {
+        let plist = render_macos_plist(
+            std::path::Path::new("/usr/local/bin/clawyer"),
+            std::path::Path::new("/tmp/stdout.log"),
+            std::path::Path::new("/tmp/stderr.log"),
+        );
+        assert!(plist.contains("<string>run</string>"));
+        assert!(plist.contains("<string>--headless</string>"));
+        assert!(plist.contains("<string>--no-onboard</string>"));
     }
 }
