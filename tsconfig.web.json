@@ -17,6 +17,7 @@
     "skipLibCheck": true
   },
   "include": [
+    "src/channels/web/static/app/main.js",
     "src/channels/web/static/app/core/**/*.js"
   ]
 }

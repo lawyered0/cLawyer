@@ -11,9 +11,15 @@ import {
 } from '/app/core/state.js';
 import { OVERFLOW_TABS, PRIMARY_TABS, SHORTCUT_TABS } from '/app/core/tabs.js';
 
+/** @type {any} */
+const globalWindow = window;
+
 function loadLegacyScript(src) {
   return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`script[data-clawyer-legacy="1"][src="${src}"]`);
+    /** @type {HTMLScriptElement | null} */
+    const existing = /** @type {HTMLScriptElement | null} */ (
+      document.querySelector(`script[data-clawyer-legacy="1"][src="${src}"]`)
+    );
     if (existing) {
       if (existing.dataset.loaded === '1') {
         resolve();
@@ -74,10 +80,10 @@ const FEATURE_SCRIPTS = [
 
 (async function bootstrap() {
   try {
-    if (window.__clawyerClientBootstrapped) return;
-    window.__clawyerClientBootstrapped = true;
+    if (globalWindow.__clawyerClientBootstrapped) return;
+    globalWindow.__clawyerClientBootstrapped = true;
 
-    window.__clawyerCore = {
+    globalWindow.__clawyerCore = {
       appState,
       setAuthToken,
       setCurrentTab,
