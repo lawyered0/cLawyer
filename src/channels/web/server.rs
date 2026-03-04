@@ -340,8 +340,8 @@ pub(crate) fn build_turns_from_db_messages(
             // Check if next message is an assistant response
             if let Some(next) = iter.peek()
                 && next.role == "assistant"
+                && let Some(assistant_msg) = iter.next()
             {
-                let assistant_msg = iter.next().expect("peeked");
                 turn.response = Some(assistant_msg.content.clone());
                 turn.completed_at = Some(assistant_msg.created_at.to_rfc3339());
             }
