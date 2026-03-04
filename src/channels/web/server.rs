@@ -2,181 +2,49 @@
 //!
 //! Handles all API routes: chat, memory, jobs, health, and static file serving.
 
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Component as FsComponent, Path as FsPath};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path, Query, State, WebSocketUpgrade},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{StatusCode, header},
     middleware,
-    response::{
-        IntoResponse,
-        sse::{Event, KeepAlive, Sse},
-    },
     routing::{get, post},
 };
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tokio::sync::{mpsc, oneshot};
-use tokio_stream::StreamExt;
+use tokio::sync::oneshot;
 use tower_http::cors::{AllowHeaders, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use uuid::Uuid;
 
-use crate::agent::SessionManager;
-use crate::channels::IncomingMessage;
 use crate::channels::web::auth::{AuthState, auth_middleware};
-use crate::channels::web::handlers::skills::{
-    skills_install_handler, skills_list_handler, skills_remove_handler, skills_search_handler,
-};
-use crate::channels::web::log_layer::LogBroadcaster;
-use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
 use crate::db::{
-    AuditEventQuery as DbAuditEventQuery, AuditSeverity, ClientType, ConflictClearanceRecord,
-    ConflictDecision, ConflictHit, CreateClientParams, CreateDocumentVersionParams,
-    CreateExpenseEntryParams, CreateMatterDeadlineParams, CreateMatterNoteParams,
-    CreateMatterTaskParams, CreateTimeEntryParams, Database, ExpenseCategory,
-    InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus, MatterDeadlineType,
-    MatterDocumentCategory, MatterStatus, MatterTaskStatus, TrustLedgerEntryRecord,
-    UpdateClientParams, UpdateExpenseEntryParams, UpdateMatterDeadlineParams,
-    UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
-    UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams,
+    AuditSeverity, ClientType, ConflictClearanceRecord, ConflictDecision, ConflictHit,
+    CreateClientParams, CreateDocumentVersionParams, CreateMatterDeadlineParams, ExpenseCategory,
+    InvoiceLineItemRecord, InvoiceRecord, MatterDeadlineType, MatterDocumentCategory, MatterStatus,
+    MatterTaskStatus, TrustLedgerEntryRecord, UpdateClientParams, UpdateMatterDeadlineParams,
+    UpdateMatterParams, UpsertDocumentTemplateParams, UpsertMatterDocumentParams,
+    UpsertMatterParams,
 };
-use crate::extensions::ExtensionManager;
-use crate::llm::{ChatMessage, CompletionRequest};
-use crate::orchestrator::job_manager::ContainerJobManager;
-use crate::tools::ToolRegistry;
+#[cfg(test)]
+use crate::llm::CompletionRequest;
 use crate::workspace::{Workspace, paths};
 
-/// Shared prompt queue: maps job IDs to pending follow-up prompts for Claude Code bridges.
-pub type PromptQueue = Arc<
-    tokio::sync::Mutex<
-        std::collections::HashMap<
-            uuid::Uuid,
-            std::collections::VecDeque<crate::orchestrator::api::PendingPrompt>,
-        >,
-    >,
->;
-
-/// Simple sliding-window rate limiter.
-///
-/// Tracks the number of requests in the current window. Resets when the window expires.
-/// Not per-IP (since this is a single-user gateway with auth), but prevents flooding.
-pub struct RateLimiter {
-    /// Requests remaining in the current window.
-    remaining: AtomicU64,
-    /// Epoch second when the current window started.
-    window_start: AtomicU64,
-    /// Maximum requests per window.
-    max_requests: u64,
-    /// Window duration in seconds.
-    window_secs: u64,
-}
-
-impl RateLimiter {
-    pub fn new(max_requests: u64, window_secs: u64) -> Self {
-        Self {
-            remaining: AtomicU64::new(max_requests),
-            window_start: AtomicU64::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            max_requests,
-            window_secs,
-        }
-    }
-
-    /// Try to consume one request. Returns `true` if allowed, `false` if rate limited.
-    pub fn check(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let window = self.window_start.load(Ordering::Relaxed);
-        if now.saturating_sub(window) >= self.window_secs {
-            // Window expired, reset
-            self.window_start.store(now, Ordering::Relaxed);
-            self.remaining
-                .store(self.max_requests - 1, Ordering::Relaxed);
-            return true;
-        }
-
-        // Try to decrement remaining
-        loop {
-            let current = self.remaining.load(Ordering::Relaxed);
-            if current == 0 {
-                return false;
-            }
-            if self
-                .remaining
-                .compare_exchange_weak(current, current - 1, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return true;
-            }
-        }
-    }
-}
-
-/// Shared state for all gateway handlers.
-pub struct GatewayState {
-    /// Channel to send messages to the agent loop.
-    pub msg_tx: tokio::sync::RwLock<Option<mpsc::Sender<IncomingMessage>>>,
-    /// SSE broadcast manager.
-    pub sse: SseManager,
-    /// Workspace for memory API.
-    pub workspace: Option<Arc<Workspace>>,
-    /// Session manager for thread info.
-    pub session_manager: Option<Arc<SessionManager>>,
-    /// Log broadcaster for the logs SSE endpoint.
-    pub log_broadcaster: Option<Arc<LogBroadcaster>>,
-    /// Handle for changing the tracing log level at runtime.
-    pub log_level_handle: Option<Arc<crate::channels::web::log_layer::LogLevelHandle>>,
-    /// Extension manager for extension management API.
-    pub extension_manager: Option<Arc<ExtensionManager>>,
-    /// Tool registry for listing registered tools.
-    pub tool_registry: Option<Arc<ToolRegistry>>,
-    /// Database store for sandbox job persistence.
-    pub store: Option<Arc<dyn Database>>,
-    /// Container job manager for sandbox operations.
-    pub job_manager: Option<Arc<ContainerJobManager>>,
-    /// Prompt queue for Claude Code follow-up prompts.
-    pub prompt_queue: Option<PromptQueue>,
-    /// User ID for this gateway.
-    pub user_id: String,
-    /// Shutdown signal sender.
-    pub shutdown_tx: tokio::sync::RwLock<Option<oneshot::Sender<()>>>,
-    /// WebSocket connection tracker.
-    pub ws_tracker: Option<Arc<crate::channels::web::ws::WsConnectionTracker>>,
-    /// LLM provider for OpenAI-compatible API proxy.
-    pub llm_provider: Option<Arc<dyn crate::llm::LlmProvider>>,
-    /// Skill registry for skill management API.
-    pub skill_registry: Option<Arc<std::sync::RwLock<crate::skills::SkillRegistry>>>,
-    /// Skill catalog for searching the ClawHub registry.
-    pub skill_catalog: Option<Arc<crate::skills::catalog::SkillCatalog>>,
-    /// Rate limiter for chat endpoints (30 messages per 60 seconds).
-    pub chat_rate_limiter: RateLimiter,
-    /// Registry catalog entries for the available extensions API.
-    /// Populated at startup from `registry/` manifests, independent of extension manager.
-    pub registry_entries: Vec<crate::extensions::RegistryEntry>,
-    /// Cost guard for token/cost tracking.
-    pub cost_guard: Option<Arc<crate::agent::cost_guard::CostGuard>>,
-    /// Server startup time for uptime calculation.
-    pub startup_time: std::time::Instant,
-    /// Legal config for legal-policy-aware web endpoints.
-    pub legal_config: Option<crate::config::LegalConfig>,
-    /// Snapshot of runtime facts used for compliance scoring.
-    pub runtime_facts: crate::compliance::ComplianceRuntimeFacts,
-}
+#[cfg(test)]
+use crate::agent::SessionManager;
+#[cfg(test)]
+use crate::channels::web::sse::SseManager;
+pub use crate::channels::web::state::{GatewayState, PromptQueue, RateLimiter};
+#[cfg(test)]
+use axum::{
+    extract::{Multipart, WebSocketUpgrade},
+    response::IntoResponse,
+};
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
 
@@ -203,31 +71,12 @@ pub async fn start_server(
             })?;
 
     // Public routes (no auth)
-    let public = Router::new().route("/api/health", get(health_handler));
+    let public = crate::channels::web::handlers::routes::public_routes();
 
     // Protected routes (require auth)
     let auth_state = AuthState { token: auth_token };
     let protected = Router::new()
-        // Chat
-        .route("/api/chat/send", post(chat_send_handler))
-        .route("/api/chat/approval", post(chat_approval_handler))
-        .route("/api/chat/auth-token", post(chat_auth_token_handler))
-        .route("/api/chat/auth-cancel", post(chat_auth_cancel_handler))
-        .route("/api/chat/events", get(chat_events_handler))
-        .route("/api/chat/ws", get(chat_ws_handler))
-        .route("/api/chat/history", get(chat_history_handler))
-        .route("/api/chat/threads", get(chat_threads_handler))
-        .route("/api/chat/thread/new", post(chat_new_thread_handler))
-        // Memory
-        .route("/api/memory/tree", get(memory_tree_handler))
-        .route("/api/memory/list", get(memory_list_handler))
-        .route("/api/memory/read", get(memory_read_handler))
-        .route("/api/memory/write", post(memory_write_handler))
-        .route("/api/memory/search", post(memory_search_handler))
-        .route(
-            "/api/memory/upload",
-            post(memory_upload_handler).layer(DefaultBodyLimit::max(UPLOAD_FILE_SIZE_LIMIT)),
-        )
+        .merge(crate::channels::web::handlers::routes::protected_feature_routes())
         // Matters
         .route(
             "/api/matters",
@@ -250,69 +99,9 @@ pub async fn start_server(
                 .delete(matter_delete_handler),
         )
         .route(
-            "/api/matters/{id}/tasks",
-            get(matter_tasks_list_handler).post(matter_tasks_create_handler),
-        )
-        .route(
-            "/api/matters/{id}/tasks/{task_id}",
-            axum::routing::patch(matter_tasks_patch_handler).delete(matter_tasks_delete_handler),
-        )
-        .route(
-            "/api/matters/{id}/notes",
-            get(matter_notes_list_handler).post(matter_notes_create_handler),
-        )
-        .route(
-            "/api/matters/{id}/notes/{note_id}",
-            axum::routing::patch(matter_notes_patch_handler).delete(matter_notes_delete_handler),
-        )
-        .route(
-            "/api/matters/{id}/time",
-            get(matter_time_list_handler).post(matter_time_create_handler),
-        )
-        .route(
-            "/api/matters/{id}/time/{entry_id}",
-            axum::routing::patch(matter_time_patch_handler).delete(matter_time_delete_handler),
-        )
-        .route(
-            "/api/matters/{id}/expenses",
-            get(matter_expenses_list_handler).post(matter_expenses_create_handler),
-        )
-        .route(
-            "/api/matters/{id}/expenses/{entry_id}",
-            axum::routing::patch(matter_expenses_patch_handler)
-                .delete(matter_expenses_delete_handler),
-        )
-        .route(
-            "/api/matters/{id}/time-summary",
-            get(matter_time_summary_handler),
-        )
-        .route(
-            "/api/matters/{id}/invoices",
-            get(matter_invoices_list_handler),
-        )
-        .route("/api/invoices/draft", post(invoices_draft_handler))
-        .route("/api/invoices", post(invoices_save_handler))
-        .route("/api/invoices/{id}", get(invoices_get_handler))
-        .route(
-            "/api/invoices/{id}/finalize",
-            post(invoices_finalize_handler),
-        )
-        .route("/api/invoices/{id}/void", post(invoices_void_handler))
-        .route("/api/invoices/{id}/payment", post(invoices_payment_handler))
-        .route(
-            "/api/matters/{id}/trust/deposit",
-            post(matter_trust_deposit_handler),
-        )
-        .route(
-            "/api/matters/{id}/trust/ledger",
-            get(matter_trust_ledger_handler),
-        )
-        .route(
             "/api/matters/active",
             get(matters_active_get_handler).post(matters_active_set_handler),
         )
-        .route("/api/matters/{id}/documents", get(matter_documents_handler))
-        .route("/api/matters/{id}/dashboard", get(matter_dashboard_handler))
         .route(
             "/api/matters/{id}/deadlines",
             get(matter_deadlines_handler).post(matter_deadlines_create_handler),
@@ -326,120 +115,6 @@ pub async fn start_server(
             "/api/matters/{id}/deadlines/compute",
             post(matter_deadlines_compute_handler),
         )
-        .route("/api/matters/{id}/templates", get(matter_templates_handler))
-        .route(
-            "/api/matters/{id}/templates/apply",
-            post(matter_template_apply_handler),
-        )
-        .route(
-            "/api/matters/{id}/exports/retrieval-packet",
-            post(matter_retrieval_export_handler),
-        )
-        .route("/api/documents/generate", post(documents_generate_handler))
-        .route(
-            "/api/matters/{id}/filing-package",
-            post(matter_filing_package_handler),
-        )
-        .route(
-            "/api/matters/conflict-check",
-            post(matters_conflict_check_handler),
-        )
-        .route(
-            "/api/matters/conflicts/check",
-            post(matters_conflicts_check_handler),
-        )
-        .route(
-            "/api/matters/conflicts/reindex",
-            post(matters_conflicts_reindex_handler),
-        )
-        .route("/api/legal/audit", get(legal_audit_list_handler))
-        .route("/api/compliance/status", get(compliance_status_handler))
-        .route("/api/compliance/letter", post(compliance_letter_handler))
-        .route("/api/legal/court-rules", get(legal_court_rules_handler))
-        // Jobs
-        .route("/api/jobs", get(jobs_list_handler))
-        .route("/api/jobs/summary", get(jobs_summary_handler))
-        .route("/api/jobs/{id}", get(jobs_detail_handler))
-        .route("/api/jobs/{id}/cancel", post(jobs_cancel_handler))
-        .route("/api/jobs/{id}/restart", post(jobs_restart_handler))
-        .route("/api/jobs/{id}/prompt", post(jobs_prompt_handler))
-        .route("/api/jobs/{id}/events", get(jobs_events_handler))
-        .route("/api/jobs/{id}/files/list", get(job_files_list_handler))
-        .route("/api/jobs/{id}/files/read", get(job_files_read_handler))
-        // Logs
-        .route("/api/logs/events", get(logs_events_handler))
-        .route("/api/logs/level", get(logs_level_get_handler))
-        .route(
-            "/api/logs/level",
-            axum::routing::put(logs_level_set_handler),
-        )
-        // Extensions
-        .route("/api/extensions", get(extensions_list_handler))
-        .route("/api/extensions/tools", get(extensions_tools_handler))
-        .route("/api/extensions/registry", get(extensions_registry_handler))
-        .route("/api/extensions/install", post(extensions_install_handler))
-        .route(
-            "/api/extensions/{name}/activate",
-            post(extensions_activate_handler),
-        )
-        .route(
-            "/api/extensions/{name}/remove",
-            post(extensions_remove_handler),
-        )
-        .route(
-            "/api/extensions/{name}/setup",
-            get(extensions_setup_handler).post(extensions_setup_submit_handler),
-        )
-        // Pairing
-        .route("/api/pairing/{channel}", get(pairing_list_handler))
-        .route(
-            "/api/pairing/{channel}/approve",
-            post(pairing_approve_handler),
-        )
-        // Routines
-        .route(
-            "/api/routines",
-            get(routines_list_handler).post(routines_create_handler),
-        )
-        .route("/api/routines/summary", get(routines_summary_handler))
-        .route("/api/routines/{id}", get(routines_detail_handler))
-        .route("/api/routines/{id}/trigger", post(routines_trigger_handler))
-        .route("/api/routines/{id}/toggle", post(routines_toggle_handler))
-        .route(
-            "/api/routines/{id}",
-            axum::routing::delete(routines_delete_handler),
-        )
-        .route("/api/routines/{id}/runs", get(routines_runs_handler))
-        // Skills
-        .route("/api/skills", get(skills_list_handler))
-        .route("/api/skills/search", post(skills_search_handler))
-        .route("/api/skills/install", post(skills_install_handler))
-        .route(
-            "/api/skills/{name}",
-            axum::routing::delete(skills_remove_handler),
-        )
-        // Settings
-        .route("/api/settings", get(settings_list_handler))
-        .route("/api/settings/export", get(settings_export_handler))
-        .route("/api/settings/import", post(settings_import_handler))
-        .route("/api/settings/{key}", get(settings_get_handler))
-        .route(
-            "/api/settings/{key}",
-            axum::routing::put(settings_set_handler),
-        )
-        .route(
-            "/api/settings/{key}",
-            axum::routing::delete(settings_delete_handler),
-        )
-        .route("/api/backups/create", post(backups_create_handler))
-        .route("/api/backups/verify", post(backups_verify_handler))
-        .route(
-            "/api/backups/restore",
-            post(backups_restore_handler).layer(DefaultBodyLimit::max(BACKUP_RESTORE_SIZE_LIMIT)),
-        )
-        .route("/api/backups/{id}/download", get(backups_download_handler))
-        // Gateway control plane
-        .route("/api/gateway/status", get(gateway_status_handler))
         // OpenAI-compatible API
         .route(
             "/v1/chat/completions",
@@ -452,21 +127,10 @@ pub async fn start_server(
         ));
 
     // Static file routes (no auth, served from embedded strings)
-    let statics = Router::new()
-        .route("/", get(index_handler))
-        .route("/style.css", get(css_handler))
-        .route("/app.js", get(js_handler))
-        .route("/favicon.ico", get(favicon_handler));
+    let statics = crate::channels::web::handlers::routes::static_routes();
 
     // Project file serving (behind auth to prevent unauthorized file access).
-    let projects = Router::new()
-        .route("/projects/{project_id}", get(project_redirect_handler))
-        .route("/projects/{project_id}/", get(project_index_handler))
-        .route("/projects/{project_id}/{*path}", get(project_file_handler))
-        .route_layer(middleware::from_fn_with_state(
-            auth_state.clone(),
-            auth_middleware,
-        ));
+    let projects = crate::channels::web::handlers::routes::project_routes(auth_state.clone());
 
     // CORS: restrict to same-origin by default. Only localhost/127.0.0.1
     // origins are allowed, since the gateway is a local-first service.
@@ -532,58 +196,9 @@ pub async fn start_server(
 
 // --- Static file handlers ---
 
-async fn index_handler() -> impl IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        include_str!("static/index.html"),
-    )
-}
-
-async fn css_handler() -> impl IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "text/css"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        include_str!("static/style.css"),
-    )
-}
-
-async fn js_handler() -> impl IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "application/javascript"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        include_str!("static/app.js"),
-    )
-}
-
-async fn favicon_handler() -> impl IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "image/x-icon"),
-            (header::CACHE_CONTROL, "public, max-age=86400"),
-        ],
-        include_bytes!("static/favicon.ico").as_slice(),
-    )
-}
-
-// --- Health ---
-
-async fn health_handler() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "healthy",
-        channel: "gateway",
-    })
-}
-
 // --- Chat handlers ---
 
-async fn load_active_matter_for_chat(state: &GatewayState) -> Option<String> {
+pub(crate) async fn load_active_matter_for_chat(state: &GatewayState) -> Option<String> {
     let store = state.store.as_ref()?;
     let value = match store
         .get_setting(&state.user_id, MATTER_ACTIVE_SETTING)
@@ -602,7 +217,7 @@ async fn load_active_matter_for_chat(state: &GatewayState) -> Option<String> {
     crate::legal::policy::sanitize_optional_matter_id(raw)
 }
 
-async fn build_chat_message_metadata(
+pub(crate) async fn build_chat_message_metadata(
     state: &GatewayState,
     thread_id: Option<&str>,
 ) -> serde_json::Value {
@@ -623,182 +238,42 @@ async fn build_chat_message_metadata(
     serde_json::Value::Object(metadata)
 }
 
+#[cfg(test)]
 async fn chat_send_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<(StatusCode, Json<SendMessageResponse>), (StatusCode, String)> {
-    if !state.chat_rate_limiter.check() {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "Rate limit exceeded. Try again shortly.".to_string(),
-        ));
-    }
-
-    let mut msg = IncomingMessage::new("gateway", &state.user_id, &req.content);
-
-    if let Some(ref thread_id) = req.thread_id {
-        msg = msg.with_thread(thread_id);
-    }
-    msg = msg
-        .with_metadata(build_chat_message_metadata(state.as_ref(), req.thread_id.as_deref()).await);
-
-    let msg_id = msg.id;
-
-    let tx_guard = state.msg_tx.read().await;
-    let tx = tx_guard.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Channel not started".to_string(),
-    ))?;
-
-    tx.send(msg).await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Channel closed".to_string(),
-        )
-    })?;
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(SendMessageResponse {
-            message_id: msg_id,
-            status: "accepted",
-        }),
-    ))
+    crate::channels::web::handlers::chat::chat_send_handler(State(state), Json(req)).await
 }
 
+#[cfg(test)]
 async fn chat_approval_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<ApprovalRequest>,
 ) -> Result<(StatusCode, Json<SendMessageResponse>), (StatusCode, String)> {
-    let (approved, always) = match req.action.as_str() {
-        "approve" => (true, false),
-        "always" => (true, true),
-        "deny" => (false, false),
-        other => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("Unknown action: {}", other),
-            ));
-        }
-    };
-
-    let request_id = Uuid::parse_str(&req.request_id).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Invalid request_id (expected UUID)".to_string(),
-        )
-    })?;
-
-    // Build a structured ExecApproval submission as JSON, sent through the
-    // existing message pipeline so the agent loop picks it up.
-    let approval = crate::agent::submission::Submission::ExecApproval {
-        request_id,
-        approved,
-        always,
-    };
-    let content = serde_json::to_string(&approval).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to serialize approval: {}", e),
-        )
-    })?;
-
-    let mut msg = IncomingMessage::new("gateway", &state.user_id, content);
-
-    if let Some(ref thread_id) = req.thread_id {
-        msg = msg.with_thread(thread_id);
-    }
-    msg = msg
-        .with_metadata(build_chat_message_metadata(state.as_ref(), req.thread_id.as_deref()).await);
-
-    let msg_id = msg.id;
-
-    let tx_guard = state.msg_tx.read().await;
-    let tx = tx_guard.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Channel not started".to_string(),
-    ))?;
-
-    tx.send(msg).await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Channel closed".to_string(),
-        )
-    })?;
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(SendMessageResponse {
-            message_id: msg_id,
-            status: "accepted",
-        }),
-    ))
+    crate::channels::web::handlers::chat::chat_approval_handler(State(state), Json(req)).await
 }
 
 /// Submit an auth token directly to the extension manager, bypassing the message pipeline.
 ///
 /// The token never touches the LLM, chat history, or SSE stream.
+#[cfg(test)]
+#[allow(dead_code)]
 async fn chat_auth_token_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<AuthTokenRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let ext_mgr = state.extension_manager.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Extension manager not available".to_string(),
-    ))?;
-
-    let result = ext_mgr
-        .auth(&req.extension_name, Some(&req.token))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if result.status == "authenticated" {
-        // Auto-activate so tools are available immediately
-        let msg = match ext_mgr.activate(&req.extension_name).await {
-            Ok(r) => format!(
-                "{} authenticated ({} tools loaded)",
-                req.extension_name,
-                r.tools_loaded.len()
-            ),
-            Err(e) => format!(
-                "{} authenticated but activation failed: {}",
-                req.extension_name, e
-            ),
-        };
-
-        // Clear auth mode on the active thread
-        clear_auth_mode(&state).await;
-
-        state.sse.broadcast(SseEvent::AuthCompleted {
-            extension_name: req.extension_name,
-            success: true,
-            message: msg.clone(),
-        });
-
-        Ok(Json(ActionResponse::ok(msg)))
-    } else {
-        // Re-emit auth_required for retry
-        state.sse.broadcast(SseEvent::AuthRequired {
-            extension_name: req.extension_name.clone(),
-            instructions: result.instructions.clone(),
-            auth_url: result.auth_url.clone(),
-            setup_url: result.setup_url.clone(),
-        });
-        Ok(Json(ActionResponse::fail(
-            result
-                .instructions
-                .unwrap_or_else(|| "Invalid token".to_string()),
-        )))
-    }
+    crate::channels::web::handlers::chat::chat_auth_token_handler(State(state), Json(req)).await
 }
 
 /// Cancel an in-progress auth flow.
+#[cfg(test)]
+#[allow(dead_code)]
 async fn chat_auth_cancel_handler(
     State(state): State<Arc<GatewayState>>,
-    Json(_req): Json<AuthCancelRequest>,
+    Json(req): Json<AuthCancelRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    clear_auth_mode(&state).await;
-    Ok(Json(ActionResponse::ok("Auth cancelled")))
+    crate::channels::web::handlers::chat::chat_auth_cancel_handler(State(state), Json(req)).await
 }
 
 /// Clear pending auth mode on the active thread.
@@ -814,68 +289,38 @@ pub async fn clear_auth_mode(state: &GatewayState) {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn chat_events_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let sse = state.sse.subscribe().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Too many connections".to_string(),
-    ))?;
-    Ok((
-        [("X-Accel-Buffering", "no"), ("Cache-Control", "no-cache")],
-        sse,
-    ))
+    crate::channels::web::handlers::chat::chat_events_handler(State(state)).await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn chat_ws_handler(
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
     State(state): State<Arc<GatewayState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // Validate Origin header to prevent cross-site WebSocket hijacking.
-    // Require the header outright; browsers always send it for WS upgrades,
-    // so a missing Origin means a non-browser client trying to bypass the check.
-    let origin = headers
-        .get("origin")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            (
-                StatusCode::FORBIDDEN,
-                "WebSocket Origin header required".to_string(),
-            )
-        })?;
-
-    // Extract the host from the origin and compare exactly, so that
-    // crafted origins like "http://localhost.evil.com" are rejected.
-    // Origin format is "scheme://host[:port]".
-    let host = origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-        .and_then(|rest| rest.split(':').next()?.split('/').next())
-        .unwrap_or("");
-
-    let is_local = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
-    if !is_local {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "WebSocket origin not allowed".to_string(),
-        ));
-    }
-    Ok(ws.on_upgrade(move |socket| crate::channels::web::ws::handle_ws_connection(socket, state)))
+    crate::channels::web::handlers::chat::chat_ws_handler(headers, ws, State(state)).await
 }
 
 #[derive(Deserialize)]
-struct HistoryQuery {
-    thread_id: Option<String>,
-    limit: Option<usize>,
-    before: Option<String>,
+pub(crate) struct HistoryQuery {
+    pub(crate) thread_id: Option<String>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) before: Option<String>,
 }
 
-const CHAT_HISTORY_DEFAULT_LIMIT: usize = 50;
-const CHAT_HISTORY_MIN_LIMIT: usize = 1;
-const CHAT_HISTORY_MAX_LIMIT: usize = 200;
+pub(crate) const CHAT_HISTORY_DEFAULT_LIMIT: usize = 50;
+pub(crate) const CHAT_HISTORY_MIN_LIMIT: usize = 1;
+pub(crate) const CHAT_HISTORY_MAX_LIMIT: usize = 200;
 
-fn build_turns_from_session_thread(thread: &crate::agent::session::Thread) -> Vec<TurnInfo> {
+pub(crate) fn build_turns_from_session_thread(
+    thread: &crate::agent::session::Thread,
+) -> Vec<TurnInfo> {
     thread
         .turns
         .iter()
@@ -899,137 +344,18 @@ fn build_turns_from_session_thread(thread: &crate::agent::session::Thread) -> Ve
         .collect()
 }
 
+#[cfg(test)]
 async fn chat_history_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<HistoryResponse>, (StatusCode, String)> {
-    let session_manager = state.session_manager.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Session manager not available".to_string(),
-    ))?;
-
-    let session = session_manager.get_or_create_session(&state.user_id).await;
-    let limit = query.limit.unwrap_or(CHAT_HISTORY_DEFAULT_LIMIT);
-    if !(CHAT_HISTORY_MIN_LIMIT..=CHAT_HISTORY_MAX_LIMIT).contains(&limit) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "'limit' must be between 1 and 200".to_string(),
-        ));
-    }
-
-    let before_cursor = query
-        .before
-        .as_deref()
-        .map(|s| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|_| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "Invalid 'before' timestamp".to_string(),
-                    )
-                })
-        })
-        .transpose()?;
-
-    let (thread_id, thread_exists_in_memory, in_memory_turns) = {
-        let sess = session.lock().await;
-        let thread_id = if let Some(ref tid) = query.thread_id {
-            Uuid::parse_str(tid)
-                .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid thread_id".to_string()))?
-        } else {
-            sess.active_thread
-                .ok_or((StatusCode::NOT_FOUND, "No active thread".to_string()))?
-        };
-        let in_memory_turns = if before_cursor.is_none() {
-            sess.threads
-                .get(&thread_id)
-                .filter(|thread| !thread.turns.is_empty())
-                .map(build_turns_from_session_thread)
-        } else {
-            None
-        };
-        (
-            thread_id,
-            sess.threads.contains_key(&thread_id),
-            in_memory_turns,
-        )
-    };
-
-    // Verify the thread belongs to the authenticated user before returning any data.
-    // In-memory threads are already scoped by user via session_manager, but DB
-    // lookups could expose another user's conversation if the UUID is guessed.
-    if query.thread_id.is_some()
-        && let Some(ref store) = state.store
-    {
-        let owned = store
-            .conversation_belongs_to_user(thread_id, &state.user_id)
-            .await
-            .unwrap_or(false);
-        if !owned && !thread_exists_in_memory {
-            return Err((StatusCode::NOT_FOUND, "Thread not found".to_string()));
-        }
-    }
-
-    // For paginated requests (before cursor set), always go to DB
-    if before_cursor.is_some()
-        && let Some(ref store) = state.store
-    {
-        let (messages, has_more) = store
-            .list_conversation_messages_paginated(thread_id, before_cursor, limit as i64)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        let oldest_timestamp = messages.first().map(|m| m.created_at.to_rfc3339());
-        let turns = build_turns_from_db_messages(&messages);
-        return Ok(Json(HistoryResponse {
-            thread_id,
-            turns,
-            has_more,
-            oldest_timestamp,
-        }));
-    }
-
-    // Try in-memory first (freshest data for active threads)
-    if let Some(turns) = in_memory_turns {
-        return Ok(Json(HistoryResponse {
-            thread_id,
-            turns,
-            has_more: false,
-            oldest_timestamp: None,
-        }));
-    }
-
-    // Fall back to DB for historical threads not in memory (paginated)
-    if let Some(ref store) = state.store {
-        let (messages, has_more) = store
-            .list_conversation_messages_paginated(thread_id, None, limit as i64)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        if !messages.is_empty() {
-            let oldest_timestamp = messages.first().map(|m| m.created_at.to_rfc3339());
-            let turns = build_turns_from_db_messages(&messages);
-            return Ok(Json(HistoryResponse {
-                thread_id,
-                turns,
-                has_more,
-                oldest_timestamp,
-            }));
-        }
-    }
-
-    // Empty thread (just created, no messages yet)
-    Ok(Json(HistoryResponse {
-        thread_id,
-        turns: Vec::new(),
-        has_more: false,
-        oldest_timestamp: None,
-    }))
+    crate::channels::web::handlers::chat::chat_history_handler(State(state), Query(query)).await
 }
 
 /// Build TurnInfo pairs from flat DB messages (alternating user/assistant).
-fn build_turns_from_db_messages(messages: &[crate::history::ConversationMessage]) -> Vec<TurnInfo> {
+pub(crate) fn build_turns_from_db_messages(
+    messages: &[crate::history::ConversationMessage],
+) -> Vec<TurnInfo> {
     let mut turns = Vec::new();
     let mut turn_number = 0;
     let mut iter = messages.iter().peekable();
@@ -1069,469 +395,99 @@ fn build_turns_from_db_messages(messages: &[crate::history::ConversationMessage]
 }
 
 #[derive(Debug, Deserialize)]
-struct ThreadListQuery {
-    matter_id: Option<String>,
+pub(crate) struct ThreadListQuery {
+    pub(crate) matter_id: Option<String>,
 }
 
+#[cfg(test)]
 async fn chat_threads_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<ThreadListQuery>,
 ) -> Result<Json<ThreadListResponse>, (StatusCode, String)> {
-    let matter_filter = query
-        .matter_id
-        .as_deref()
-        .and_then(crate::legal::policy::sanitize_optional_matter_id);
-    if query.matter_id.as_deref().is_some() && matter_filter.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "'matter_id' is empty after sanitization".to_string(),
-        ));
-    }
-
-    let session_manager = state.session_manager.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Session manager not available".to_string(),
-    ))?;
-
-    let session = session_manager.get_or_create_session(&state.user_id).await;
-    let active_thread = {
-        let sess = session.lock().await;
-        sess.active_thread
-    };
-
-    // Try DB first for persistent thread list
-    if let Some(ref store) = state.store {
-        let assistant_id = if matter_filter.is_none() {
-            Some(
-                store
-                    .get_or_create_assistant_conversation(&state.user_id, "gateway")
-                    .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-            )
-        } else {
-            None
-        };
-
-        let summaries_result = if let Some(ref matter_id) = matter_filter {
-            store.list_conversations_with_preview_for_matter(
-                &state.user_id,
-                "gateway",
-                matter_id,
-                50,
-            )
-        } else {
-            store.list_conversations_with_preview(&state.user_id, "gateway", 50)
-        };
-
-        match summaries_result.await {
-            Ok(summaries) => {
-                let mut assistant_thread = None;
-                let mut threads = Vec::new();
-
-                for summary in summaries {
-                    let info = ThreadInfo {
-                        id: summary.id,
-                        state: "Idle".to_string(),
-                        turn_count: (summary.message_count / 2).max(0) as usize,
-                        created_at: summary.started_at.to_rfc3339(),
-                        updated_at: summary.last_activity.to_rfc3339(),
-                        title: summary.title,
-                        matter_id: summary.matter_id,
-                        thread_type: summary.thread_type,
-                    };
-
-                    if assistant_id.is_some_and(|id| summary.id == id) {
-                        assistant_thread = Some(info);
-                    } else {
-                        threads.push(info);
-                    }
-                }
-
-                // If assistant wasn't in the list (0 messages), synthesize it
-                if assistant_thread.is_none()
-                    && let Some(id) = assistant_id
-                {
-                    assistant_thread = Some(ThreadInfo {
-                        id,
-                        state: "Idle".to_string(),
-                        turn_count: 0,
-                        created_at: chrono::Utc::now().to_rfc3339(),
-                        updated_at: chrono::Utc::now().to_rfc3339(),
-                        title: None,
-                        matter_id: None,
-                        thread_type: Some("assistant".to_string()),
-                    });
-                }
-
-                return Ok(Json(ThreadListResponse {
-                    assistant_thread,
-                    threads,
-                    active_thread,
-                }));
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "Falling back to in-memory thread list after DB query error: {}",
-                    err
-                );
-            }
-        }
-    }
-
-    // Fallback: in-memory only (no assistant thread without DB)
-    let sess = session.lock().await;
-    let threads: Vec<ThreadInfo> = sess
-        .threads
-        .values()
-        .filter(|thread| {
-            if let Some(ref filter) = matter_filter {
-                crate::legal::policy::matter_id_from_metadata(&thread.metadata)
-                    .as_ref()
-                    .is_some_and(|matter_id| matter_id == filter)
-            } else {
-                true
-            }
-        })
-        .map(|t| ThreadInfo {
-            id: t.id,
-            state: format!("{:?}", t.state),
-            turn_count: t.turns.len(),
-            created_at: t.created_at.to_rfc3339(),
-            updated_at: t.updated_at.to_rfc3339(),
-            title: None,
-            matter_id: crate::legal::policy::matter_id_from_metadata(&t.metadata),
-            thread_type: None,
-        })
-        .collect();
-
-    Ok(Json(ThreadListResponse {
-        assistant_thread: None,
-        threads,
-        active_thread: sess.active_thread,
-    }))
+    crate::channels::web::handlers::chat::chat_threads_handler(State(state), Query(query)).await
 }
 
+#[cfg(test)]
 async fn chat_new_thread_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<ThreadInfo>, (StatusCode, String)> {
-    let session_manager = state.session_manager.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Session manager not available".to_string(),
-    ))?;
-
-    let active_matter = load_active_matter_for_chat(state.as_ref()).await;
-    let session = session_manager.get_or_create_session(&state.user_id).await;
-    let (thread_id, state_label, turn_count, created_at, updated_at) = {
-        let mut sess = session.lock().await;
-        let thread = sess.create_thread();
-        if let Some(ref matter_id) = active_matter {
-            thread.metadata = serde_json::json!({ "matter_id": matter_id });
-        }
-        (
-            thread.id,
-            format!("{:?}", thread.state),
-            thread.turns.len(),
-            thread.created_at.to_rfc3339(),
-            thread.updated_at.to_rfc3339(),
-        )
-    };
-    let info = ThreadInfo {
-        id: thread_id,
-        state: state_label,
-        turn_count,
-        created_at,
-        updated_at,
-        title: None,
-        matter_id: active_matter.clone(),
-        thread_type: Some("thread".to_string()),
-    };
-
-    // Persist the empty conversation row with thread_type metadata
-    if let Some(ref store) = state.store {
-        if let Err(e) = store
-            .ensure_conversation(thread_id, "gateway", &state.user_id, None)
-            .await
-        {
-            tracing::warn!("Failed to persist new thread: {}", e);
-        }
-        let metadata_val = serde_json::json!("thread");
-        if let Err(e) = store
-            .update_conversation_metadata_field(thread_id, "thread_type", &metadata_val)
-            .await
-        {
-            tracing::warn!("Failed to set thread_type metadata: {}", e);
-        }
-        if let Some(matter_id) = active_matter
-            && let Err(e) = store
-                .bind_conversation_to_matter(thread_id, &state.user_id, &matter_id)
-                .await
-        {
-            tracing::warn!(
-                "Failed to bind new thread {} to matter {}: {}",
-                thread_id,
-                matter_id,
-                e
-            );
-        }
-    }
-
-    Ok(Json(info))
+    crate::channels::web::handlers::chat::chat_new_thread_handler(State(state)).await
 }
 
 // --- Memory handlers ---
 
 #[derive(Deserialize)]
-struct TreeQuery {
+pub(crate) struct TreeQuery {
     #[allow(dead_code)]
-    depth: Option<usize>,
+    pub(crate) depth: Option<usize>,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn memory_tree_handler(
     State(state): State<Arc<GatewayState>>,
-    Query(_query): Query<TreeQuery>,
+    Query(query): Query<TreeQuery>,
 ) -> Result<Json<MemoryTreeResponse>, (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-
-    // Build tree from list_all (flat list of all paths)
-    let all_paths = workspace
-        .list_all()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Collect unique directories and files
-    let mut entries: Vec<TreeEntry> = Vec::new();
-    let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for path in &all_paths {
-        // Add parent directories
-        let parts: Vec<&str> = path.split('/').collect();
-        for i in 0..parts.len().saturating_sub(1) {
-            let dir_path = parts[..=i].join("/");
-            if seen_dirs.insert(dir_path.clone()) {
-                entries.push(TreeEntry {
-                    path: dir_path,
-                    is_dir: true,
-                });
-            }
-        }
-        // Add the file itself
-        entries.push(TreeEntry {
-            path: path.clone(),
-            is_dir: false,
-        });
-    }
-
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-
-    Ok(Json(MemoryTreeResponse { entries }))
+    crate::channels::web::handlers::memory::memory_tree_handler(State(state), Query(query)).await
 }
 
 #[derive(Deserialize)]
-struct ListQuery {
-    path: Option<String>,
+pub(crate) struct ListQuery {
+    pub(crate) path: Option<String>,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn memory_list_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<MemoryListResponse>, (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-
-    let path = query.path.as_deref().unwrap_or("");
-    let entries = workspace
-        .list(path)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let list_entries: Vec<ListEntry> = entries
-        .iter()
-        .map(|e| ListEntry {
-            name: e.path.rsplit('/').next().unwrap_or(&e.path).to_string(),
-            path: e.path.clone(),
-            is_dir: e.is_directory,
-            updated_at: e.updated_at.map(|dt| dt.to_rfc3339()),
-        })
-        .collect();
-
-    Ok(Json(MemoryListResponse {
-        path: path.to_string(),
-        entries: list_entries,
-    }))
+    crate::channels::web::handlers::memory::memory_list_handler(State(state), Query(query)).await
 }
 
 #[derive(Deserialize)]
-struct ReadQuery {
-    path: String,
+pub(crate) struct ReadQuery {
+    pub(crate) path: String,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn memory_read_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<ReadQuery>,
 ) -> Result<Json<MemoryReadResponse>, (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-
-    let doc = workspace
-        .read(&query.path)
-        .await
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
-
-    Ok(Json(MemoryReadResponse {
-        path: query.path,
-        content: doc.content,
-        updated_at: Some(doc.updated_at.to_rfc3339()),
-    }))
+    crate::channels::web::handlers::memory::memory_read_handler(State(state), Query(query)).await
 }
 
+#[cfg(test)]
 async fn memory_write_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<MemoryWriteRequest>,
 ) -> Result<Json<MemoryWriteResponse>, (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-
-    let resolved_path = resolve_memory_write_path_for_gateway(state.as_ref(), &req.path).await?;
-
-    workspace
-        .write(&resolved_path, &req.content)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if crate::legal::matter::is_workspace_conflicts_path(&resolved_path) {
-        crate::legal::matter::invalidate_conflict_cache();
-    }
-
-    Ok(Json(MemoryWriteResponse {
-        path: resolved_path,
-        status: "written",
-    }))
+    crate::channels::web::handlers::memory::memory_write_handler(State(state), Json(req)).await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn memory_search_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<MemorySearchRequest>,
 ) -> Result<Json<MemorySearchResponse>, (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-
-    let limit = req.limit.unwrap_or(10);
-    let results = workspace
-        .search(&req.query, limit)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let hits: Vec<SearchHit> = results
-        .iter()
-        .map(|r| SearchHit {
-            path: r.document_id.to_string(),
-            content: r.content.clone(),
-            score: r.score as f64,
-        })
-        .collect();
-
-    Ok(Json(MemorySearchResponse { results: hits }))
+    crate::channels::web::handlers::memory::memory_search_handler(State(state), Json(req)).await
 }
 
 /// Maximum size accepted for a single uploaded file (10 MiB).
-const UPLOAD_FILE_SIZE_LIMIT: usize = 10 * 1024 * 1024;
+pub(crate) const UPLOAD_FILE_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 /// Maximum size accepted for backup restore uploads (128 MiB).
-const BACKUP_RESTORE_SIZE_LIMIT: usize = 128 * 1024 * 1024;
+pub(crate) const BACKUP_RESTORE_SIZE_LIMIT: usize = 128 * 1024 * 1024;
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn memory_upload_handler(
     State(state): State<Arc<GatewayState>>,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> Result<(StatusCode, Json<MemoryUploadResponse>), (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-
-    let mut uploaded: Vec<UploadedFile> = Vec::new();
-
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Multipart read error: {e}"),
-        )
-    })? {
-        // Derive a safe filename: take the basename only, keep alphanumerics
-        // plus a small allow-set of punctuation, collapse empty result to a
-        // safe default.  This prevents path traversal via the filename header.
-        let raw_name = field.file_name().unwrap_or("document.txt").to_string();
-        let safe_name: String = raw_name
-            .rsplit('/')
-            .next()
-            .unwrap_or("document.txt")
-            .chars()
-            .filter(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' '))
-            .collect();
-        let safe_name = if safe_name.trim().is_empty() {
-            "document.txt".to_string()
-        } else {
-            safe_name.trim().to_string()
-        };
-        let dest_path = format!("uploads/{safe_name}");
-
-        // Read the field body, enforcing the per-file size limit.
-        let data = field.bytes().await.map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to read upload body: {e}"),
-            )
-        })?;
-
-        if data.len() > UPLOAD_FILE_SIZE_LIMIT {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!(
-                    "File '{}' exceeds the 10 MiB upload limit ({} bytes)",
-                    raw_name,
-                    data.len()
-                ),
-            ));
-        }
-
-        // Workspace stores text; reject binary (non-UTF-8) content with a
-        // helpful error rather than storing garbled data.
-        let content = String::from_utf8(data.to_vec()).map_err(|_| {
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "File '{}' contains non-UTF-8 bytes. Only plain-text files are supported.",
-                    raw_name
-                ),
-            )
-        })?;
-
-        let byte_count = content.len();
-        workspace
-            .write(&dest_path, &content)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        uploaded.push(UploadedFile {
-            path: dest_path,
-            bytes: byte_count,
-            status: "written",
-        });
-    }
-
-    Ok((
-        StatusCode::CREATED,
-        Json(MemoryUploadResponse { files: uploaded }),
-    ))
+    crate::channels::web::handlers::memory::memory_upload_handler(State(state), multipart).await
 }
 
 // --- Matter handlers ---
@@ -1541,34 +497,32 @@ const MATTER_ROOT: &str = "matters";
 /// Settings key used to persist the active matter ID.
 const MATTER_ACTIVE_SETTING: &str = "legal.active_matter";
 /// Maximum number of party names accepted by intake conflict endpoints.
-const MAX_INTAKE_CONFLICT_PARTIES: usize = 64;
+pub(crate) const MAX_INTAKE_CONFLICT_PARTIES: usize = 64;
 /// Maximum length for a single intake party name.
 const MAX_INTAKE_CONFLICT_PARTY_CHARS: usize = 160;
-/// Maximum preview length recorded for text conflict checks.
-const MAX_CONFLICT_TEXT_PREVIEW_CHARS: usize = 100;
 /// Maximum reminder offsets accepted for a single deadline.
 const MAX_DEADLINE_REMINDERS: usize = 16;
 /// Maximum allowed reminder offset in days.
 const MAX_DEADLINE_REMINDER_DAYS: i32 = 3650;
 /// Maximum allowed body text length for `/api/matters/conflicts/check`.
-const MAX_CONFLICT_CHECK_TEXT_LEN: usize = 32 * 1024;
+pub(crate) const MAX_CONFLICT_CHECK_TEXT_LEN: usize = 32 * 1024;
 /// Default invoice rows returned by `/api/matters/{id}/invoices`.
-const MATTER_INVOICES_DEFAULT_LIMIT: usize = 25;
+pub(crate) const MATTER_INVOICES_DEFAULT_LIMIT: usize = 25;
 /// Maximum invoice rows returned by `/api/matters/{id}/invoices`.
-const MATTER_INVOICES_MAX_LIMIT: usize = 100;
+pub(crate) const MATTER_INVOICES_MAX_LIMIT: usize = 100;
 
 /// Identity files that must not be overwritten through web memory-write APIs.
 const PROTECTED_IDENTITY_FILES: &[&str] =
     &[paths::IDENTITY, paths::SOUL, paths::AGENTS, paths::USER];
 
-fn legal_config_for_gateway(state: &GatewayState) -> crate::config::LegalConfig {
+pub(crate) fn legal_config_for_gateway(state: &GatewayState) -> crate::config::LegalConfig {
     state.legal_config.clone().unwrap_or_else(|| {
         crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
             .expect("default legal config should resolve")
     })
 }
 
-fn matter_root_for_gateway(state: &GatewayState) -> String {
+pub(crate) fn matter_root_for_gateway(state: &GatewayState) -> String {
     let configured = legal_config_for_gateway(state).matter_root;
     let normalized = configured.trim_matches('/');
     if normalized.is_empty() {
@@ -1613,7 +567,7 @@ fn is_protected_identity_path(path: &str) -> bool {
         .any(|protected| normalized.eq_ignore_ascii_case(protected))
 }
 
-async fn resolve_memory_write_path_for_gateway(
+pub(crate) async fn resolve_memory_write_path_for_gateway(
     state: &GatewayState,
     requested_path: &str,
 ) -> Result<String, (StatusCode, String)> {
@@ -1692,19 +646,19 @@ async fn resolve_memory_write_path_for_gateway(
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct LegalAuditQuery {
-    limit: Option<usize>,
-    offset: Option<usize>,
-    event_type: Option<String>,
-    matter_id: Option<String>,
-    severity: Option<String>,
-    since: Option<String>,
-    until: Option<String>,
-    from: Option<String>,
-    to: Option<String>,
+pub(crate) struct LegalAuditQuery {
+    pub(crate) limit: Option<usize>,
+    pub(crate) offset: Option<usize>,
+    pub(crate) event_type: Option<String>,
+    pub(crate) matter_id: Option<String>,
+    pub(crate) severity: Option<String>,
+    pub(crate) since: Option<String>,
+    pub(crate) until: Option<String>,
+    pub(crate) from: Option<String>,
+    pub(crate) to: Option<String>,
 }
 
-fn parse_utc_query_ts(
+pub(crate) fn parse_utc_query_ts(
     field_name: &str,
     raw: Option<&str>,
 ) -> Result<Option<DateTime<Utc>>, (StatusCode, String)> {
@@ -1724,7 +678,7 @@ fn parse_utc_query_ts(
     Ok(Some(parsed.with_timezone(&Utc)))
 }
 
-fn parse_audit_severity_query(
+pub(crate) fn parse_audit_severity_query(
     raw: Option<&str>,
 ) -> Result<Option<AuditSeverity>, (StatusCode, String)> {
     let Some(raw) = raw else {
@@ -1745,7 +699,7 @@ fn parse_audit_severity_query(
     }
 }
 
-async fn record_legal_audit_event(
+pub(crate) async fn record_legal_audit_event(
     state: &GatewayState,
     event_type: &str,
     actor: &str,
@@ -1770,13 +724,13 @@ async fn record_legal_audit_event(
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct MatterDocumentsQuery {
-    include_templates: Option<bool>,
+pub(crate) struct MatterDocumentsQuery {
+    pub(crate) include_templates: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct MatterInvoicesQuery {
-    limit: Option<usize>,
+pub(crate) struct MatterInvoicesQuery {
+    pub(crate) limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1784,7 +738,7 @@ struct ClientsQuery {
     q: Option<String>,
 }
 
-fn sanitize_matter_id_for_route(raw: &str) -> Result<String, (StatusCode, String)> {
+pub(crate) fn sanitize_matter_id_for_route(raw: &str) -> Result<String, (StatusCode, String)> {
     let sanitized = crate::legal::policy::sanitize_matter_id(raw);
     if sanitized.is_empty() {
         return Err((StatusCode::NOT_FOUND, "Matter not found".to_string()));
@@ -1792,7 +746,7 @@ fn sanitize_matter_id_for_route(raw: &str) -> Result<String, (StatusCode, String
     Ok(sanitized)
 }
 
-async fn ensure_existing_matter_for_route(
+pub(crate) async fn ensure_existing_matter_for_route(
     workspace: &Workspace,
     matter_root: &str,
     raw_matter_id: &str,
@@ -1816,7 +770,7 @@ async fn ensure_existing_matter_for_route(
     }
 }
 
-fn parse_template_name(raw: &str) -> Result<String, (StatusCode, String)> {
+pub(crate) fn parse_template_name(raw: &str) -> Result<String, (StatusCode, String)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err((
@@ -1844,7 +798,7 @@ fn parse_template_name(raw: &str) -> Result<String, (StatusCode, String)> {
     Ok(trimmed.to_string())
 }
 
-async fn choose_template_apply_destination(
+pub(crate) async fn choose_template_apply_destination(
     workspace: &Workspace,
     matter_prefix: &str,
     template_name: &str,
@@ -1884,7 +838,7 @@ async fn choose_template_apply_destination(
     ))
 }
 
-async fn choose_generated_document_destination(
+pub(crate) async fn choose_generated_document_destination(
     workspace: &Workspace,
     matter_prefix: &str,
     template_name: &str,
@@ -1922,7 +876,7 @@ async fn choose_generated_document_destination(
     ))
 }
 
-async fn list_matter_documents_recursive(
+pub(crate) async fn list_matter_documents_recursive(
     workspace: &Workspace,
     matter_prefix: &str,
     include_templates: bool,
@@ -1971,7 +925,7 @@ async fn list_matter_documents_recursive(
     Ok(documents)
 }
 
-fn checklist_completion_from_markdown(markdown: &str) -> (usize, usize) {
+pub(crate) fn checklist_completion_from_markdown(markdown: &str) -> (usize, usize) {
     let mut completed = 0usize;
     let mut total = 0usize;
 
@@ -2151,7 +1105,7 @@ async fn read_matter_deadlines(
     }
 }
 
-async fn read_matter_deadlines_for_matter(
+pub(crate) async fn read_matter_deadlines_for_matter(
     state: &GatewayState,
     matter_id: &str,
     matter_prefix: &str,
@@ -2177,7 +1131,7 @@ async fn read_matter_deadlines_for_matter(
     read_matter_deadlines(workspace.as_ref(), matter_prefix, today).await
 }
 
-async fn list_matter_templates(
+pub(crate) async fn list_matter_templates(
     workspace: &Workspace,
     matter_root: &str,
     matter_id: &str,
@@ -2211,7 +1165,7 @@ async fn list_matter_templates(
     Ok(templates)
 }
 
-fn document_template_record_to_info(
+pub(crate) fn document_template_record_to_info(
     matter_root: &str,
     record: crate::db::DocumentTemplateRecord,
 ) -> MatterTemplateInfo {
@@ -2229,7 +1183,9 @@ fn document_template_record_to_info(
     }
 }
 
-fn matter_document_record_to_info(record: crate::db::MatterDocumentRecord) -> MatterDocumentInfo {
+pub(crate) fn matter_document_record_to_info(
+    record: crate::db::MatterDocumentRecord,
+) -> MatterDocumentInfo {
     let fallback_name = record.path.rsplit('/').next().unwrap_or("").to_string();
     MatterDocumentInfo {
         id: Some(record.id.to_string()),
@@ -2243,7 +1199,7 @@ fn matter_document_record_to_info(record: crate::db::MatterDocumentRecord) -> Ma
     }
 }
 
-async fn backfill_matter_templates_from_workspace(
+pub(crate) async fn backfill_matter_templates_from_workspace(
     state: &GatewayState,
     matter_id: &str,
 ) -> Result<(), (StatusCode, String)> {
@@ -2276,7 +1232,7 @@ async fn backfill_matter_templates_from_workspace(
     Ok(())
 }
 
-async fn backfill_matter_documents_from_workspace(
+pub(crate) async fn backfill_matter_documents_from_workspace(
     state: &GatewayState,
     matter_id: &str,
 ) -> Result<(), (StatusCode, String)> {
@@ -2329,7 +1285,7 @@ async fn backfill_matter_documents_from_workspace(
     Ok(())
 }
 
-async fn choose_filing_package_destination(
+pub(crate) async fn choose_filing_package_destination(
     workspace: &Workspace,
     matter_prefix: &str,
     timestamp: &str,
@@ -2354,7 +1310,7 @@ async fn choose_filing_package_destination(
     ))
 }
 
-async fn read_workspace_matter_metadata_optional(
+pub(crate) async fn read_workspace_matter_metadata_optional(
     workspace: Option<&Arc<Workspace>>,
     matter_root: &str,
     matter_id: &str,
@@ -2417,7 +1373,7 @@ async fn db_matter_to_info(state: &GatewayState, matter: crate::db::MatterRecord
     }
 }
 
-async fn ensure_existing_matter_db(
+pub(crate) async fn ensure_existing_matter_db(
     state: &GatewayState,
     matter_id: &str,
 ) -> Result<(), (StatusCode, String)> {
@@ -2436,7 +1392,7 @@ async fn ensure_existing_matter_db(
     Ok(())
 }
 
-async fn ensure_matter_db_row_from_workspace(
+pub(crate) async fn ensure_matter_db_row_from_workspace(
     state: &GatewayState,
     matter_id: &str,
 ) -> Result<(), (StatusCode, String)> {
@@ -2848,960 +1804,336 @@ async fn matter_delete_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[cfg(test)]
 async fn matter_tasks_list_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<MatterTasksListResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let tasks = store
-        .list_matter_tasks(&state.user_id, &matter_id)
+    crate::channels::web::handlers::matters::work::matter_tasks_list_handler(State(state), Path(id))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .into_iter()
-        .map(matter_task_record_to_info)
-        .collect();
-    Ok(Json(MatterTasksListResponse { tasks }))
 }
 
+#[cfg(test)]
 async fn matter_tasks_create_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Json(req): Json<CreateMatterTaskRequest>,
 ) -> Result<(StatusCode, Json<MatterTaskInfo>), (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let title = parse_required_matter_field("title", &req.title)?;
-    let status = req
-        .status
-        .as_deref()
-        .map(parse_matter_task_status)
-        .transpose()?
-        .unwrap_or(MatterTaskStatus::Todo);
-    let due_at = parse_optional_datetime("due_at", req.due_at)?;
-    let blocked_by = parse_uuid_list(&req.blocked_by, "blocked_by")?;
-    let task = store
-        .create_matter_task(
-            &state.user_id,
-            &matter_id,
-            &CreateMatterTaskParams {
-                title,
-                description: parse_optional_matter_field(req.description),
-                status,
-                assignee: parse_optional_matter_field(req.assignee),
-                due_at,
-                blocked_by,
-            },
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok((StatusCode::CREATED, Json(matter_task_record_to_info(task))))
+    crate::channels::web::handlers::matters::work::matter_tasks_create_handler(
+        State(state),
+        Path(id),
+        Json(req),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_tasks_patch_handler(
     State(state): State<Arc<GatewayState>>,
     Path((id, task_id)): Path<(String, String)>,
     Json(req): Json<UpdateMatterTaskRequest>,
 ) -> Result<Json<MatterTaskInfo>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let task_id = parse_uuid(&task_id, "task_id")?;
-    let status = req
-        .status
-        .as_deref()
-        .map(parse_matter_task_status)
-        .transpose()?;
-    let blocked_by = req
-        .blocked_by
-        .as_ref()
-        .map(|values| parse_uuid_list(values, "blocked_by"))
-        .transpose()?;
-    let due_at = parse_optional_datetime_patch("due_at", req.due_at)?;
-    let task = store
-        .update_matter_task(
-            &state.user_id,
-            &matter_id,
-            task_id,
-            &UpdateMatterTaskParams {
-                title: req.title.map(|value| value.trim().to_string()),
-                description: req
-                    .description
-                    .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
-                status,
-                assignee: req
-                    .assignee
-                    .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
-                due_at,
-                blocked_by,
-            },
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Task not found".to_string()))?;
-    Ok(Json(matter_task_record_to_info(task)))
+    crate::channels::web::handlers::matters::work::matter_tasks_patch_handler(
+        State(state),
+        Path((id, task_id)),
+        Json(req),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_tasks_delete_handler(
     State(state): State<Arc<GatewayState>>,
     Path((id, task_id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let task_id = parse_uuid(&task_id, "task_id")?;
-    let deleted = store
-        .delete_matter_task(&state.user_id, &matter_id, task_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if !deleted {
-        return Err((StatusCode::NOT_FOUND, "Task not found".to_string()));
-    }
-    Ok(StatusCode::NO_CONTENT)
+    crate::channels::web::handlers::matters::work::matter_tasks_delete_handler(
+        State(state),
+        Path((id, task_id)),
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn matter_notes_list_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<MatterNotesListResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let notes = store
-        .list_matter_notes(&state.user_id, &matter_id)
+    crate::channels::web::handlers::matters::work::matter_notes_list_handler(State(state), Path(id))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .into_iter()
-        .map(matter_note_record_to_info)
-        .collect();
-    Ok(Json(MatterNotesListResponse { notes }))
 }
 
+#[cfg(test)]
 async fn matter_notes_create_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Json(req): Json<CreateMatterNoteRequest>,
 ) -> Result<(StatusCode, Json<MatterNoteInfo>), (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let author = parse_required_matter_field("author", &req.author)?;
-    let body = parse_required_matter_field("body", &req.body)?;
-    let note = store
-        .create_matter_note(
-            &state.user_id,
-            &matter_id,
-            &CreateMatterNoteParams {
-                author,
-                body,
-                pinned: req.pinned,
-            },
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok((StatusCode::CREATED, Json(matter_note_record_to_info(note))))
+    crate::channels::web::handlers::matters::work::matter_notes_create_handler(
+        State(state),
+        Path(id),
+        Json(req),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_notes_patch_handler(
     State(state): State<Arc<GatewayState>>,
     Path((id, note_id)): Path<(String, String)>,
     Json(req): Json<UpdateMatterNoteRequest>,
 ) -> Result<Json<MatterNoteInfo>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let note_id = parse_uuid(&note_id, "note_id")?;
-    let note = store
-        .update_matter_note(
-            &state.user_id,
-            &matter_id,
-            note_id,
-            &UpdateMatterNoteParams {
-                author: req.author.map(|value| value.trim().to_string()),
-                body: req.body.map(|value| value.trim().to_string()),
-                pinned: req.pinned,
-            },
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Note not found".to_string()))?;
-    Ok(Json(matter_note_record_to_info(note)))
+    crate::channels::web::handlers::matters::work::matter_notes_patch_handler(
+        State(state),
+        Path((id, note_id)),
+        Json(req),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_notes_delete_handler(
     State(state): State<Arc<GatewayState>>,
     Path((id, note_id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let note_id = parse_uuid(&note_id, "note_id")?;
-    let deleted = store
-        .delete_matter_note(&state.user_id, &matter_id, note_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if !deleted {
-        return Err((StatusCode::NOT_FOUND, "Note not found".to_string()));
-    }
-    Ok(StatusCode::NO_CONTENT)
+    crate::channels::web::handlers::matters::work::matter_notes_delete_handler(
+        State(state),
+        Path((id, note_id)),
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn matter_time_list_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<MatterTimeEntriesResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let entries = store
-        .list_time_entries(&state.user_id, &matter_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .into_iter()
-        .map(time_entry_record_to_info)
-        .collect();
-    Ok(Json(MatterTimeEntriesResponse { entries }))
+    crate::channels::web::handlers::matters::finance::matter_time_list_handler(
+        State(state),
+        Path(id),
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn matter_time_create_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Json(req): Json<CreateTimeEntryRequest>,
 ) -> Result<(StatusCode, Json<TimeEntryInfo>), (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-
-    let timekeeper = parse_required_matter_field("timekeeper", &req.timekeeper)?;
-    let description = parse_required_matter_field("description", &req.description)?;
-    validate_optional_matter_field_length("timekeeper", &Some(timekeeper.clone()))?;
-    validate_optional_matter_field_length("description", &Some(description.clone()))?;
-    let hours = parse_decimal_field("hours", &req.hours)?;
-    let hourly_rate = parse_optional_decimal_field("hourly_rate", req.hourly_rate)?;
-    let entry_date = parse_date_only("entry_date", &req.entry_date)?;
-    let billable = req.billable.unwrap_or(true);
-
-    let created = store
-        .create_time_entry(
-            &state.user_id,
-            &matter_id,
-            &CreateTimeEntryParams {
-                timekeeper,
-                description,
-                hours,
-                hourly_rate,
-                entry_date,
-                billable,
-            },
-        )
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(time_entry_record_to_info(created)),
-    ))
+    crate::channels::web::handlers::matters::finance::matter_time_create_handler(
+        State(state),
+        Path(id),
+        Json(req),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_time_patch_handler(
     State(state): State<Arc<GatewayState>>,
     Path((id, entry_id)): Path<(String, String)>,
     Json(req): Json<UpdateTimeEntryRequest>,
 ) -> Result<Json<TimeEntryInfo>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let entry_id = parse_uuid(&entry_id, "entry_id")?;
-
-    let timekeeper = req.timekeeper.map(|value| value.trim().to_string());
-    if let Some(ref value) = timekeeper {
-        validate_optional_matter_field_length("timekeeper", &Some(value.clone()))?;
-    }
-    let description = req.description.map(|value| value.trim().to_string());
-    if let Some(ref value) = description {
-        validate_optional_matter_field_length("description", &Some(value.clone()))?;
-    }
-    let hours = req
-        .hours
-        .as_deref()
-        .map(|value| parse_decimal_field("hours", value))
-        .transpose()?;
-    let hourly_rate = match req.hourly_rate {
-        None => None,
-        Some(None) => Some(None),
-        Some(Some(raw)) => Some(Some(parse_decimal_field("hourly_rate", &raw)?)),
-    };
-    let entry_date = req
-        .entry_date
-        .as_deref()
-        .map(|value| parse_date_only("entry_date", value))
-        .transpose()?;
-
-    let updated = store
-        .update_time_entry(
-            &state.user_id,
-            &matter_id,
-            entry_id,
-            &UpdateTimeEntryParams {
-                timekeeper,
-                description,
-                hours,
-                hourly_rate,
-                entry_date,
-                billable: req.billable,
-            },
-        )
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Time entry not found".to_string()))?;
-
-    Ok(Json(time_entry_record_to_info(updated)))
+    crate::channels::web::handlers::matters::finance::matter_time_patch_handler(
+        State(state),
+        Path((id, entry_id)),
+        Json(req),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_time_delete_handler(
     State(state): State<Arc<GatewayState>>,
     Path((id, entry_id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let entry_id = parse_uuid(&entry_id, "entry_id")?;
-
-    let existing = store
-        .get_time_entry(&state.user_id, &matter_id, entry_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Time entry not found".to_string()))?;
-    if existing.billed_invoice_id.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            "Time entry is billed and cannot be deleted".to_string(),
-        ));
-    }
-
-    let deleted = store
-        .delete_time_entry(&state.user_id, &matter_id, entry_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    if !deleted {
-        return Err((StatusCode::NOT_FOUND, "Time entry not found".to_string()));
-    }
-    Ok(StatusCode::NO_CONTENT)
+    crate::channels::web::handlers::matters::finance::matter_time_delete_handler(
+        State(state),
+        Path((id, entry_id)),
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn matter_expenses_list_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<MatterExpenseEntriesResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let entries = store
-        .list_expense_entries(&state.user_id, &matter_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .into_iter()
-        .map(expense_entry_record_to_info)
-        .collect();
-    Ok(Json(MatterExpenseEntriesResponse { entries }))
+    crate::channels::web::handlers::matters::finance::matter_expenses_list_handler(
+        State(state),
+        Path(id),
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn matter_expenses_create_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Json(req): Json<CreateExpenseEntryRequest>,
 ) -> Result<(StatusCode, Json<ExpenseEntryInfo>), (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-
-    let submitted_by = parse_required_matter_field("submitted_by", &req.submitted_by)?;
-    let description = parse_required_matter_field("description", &req.description)?;
-    validate_optional_matter_field_length("submitted_by", &Some(submitted_by.clone()))?;
-    validate_optional_matter_field_length("description", &Some(description.clone()))?;
-    let amount = parse_decimal_field("amount", &req.amount)?;
-    let category = parse_expense_category(&req.category)?;
-    let entry_date = parse_date_only("entry_date", &req.entry_date)?;
-    let receipt_path = parse_optional_matter_field(req.receipt_path);
-    validate_optional_matter_field_length("receipt_path", &receipt_path)?;
-    let billable = req.billable.unwrap_or(true);
-
-    let created = store
-        .create_expense_entry(
-            &state.user_id,
-            &matter_id,
-            &CreateExpenseEntryParams {
-                submitted_by,
-                description,
-                amount,
-                category,
-                entry_date,
-                receipt_path,
-                billable,
-            },
-        )
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(expense_entry_record_to_info(created)),
-    ))
+    crate::channels::web::handlers::matters::finance::matter_expenses_create_handler(
+        State(state),
+        Path(id),
+        Json(req),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_expenses_patch_handler(
     State(state): State<Arc<GatewayState>>,
     Path((id, entry_id)): Path<(String, String)>,
     Json(req): Json<UpdateExpenseEntryRequest>,
 ) -> Result<Json<ExpenseEntryInfo>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let entry_id = parse_uuid(&entry_id, "entry_id")?;
-
-    let submitted_by = req.submitted_by.map(|value| value.trim().to_string());
-    if let Some(ref value) = submitted_by {
-        validate_optional_matter_field_length("submitted_by", &Some(value.clone()))?;
-    }
-    let description = req.description.map(|value| value.trim().to_string());
-    if let Some(ref value) = description {
-        validate_optional_matter_field_length("description", &Some(value.clone()))?;
-    }
-    let amount = req
-        .amount
-        .as_deref()
-        .map(|value| parse_decimal_field("amount", value))
-        .transpose()?;
-    let category = req
-        .category
-        .as_deref()
-        .map(parse_expense_category)
-        .transpose()?;
-    let entry_date = req
-        .entry_date
-        .as_deref()
-        .map(|value| parse_date_only("entry_date", value))
-        .transpose()?;
-    let receipt_path = req.receipt_path.map(|value| {
-        value.and_then(|inner| {
-            let trimmed = inner.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        })
-    });
-    if let Some(Some(ref value)) = receipt_path {
-        validate_optional_matter_field_length("receipt_path", &Some(value.clone()))?;
-    }
-
-    let updated = store
-        .update_expense_entry(
-            &state.user_id,
-            &matter_id,
-            entry_id,
-            &UpdateExpenseEntryParams {
-                submitted_by,
-                description,
-                amount,
-                category,
-                entry_date,
-                receipt_path,
-                billable: req.billable,
-            },
-        )
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Expense entry not found".to_string()))?;
-
-    Ok(Json(expense_entry_record_to_info(updated)))
+    crate::channels::web::handlers::matters::finance::matter_expenses_patch_handler(
+        State(state),
+        Path((id, entry_id)),
+        Json(req),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_expenses_delete_handler(
     State(state): State<Arc<GatewayState>>,
     Path((id, entry_id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let entry_id = parse_uuid(&entry_id, "entry_id")?;
-
-    let existing = store
-        .get_expense_entry(&state.user_id, &matter_id, entry_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Expense entry not found".to_string()))?;
-    if existing.billed_invoice_id.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            "Expense entry is billed and cannot be deleted".to_string(),
-        ));
-    }
-
-    let deleted = store
-        .delete_expense_entry(&state.user_id, &matter_id, entry_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    if !deleted {
-        return Err((StatusCode::NOT_FOUND, "Expense entry not found".to_string()));
-    }
-    Ok(StatusCode::NO_CONTENT)
+    crate::channels::web::handlers::matters::finance::matter_expenses_delete_handler(
+        State(state),
+        Path((id, entry_id)),
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn matter_time_summary_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<MatterTimeSummaryResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let summary = store
-        .matter_time_summary(&state.user_id, &matter_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    Ok(Json(matter_time_summary_to_response(summary)))
+    crate::channels::web::handlers::matters::finance::matter_time_summary_handler(
+        State(state),
+        Path(id),
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn matter_invoices_list_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Query(query): Query<MatterInvoicesQuery>,
 ) -> Result<Json<MatterInvoicesResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-
-    let limit = query.limit.unwrap_or(MATTER_INVOICES_DEFAULT_LIMIT);
-    if limit == 0 || limit > MATTER_INVOICES_MAX_LIMIT {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "'limit' must be between 1 and {}",
-                MATTER_INVOICES_MAX_LIMIT
-            ),
-        ));
-    }
-
-    let mut invoices = store
-        .list_invoices(&state.user_id, Some(&matter_id))
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-    // Normalize newest-first ordering for the web detail panel regardless of backend ordering.
-    invoices.sort_by(|a, b| {
-        b.created_at
-            .cmp(&a.created_at)
-            .then_with(|| b.id.cmp(&a.id))
-    });
-
-    Ok(Json(MatterInvoicesResponse {
-        matter_id,
-        invoices: invoices
-            .into_iter()
-            .take(limit)
-            .map(invoice_record_to_info)
-            .collect(),
-    }))
+    crate::channels::web::handlers::matters::finance::matter_invoices_list_handler(
+        State(state),
+        Path(id),
+        Query(query),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn invoices_draft_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<DraftInvoiceRequest>,
 ) -> Result<Json<InvoiceDraftResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&req.matter_id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let invoice_number = parse_required_matter_field("invoice_number", &req.invoice_number)?;
-    let due_date = req
-        .due_date
-        .as_deref()
-        .map(|raw| parse_date_only("due_date", raw))
-        .transpose()?;
-    let notes = parse_optional_matter_field(req.notes);
-    let draft = crate::legal::billing::draft_invoice(
-        store.as_ref(),
-        &state.user_id,
-        &matter_id,
-        &invoice_number,
-        due_date,
-        notes,
+    crate::channels::web::handlers::matters::finance::invoices_draft_handler(
+        State(state),
+        Json(req),
     )
     .await
-    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-    Ok(Json(InvoiceDraftResponse {
-        invoice: invoice_draft_to_info(&draft.invoice),
-        line_items: draft
-            .line_items
-            .iter()
-            .map(invoice_line_item_params_to_info)
-            .collect(),
-    }))
 }
 
+#[cfg(test)]
 async fn invoices_save_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<DraftInvoiceRequest>,
 ) -> Result<(StatusCode, Json<InvoiceDetailResponse>), (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&req.matter_id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let invoice_number = parse_required_matter_field("invoice_number", &req.invoice_number)?;
-    let due_date = req
-        .due_date
-        .as_deref()
-        .map(|raw| parse_date_only("due_date", raw))
-        .transpose()?;
-    let notes = parse_optional_matter_field(req.notes);
-    let draft = crate::legal::billing::draft_invoice(
-        store.as_ref(),
-        &state.user_id,
-        &matter_id,
-        &invoice_number,
-        due_date,
-        notes,
-    )
-    .await
-    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    let (invoice, line_items) =
-        crate::legal::billing::save_draft(store.as_ref(), &state.user_id, &draft)
-            .await
-            .map_err(|err| {
-                let message = err.to_string();
-                if message.contains("UNIQUE constraint")
-                    || message.contains("duplicate key value")
-                    || message.contains("invoice_number")
-                {
-                    (
-                        StatusCode::CONFLICT,
-                        "Invoice number already exists".to_string(),
-                    )
-                } else {
-                    (StatusCode::INTERNAL_SERVER_ERROR, message)
-                }
-            })?;
-    Ok((
-        StatusCode::CREATED,
-        Json(InvoiceDetailResponse {
-            invoice: invoice_record_to_info(invoice),
-            line_items: line_items
-                .into_iter()
-                .map(invoice_line_item_record_to_info)
-                .collect(),
-        }),
-    ))
+    crate::channels::web::handlers::matters::finance::invoices_save_handler(State(state), Json(req))
+        .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn invoices_get_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let invoice_id = parse_uuid(&id, "invoice_id")?;
-    let invoice = store
-        .get_invoice(&state.user_id, invoice_id)
+    crate::channels::web::handlers::matters::finance::invoices_get_handler(State(state), Path(id))
         .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
-    let line_items = store
-        .list_invoice_line_items(&state.user_id, invoice_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    Ok(Json(InvoiceDetailResponse {
-        invoice: invoice_record_to_info(invoice),
-        line_items: line_items
-            .into_iter()
-            .map(invoice_line_item_record_to_info)
-            .collect(),
-    }))
 }
 
+#[cfg(test)]
 async fn invoices_finalize_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let invoice_id = parse_uuid(&id, "invoice_id")?;
-    let invoice =
-        crate::legal::billing::finalize_invoice(store.as_ref(), &state.user_id, invoice_id)
-            .await
-            .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
-    let line_items = store
-        .list_invoice_line_items(&state.user_id, invoice_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    record_legal_audit_event(
-        state.as_ref(),
-        "invoice_finalized",
-        state.user_id.as_str(),
-        Some(invoice.matter_id.as_str()),
-        AuditSeverity::Info,
-        serde_json::json!({
-            "invoice_id": invoice.id.to_string(),
-            "invoice_number": invoice.invoice_number.clone(),
-            "matter_id": invoice.matter_id.clone(),
-        }),
+    crate::channels::web::handlers::matters::finance::invoices_finalize_handler(
+        State(state),
+        Path(id),
     )
-    .await;
-    Ok(Json(InvoiceDetailResponse {
-        invoice: invoice_record_to_info(invoice),
-        line_items: line_items
-            .into_iter()
-            .map(invoice_line_item_record_to_info)
-            .collect(),
-    }))
+    .await
 }
 
+#[cfg(test)]
 async fn invoices_void_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let invoice_id = parse_uuid(&id, "invoice_id")?;
-    let existing = store
-        .get_invoice(&state.user_id, invoice_id)
+    crate::channels::web::handlers::matters::finance::invoices_void_handler(State(state), Path(id))
         .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
-    if !matches!(existing.status, InvoiceStatus::Draft | InvoiceStatus::Sent) {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "Cannot void invoice with status '{}'",
-                existing.status.as_str()
-            ),
-        ));
-    }
-
-    let invoice = store
-        .set_invoice_status(&state.user_id, invoice_id, InvoiceStatus::Void, None)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
-    let line_items = store
-        .list_invoice_line_items(&state.user_id, invoice_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    Ok(Json(InvoiceDetailResponse {
-        invoice: invoice_record_to_info(invoice),
-        line_items: line_items
-            .into_iter()
-            .map(invoice_line_item_record_to_info)
-            .collect(),
-    }))
 }
 
+#[cfg(test)]
 async fn invoices_payment_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Json(req): Json<RecordInvoicePaymentRequest>,
 ) -> Result<Json<RecordInvoicePaymentResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let invoice_id = parse_uuid(&id, "invoice_id")?;
-    let amount = parse_decimal_field("amount", &req.amount)?;
-    let recorded_by = parse_required_matter_field("recorded_by", &req.recorded_by)?;
-    let payment_result = crate::legal::billing::record_payment(
-        store.as_ref(),
-        &state.user_id,
-        invoice_id,
-        amount,
-        &recorded_by,
-        req.draw_from_trust,
-        req.description.as_deref(),
+    crate::channels::web::handlers::matters::finance::invoices_payment_handler(
+        State(state),
+        Path(id),
+        Json(req),
     )
-    .await;
-    let (invoice, trust_entry) = match payment_result {
-        Ok(result) => result,
-        Err(err) => {
-            if req.draw_from_trust && err.to_ascii_lowercase().contains("insufficient") {
-                record_legal_audit_event(
-                    state.as_ref(),
-                    "trust_withdrawal_rejected",
-                    state.user_id.as_str(),
-                    None,
-                    AuditSeverity::Warn,
-                    serde_json::json!({
-                        "invoice_id": invoice_id.to_string(),
-                        "amount": amount.to_string(),
-                        "reason": "insufficient_balance",
-                    }),
-                )
-                .await;
-            }
-            return Err((StatusCode::BAD_REQUEST, err));
-        }
-    };
-    record_legal_audit_event(
-        state.as_ref(),
-        "payment_recorded",
-        state.user_id.as_str(),
-        Some(invoice.matter_id.as_str()),
-        AuditSeverity::Info,
-        serde_json::json!({
-            "invoice_id": invoice.id.to_string(),
-            "matter_id": invoice.matter_id.clone(),
-            "amount": amount.to_string(),
-            "draw_from_trust": req.draw_from_trust,
-            "trust_entry_created": trust_entry.is_some(),
-        }),
-    )
-    .await;
-    Ok(Json(RecordInvoicePaymentResponse {
-        invoice: invoice_record_to_info(invoice),
-        trust_entry: trust_entry.map(trust_ledger_entry_record_to_info),
-    }))
+    .await
 }
 
+#[cfg(test)]
 async fn matter_trust_deposit_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Json(req): Json<TrustDepositRequest>,
 ) -> Result<(StatusCode, Json<TrustLedgerEntryInfo>), (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let amount = parse_decimal_field("amount", &req.amount)?;
-    let recorded_by = parse_required_matter_field("recorded_by", &req.recorded_by)?;
-    let description =
-        parse_optional_matter_field(req.description).unwrap_or_else(|| "Trust deposit".to_string());
-    let entry = crate::legal::billing::record_trust_deposit(
-        store.as_ref(),
-        &state.user_id,
-        &matter_id,
-        amount,
-        &recorded_by,
-        &description,
+    crate::channels::web::handlers::matters::finance::matter_trust_deposit_handler(
+        State(state),
+        Path(id),
+        Json(req),
     )
     .await
-    .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
-    record_legal_audit_event(
-        state.as_ref(),
-        "trust_deposit",
-        state.user_id.as_str(),
-        Some(matter_id.as_str()),
-        AuditSeverity::Info,
-        serde_json::json!({
-            "matter_id": matter_id.clone(),
-            "entry_id": entry.id.to_string(),
-            "amount": entry.amount.to_string(),
-            "recorded_by": recorded_by,
-        }),
-    )
-    .await;
-    Ok((
-        StatusCode::CREATED,
-        Json(trust_ledger_entry_record_to_info(entry)),
-    ))
 }
 
+#[cfg(test)]
 async fn matter_trust_ledger_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<TrustLedgerResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
-    let entries = store
-        .list_trust_ledger_entries(&state.user_id, &matter_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    let balance = store
-        .current_trust_balance(&state.user_id, &matter_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    Ok(Json(TrustLedgerResponse {
-        matter_id,
-        balance: balance.to_string(),
-        entries: entries
-            .into_iter()
-            .map(trust_ledger_entry_record_to_info)
-            .collect(),
-    }))
+    crate::channels::web::handlers::matters::finance::matter_trust_ledger_handler(
+        State(state),
+        Path(id),
+    )
+    .await
 }
 
-fn parse_required_matter_field(
+pub(crate) fn parse_required_matter_field(
     field_name: &str,
     value: &str,
 ) -> Result<String, (StatusCode, String)> {
@@ -3815,7 +2147,7 @@ fn parse_required_matter_field(
     Ok(trimmed.to_string())
 }
 
-fn parse_optional_matter_field(value: Option<String>) -> Option<String> {
+pub(crate) fn parse_optional_matter_field(value: Option<String>) -> Option<String> {
     value.and_then(|raw| {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -3836,7 +2168,7 @@ fn parse_optional_matter_field_patch(value: Option<Option<String>>) -> Option<Op
 
 const OPTIONAL_MATTER_FIELD_MAX_CHARS: usize = 256;
 
-fn validate_optional_matter_field_length(
+pub(crate) fn validate_optional_matter_field_length(
     field_name: &str,
     value: &Option<String>,
 ) -> Result<(), (StatusCode, String)> {
@@ -3864,7 +2196,7 @@ fn validate_opened_date(value: &str) -> Result<(), (StatusCode, String)> {
     }
 }
 
-fn parse_matter_list(values: Vec<String>) -> Vec<String> {
+pub(crate) fn parse_matter_list(values: Vec<String>) -> Vec<String> {
     values
         .into_iter()
         .map(|v| v.trim().to_string())
@@ -3897,7 +2229,9 @@ fn parse_matter_status(value: &str) -> Result<MatterStatus, (StatusCode, String)
     }
 }
 
-fn parse_matter_task_status(value: &str) -> Result<MatterTaskStatus, (StatusCode, String)> {
+pub(crate) fn parse_matter_task_status(
+    value: &str,
+) -> Result<MatterTaskStatus, (StatusCode, String)> {
     match value.trim().to_ascii_lowercase().as_str() {
         "todo" => Ok(MatterTaskStatus::Todo),
         "in_progress" => Ok(MatterTaskStatus::InProgress),
@@ -3926,7 +2260,7 @@ fn parse_matter_deadline_type(value: &str) -> Result<MatterDeadlineType, (Status
     }
 }
 
-fn parse_expense_category(value: &str) -> Result<ExpenseCategory, (StatusCode, String)> {
+pub(crate) fn parse_expense_category(value: &str) -> Result<ExpenseCategory, (StatusCode, String)> {
     match value.trim().to_ascii_lowercase().as_str() {
         "filing_fee" => Ok(ExpenseCategory::FilingFee),
         "travel" => Ok(ExpenseCategory::Travel),
@@ -3942,7 +2276,10 @@ fn parse_expense_category(value: &str) -> Result<ExpenseCategory, (StatusCode, S
     }
 }
 
-fn parse_date_only(field_name: &str, raw: &str) -> Result<NaiveDate, (StatusCode, String)> {
+pub(crate) fn parse_date_only(
+    field_name: &str,
+    raw: &str,
+) -> Result<NaiveDate, (StatusCode, String)> {
     let value = raw.trim();
     if value.is_empty() {
         return Err((
@@ -3965,7 +2302,10 @@ fn parse_date_only(field_name: &str, raw: &str) -> Result<NaiveDate, (StatusCode
     Ok(parsed)
 }
 
-fn parse_decimal_field(field_name: &str, raw: &str) -> Result<Decimal, (StatusCode, String)> {
+pub(crate) fn parse_decimal_field(
+    field_name: &str,
+    raw: &str,
+) -> Result<Decimal, (StatusCode, String)> {
     let value = raw.trim();
     if value.is_empty() {
         return Err((
@@ -3988,7 +2328,7 @@ fn parse_decimal_field(field_name: &str, raw: &str) -> Result<Decimal, (StatusCo
     Ok(decimal)
 }
 
-fn parse_optional_decimal_field(
+pub(crate) fn parse_optional_decimal_field(
     field_name: &str,
     raw: Option<String>,
 ) -> Result<Option<Decimal>, (StatusCode, String)> {
@@ -3998,7 +2338,7 @@ fn parse_optional_decimal_field(
     }
 }
 
-fn parse_matter_document_category(
+pub(crate) fn parse_matter_document_category(
     value: Option<&str>,
 ) -> Result<MatterDocumentCategory, (StatusCode, String)> {
     let raw = value.unwrap_or("internal").trim().to_ascii_lowercase();
@@ -4089,7 +2429,7 @@ fn parse_datetime_value(field: &str, raw: &str) -> Result<DateTime<Utc>, (Status
     ))
 }
 
-fn parse_optional_datetime(
+pub(crate) fn parse_optional_datetime(
     field: &str,
     raw: Option<String>,
 ) -> Result<Option<DateTime<Utc>>, (StatusCode, String)> {
@@ -4102,7 +2442,7 @@ fn parse_optional_datetime(
     parse_datetime_value(field, &raw).map(Some)
 }
 
-fn parse_optional_datetime_patch(
+pub(crate) fn parse_optional_datetime_patch(
     field: &str,
     raw: Option<Option<String>>,
 ) -> Result<Option<Option<DateTime<Utc>>>, (StatusCode, String)> {
@@ -4118,7 +2458,7 @@ fn parse_optional_datetime_patch(
     Ok(Some(Some(parse_datetime_value(field, &raw)?)))
 }
 
-fn parse_uuid(value: &str, field: &str) -> Result<Uuid, (StatusCode, String)> {
+pub(crate) fn parse_uuid(value: &str, field: &str) -> Result<Uuid, (StatusCode, String)> {
     Uuid::parse_str(value).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -4359,7 +2699,10 @@ async fn sync_deadline_reminder_routines_for_record(
     Ok(())
 }
 
-fn parse_uuid_list(values: &[String], field: &str) -> Result<Vec<Uuid>, (StatusCode, String)> {
+pub(crate) fn parse_uuid_list(
+    values: &[String],
+    field: &str,
+) -> Result<Vec<Uuid>, (StatusCode, String)> {
     values
         .iter()
         .map(|value| parse_uuid(value, field))
@@ -4380,7 +2723,7 @@ fn client_record_to_info(client: crate::db::ClientRecord) -> ClientInfo {
     }
 }
 
-fn matter_task_record_to_info(task: crate::db::MatterTaskRecord) -> MatterTaskInfo {
+pub(crate) fn matter_task_record_to_info(task: crate::db::MatterTaskRecord) -> MatterTaskInfo {
     MatterTaskInfo {
         id: task.id.to_string(),
         title: task.title,
@@ -4398,7 +2741,7 @@ fn matter_task_record_to_info(task: crate::db::MatterTaskRecord) -> MatterTaskIn
     }
 }
 
-fn matter_note_record_to_info(note: crate::db::MatterNoteRecord) -> MatterNoteInfo {
+pub(crate) fn matter_note_record_to_info(note: crate::db::MatterNoteRecord) -> MatterNoteInfo {
     MatterNoteInfo {
         id: note.id.to_string(),
         author: note.author,
@@ -4409,7 +2752,7 @@ fn matter_note_record_to_info(note: crate::db::MatterNoteRecord) -> MatterNoteIn
     }
 }
 
-fn time_entry_record_to_info(entry: crate::db::TimeEntryRecord) -> TimeEntryInfo {
+pub(crate) fn time_entry_record_to_info(entry: crate::db::TimeEntryRecord) -> TimeEntryInfo {
     TimeEntryInfo {
         id: entry.id.to_string(),
         timekeeper: entry.timekeeper,
@@ -4424,7 +2767,9 @@ fn time_entry_record_to_info(entry: crate::db::TimeEntryRecord) -> TimeEntryInfo
     }
 }
 
-fn expense_entry_record_to_info(entry: crate::db::ExpenseEntryRecord) -> ExpenseEntryInfo {
+pub(crate) fn expense_entry_record_to_info(
+    entry: crate::db::ExpenseEntryRecord,
+) -> ExpenseEntryInfo {
     ExpenseEntryInfo {
         id: entry.id.to_string(),
         submitted_by: entry.submitted_by,
@@ -4440,7 +2785,7 @@ fn expense_entry_record_to_info(entry: crate::db::ExpenseEntryRecord) -> Expense
     }
 }
 
-fn matter_time_summary_to_response(
+pub(crate) fn matter_time_summary_to_response(
     summary: crate::db::MatterTimeSummary,
 ) -> MatterTimeSummaryResponse {
     MatterTimeSummaryResponse {
@@ -4453,7 +2798,7 @@ fn matter_time_summary_to_response(
     }
 }
 
-fn invoice_record_to_info(invoice: InvoiceRecord) -> InvoiceInfo {
+pub(crate) fn invoice_record_to_info(invoice: InvoiceRecord) -> InvoiceInfo {
     InvoiceInfo {
         id: invoice.id.to_string(),
         matter_id: invoice.matter_id,
@@ -4471,7 +2816,7 @@ fn invoice_record_to_info(invoice: InvoiceRecord) -> InvoiceInfo {
     }
 }
 
-fn invoice_draft_to_info(invoice: &crate::db::CreateInvoiceParams) -> InvoiceDraftInfo {
+pub(crate) fn invoice_draft_to_info(invoice: &crate::db::CreateInvoiceParams) -> InvoiceDraftInfo {
     InvoiceDraftInfo {
         matter_id: invoice.matter_id.clone(),
         invoice_number: invoice.invoice_number.clone(),
@@ -4484,7 +2829,7 @@ fn invoice_draft_to_info(invoice: &crate::db::CreateInvoiceParams) -> InvoiceDra
     }
 }
 
-fn invoice_line_item_record_to_info(item: InvoiceLineItemRecord) -> InvoiceLineItemInfo {
+pub(crate) fn invoice_line_item_record_to_info(item: InvoiceLineItemRecord) -> InvoiceLineItemInfo {
     InvoiceLineItemInfo {
         id: item.id.to_string(),
         description: item.description,
@@ -4497,7 +2842,7 @@ fn invoice_line_item_record_to_info(item: InvoiceLineItemRecord) -> InvoiceLineI
     }
 }
 
-fn invoice_line_item_params_to_info(
+pub(crate) fn invoice_line_item_params_to_info(
     item: &crate::db::CreateInvoiceLineItemParams,
 ) -> InvoiceLineItemInfo {
     InvoiceLineItemInfo {
@@ -4512,7 +2857,9 @@ fn invoice_line_item_params_to_info(
     }
 }
 
-fn trust_ledger_entry_record_to_info(entry: TrustLedgerEntryRecord) -> TrustLedgerEntryInfo {
+pub(crate) fn trust_ledger_entry_record_to_info(
+    entry: TrustLedgerEntryRecord,
+) -> TrustLedgerEntryInfo {
     TrustLedgerEntryInfo {
         id: entry.id.to_string(),
         matter_id: entry.matter_id,
@@ -4526,7 +2873,9 @@ fn trust_ledger_entry_record_to_info(entry: TrustLedgerEntryRecord) -> TrustLedg
     }
 }
 
-fn audit_event_record_to_info(event: crate::db::AuditEventRecord) -> LegalAuditEventInfo {
+pub(crate) fn audit_event_record_to_info(
+    event: crate::db::AuditEventRecord,
+) -> LegalAuditEventInfo {
     LegalAuditEventInfo {
         id: event.id.to_string(),
         ts: event.created_at.to_rfc3339(),
@@ -4551,7 +2900,7 @@ fn validate_intake_party_name(field_name: &str, value: &str) -> Result<(), (Stat
     Ok(())
 }
 
-fn validate_intake_party_list(
+pub(crate) fn validate_intake_party_list(
     field_name: &str,
     values: &[String],
 ) -> Result<(), (StatusCode, String)> {
@@ -4568,23 +2917,6 @@ fn validate_intake_party_list(
         validate_intake_party_name(field_name, value)?;
     }
     Ok(())
-}
-
-fn conflict_text_preview(text: &str) -> String {
-    let normalized = text
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect::<String>();
-    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    let preview: String = collapsed
-        .chars()
-        .take(MAX_CONFLICT_TEXT_PREVIEW_CHARS)
-        .collect();
-    if collapsed.chars().count() > MAX_CONFLICT_TEXT_PREVIEW_CHARS {
-        format!("{preview}...")
-    } else {
-        preview
-    }
 }
 
 fn build_checked_parties(client: &str, adversaries: &[String]) -> Vec<String> {
@@ -4632,7 +2964,7 @@ fn conflict_declined_error(hits: &[ConflictHit]) -> (StatusCode, String) {
     )
 }
 
-fn list_matters_root_entries(
+pub(crate) fn list_matters_root_entries(
     result: Result<Vec<crate::workspace::WorkspaceEntry>, crate::error::WorkspaceError>,
 ) -> Result<Vec<crate::workspace::WorkspaceEntry>, (StatusCode, String)> {
     match result {
@@ -5070,145 +3402,30 @@ async fn matters_active_set_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[cfg(test)]
 async fn matter_documents_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Query(query): Query<MatterDocumentsQuery>,
 ) -> Result<Json<MatterDocumentsResponse>, (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
-    let include_templates = query.include_templates.unwrap_or(false);
-
-    let documents = if state.store.is_some() {
-        ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
-        backfill_matter_documents_from_workspace(state.as_ref(), &matter_id).await?;
-        let store = state.store.as_ref().ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Database not available".to_string(),
-        ))?;
-        let mut docs = store
-            .list_matter_documents_db(&state.user_id, &matter_id)
-            .await
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-            .into_iter()
-            .map(matter_document_record_to_info)
-            .collect::<Vec<_>>();
-        if include_templates {
-            backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
-            let templates = store
-                .list_document_templates(&state.user_id, Some(&matter_id))
-                .await
-                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-            docs.extend(
-                templates
-                    .into_iter()
-                    .map(|record| document_template_record_to_info(&matter_root, record))
-                    .map(|template| MatterDocumentInfo {
-                        id: template.id,
-                        memory_document_id: None,
-                        name: template.name.clone(),
-                        display_name: Some(template.name),
-                        path: template.path,
-                        is_dir: false,
-                        category: Some("template".to_string()),
-                        updated_at: template.updated_at,
-                    }),
-            );
-            docs.sort_by(|a, b| a.path.cmp(&b.path));
-        }
-        docs
-    } else {
-        let matter_prefix = format!("{matter_root}/{matter_id}");
-        list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, include_templates)
-            .await?
-    };
-
-    Ok(Json(MatterDocumentsResponse {
-        matter_id,
-        documents,
-    }))
+    crate::channels::web::handlers::matters::documents::matter_documents_handler(
+        State(state),
+        Path(id),
+        Query(query),
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn matter_dashboard_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<MatterDashboardResponse>, (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
-    let matter_prefix = format!("{matter_root}/{matter_id}");
-    let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, false).await?;
-    let templates = list_matter_templates(workspace.as_ref(), &matter_root, &matter_id).await?;
-    let today = Utc::now().date_naive();
-    let deadlines =
-        read_matter_deadlines_for_matter(state.as_ref(), &matter_id, &matter_prefix, today).await?;
-
-    let document_count = docs.iter().filter(|doc| !doc.is_dir).count();
-    let draft_prefix = format!("{matter_prefix}/drafts/");
-    let draft_count = docs
-        .iter()
-        .filter(|doc| !doc.is_dir && doc.path.starts_with(&draft_prefix))
-        .count();
-
-    let checklist_files = [
-        format!("{matter_prefix}/workflows/intake_checklist.md"),
-        format!("{matter_prefix}/workflows/review_and_filing_checklist.md"),
-    ];
-    let mut checklist_completed = 0usize;
-    let mut checklist_total = 0usize;
-    for path in checklist_files {
-        match workspace.read(&path).await {
-            Ok(doc) => {
-                let (completed, total) = checklist_completion_from_markdown(&doc.content);
-                checklist_completed += completed;
-                checklist_total += total;
-            }
-            Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => {}
-            Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
-        }
-    }
-
-    let mut overdue_deadlines = 0usize;
-    let mut upcoming_deadlines_14d = 0usize;
-    let mut next_deadline: Option<(NaiveDate, MatterDeadlineInfo)> = None;
-    for deadline in deadlines {
-        let Ok(date) = NaiveDate::parse_from_str(&deadline.date, "%Y-%m-%d") else {
-            continue;
-        };
-        if date < today {
-            overdue_deadlines += 1;
-            continue;
-        }
-        let days_until = date.signed_duration_since(today).num_days();
-        if days_until <= 14 {
-            upcoming_deadlines_14d += 1;
-        }
-        if next_deadline
-            .as_ref()
-            .is_none_or(|(existing, _)| date < *existing)
-        {
-            next_deadline = Some((date, deadline));
-        }
-    }
-
-    Ok(Json(MatterDashboardResponse {
-        matter_id,
-        document_count,
-        template_count: templates.len(),
-        draft_count,
-        checklist_completed,
-        checklist_total,
-        overdue_deadlines,
-        upcoming_deadlines_14d,
-        next_deadline: next_deadline.map(|(_, item)| item),
-    }))
+    crate::channels::web::handlers::matters::documents::matter_dashboard_handler(
+        State(state),
+        Path(id),
+    )
+    .await
 }
 
 async fn matter_deadlines_handler(
@@ -5454,3161 +3671,172 @@ async fn matter_deadlines_compute_handler(
     }))
 }
 
+#[cfg(test)]
 async fn legal_court_rules_handler() -> Result<Json<CourtRulesResponse>, (StatusCode, String)> {
-    let rules = crate::legal::calendar::all_court_rules()
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
-    let payload = rules.iter().map(court_rule_to_info).collect::<Vec<_>>();
-    Ok(Json(CourtRulesResponse { rules: payload }))
+    crate::channels::web::handlers::legal::legal_court_rules_handler().await
 }
 
+#[cfg(test)]
 async fn matter_templates_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<MatterTemplatesResponse>, (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
-    let templates = if let Some(store) = state.store.as_ref() {
-        ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
-        backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
-        store
-            .list_document_templates(&state.user_id, Some(&matter_id))
-            .await
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-            .into_iter()
-            .map(|record| document_template_record_to_info(&matter_root, record))
-            .collect::<Vec<_>>()
-    } else {
-        list_matter_templates(workspace.as_ref(), &matter_root, &matter_id).await?
-    };
-
-    Ok(Json(MatterTemplatesResponse {
-        matter_id,
-        templates,
-    }))
+    crate::channels::web::handlers::matters::documents::matter_templates_handler(
+        State(state),
+        Path(id),
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn matter_template_apply_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Json(req): Json<MatterTemplateApplyRequest>,
 ) -> Result<(StatusCode, Json<MatterTemplateApplyResponse>), (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
-    let matter_prefix = format!("{matter_root}/{matter_id}");
-    let template_name = parse_template_name(&req.template_name)?;
-
-    let template_body = if let Some(store) = state.store.as_ref() {
-        ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
-        backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
-        let template = store
-            .get_document_template_by_name(&state.user_id, Some(&matter_id), &template_name)
-            .await
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-            .ok_or((
-                StatusCode::NOT_FOUND,
-                format!("Template '{}' not found", template_name),
-            ))?;
-        template.body
-    } else {
-        let template_path = format!("{matter_prefix}/templates/{template_name}");
-        workspace
-            .read(&template_path)
-            .await
-            .map_err(|err| match err {
-                crate::error::WorkspaceError::DocumentNotFound { .. } => (
-                    StatusCode::NOT_FOUND,
-                    format!("Template '{}' not found", template_name),
-                ),
-                other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-            })?
-            .content
-    };
-
-    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let destination = choose_template_apply_destination(
-        workspace.as_ref(),
-        &matter_prefix,
-        &template_name,
-        &timestamp,
+    crate::channels::web::handlers::matters::documents::matter_template_apply_handler(
+        State(state),
+        Path(id),
+        Json(req),
     )
-    .await?;
-
-    let written = workspace
-        .write(&destination, &template_body)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    if let Some(store) = state.store.as_ref() {
-        let linked = store
-            .upsert_matter_document(
-                &state.user_id,
-                &matter_id,
-                &UpsertMatterDocumentParams {
-                    memory_document_id: written.id,
-                    path: written.path.clone(),
-                    display_name: template_name.clone(),
-                    category: MatterDocumentCategory::Internal,
-                },
-            )
-            .await;
-        let linked = match linked {
-            Ok(value) => value,
-            Err(err) => {
-                let _ = workspace.delete(&destination).await;
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
-            }
-        };
-        if let Err(err) = store
-            .create_document_version(
-                &state.user_id,
-                &CreateDocumentVersionParams {
-                    matter_document_id: linked.id,
-                    label: "draft".to_string(),
-                    memory_document_id: written.id,
-                },
-            )
-            .await
-        {
-            let _ = store
-                .delete_matter_document(&state.user_id, &matter_id, linked.id)
-                .await;
-            let _ = workspace.delete(&destination).await;
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
-        }
-    }
-
-    Ok((
-        StatusCode::CREATED,
-        Json(MatterTemplateApplyResponse {
-            path: destination,
-            status: "created",
-        }),
-    ))
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_retrieval_export_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     body: Option<Json<MatterRetrievalExportRequest>>,
 ) -> Result<(StatusCode, Json<MatterRetrievalExportResponse>), (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let legal = legal_config_for_gateway(state.as_ref());
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
-    ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
-
-    let unredacted = body.as_ref().is_some_and(|Json(value)| value.unredacted);
-
-    let result = crate::legal::backup::export_matter_retrieval_packet(
-        store.as_ref(),
-        workspace.as_ref(),
-        &state.user_id,
-        &matter_id,
-        &crate::legal::backup::MatterRetrievalExportOptions {
-            redacted: !unredacted,
-            matter_root: legal.matter_root.clone(),
-        },
-        Some(&legal.redaction),
+    crate::channels::web::handlers::matters::documents::matter_retrieval_export_handler(
+        State(state),
+        Path(id),
+        body,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    record_legal_audit_event(
-        state.as_ref(),
-        "matter_retrieval_exported",
-        state.user_id.as_str(),
-        Some(matter_id.as_str()),
-        if unredacted {
-            AuditSeverity::Warn
-        } else {
-            AuditSeverity::Info
-        },
-        serde_json::json!({
-            "output_dir": result.output_dir,
-            "redacted": result.redacted,
-            "file_count": result.files.len(),
-            "warning": result.warning,
-        }),
-    )
-    .await;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(MatterRetrievalExportResponse {
-            matter_id: result.matter_id,
-            output_dir: result.output_dir,
-            redacted: result.redacted,
-            files: result.files,
-            warning: result.warning,
-        }),
-    ))
 }
 
+#[cfg(test)]
 async fn documents_generate_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<GenerateDocumentRequest>,
 ) -> Result<(StatusCode, Json<GenerateDocumentResponse>), (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    let matter_id =
-        ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &req.matter_id).await?;
-    ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
-    backfill_matter_templates_from_workspace(state.as_ref(), &matter_id).await?;
-
-    let template_id = parse_uuid(req.template_id.trim(), "template_id")?;
-    let template = store
-        .get_document_template(&state.user_id, template_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Template not found".to_string()))?;
-    if let Some(ref template_matter) = template.matter_id
-        && template_matter != &matter_id
-    {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "Template not available for this matter".to_string(),
-        ));
-    }
-
-    let matter = store
-        .get_matter_db(&state.user_id, &matter_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Matter not found".to_string()))?;
-    let client = store
-        .get_client(&state.user_id, matter.client_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Matter is missing an associated client record".to_string(),
-        ))?;
-
-    let extra = if req.extra.is_object() {
-        req.extra
-    } else {
-        serde_json::json!({})
-    };
-    let context = crate::legal::docgen::build_context(&matter, &client, Some(&extra));
-    let rendered = crate::legal::docgen::render_template(&template.body, &context)
-        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
-
-    let category = parse_matter_document_category(req.category.as_deref())?;
-    let display_name =
-        parse_optional_matter_field(req.display_name).unwrap_or_else(|| template.name.clone());
-    let label = parse_optional_matter_field(req.label).unwrap_or_else(|| "draft".to_string());
-    validate_optional_matter_field_length("display_name", &Some(display_name.clone()))?;
-    validate_optional_matter_field_length("label", &Some(label.clone()))?;
-
-    let matter_prefix = format!("{matter_root}/{matter_id}");
-    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let destination = choose_generated_document_destination(
-        workspace.as_ref(),
-        &matter_prefix,
-        &template.name,
-        &timestamp,
+    crate::channels::web::handlers::matters::documents::documents_generate_handler(
+        State(state),
+        Json(req),
     )
-    .await?;
-
-    let written = workspace
-        .write(&destination, &rendered)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    let linked = match store
-        .upsert_matter_document(
-            &state.user_id,
-            &matter_id,
-            &UpsertMatterDocumentParams {
-                memory_document_id: written.id,
-                path: written.path.clone(),
-                display_name: display_name.clone(),
-                category,
-            },
-        )
-        .await
-    {
-        Ok(linked) => linked,
-        Err(err) => {
-            let _ = workspace.delete(&destination).await;
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
-        }
-    };
-
-    let version = match store
-        .create_document_version(
-            &state.user_id,
-            &CreateDocumentVersionParams {
-                matter_document_id: linked.id,
-                label: label.clone(),
-                memory_document_id: written.id,
-            },
-        )
-        .await
-    {
-        Ok(version) => version,
-        Err(err) => {
-            let _ = store
-                .delete_matter_document(&state.user_id, &matter_id, linked.id)
-                .await;
-            let _ = workspace.delete(&destination).await;
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
-        }
-    };
-
-    Ok((
-        StatusCode::CREATED,
-        Json(GenerateDocumentResponse {
-            matter_document_id: linked.id.to_string(),
-            memory_document_id: linked.memory_document_id.to_string(),
-            path: linked.path,
-            display_name: linked.display_name,
-            category: linked.category.as_str().to_string(),
-            version_number: version.version_number,
-            label: version.label,
-        }),
-    ))
+    .await
 }
 
+#[cfg(test)]
 async fn matter_filing_package_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<MatterFilingPackageResponse>), (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
-    let matter_prefix = format!("{matter_root}/{matter_id}");
-    let generated_at = Utc::now();
-    let timestamp = generated_at.format("%Y%m%d-%H%M%S").to_string();
-    let destination =
-        choose_filing_package_destination(workspace.as_ref(), &matter_prefix, &timestamp).await?;
-
-    let metadata = crate::legal::matter::read_matter_metadata_for_root(
-        workspace.as_ref(),
-        &matter_root,
-        &matter_id,
+    crate::channels::web::handlers::matters::documents::matter_filing_package_handler(
+        State(state),
+        Path(id),
     )
     .await
-    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    let docs = list_matter_documents_recursive(workspace.as_ref(), &matter_prefix, true).await?;
-    let templates = list_matter_templates(workspace.as_ref(), &matter_root, &matter_id).await?;
-    let today = generated_at.date_naive();
-    let deadlines =
-        read_matter_deadlines_for_matter(state.as_ref(), &matter_id, &matter_prefix, today).await?;
-
-    let checklist_files = [
-        format!("{matter_prefix}/workflows/intake_checklist.md"),
-        format!("{matter_prefix}/workflows/review_and_filing_checklist.md"),
-    ];
-    let mut checklist_completed = 0usize;
-    let mut checklist_total = 0usize;
-    for path in checklist_files {
-        match workspace.read(&path).await {
-            Ok(doc) => {
-                let (completed, total) = checklist_completion_from_markdown(&doc.content);
-                checklist_completed += completed;
-                checklist_total += total;
-            }
-            Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => {}
-            Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
-        }
-    }
-
-    let mut package = String::new();
-    package.push_str("# Filing Package Index\n\n");
-    package.push_str(&format!("Matter: `{}`\n", matter_id));
-    package.push_str(&format!("Client: {}\n", metadata.client));
-    package.push_str(&format!("Confidentiality: {}\n", metadata.confidentiality));
-    package.push_str(&format!("Generated: {}\n\n", generated_at.to_rfc3339()));
-
-    let file_docs: Vec<&MatterDocumentInfo> = docs.iter().filter(|doc| !doc.is_dir).collect();
-    let draft_prefix = format!("{matter_prefix}/drafts/");
-    let draft_count = file_docs
-        .iter()
-        .filter(|doc| doc.path.starts_with(&draft_prefix))
-        .count();
-    let overdue_deadlines = deadlines.iter().filter(|item| item.is_overdue).count();
-    let upcoming_deadlines_14d = deadlines
-        .iter()
-        .filter_map(|item| {
-            NaiveDate::parse_from_str(&item.date, "%Y-%m-%d")
-                .ok()
-                .map(|date| date.signed_duration_since(today).num_days())
-        })
-        .filter(|days| (0..=14).contains(days))
-        .count();
-
-    package.push_str("## Workflow Scorecard\n\n");
-    package.push_str(&format!("- Documents: {}\n", file_docs.len()));
-    package.push_str(&format!("- Drafts: {}\n", draft_count));
-    package.push_str(&format!("- Templates: {}\n", templates.len()));
-    package.push_str(&format!(
-        "- Checklist completion: {}/{}\n",
-        checklist_completed, checklist_total
-    ));
-    package.push_str(&format!("- Overdue deadlines: {}\n", overdue_deadlines));
-    package.push_str(&format!(
-        "- Upcoming deadlines (14d): {}\n\n",
-        upcoming_deadlines_14d
-    ));
-
-    package.push_str("## Deadlines Snapshot\n\n");
-    if deadlines.is_empty() {
-        package.push_str("- None parsed from `deadlines/calendar.md`.\n\n");
-    } else {
-        package.push_str("| Date | Event | Owner | Status | Source |\n");
-        package.push_str("|---|---|---|---|---|\n");
-        for item in &deadlines {
-            package.push_str(&format!(
-                "| {} | {} | {} | {} | {} |\n",
-                item.date,
-                item.title.replace('|', "\\|"),
-                item.owner.clone().unwrap_or_default().replace('|', "\\|"),
-                item.status.clone().unwrap_or_default().replace('|', "\\|"),
-                item.source.clone().unwrap_or_default().replace('|', "\\|"),
-            ));
-        }
-        package.push('\n');
-    }
-
-    package.push_str("## Document Inventory\n\n");
-    if file_docs.is_empty() {
-        package.push_str("- No documents found.\n\n");
-    } else {
-        for doc in &file_docs {
-            package.push_str(&format!("- `{}`\n", doc.path));
-        }
-        package.push('\n');
-    }
-
-    package.push_str("## Template Inventory\n\n");
-    if templates.is_empty() {
-        package.push_str("- No templates found.\n");
-    } else {
-        for template in &templates {
-            package.push_str(&format!("- `{}`\n", template.path));
-        }
-    }
-
-    workspace
-        .write(&destination, &package)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(MatterFilingPackageResponse {
-            matter_id,
-            path: destination,
-            generated_at: generated_at.to_rfc3339(),
-            status: "created",
-        }),
-    ))
 }
 
+#[cfg(test)]
 async fn matters_conflict_check_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<MatterIntakeConflictCheckRequest>,
 ) -> Result<Json<MatterIntakeConflictCheckResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let legal = legal_config_for_gateway(state.as_ref());
-    if !legal.enabled || !legal.conflict_check_enabled {
-        return Err((
-            StatusCode::CONFLICT,
-            "Conflict check is disabled by legal policy".to_string(),
-        ));
-    }
-
-    let matter_id = crate::legal::policy::sanitize_matter_id(req.matter_id.trim());
-    if matter_id.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "'matter_id' is empty after sanitization".to_string(),
-        ));
-    }
-
-    let client_names = parse_matter_list(req.client_names);
-    if client_names.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "'client_names' must include at least one non-empty name".to_string(),
-        ));
-    }
-    validate_intake_party_list("client_names", &client_names)?;
-    let adversary_names = parse_matter_list(req.adversary_names);
-    validate_intake_party_list("adversary_names", &adversary_names)?;
-
-    let mut checked_parties: Vec<String> = Vec::new();
-    for value in client_names.iter().chain(adversary_names.iter()) {
-        if checked_parties
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(value))
-        {
-            continue;
-        }
-        checked_parties.push(value.clone());
-    }
-    if checked_parties.len() > MAX_INTAKE_CONFLICT_PARTIES {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "combined client/adversary names may include at most {} values",
-                MAX_INTAKE_CONFLICT_PARTIES
-            ),
-        ));
-    }
-
-    let hits = store
-        .find_conflict_hits_for_names(&checked_parties, 100)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let matched = !hits.is_empty();
-    let top_conflict = hits.first().map(|hit| hit.party.clone());
-
-    record_legal_audit_event(
-        state.as_ref(),
-        "matter_intake_conflict_check",
-        state.user_id.as_str(),
-        Some(matter_id.as_str()),
-        AuditSeverity::Info,
-        serde_json::json!({
-            "matter_id": matter_id.clone(),
-            "matched": matched,
-            "hit_count": hits.len(),
-            "top_conflict": top_conflict,
-            "checked_party_count": checked_parties.len(),
-            "checked_by": state.user_id.clone(),
-        }),
+    crate::channels::web::handlers::matters::conflicts::matters_conflict_check_handler(
+        State(state),
+        Json(req),
     )
-    .await;
-    if matched {
-        record_legal_audit_event(
-            state.as_ref(),
-            "conflict_detected",
-            state.user_id.as_str(),
-            Some(matter_id.as_str()),
-            AuditSeverity::Warn,
-            serde_json::json!({
-                "source": "intake_conflict_check",
-                "hit_count": hits.len(),
-                "top_conflict": hits.first().map(|hit| hit.party.clone()),
-            }),
-        )
-        .await;
-    }
-
-    Ok(Json(MatterIntakeConflictCheckResponse {
-        matched,
-        hits,
-        matter_id,
-        checked_parties,
-    }))
+    .await
 }
 
+#[cfg(test)]
 async fn matters_conflicts_check_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<MatterConflictCheckRequest>,
 ) -> Result<Json<MatterConflictCheckResponse>, (StatusCode, String)> {
-    let text = req.text.trim();
-    if text.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "'text' must not be empty".to_string(),
-        ));
-    }
-    if text.len() > MAX_CONFLICT_CHECK_TEXT_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "'text' must be at most {} bytes",
-                MAX_CONFLICT_CHECK_TEXT_LEN
-            ),
-        ));
-    }
-
-    let mut legal = legal_config_for_gateway(state.as_ref());
-    if !legal.enabled || !legal.conflict_check_enabled {
-        return Err((
-            StatusCode::CONFLICT,
-            "Conflict check is disabled by legal policy".to_string(),
-        ));
-    }
-
-    let effective_matter_id = if let Some(override_id) = req.matter_id {
-        let trimmed = override_id.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            let sanitized = crate::legal::policy::sanitize_matter_id(trimmed);
-            if sanitized.is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "'matter_id' is empty after sanitization".to_string(),
-                ));
-            }
-            Some(sanitized)
-        }
-    } else {
-        load_active_matter_for_chat(state.as_ref()).await
-    };
-    if legal.require_matter_context && effective_matter_id.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Active matter is required by legal policy for conflict checks".to_string(),
-        ));
-    }
-
-    legal.active_matter = effective_matter_id.clone();
-    let db_available = state.store.is_some();
-    let db_hits = if let Some(store) = state.store.as_ref() {
-        match store
-            .find_conflict_hits_for_text(text, legal.active_matter.as_deref(), 50)
-            .await
-        {
-            Ok(hits) => hits,
-            Err(err) => {
-                tracing::warn!(
-                    "DB text conflict check failed, falling back to workspace cache: {err}"
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-    let conflict = if let Some(first_hit) = db_hits.first() {
-        Some(first_hit.party.clone())
-    } else if db_available && !legal.conflict_file_fallback_enabled {
-        None
-    } else {
-        let workspace = state.workspace.as_ref().ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Workspace not available".to_string(),
-        ))?;
-        crate::legal::matter::detect_conflict_with_store(None, workspace.as_ref(), &legal, text)
-            .await
-    };
-    let matched = conflict.is_some();
-
-    record_legal_audit_event(
-        state.as_ref(),
-        "matter_conflict_check",
-        state.user_id.as_str(),
-        effective_matter_id.as_deref(),
-        AuditSeverity::Info,
-        serde_json::json!({
-            "matter_id": effective_matter_id.clone(),
-            "matched": matched,
-            "conflict": conflict.clone(),
-            "text_preview": conflict_text_preview(text),
-            "checked_by": state.user_id.clone(),
-            "source": "manual_text_check",
-        }),
+    crate::channels::web::handlers::matters::conflicts::matters_conflicts_check_handler(
+        State(state),
+        Json(req),
     )
-    .await;
-    if matched {
-        record_legal_audit_event(
-            state.as_ref(),
-            "conflict_detected",
-            state.user_id.as_str(),
-            effective_matter_id.as_deref(),
-            AuditSeverity::Warn,
-            serde_json::json!({
-                "source": "manual_text_check",
-                "conflict": conflict.clone(),
-                "hit_count": db_hits.len(),
-            }),
-        )
-        .await;
-    }
-
-    Ok(Json(MatterConflictCheckResponse {
-        matched,
-        conflict,
-        matter_id: effective_matter_id,
-        hits: db_hits,
-    }))
+    .await
 }
 
+#[cfg(test)]
 async fn matters_conflicts_reindex_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<MatterConflictGraphReindexResponse>, (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let legal = legal_config_for_gateway(state.as_ref());
-    if !legal.enabled || !legal.conflict_check_enabled {
-        return Err((
-            StatusCode::CONFLICT,
-            "Conflict reindex is disabled by legal policy".to_string(),
-        ));
-    }
-
-    let report = crate::legal::matter::reindex_conflict_graph(workspace.as_ref(), store, &legal)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
-
-    record_legal_audit_event(
-        state.as_ref(),
-        "conflict_graph_reindexed",
-        state.user_id.as_str(),
-        None,
-        AuditSeverity::Info,
-        serde_json::json!({
-            "triggered_by": state.user_id.clone(),
-            "scanned_matters": report.scanned_matters,
-            "seeded_matters": report.seeded_matters,
-            "skipped_matters": report.skipped_matters,
-            "global_conflicts_seeded": report.global_conflicts_seeded,
-            "global_aliases_seeded": report.global_aliases_seeded,
-            "warning_count": report.warnings.len(),
-        }),
-    )
-    .await;
-
-    Ok(Json(MatterConflictGraphReindexResponse {
-        status: "ok",
-        report,
-    }))
+    crate::channels::web::handlers::matters::conflicts::matters_conflicts_reindex_handler(State(
+        state,
+    ))
+    .await
 }
 
+#[cfg(test)]
 async fn legal_audit_list_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<LegalAuditQuery>,
 ) -> Result<Json<LegalAuditListResponse>, (StatusCode, String)> {
-    let legal = legal_config_for_gateway(state.as_ref());
-    if !legal.audit.enabled {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "Legal audit logging is disabled".to_string(),
-        ));
-    }
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let limit = query.limit.unwrap_or(50);
-    if limit == 0 || limit > 200 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "'limit' must be between 1 and 200".to_string(),
-        ));
-    }
-    let offset = query.offset.unwrap_or(0);
-    let event_type_filter = query.event_type.as_ref().and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    });
-    let matter_id_filter = query.matter_id.as_ref().and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    });
-    let severity_filter = parse_audit_severity_query(query.severity.as_deref())?;
-    // Keep backward compatibility with existing `from`/`to` query names.
-    let since_ts = parse_utc_query_ts("since", query.since.as_deref().or(query.from.as_deref()))?;
-    let until_ts = parse_utc_query_ts("until", query.until.as_deref().or(query.to.as_deref()))?;
-
-    if let (Some(since), Some(until)) = (since_ts, until_ts)
-        && since > until
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "'since' must be earlier than or equal to 'until'".to_string(),
-        ));
-    }
-
-    let db_query = DbAuditEventQuery {
-        event_type: event_type_filter,
-        matter_id: matter_id_filter,
-        severity: severity_filter,
-        since: since_ts,
-        until: until_ts,
-    };
-    let total = store
-        .count_audit_events(&state.user_id, &db_query)
+    crate::channels::web::handlers::legal::legal_audit_list_handler(State(state), Query(query))
         .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    let events = store
-        .list_audit_events(&state.user_id, &db_query, limit, offset)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .into_iter()
-        .map(audit_event_record_to_info)
-        .collect::<Vec<_>>();
-    let next_offset = if offset + events.len() < total {
-        Some(offset + events.len())
-    } else {
-        None
-    };
-
-    Ok(Json(LegalAuditListResponse {
-        events,
-        total,
-        next_offset,
-    }))
 }
 
-fn compliance_status_level(level: crate::compliance::ComplianceState) -> ComplianceStatusLevel {
-    match level {
-        crate::compliance::ComplianceState::Compliant => ComplianceStatusLevel::Compliant,
-        crate::compliance::ComplianceState::Partial => ComplianceStatusLevel::Partial,
-        crate::compliance::ComplianceState::NeedsReview => ComplianceStatusLevel::NeedsReview,
-    }
-}
-
-fn compliance_function_to_response(
-    function: &crate::compliance::ComplianceFunction,
-) -> ComplianceFunctionStatus {
-    ComplianceFunctionStatus {
-        status: compliance_status_level(function.status),
-        checks: function
-            .checks
-            .iter()
-            .map(|check| ComplianceCheckResult {
-                id: check.id.to_string(),
-                label: check.label.to_string(),
-                status: compliance_status_level(check.status),
-                detail: check.detail.clone(),
-            })
-            .collect(),
-    }
-}
-
-fn normalize_compliance_framework(raw: Option<&str>) -> Result<String, (StatusCode, String)> {
-    let framework = raw
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("nist")
-        .to_ascii_lowercase();
-    match framework.as_str() {
-        "nist" | "colorado-sb205" | "eu-ai-act" => Ok(framework),
-        _ => Err((
-            StatusCode::BAD_REQUEST,
-            "'framework' must be one of: nist, colorado-sb205, eu-ai-act".to_string(),
-        )),
-    }
-}
-
-fn is_matter_classified(metadata: &crate::legal::matter::MatterMetadata) -> bool {
-    !metadata.confidentiality.trim().is_empty() && !metadata.retention.trim().is_empty()
-}
-
-async fn collect_compliance_matter_metrics(state: &GatewayState) -> (usize, usize, Vec<String>) {
-    let mut data_gaps = Vec::new();
-    let matter_root = matter_root_for_gateway(state);
-
-    if let Some(store) = state.store.as_ref() {
-        match store.list_matters_db(&state.user_id).await {
-            Ok(rows) => {
-                let total = rows.len();
-                let mut classified = 0usize;
-                if let Some(workspace) = state.workspace.as_ref() {
-                    for row in rows {
-                        if let Some(metadata) = read_workspace_matter_metadata_optional(
-                            Some(workspace),
-                            &matter_root,
-                            &row.matter_id,
-                        )
-                        .await
-                            && is_matter_classified(&metadata)
-                        {
-                            classified += 1;
-                        }
-                    }
-                } else {
-                    data_gaps.push(
-                        "Workspace unavailable; matter classification coverage may be understated."
-                            .to_string(),
-                    );
-                }
-                return (total, classified, data_gaps);
-            }
-            Err(err) => {
-                data_gaps.push(format!(
-                    "Failed to list matters from database; falling back to workspace scan: {err}"
-                ));
-            }
-        }
-    }
-
-    let Some(workspace) = state.workspace.as_ref() else {
-        data_gaps.push(
-            "Matter metrics unavailable: both database and workspace are unavailable.".to_string(),
-        );
-        return (0, 0, data_gaps);
-    };
-
-    let entries = match list_matters_root_entries(workspace.list(&matter_root).await) {
-        Ok(entries) => entries,
-        Err((_status, message)) => {
-            data_gaps.push(format!(
-                "Failed to list matter root '{}': {}",
-                matter_root, message
-            ));
-            return (0, 0, data_gaps);
-        }
-    };
-
-    let mut total = 0usize;
-    let mut classified = 0usize;
-    for entry in entries.into_iter().filter(|entry| entry.is_directory) {
-        let matter_id = entry.path.rsplit('/').next().unwrap_or("");
-        if matter_id.is_empty() || matter_id == "_template" {
-            continue;
-        }
-        total += 1;
-        if let Some(metadata) =
-            read_workspace_matter_metadata_optional(Some(workspace), &matter_root, matter_id).await
-            && is_matter_classified(&metadata)
-        {
-            classified += 1;
-        }
-    }
-
-    (total, classified, data_gaps)
-}
-
-async fn collect_compliance_tool_count(state: &GatewayState) -> (usize, Vec<String>) {
-    let mut data_gaps = Vec::new();
-    let count = if let Some(registry) = state.tool_registry.as_ref() {
-        registry.tool_definitions().await.len()
-    } else {
-        data_gaps.push("Tool registry unavailable; inventory count reported as 0.".to_string());
-        0
-    };
-    (count, data_gaps)
-}
-
-async fn collect_compliance_audit_metrics(
-    state: &GatewayState,
-) -> (
-    Option<usize>,
-    Option<usize>,
-    Option<usize>,
-    Option<usize>,
-    Option<usize>,
-    Vec<String>,
-) {
-    let mut data_gaps = Vec::new();
-    let Some(store) = state.store.as_ref() else {
-        data_gaps.push("Audit metrics unavailable because database is not configured.".to_string());
-        return (None, None, None, None, None, data_gaps);
-    };
-
-    let base_query = DbAuditEventQuery::default();
-    let total = match store.count_audit_events(&state.user_id, &base_query).await {
-        Ok(value) => Some(value),
-        Err(err) => {
-            data_gaps.push(format!("Failed to read audit event count: {err}"));
-            None
-        }
-    };
-
-    let severity_count = |severity: AuditSeverity| DbAuditEventQuery {
-        severity: Some(severity),
-        ..DbAuditEventQuery::default()
-    };
-
-    let info_count = match store
-        .count_audit_events(&state.user_id, &severity_count(AuditSeverity::Info))
-        .await
-    {
-        Ok(value) => Some(value),
-        Err(err) => {
-            data_gaps.push(format!("Failed to read info audit count: {err}"));
-            None
-        }
-    };
-
-    let warn_count = match store
-        .count_audit_events(&state.user_id, &severity_count(AuditSeverity::Warn))
-        .await
-    {
-        Ok(value) => Some(value),
-        Err(err) => {
-            data_gaps.push(format!("Failed to read warn audit count: {err}"));
-            None
-        }
-    };
-
-    let critical_count = match store
-        .count_audit_events(&state.user_id, &severity_count(AuditSeverity::Critical))
-        .await
-    {
-        Ok(value) => Some(value),
-        Err(err) => {
-            data_gaps.push(format!("Failed to read critical audit count: {err}"));
-            None
-        }
-    };
-
-    let approval_required_count = match store
-        .count_audit_events(
-            &state.user_id,
-            &DbAuditEventQuery {
-                event_type: Some("approval_required".to_string()),
-                ..DbAuditEventQuery::default()
-            },
-        )
-        .await
-    {
-        Ok(value) => Some(value),
-        Err(err) => {
-            data_gaps.push(format!(
-                "Failed to read approval-required audit count: {err}"
-            ));
-            None
-        }
-    };
-
-    let approval_decision_count = match store
-        .count_audit_events(
-            &state.user_id,
-            &DbAuditEventQuery {
-                event_type: Some("approval_decision".to_string()),
-                ..DbAuditEventQuery::default()
-            },
-        )
-        .await
-    {
-        Ok(value) => Some(value),
-        Err(err) => {
-            data_gaps.push(format!(
-                "Failed to read approval-decision audit count: {err}"
-            ));
-            None
-        }
-    };
-
-    let approval_events_total = match (approval_required_count, approval_decision_count) {
-        (Some(required), Some(decision)) => Some(required + decision),
-        (Some(required), None) => Some(required),
-        (None, Some(decision)) => Some(decision),
-        (None, None) => None,
-    };
-
-    (
-        total,
-        approval_events_total,
-        info_count,
-        warn_count,
-        critical_count,
-        data_gaps,
-    )
-}
-
-async fn build_compliance_status(
-    state: &GatewayState,
-    legal: &crate::config::LegalConfig,
-) -> crate::compliance::ComplianceStatus {
-    let (matters_total, matters_classified, matter_gaps) =
-        collect_compliance_matter_metrics(state).await;
-    let (tools_total, tool_gaps) = collect_compliance_tool_count(state).await;
-    let (
-        audit_events_total,
-        approval_events_total,
-        audit_info_count,
-        audit_warn_count,
-        audit_critical_count,
-        audit_gaps,
-    ) = collect_compliance_audit_metrics(state).await;
-
-    let mut data_gaps = Vec::new();
-    data_gaps.extend(matter_gaps);
-    data_gaps.extend(tool_gaps);
-    data_gaps.extend(audit_gaps);
-
-    let inputs = crate::compliance::ComplianceInputs {
-        audit_enabled: legal.audit.enabled,
-        audit_hash_chain: legal.audit.hash_chain,
-        hardening_max_lockdown: legal.hardening
-            == crate::config::LegalHardeningProfile::MaxLockdown,
-        conflict_check_enabled: legal.conflict_check_enabled,
-        conflict_file_fallback_enabled: legal.conflict_file_fallback_enabled,
-        privilege_guard_enabled: legal.privilege_guard,
-        network_deny_by_default: legal.network.deny_by_default,
-        redaction_pii: legal.redaction.pii,
-        redaction_phi: legal.redaction.phi,
-        redaction_financial: legal.redaction.financial,
-        matters_total,
-        matters_classified,
-        tools_total,
-        audit_events_total,
-        approval_events_total,
-        audit_info_count,
-        audit_warn_count,
-        audit_critical_count,
-        runtime: state.runtime_facts.clone(),
-        data_gaps,
-    };
-    crate::compliance::evaluate_nist_rmf(&inputs)
-}
-
+#[cfg(test)]
 async fn compliance_status_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<ComplianceStatusResponse>, (StatusCode, String)> {
-    let legal = legal_config_for_gateway(state.as_ref());
-    let status = build_compliance_status(state.as_ref(), &legal).await;
-    let generated_at = Utc::now().to_rfc3339();
-
-    let response = ComplianceStatusResponse {
-        overall: compliance_status_level(status.overall),
-        govern: compliance_function_to_response(&status.govern),
-        map: compliance_function_to_response(&status.map),
-        measure: compliance_function_to_response(&status.measure),
-        manage: compliance_function_to_response(&status.manage),
-        metrics: ComplianceMetrics {
-            matters_total: status.metrics.matters_total,
-            matters_classified: status.metrics.matters_classified,
-            tools_total: status.metrics.tools_total,
-            audit_events_total: status.metrics.audit_events_total,
-            audit_info_count: status.metrics.audit_info_count,
-            audit_warn_count: status.metrics.audit_warn_count,
-            audit_critical_count: status.metrics.audit_critical_count,
-            safety_policy_rule_count: state.runtime_facts.safety_policy_rule_count,
-            safety_leak_pattern_count: state.runtime_facts.safety_leak_pattern_count,
-        },
-        data_gaps: status.data_gaps.clone(),
-        generated_at: generated_at.clone(),
-    };
-
-    record_legal_audit_event(
-        state.as_ref(),
-        "compliance_status_viewed",
-        "gateway",
-        legal.active_matter.as_deref(),
-        AuditSeverity::Info,
-        serde_json::json!({
-            "overall": response.overall,
-            "generated_at": generated_at,
-            "data_gap_count": response.data_gaps.len(),
-        }),
-    )
-    .await;
-
-    Ok(Json(response))
+    crate::channels::web::handlers::legal::compliance_status_handler(State(state)).await
 }
 
+#[cfg(test)]
 async fn compliance_letter_handler(
     State(state): State<Arc<GatewayState>>,
     body: Option<Json<ComplianceLetterRequest>>,
 ) -> Result<Json<ComplianceLetterResponse>, (StatusCode, String)> {
-    let req = body.map(|Json(value)| value).unwrap_or_default();
-    let framework = normalize_compliance_framework(req.framework.as_deref())?;
-    let legal = legal_config_for_gateway(state.as_ref());
-    let status = build_compliance_status(state.as_ref(), &legal).await;
-    let llm = state.llm_provider.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "LLM provider is not available".to_string(),
-    ))?;
-    let model = llm.active_model_name();
-    let generated_at = Utc::now().to_rfc3339();
-    let prompt = crate::compliance::build_attestation_prompt(
-        &framework,
-        req.firm_name.as_deref(),
-        &generated_at,
-        &legal,
-        &status,
-        &model,
-    );
-
-    let request = CompletionRequest::new(vec![
-        ChatMessage::system(
-            "You write factual operational attestation letters from provided runtime evidence only.",
-        ),
-        ChatMessage::user(prompt),
-    ])
-    .with_temperature(0.1)
-    .with_max_tokens(1800);
-
-    let completion = llm.complete(request).await.map_err(|err| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to generate compliance letter: {}", err),
-        )
-    })?;
-    let base_markdown = completion.content.trim();
-    if base_markdown.is_empty() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            "LLM returned an empty compliance letter".to_string(),
-        ));
-    }
-
-    let markdown = format!(
-        "{base_markdown}\n\n---\n\n*Disclaimer: Configuration summary only; not legal advice.*\n"
-    );
-    let overall = compliance_status_level(status.overall);
-
-    record_legal_audit_event(
-        state.as_ref(),
-        "compliance_letter_generated",
-        "gateway",
-        legal.active_matter.as_deref(),
-        AuditSeverity::Info,
-        serde_json::json!({
-            "framework": framework,
-            "model": model,
-            "overall": overall,
-            "firm_name": req.firm_name,
-            "generated_at": generated_at,
-        }),
-    )
-    .await;
-
-    Ok(Json(ComplianceLetterResponse {
-        framework,
-        model,
-        generated_at,
-        overall,
-        markdown,
-    }))
+    crate::channels::web::handlers::legal::compliance_letter_handler(State(state), body).await
 }
 
 // --- Jobs handlers ---
 
-async fn jobs_list_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<Json<JobListResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    // Fetch sandbox jobs scoped to the authenticated user.
-    let sandbox_jobs = store
-        .list_sandbox_jobs_for_user(&state.user_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Scope jobs to the authenticated user.
-    let mut jobs: Vec<JobInfo> = sandbox_jobs
-        .iter()
-        .filter(|j| j.user_id == state.user_id)
-        .map(|j| {
-            let ui_state = match j.status.as_str() {
-                "creating" => "pending",
-                "running" => "in_progress",
-                s => s,
-            };
-            JobInfo {
-                id: j.id,
-                title: j.task.clone(),
-                state: ui_state.to_string(),
-                user_id: j.user_id.clone(),
-                created_at: j.created_at.to_rfc3339(),
-                started_at: j.started_at.map(|dt| dt.to_rfc3339()),
-            }
-        })
-        .collect();
-
-    // Most recent first.
-    jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-    Ok(Json(JobListResponse { jobs }))
-}
-
-async fn jobs_summary_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<Json<JobSummaryResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let s = store
-        .sandbox_job_summary_for_user(&state.user_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(JobSummaryResponse {
-        total: s.total,
-        pending: s.creating,
-        in_progress: s.running,
-        completed: s.completed,
-        failed: s.failed + s.interrupted,
-        stuck: 0,
-    }))
-}
-
-async fn jobs_detail_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(id): Path<String>,
-) -> Result<Json<JobDetailResponse>, (StatusCode, String)> {
-    let job_id = Uuid::parse_str(&id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
-
-    // Try sandbox job from DB first, scoped to the authenticated user.
-    if let Some(ref store) = state.store
-        && let Ok(Some(job)) = store.get_sandbox_job(job_id).await
-    {
-        if job.user_id != state.user_id {
-            return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
-        }
-        let browse_id = std::path::Path::new(&job.project_dir)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| job.id.to_string());
-
-        let ui_state = match job.status.as_str() {
-            "creating" => "pending",
-            "running" => "in_progress",
-            s => s,
-        };
-
-        let elapsed_secs = job.started_at.map(|start| {
-            let end = job.completed_at.unwrap_or_else(chrono::Utc::now);
-            (end - start).num_seconds().max(0) as u64
-        });
-
-        // Synthesize transitions from timestamps.
-        let mut transitions = Vec::new();
-        if let Some(started) = job.started_at {
-            transitions.push(TransitionInfo {
-                from: "creating".to_string(),
-                to: "running".to_string(),
-                timestamp: started.to_rfc3339(),
-                reason: None,
-            });
-        }
-        if let Some(completed) = job.completed_at {
-            transitions.push(TransitionInfo {
-                from: "running".to_string(),
-                to: job.status.clone(),
-                timestamp: completed.to_rfc3339(),
-                reason: job.failure_reason.clone(),
-            });
-        }
-
-        return Ok(Json(JobDetailResponse {
-            id: job.id,
-            title: job.task.clone(),
-            description: String::new(),
-            state: ui_state.to_string(),
-            user_id: job.user_id.clone(),
-            created_at: job.created_at.to_rfc3339(),
-            started_at: job.started_at.map(|dt| dt.to_rfc3339()),
-            completed_at: job.completed_at.map(|dt| dt.to_rfc3339()),
-            elapsed_secs,
-            project_dir: Some(job.project_dir.clone()),
-            browse_url: Some(format!("/projects/{}/", browse_id)),
-            job_mode: {
-                let mode = store.get_sandbox_job_mode(job.id).await.ok().flatten();
-                mode.filter(|m| m != "worker")
-            },
-            transitions,
-        }));
-    }
-
-    Err((StatusCode::NOT_FOUND, "Job not found".to_string()))
-}
-
-async fn jobs_cancel_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let job_id = Uuid::parse_str(&id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
-
-    // Try sandbox job cancellation, scoped to the authenticated user.
-    if let Some(ref store) = state.store
-        && let Ok(Some(job)) = store.get_sandbox_job(job_id).await
-    {
-        if job.user_id != state.user_id {
-            return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
-        }
-        if job.status == "running" || job.status == "creating" {
-            // Stop the container if we have a job manager.
-            if let Some(ref jm) = state.job_manager
-                && let Err(e) = jm.stop_job(job_id).await
-            {
-                tracing::warn!(job_id = %job_id, error = %e, "Failed to stop container during cancellation");
-            }
-            store
-                .update_sandbox_job_status(
-                    job_id,
-                    "failed",
-                    Some(false),
-                    Some("Cancelled by user"),
-                    None,
-                    Some(chrono::Utc::now()),
-                )
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        }
-        return Ok(Json(serde_json::json!({
-            "status": "cancelled",
-            "job_id": job_id,
-        })));
-    }
-
-    Err((StatusCode::NOT_FOUND, "Job not found".to_string()))
-}
-
-async fn jobs_restart_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let jm = state.job_manager.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Sandbox not enabled".to_string(),
-    ))?;
-
-    let old_job_id = Uuid::parse_str(&id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
-
-    let old_job = store
-        .get_sandbox_job(old_job_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?;
-
-    // Scope to the authenticated user.
-    if old_job.user_id != state.user_id {
-        return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
-    }
-
-    if old_job.status != "interrupted" && old_job.status != "failed" {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("Cannot restart job in state '{}'", old_job.status),
-        ));
-    }
-
-    // Create a new job with the same task and project_dir.
-    let new_job_id = Uuid::new_v4();
-    let now = chrono::Utc::now();
-
-    let record = crate::history::SandboxJobRecord {
-        id: new_job_id,
-        task: old_job.task.clone(),
-        status: "creating".to_string(),
-        user_id: old_job.user_id.clone(),
-        project_dir: old_job.project_dir.clone(),
-        success: None,
-        failure_reason: None,
-        created_at: now,
-        started_at: None,
-        completed_at: None,
-        credential_grants_json: old_job.credential_grants_json.clone(),
-    };
-    store
-        .save_sandbox_job(&record)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Look up the original job's mode so the restart uses the same mode.
-    let mode = match store.get_sandbox_job_mode(old_job_id).await {
-        Ok(Some(m)) if m == "claude_code" => crate::orchestrator::job_manager::JobMode::ClaudeCode,
-        _ => crate::orchestrator::job_manager::JobMode::Worker,
-    };
-
-    // Restore credential grants from the original job so the restarted container
-    // has access to the same secrets.
-    let credential_grants: Vec<crate::orchestrator::auth::CredentialGrant> =
-        serde_json::from_str(&old_job.credential_grants_json).unwrap_or_else(|e| {
-            tracing::warn!(
-                job_id = %old_job.id,
-                "Failed to deserialize credential grants from stored job: {}. \
-                 Restarted job will have no credentials.",
-                e
-            );
-            vec![]
-        });
-
-    let project_dir = std::path::PathBuf::from(&old_job.project_dir);
-    let _token = jm
-        .create_job(
-            new_job_id,
-            &old_job.task,
-            Some(project_dir),
-            mode,
-            credential_grants,
-        )
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create container: {}", e),
-            )
-        })?;
-
-    store
-        .update_sandbox_job_status(new_job_id, "running", None, None, Some(now), None)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(serde_json::json!({
-        "status": "restarted",
-        "old_job_id": old_job_id,
-        "new_job_id": new_job_id,
-    })))
-}
-
-// --- Claude Code prompt and events handlers ---
-
-/// Submit a follow-up prompt to a running Claude Code sandbox job.
-async fn jobs_prompt_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(id): Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let prompt_queue = state.prompt_queue.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        "Claude Code not configured".to_string(),
-    ))?;
-
-    let job_id: uuid::Uuid = id
-        .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
-
-    // Verify user owns this job.
-    if let Some(ref store) = state.store
-        && !store
-            .sandbox_job_belongs_to_user(job_id, &state.user_id)
-            .await
-            .unwrap_or(false)
-    {
-        return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
-    }
-
-    let content = body
-        .get("content")
-        .and_then(|v| v.as_str())
-        .ok_or((
-            StatusCode::BAD_REQUEST,
-            "Missing 'content' field".to_string(),
-        ))?
-        .to_string();
-
-    let done = body.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
-
-    let prompt = crate::orchestrator::api::PendingPrompt { content, done };
-
-    {
-        let mut queue = prompt_queue.lock().await;
-        crate::orchestrator::api::enqueue_pending_prompt(&mut queue, job_id, prompt)
-            .map_err(|msg| (StatusCode::TOO_MANY_REQUESTS, msg.to_string()))?;
-    }
-
-    Ok(Json(serde_json::json!({
-        "status": "queued",
-        "job_id": job_id.to_string(),
-    })))
-}
-
-/// Load persisted job events for a job (for history replay on page open).
-async fn jobs_events_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        "Database not available".to_string(),
-    ))?;
-
-    let job_id: uuid::Uuid = id
-        .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
-
-    // Verify user owns this job.
-    if !store
-        .sandbox_job_belongs_to_user(job_id, &state.user_id)
-        .await
-        .unwrap_or(false)
-    {
-        return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
-    }
-
-    let events = store
-        .list_job_events(job_id, None)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let events_json: Vec<serde_json::Value> = events
-        .into_iter()
-        .map(|e| {
-            serde_json::json!({
-                "id": e.id,
-                "event_type": e.event_type,
-                "data": e.data,
-                "created_at": e.created_at.to_rfc3339(),
-            })
-        })
-        .collect();
-
-    Ok(Json(serde_json::json!({
-        "job_id": job_id.to_string(),
-        "events": events_json,
-    })))
-}
-
-// --- Project file handlers for sandbox jobs ---
-
-#[derive(Deserialize)]
-struct FilePathQuery {
-    path: Option<String>,
-}
-
-async fn job_files_list_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(id): Path<String>,
-    Query(query): Query<FilePathQuery>,
-) -> Result<Json<ProjectFilesResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let job_id = Uuid::parse_str(&id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
-
-    let job = store
-        .get_sandbox_job(job_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?;
-
-    // Verify user owns this job.
-    if job.user_id != state.user_id {
-        return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
-    }
-
-    let base = std::path::PathBuf::from(&job.project_dir);
-    let rel_path = query.path.as_deref().unwrap_or("");
-    let target = base.join(rel_path);
-
-    // Path traversal guard.
-    let canonical = target
-        .canonicalize()
-        .map_err(|_| (StatusCode::NOT_FOUND, "Path not found".to_string()))?;
-    let base_canonical = base
-        .canonicalize()
-        .map_err(|_| (StatusCode::NOT_FOUND, "Project dir not found".to_string()))?;
-    if !canonical.starts_with(&base_canonical) {
-        return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
-    }
-
-    let mut entries = Vec::new();
-    let mut read_dir = tokio::fs::read_dir(&canonical)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "Cannot read directory".to_string()))?;
-
-    while let Ok(Some(entry)) = read_dir.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let is_dir = entry
-            .file_type()
-            .await
-            .map(|ft| ft.is_dir())
-            .unwrap_or(false);
-        let rel = if rel_path.is_empty() {
-            name.clone()
-        } else {
-            format!("{}/{}", rel_path, name)
-        };
-        entries.push(ProjectFileEntry {
-            name,
-            path: rel,
-            is_dir,
-        });
-    }
-
-    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-
-    Ok(Json(ProjectFilesResponse { entries }))
-}
-
-async fn job_files_read_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(id): Path<String>,
-    Query(query): Query<FilePathQuery>,
-) -> Result<Json<ProjectFileReadResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let job_id = Uuid::parse_str(&id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
-
-    let job = store
-        .get_sandbox_job(job_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?;
-
-    // Verify user owns this job.
-    if job.user_id != state.user_id {
-        return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
-    }
-
-    let path = query.path.as_deref().ok_or((
-        StatusCode::BAD_REQUEST,
-        "path parameter required".to_string(),
-    ))?;
-
-    let base = std::path::PathBuf::from(&job.project_dir);
-    let file_path = base.join(path);
-
-    let canonical = file_path
-        .canonicalize()
-        .map_err(|_| (StatusCode::NOT_FOUND, "File not found".to_string()))?;
-    let base_canonical = base
-        .canonicalize()
-        .map_err(|_| (StatusCode::NOT_FOUND, "Project dir not found".to_string()))?;
-    if !canonical.starts_with(&base_canonical) {
-        return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
-    }
-
-    let content = tokio::fs::read_to_string(&canonical)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "Cannot read file".to_string()))?;
-
-    Ok(Json(ProjectFileReadResponse {
-        path: path.to_string(),
-        content,
-    }))
-}
-
-// --- Logs handlers ---
-
-async fn logs_events_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let broadcaster = state.log_broadcaster.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Log broadcaster not available".to_string(),
-    ))?;
-
-    // Replay recent history so late-joining browsers see startup logs.
-    // Subscribe BEFORE snapshotting to avoid a gap between history and live.
-    let rx = broadcaster.subscribe();
-    let history = broadcaster.recent_entries();
-
-    let history_stream = futures::stream::iter(history).map(|entry| {
-        let data = serde_json::to_string(&entry).unwrap_or_default();
-        Ok::<_, Infallible>(Event::default().event("log").data(data))
-    });
-
-    let live_stream = tokio_stream::wrappers::BroadcastStream::new(rx)
-        .filter_map(|result| result.ok())
-        .map(|entry| {
-            let data = serde_json::to_string(&entry).unwrap_or_default();
-            Ok::<_, Infallible>(Event::default().event("log").data(data))
-        });
-
-    let stream = history_stream.chain(live_stream);
-
-    Ok((
-        [("X-Accel-Buffering", "no"), ("Cache-Control", "no-cache")],
-        Sse::new(stream).keep_alive(
-            KeepAlive::new()
-                .interval(std::time::Duration::from_secs(30))
-                .text(""),
-        ),
-    ))
-}
-
-async fn logs_level_get_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let handle = state.log_level_handle.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Log level control not available".to_string(),
-    ))?;
-    Ok(Json(serde_json::json!({ "level": handle.current_level() })))
-}
-
-async fn logs_level_set_handler(
-    State(state): State<Arc<GatewayState>>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let handle = state.log_level_handle.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Log level control not available".to_string(),
-    ))?;
-
-    let level = body
-        .get("level")
-        .and_then(|v| v.as_str())
-        .ok_or((StatusCode::BAD_REQUEST, "missing 'level' field".to_string()))?;
-
-    handle
-        .set_level(level)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-
-    tracing::info!("Log level changed to '{}'", handle.current_level());
-    Ok(Json(serde_json::json!({ "level": handle.current_level() })))
-}
-
-// --- Extension handlers ---
-
-async fn extensions_list_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<Json<ExtensionListResponse>, (StatusCode, String)> {
-    let ext_mgr = state.extension_manager.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        "Extension manager not available (secrets store required)".to_string(),
-    ))?;
-
-    let installed = ext_mgr
-        .list(None, false)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let extensions = installed
-        .into_iter()
-        .map(|ext| ExtensionInfo {
-            name: ext.name,
-            kind: ext.kind.to_string(),
-            description: ext.description,
-            url: ext.url,
-            authenticated: ext.authenticated,
-            active: ext.active,
-            tools: ext.tools,
-            needs_setup: ext.needs_setup,
-        })
-        .collect();
-
-    Ok(Json(ExtensionListResponse { extensions }))
-}
-
-async fn extensions_tools_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<Json<ToolListResponse>, (StatusCode, String)> {
-    let registry = state.tool_registry.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Tool registry not available".to_string(),
-    ))?;
-
-    let definitions = registry.tool_definitions().await;
-    let tools = definitions
-        .into_iter()
-        .map(|td| ToolInfo {
-            name: td.name,
-            description: td.description,
-        })
-        .collect();
-
-    Ok(Json(ToolListResponse { tools }))
-}
-
-async fn extensions_install_handler(
-    State(state): State<Arc<GatewayState>>,
-    Json(req): Json<InstallExtensionRequest>,
-) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    // When extension manager isn't available, check registry entries for a helpful message
-    let Some(ext_mgr) = state.extension_manager.as_ref() else {
-        // Look up the entry in the catalog to give a specific error
-        if let Some(entry) = state.registry_entries.iter().find(|e| e.name == req.name) {
-            let msg = match &entry.source {
-                crate::extensions::ExtensionSource::WasmBuildable { .. } => {
-                    format!(
-                        "'{}' requires building from source. \
-                         Run `clawyer registry install {}` from the CLI.",
-                        req.name, req.name
-                    )
-                }
-                _ => format!(
-                    "Extension manager not available (secrets store required). \
-                     Configure DATABASE_URL or a secrets backend to enable installation of '{}'.",
-                    req.name
-                ),
-            };
-            return Ok(Json(ActionResponse::fail(msg)));
-        }
-        return Ok(Json(ActionResponse::fail(
-            "Extension manager not available (secrets store required)".to_string(),
-        )));
-    };
-
-    let kind_hint = req.kind.as_deref().and_then(|k| match k {
-        "mcp_server" => Some(crate::extensions::ExtensionKind::McpServer),
-        "wasm_tool" => Some(crate::extensions::ExtensionKind::WasmTool),
-        "wasm_channel" => Some(crate::extensions::ExtensionKind::WasmChannel),
-        _ => None,
-    });
-
-    match ext_mgr
-        .install(&req.name, req.url.as_deref(), kind_hint)
-        .await
-    {
-        Ok(result) => Ok(Json(ActionResponse::ok(result.message))),
-        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
-    }
-}
-
-async fn extensions_activate_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(name): Path<String>,
-) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let ext_mgr = state.extension_manager.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        "Extension manager not available (secrets store required)".to_string(),
-    ))?;
-
-    match ext_mgr.activate(&name).await {
-        Ok(result) => Ok(Json(ActionResponse::ok(result.message))),
-        Err(activate_err) => {
-            let err_str = activate_err.to_string();
-            let needs_auth = err_str.contains("authentication")
-                || err_str.contains("401")
-                || err_str.contains("Unauthorized");
-
-            if !needs_auth {
-                return Ok(Json(ActionResponse::fail(err_str)));
-            }
-
-            // Activation failed due to auth; try authenticating first.
-            match ext_mgr.auth(&name, None).await {
-                Ok(auth_result) if auth_result.status == "authenticated" => {
-                    // Auth succeeded, retry activation.
-                    match ext_mgr.activate(&name).await {
-                        Ok(result) => Ok(Json(ActionResponse::ok(result.message))),
-                        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
-                    }
-                }
-                Ok(auth_result) => {
-                    // Auth in progress (OAuth URL or awaiting manual token).
-                    let mut resp = ActionResponse::fail(
-                        auth_result
-                            .instructions
-                            .clone()
-                            .unwrap_or_else(|| format!("'{}' requires authentication.", name)),
-                    );
-                    resp.auth_url = auth_result.auth_url;
-                    resp.awaiting_token = Some(auth_result.awaiting_token);
-                    resp.instructions = auth_result.instructions;
-                    Ok(Json(resp))
-                }
-                Err(auth_err) => Ok(Json(ActionResponse::fail(format!(
-                    "Authentication failed: {}",
-                    auth_err
-                )))),
-            }
-        }
-    }
-}
-
-// --- Project file serving handlers ---
-
-/// Redirect `/projects/{id}` to `/projects/{id}/` so relative paths in
-/// the served HTML resolve within the project namespace.
-async fn project_redirect_handler(Path(project_id): Path<String>) -> impl IntoResponse {
-    axum::response::Redirect::permanent(&format!("/projects/{project_id}/"))
-}
-
-/// Serve `index.html` when hitting `/projects/{project_id}/`.
-async fn project_index_handler(Path(project_id): Path<String>) -> impl IntoResponse {
-    serve_project_file(&project_id, "index.html").await
-}
-
-/// Serve any file under `/projects/{project_id}/{path}`.
-async fn project_file_handler(
-    Path((project_id, path)): Path<(String, String)>,
-) -> impl IntoResponse {
-    serve_project_file(&project_id, &path).await
-}
-
-/// Shared logic: resolve the file inside `~/.clawyer/projects/{project_id}/`,
-/// guard against path traversal, and stream the content with the right MIME type.
-async fn serve_project_file(project_id: &str, path: &str) -> axum::response::Response {
-    // Reject project_id values that could escape the projects directory.
-    if project_id.contains('/')
-        || project_id.contains('\\')
-        || project_id.contains("..")
-        || project_id.is_empty()
-    {
-        return (StatusCode::BAD_REQUEST, "Invalid project ID").into_response();
-    }
-
-    let base = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".clawyer")
-        .join("projects")
-        .join(project_id);
-
-    let file_path = base.join(path);
-
-    // Path traversal guard
-    let canonical = match file_path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
-    };
-    let base_canonical = match base.canonicalize() {
-        Ok(p) => p,
-        Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
-    };
-    if !canonical.starts_with(&base_canonical) {
-        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
-    }
-
-    match tokio::fs::read(&canonical).await {
-        Ok(contents) => {
-            let mime = mime_guess::from_path(&canonical)
-                .first_or_octet_stream()
-                .to_string();
-            ([(header::CONTENT_TYPE, mime)], contents).into_response()
-        }
-        Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
-    }
-}
-
-async fn extensions_remove_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(name): Path<String>,
-) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let ext_mgr = state.extension_manager.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        "Extension manager not available (secrets store required)".to_string(),
-    ))?;
-
-    match ext_mgr.remove(&name).await {
-        Ok(message) => Ok(Json(ActionResponse::ok(message))),
-        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
-    }
-}
-
-async fn extensions_registry_handler(
-    State(state): State<Arc<GatewayState>>,
-    Query(params): Query<RegistrySearchQuery>,
-) -> Json<RegistrySearchResponse> {
-    let query = params.query.unwrap_or_default();
-    let query_lower = query.to_lowercase();
-    let tokens: Vec<&str> = query_lower.split_whitespace().collect();
-
-    // Filter registry entries by query (or return all if empty)
-    let matching: Vec<&crate::extensions::RegistryEntry> = if tokens.is_empty() {
-        state.registry_entries.iter().collect()
-    } else {
-        state
-            .registry_entries
-            .iter()
-            .filter(|e| {
-                let name = e.name.to_lowercase();
-                let display = e.display_name.to_lowercase();
-                let desc = e.description.to_lowercase();
-                tokens.iter().any(|t| {
-                    name.contains(t)
-                        || display.contains(t)
-                        || desc.contains(t)
-                        || e.keywords.iter().any(|k| k.to_lowercase().contains(t))
-                })
-            })
-            .collect()
-    };
-
-    // Cross-reference with installed extensions by (name, kind) to avoid
-    // false positives when the same name exists as different kinds.
-    let installed: std::collections::HashSet<(String, String)> =
-        if let Some(ext_mgr) = state.extension_manager.as_ref() {
-            ext_mgr
-                .list(None, false)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|ext| (ext.name, ext.kind.to_string()))
-                .collect()
-        } else {
-            std::collections::HashSet::new()
-        };
-
-    let entries = matching
-        .into_iter()
-        .map(|e| {
-            let kind_str = e.kind.to_string();
-            RegistryEntryInfo {
-                name: e.name.clone(),
-                display_name: e.display_name.clone(),
-                installed: installed.contains(&(e.name.clone(), kind_str.clone())),
-                kind: kind_str,
-                description: e.description.clone(),
-                keywords: e.keywords.clone(),
-            }
-        })
-        .collect();
-
-    Json(RegistrySearchResponse { entries })
-}
-
-async fn extensions_setup_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(name): Path<String>,
-) -> Result<Json<ExtensionSetupResponse>, (StatusCode, String)> {
-    let ext_mgr = state.extension_manager.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        "Extension manager not available (secrets store required)".to_string(),
-    ))?;
-
-    let secrets = ext_mgr
-        .get_setup_schema(&name)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let kind = ext_mgr
-        .list(None, false)
-        .await
-        .ok()
-        .and_then(|list| list.into_iter().find(|e| e.name == name))
-        .map(|e| e.kind.to_string())
-        .unwrap_or_default();
-
-    Ok(Json(ExtensionSetupResponse {
-        name,
-        kind,
-        secrets,
-    }))
-}
-
-async fn extensions_setup_submit_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(name): Path<String>,
-    Json(req): Json<ExtensionSetupRequest>,
-) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let ext_mgr = state.extension_manager.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        "Extension manager not available (secrets store required)".to_string(),
-    ))?;
-
-    match ext_mgr.save_setup_secrets(&name, &req.secrets).await {
-        Ok(message) => Ok(Json(ActionResponse::ok(message))),
-        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
-    }
-}
-
-// --- Pairing handlers ---
-
-async fn pairing_list_handler(
-    Path(channel): Path<String>,
-) -> Result<Json<PairingListResponse>, (StatusCode, String)> {
-    let store = crate::pairing::PairingStore::new();
-    let requests = store
-        .list_pending(&channel)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let infos = requests
-        .into_iter()
-        .map(|r| PairingRequestInfo {
-            code: r.code,
-            sender_id: r.id,
-            meta: r.meta,
-            created_at: r.created_at,
-        })
-        .collect();
-
-    Ok(Json(PairingListResponse {
-        channel,
-        requests: infos,
-    }))
-}
-
-async fn pairing_approve_handler(
-    Path(channel): Path<String>,
-    Json(req): Json<PairingApproveRequest>,
-) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let store = crate::pairing::PairingStore::new();
-    match store.approve(&channel, &req.code) {
-        Ok(Some(approved)) => Ok(Json(ActionResponse::ok(format!(
-            "Pairing approved for sender '{}'",
-            approved.id
-        )))),
-        Ok(None) => Ok(Json(ActionResponse::fail(
-            "Invalid or expired pairing code".to_string(),
-        ))),
-        Err(crate::pairing::PairingStoreError::ApproveRateLimited) => Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many failed approve attempts; try again later".to_string(),
-        )),
-        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
-    }
-}
-
-// --- Routines handlers ---
-
-async fn routines_list_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<Json<RoutineListResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let routines = store
-        .list_routines(&state.user_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let items: Vec<RoutineInfo> = routines.iter().map(routine_to_info).collect();
-
-    Ok(Json(RoutineListResponse { routines: items }))
-}
-
-async fn routines_summary_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<Json<RoutineSummaryResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let routines = store
-        .list_routines(&state.user_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let total = routines.len() as u64;
-    let enabled = routines.iter().filter(|r| r.enabled).count() as u64;
-    let disabled = total - enabled;
-    let failing = routines
-        .iter()
-        .filter(|r| r.consecutive_failures > 0)
-        .count() as u64;
-
-    let today_start = chrono::Utc::now()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .map(|dt| dt.and_utc());
-    let runs_today = if let Some(start) = today_start {
-        routines
-            .iter()
-            .filter(|r| r.last_run_at.is_some_and(|ts| ts >= start))
-            .count() as u64
-    } else {
-        0
-    };
-
-    Ok(Json(RoutineSummaryResponse {
-        total,
-        enabled,
-        disabled,
-        failing,
-        runs_today,
-    }))
-}
-
-async fn routines_detail_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(id): Path<String>,
-) -> Result<Json<RoutineDetailResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let routine_id = Uuid::parse_str(&id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
-
-    let routine = store
-        .get_routine(routine_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
-
-    let runs = store
-        .list_routine_runs(routine_id, 20)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let recent_runs: Vec<RoutineRunInfo> = runs
-        .iter()
-        .map(|run| RoutineRunInfo {
-            id: run.id,
-            trigger_type: run.trigger_type.clone(),
-            started_at: run.started_at.to_rfc3339(),
-            completed_at: run.completed_at.map(|dt| dt.to_rfc3339()),
-            status: format!("{:?}", run.status),
-            result_summary: run.result_summary.clone(),
-            tokens_used: run.tokens_used,
-        })
-        .collect();
-
-    Ok(Json(RoutineDetailResponse {
-        id: routine.id,
-        name: routine.name.clone(),
-        description: routine.description.clone(),
-        enabled: routine.enabled,
-        trigger: serde_json::to_value(&routine.trigger).unwrap_or_default(),
-        action: serde_json::to_value(&routine.action).unwrap_or_default(),
-        guardrails: serde_json::to_value(&routine.guardrails).unwrap_or_default(),
-        notify: serde_json::to_value(&routine.notify).unwrap_or_default(),
-        last_run_at: routine.last_run_at.map(|dt| dt.to_rfc3339()),
-        next_fire_at: routine.next_fire_at.map(|dt| dt.to_rfc3339()),
-        run_count: routine.run_count,
-        consecutive_failures: routine.consecutive_failures,
-        created_at: routine.created_at.to_rfc3339(),
-        recent_runs,
-    }))
-}
-
-async fn routines_trigger_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let routine_id = Uuid::parse_str(&id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
-
-    let routine = store
-        .get_routine(routine_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
-
-    // Send the routine prompt through the message pipeline as a manual trigger.
-    let prompt = match &routine.action {
-        crate::agent::routine::RoutineAction::Lightweight { prompt, .. } => prompt.clone(),
-        crate::agent::routine::RoutineAction::FullJob {
-            title, description, ..
-        } => format!("{}: {}", title, description),
-    };
-
-    let content = format!("[routine:{}] {}", routine.name, prompt);
-    let msg = IncomingMessage::new("gateway", &state.user_id, content);
-
-    let tx_guard = state.msg_tx.read().await;
-    let tx = tx_guard.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Channel not started".to_string(),
-    ))?;
-
-    tx.send(msg).await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Channel closed".to_string(),
-        )
-    })?;
-
-    Ok(Json(serde_json::json!({
-        "status": "triggered",
-        "routine_id": routine_id,
-    })))
-}
-
-#[derive(Deserialize)]
-struct ToggleRequest {
-    enabled: Option<bool>,
-}
-
-async fn routines_toggle_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(id): Path<String>,
-    body: Option<Json<ToggleRequest>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let routine_id = Uuid::parse_str(&id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
-
-    let mut routine = store
-        .get_routine(routine_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
-
-    // If a specific value was provided, use it; otherwise toggle.
-    routine.enabled = match body {
-        Some(Json(req)) => req.enabled.unwrap_or(!routine.enabled),
-        None => !routine.enabled,
-    };
-
-    store
-        .update_routine(&routine)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(serde_json::json!({
-        "status": if routine.enabled { "enabled" } else { "disabled" },
-        "routine_id": routine_id,
-    })))
-}
-
-async fn routines_delete_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let routine_id = Uuid::parse_str(&id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
-
-    let deleted = store
-        .delete_routine(routine_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if deleted {
-        Ok(Json(serde_json::json!({
-            "status": "deleted",
-            "routine_id": routine_id,
-        })))
-    } else {
-        Err((StatusCode::NOT_FOUND, "Routine not found".to_string()))
-    }
-}
-
-async fn routines_runs_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let routine_id = Uuid::parse_str(&id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
-
-    let runs = store
-        .list_routine_runs(routine_id, 50)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let run_infos: Vec<RoutineRunInfo> = runs
-        .iter()
-        .map(|run| RoutineRunInfo {
-            id: run.id,
-            trigger_type: run.trigger_type.clone(),
-            started_at: run.started_at.to_rfc3339(),
-            completed_at: run.completed_at.map(|dt| dt.to_rfc3339()),
-            status: format!("{:?}", run.status),
-            result_summary: run.result_summary.clone(),
-            tokens_used: run.tokens_used,
-        })
-        .collect();
-
-    Ok(Json(serde_json::json!({
-        "routine_id": routine_id,
-        "runs": run_infos,
-    })))
-}
-
-/// Convert a Routine to the trimmed RoutineInfo for list display.
-fn routine_to_info(r: &crate::agent::routine::Routine) -> RoutineInfo {
-    let (trigger_type, trigger_summary) = match &r.trigger {
-        crate::agent::routine::Trigger::Cron { schedule } => {
-            ("cron".to_string(), format!("cron: {}", schedule))
-        }
-        crate::agent::routine::Trigger::Event {
-            pattern, channel, ..
-        } => {
-            let ch = channel.as_deref().unwrap_or("any");
-            ("event".to_string(), format!("on {} /{}/", ch, pattern))
-        }
-        crate::agent::routine::Trigger::Webhook { path, .. } => {
-            let p = path.as_deref().unwrap_or("/");
-            ("webhook".to_string(), format!("webhook: {}", p))
-        }
-        crate::agent::routine::Trigger::Manual => ("manual".to_string(), "manual only".to_string()),
-    };
-
-    let action_type = match &r.action {
-        crate::agent::routine::RoutineAction::Lightweight { .. } => "lightweight",
-        crate::agent::routine::RoutineAction::FullJob { .. } => "full_job",
-    };
-
-    let status = if !r.enabled {
-        "disabled"
-    } else if r.consecutive_failures > 0 {
-        "failing"
-    } else {
-        "active"
-    };
-
-    RoutineInfo {
-        id: r.id,
-        name: r.name.clone(),
-        description: r.description.clone(),
-        enabled: r.enabled,
-        trigger_type,
-        trigger_summary,
-        action_type: action_type.to_string(),
-        last_run_at: r.last_run_at.map(|dt| dt.to_rfc3339()),
-        next_fire_at: r.next_fire_at.map(|dt| dt.to_rfc3339()),
-        run_count: r.run_count,
-        consecutive_failures: r.consecutive_failures,
-        status: status.to_string(),
-    }
-}
-
-async fn routines_create_handler(
-    State(state): State<Arc<GatewayState>>,
-    Json(req): Json<RoutineCreateRequest>,
-) -> Result<(StatusCode, Json<RoutineInfo>), (StatusCode, String)> {
-    use crate::agent::routine::{
-        NotifyConfig, Routine, RoutineAction, RoutineGuardrails, Trigger, next_cron_fire,
-    };
-
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let name = req.name.trim().to_string();
-    if name.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "name is required".to_string()));
-    }
-
-    // Build trigger
-    let trigger = match req.trigger_type.as_str() {
-        "cron" => {
-            let schedule = req.schedule.as_deref().ok_or((
-                StatusCode::BAD_REQUEST,
-                "schedule is required for cron trigger".to_string(),
-            ))?;
-            next_cron_fire(schedule).map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid cron schedule: {e}"),
-                )
-            })?;
-            Trigger::Cron {
-                schedule: schedule.to_string(),
-            }
-        }
-        "event" => {
-            let pattern = req.event_pattern.as_deref().ok_or((
-                StatusCode::BAD_REQUEST,
-                "event_pattern is required for event trigger".to_string(),
-            ))?;
-            regex::Regex::new(pattern)
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid regex: {e}")))?;
-            Trigger::Event {
-                pattern: pattern.to_string(),
-                channel: req.event_channel.clone(),
-            }
-        }
-        "webhook" => Trigger::Webhook {
-            path: None,
-            secret: None,
-        },
-        "manual" => Trigger::Manual,
-        other => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("unknown trigger_type: {other}"),
-            ));
-        }
-    };
-
-    // Compute next fire time for cron triggers
-    let next_fire = if let Trigger::Cron { ref schedule } = trigger {
-        next_cron_fire(schedule).unwrap_or(None)
-    } else {
-        None
-    };
-
-    // Build action
-    let action_type = req.action_type.as_deref().unwrap_or("lightweight");
-    let context_paths = req.context_paths.unwrap_or_default();
-    let action = match action_type {
-        "lightweight" => RoutineAction::Lightweight {
-            prompt: req.prompt.clone(),
-            context_paths,
-            max_tokens: 4096,
-        },
-        "full_job" => RoutineAction::FullJob {
-            title: name.clone(),
-            description: req.prompt.clone(),
-            max_iterations: 10,
-        },
-        other => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("unknown action_type: {other}"),
-            ));
-        }
-    };
-
-    let cooldown_secs = req.cooldown_secs.unwrap_or(300);
-    let now = chrono::Utc::now();
-    let routine = Routine {
-        id: Uuid::new_v4(),
-        name: name.clone(),
-        description: req.description.unwrap_or_default(),
-        user_id: state.user_id.clone(),
-        enabled: true,
-        trigger,
-        action,
-        guardrails: RoutineGuardrails {
-            cooldown: std::time::Duration::from_secs(cooldown_secs),
-            max_concurrent: 1,
-            dedup_window: None,
-        },
-        notify: NotifyConfig::default(),
-        last_run_at: None,
-        next_fire_at: next_fire,
-        run_count: 0,
-        consecutive_failures: 0,
-        state: serde_json::json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-
-    store
-        .create_routine(&routine)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok((StatusCode::CREATED, Json(routine_to_info(&routine))))
-}
-
-// --- Settings handlers ---
-
-async fn settings_list_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<Json<SettingsListResponse>, StatusCode> {
-    let store = state
-        .store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let rows = store.list_settings(&state.user_id).await.map_err(|e| {
-        tracing::error!("Failed to list settings: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let settings = rows
-        .into_iter()
-        .map(|r| SettingResponse {
-            key: r.key,
-            value: r.value,
-            updated_at: r.updated_at.to_rfc3339(),
-        })
-        .collect();
-
-    Ok(Json(SettingsListResponse { settings }))
-}
-
-async fn settings_get_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(key): Path<String>,
-) -> Result<Json<SettingResponse>, StatusCode> {
-    let store = state
-        .store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let row = store
-        .get_setting_full(&state.user_id, &key)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to get setting '{}': {}", key, e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    Ok(Json(SettingResponse {
-        key: row.key,
-        value: row.value,
-        updated_at: row.updated_at.to_rfc3339(),
-    }))
-}
-
-async fn settings_set_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(key): Path<String>,
-    Json(body): Json<SettingWriteRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let store = state
-        .store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    store
-        .set_setting(&state.user_id, &key, &body.value)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to set setting '{}': {}", key, e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn settings_delete_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(key): Path<String>,
-) -> Result<StatusCode, StatusCode> {
-    let store = state
-        .store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    store
-        .delete_setting(&state.user_id, &key)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to delete setting '{}': {}", key, e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn settings_export_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<Json<SettingsExportResponse>, StatusCode> {
-    let store = state
-        .store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let settings = store.get_all_settings(&state.user_id).await.map_err(|e| {
-        tracing::error!("Failed to export settings: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    Ok(Json(SettingsExportResponse { settings }))
-}
-
-async fn settings_import_handler(
-    State(state): State<Arc<GatewayState>>,
-    Json(body): Json<SettingsImportRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let store = state
-        .store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    store
-        .set_all_settings(&state.user_id, &body.settings)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to import settings: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-fn parse_multipart_bool(raw: &str) -> bool {
-    matches!(
-        raw.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-async fn resolve_backup_master_key() -> Result<secrecy::SecretString, (StatusCode, String)> {
-    let secrets = crate::config::SecretsConfig::resolve()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    secrets.master_key().cloned().ok_or((
-        StatusCode::CONFLICT,
-        "SECRETS_MASTER_KEY (or keychain-backed master key) is required".to_string(),
-    ))
-}
-
+#[cfg(test)]
+#[allow(dead_code)]
 async fn backups_create_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<BackupCreateRequest>,
 ) -> Result<(StatusCode, Json<BackupCreateResponse>), (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let master_key = resolve_backup_master_key().await?;
-
-    let backup_dir = crate::legal::backup::backups_dir()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    tokio::fs::create_dir_all(&backup_dir)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let backup_id = format!(
-        "backup-{}-{}",
-        Utc::now().format("%Y%m%d-%H%M%S"),
-        Uuid::new_v4().simple()
-    );
-    let output_path = backup_dir.join(format!("{backup_id}.clawyerbak"));
-    let legal = legal_config_for_gateway(state.as_ref());
-
-    let result = crate::legal::backup::create_backup_file(
-        store.as_ref(),
-        workspace.as_ref(),
-        &state.user_id,
-        &output_path,
-        &master_key,
-        &crate::legal::backup::BackupCreateOptions {
-            include_ai_packets: req.include_ai_packets,
-            matter_root: legal.matter_root.clone(),
-        },
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    record_legal_audit_event(
-        state.as_ref(),
-        "backup_created",
-        state.user_id.as_str(),
-        None,
-        AuditSeverity::Info,
-        serde_json::json!({
-            "backup_id": result.artifact.id,
-            "path": result.artifact.path,
-            "size_bytes": result.artifact.size_bytes,
-            "include_ai_packets": req.include_ai_packets,
-        }),
-    )
-    .await;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(BackupCreateResponse {
-            artifact: BackupArtifactInfo {
-                id: result.artifact.id,
-                path: result.artifact.path,
-                created_at: result.artifact.created_at,
-                size_bytes: result.artifact.size_bytes,
-                encrypted: result.artifact.encrypted,
-                plaintext_sha256: result.artifact.plaintext_sha256,
-            },
-            warnings: result.warnings,
-            manifest: serde_json::to_value(result.manifest).unwrap_or_default(),
-        }),
-    ))
+    crate::channels::web::handlers::backups::backups_create_handler(State(state), Json(req)).await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn backups_verify_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<BackupVerifyRequest>,
 ) -> Result<Json<BackupVerifyResponse>, (StatusCode, String)> {
-    let master_key = resolve_backup_master_key().await?;
-    let input_path = crate::legal::backup::backup_path_for_id(&req.backup_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    if !input_path.exists() {
-        return Err((StatusCode::NOT_FOUND, "Backup not found".to_string()));
-    }
-
-    let report = crate::legal::backup::verify_backup_file(&input_path, &master_key)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-
-    record_legal_audit_event(
-        state.as_ref(),
-        "backup_verified",
-        state.user_id.as_str(),
-        None,
-        AuditSeverity::Info,
-        serde_json::json!({
-            "backup_id": req.backup_id,
-            "path": input_path.to_string_lossy(),
-            "valid": report.valid,
-            "warning_count": report.warnings.len(),
-        }),
-    )
-    .await;
-
-    Ok(Json(BackupVerifyResponse {
-        valid: report.valid,
-        warnings: report.warnings,
-        manifest: serde_json::to_value(report.manifest).unwrap_or_default(),
-    }))
+    crate::channels::web::handlers::backups::backups_verify_handler(State(state), Json(req)).await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn backups_download_handler(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let input_path = crate::legal::backup::backup_path_for_id(&id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let bytes = tokio::fs::read(&input_path)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "Backup not found".to_string()))?;
-
-    let file_name = input_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("backup.clawyerbak")
-        .to_string();
-
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{}\"", file_name),
-            ),
-        ],
-        bytes,
-    ))
+    crate::channels::web::handlers::backups::backups_download_handler(Path(id)).await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn backups_restore_handler(
     State(state): State<Arc<GatewayState>>,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> Result<Json<BackupRestoreResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let master_key = resolve_backup_master_key().await?;
-    let legal = legal_config_for_gateway(state.as_ref());
-
-    let mut apply = false;
-    let mut strict = false;
-    let mut protect_identity_files = true;
-    let mut file_bytes: Option<Vec<u8>> = None;
-    let mut uploaded_name: Option<String> = None;
-
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Multipart read error: {}", e),
-        )
-    })? {
-        let name = field.name().unwrap_or_default().to_string();
-        if name == "apply" {
-            let value = field.text().await.map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid apply flag: {}", e),
-                )
-            })?;
-            apply = parse_multipart_bool(&value);
-            continue;
-        }
-        if name == "strict" {
-            let value = field.text().await.map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid strict flag: {}", e),
-                )
-            })?;
-            strict = parse_multipart_bool(&value);
-            continue;
-        }
-        if name == "protect_identity_files" {
-            let value = field.text().await.map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid protect_identity_files flag: {}", e),
-                )
-            })?;
-            protect_identity_files = parse_multipart_bool(&value);
-            continue;
-        }
-
-        let filename_hint = field.file_name().map(|v| v.to_string());
-        let bytes = field.bytes().await.map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Invalid backup file: {}", e),
-            )
-        })?;
-        file_bytes = Some(bytes.to_vec());
-        uploaded_name = filename_hint;
-    }
-
-    let file_bytes = file_bytes.ok_or((
-        StatusCode::BAD_REQUEST,
-        "Missing backup file multipart field".to_string(),
-    ))?;
-
-    let backup_dir = crate::legal::backup::backups_dir()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    tokio::fs::create_dir_all(&backup_dir)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let temp_path = backup_dir.join(format!(
-        "restore-upload-{}-{}.clawyerbak",
-        Utc::now().format("%Y%m%d-%H%M%S"),
-        Uuid::new_v4().simple()
-    ));
-    tokio::fs::write(&temp_path, &file_bytes)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        if let Err(err) = std::fs::set_permissions(&temp_path, perms) {
-            tracing::warn!(
-                "failed to tighten restore upload permissions for {}: {}",
-                temp_path.to_string_lossy(),
-                err
-            );
-        }
-    }
-
-    let restore_result = crate::legal::backup::restore_backup_file(
-        store.as_ref(),
-        workspace.as_ref(),
-        &state.user_id,
-        &temp_path,
-        &master_key,
-        &crate::legal::backup::BackupRestoreOptions {
-            apply,
-            strict,
-            protect_identity_files,
-            matter_root: legal.matter_root.clone(),
-        },
-    )
-    .await;
-
-    let _ = tokio::fs::remove_file(&temp_path).await;
-    let report = restore_result.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-
-    record_legal_audit_event(
-        state.as_ref(),
-        "backup_restored",
-        state.user_id.as_str(),
-        None,
-        if apply {
-            AuditSeverity::Warn
-        } else {
-            AuditSeverity::Info
-        },
-        serde_json::json!({
-            "uploaded_name": uploaded_name,
-            "apply": apply,
-            "strict": strict,
-            "protect_identity_files": protect_identity_files,
-            "restored_settings": report.restored_settings,
-            "restored_workspace_files": report.restored_workspace_files,
-            "skipped_workspace_files": report.skipped_workspace_files,
-            "critical_failure_count": report.critical_failures.len(),
-            "warning_count": report.warnings.len(),
-        }),
-    )
-    .await;
-
-    Ok(Json(BackupRestoreResponse {
-        valid: report.valid,
-        dry_run: report.dry_run,
-        applied: report.applied,
-        strict: report.strict,
-        restored_settings: report.restored_settings,
-        restored_workspace_files: report.restored_workspace_files,
-        skipped_workspace_files: report.skipped_workspace_files,
-        integrity: serde_json::to_value(report.integrity).unwrap_or_default(),
-        critical_failures: report.critical_failures,
-        warnings: report.warnings,
-        manifest: serde_json::to_value(report.manifest).unwrap_or_default(),
-    }))
+    crate::channels::web::handlers::backups::backups_restore_handler(State(state), multipart).await
 }
 
 // --- Gateway control plane handlers ---
-
-async fn gateway_status_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> Json<GatewayStatusResponse> {
-    let sse_connections = state.sse.connection_count();
-    let ws_connections = state
-        .ws_tracker
-        .as_ref()
-        .map(|t| t.connection_count())
-        .unwrap_or(0);
-
-    let uptime_secs = state.startup_time.elapsed().as_secs();
-
-    let (daily_cost, actions_this_hour, model_usage) = if let Some(ref cg) = state.cost_guard {
-        let cost = cg.daily_spend().await;
-        let actions = cg.actions_this_hour().await;
-        let usage = cg.model_usage().await;
-        let models: Vec<ModelUsageEntry> = usage
-            .into_iter()
-            .map(|(model, tokens)| ModelUsageEntry {
-                model,
-                input_tokens: tokens.input_tokens,
-                output_tokens: tokens.output_tokens,
-                cost: format!("{:.6}", tokens.cost),
-            })
-            .collect();
-        (Some(format!("{:.4}", cost)), Some(actions), Some(models))
-    } else {
-        (None, None, None)
-    };
-
-    Json(GatewayStatusResponse {
-        sse_connections,
-        ws_connections,
-        total_connections: sse_connections + ws_connections,
-        uptime_secs,
-        daily_cost,
-        actions_this_hour,
-        model_usage,
-    })
-}
-
-#[derive(serde::Serialize)]
-struct ModelUsageEntry {
-    model: String,
-    input_tokens: u64,
-    output_tokens: u64,
-    cost: String,
-}
-
-#[derive(serde::Serialize)]
-struct GatewayStatusResponse {
-    sse_connections: u64,
-    ws_connections: u64,
-    total_connections: u64,
-    uptime_secs: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    daily_cost: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    actions_this_hour: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model_usage: Option<Vec<ModelUsageEntry>>,
-}
 
 #[cfg(test)]
 mod tests {
