@@ -535,11 +535,12 @@ pub async fn restore_backup_file(
 
             if options.protect_identity_files && is_protected_identity_path(&normalized_path) {
                 skipped_workspace_files += 1;
-                push_critical(
-                    &mut warnings,
-                    &mut critical_failures,
-                    format!("skipped protected identity file '{}'", normalized_path),
-                );
+                // This skip is expected in default restore posture and should not
+                // make strict mode fail by itself.
+                warnings.push(format!(
+                    "skipped protected identity file '{}'",
+                    normalized_path
+                ));
                 continue;
             }
 
