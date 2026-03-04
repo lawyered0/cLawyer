@@ -2,6 +2,7 @@
 
 pub mod backups;
 pub mod chat;
+pub mod common;
 pub mod extensions;
 pub mod gateway;
 pub mod jobs;

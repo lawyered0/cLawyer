@@ -21,6 +21,8 @@ pub mod openai_compat;
 pub mod server;
 pub mod sse;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod types;
 pub mod ws;
 

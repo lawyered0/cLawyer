@@ -1,98 +1,15 @@
-
 use super::*;
 use std::sync::Arc;
 
+use crate::channels::web::test_support::{
+    TestLlmProvider, assert_no_inline_event_handlers, minimal_test_gateway_state,
+};
 use crate::db::ConflictDecision;
-use async_trait::async_trait;
+use crate::workspace::Workspace;
+use axum::http::StatusCode;
+use chrono::Utc;
 use regex::Regex;
-
-struct TestLlmProvider {
-    model: String,
-    content: String,
-}
-
-#[async_trait]
-impl crate::llm::LlmProvider for TestLlmProvider {
-    fn model_name(&self) -> &str {
-        &self.model
-    }
-
-    fn cost_per_token(&self) -> (Decimal, Decimal) {
-        (Decimal::ZERO, Decimal::ZERO)
-    }
-
-    async fn complete(
-        &self,
-        _request: CompletionRequest,
-    ) -> Result<crate::llm::CompletionResponse, crate::error::LlmError> {
-        Ok(crate::llm::CompletionResponse {
-            content: self.content.clone(),
-            input_tokens: 12,
-            output_tokens: 34,
-            finish_reason: crate::llm::FinishReason::Stop,
-        })
-    }
-
-    async fn complete_with_tools(
-        &self,
-        _request: crate::llm::ToolCompletionRequest,
-    ) -> Result<crate::llm::ToolCompletionResponse, crate::error::LlmError> {
-        Ok(crate::llm::ToolCompletionResponse {
-            content: Some(self.content.clone()),
-            tool_calls: Vec::new(),
-            input_tokens: 12,
-            output_tokens: 34,
-            finish_reason: crate::llm::FinishReason::Stop,
-        })
-    }
-}
-
-fn minimal_test_gateway_state(
-    llm_provider: Option<Arc<dyn crate::llm::LlmProvider>>,
-) -> Arc<GatewayState> {
-    Arc::new(GatewayState {
-        msg_tx: tokio::sync::RwLock::new(None),
-        sse: SseManager::new(),
-        workspace: None,
-        session_manager: None,
-        log_broadcaster: None,
-        log_level_handle: None,
-        extension_manager: None,
-        tool_registry: None,
-        store: None,
-        job_manager: None,
-        prompt_queue: None,
-        user_id: "test-user".to_string(),
-        shutdown_tx: tokio::sync::RwLock::new(None),
-        ws_tracker: Some(Arc::new(
-            crate::channels::web::ws::WsConnectionTracker::new(),
-        )),
-        llm_provider,
-        skill_registry: None,
-        skill_catalog: None,
-        chat_rate_limiter: RateLimiter::new(30, 60),
-        registry_entries: Vec::new(),
-        cost_guard: None,
-        startup_time: std::time::Instant::now(),
-        legal_config: Some(
-            crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
-                .expect("default legal config"),
-        ),
-        runtime_facts: crate::compliance::ComplianceRuntimeFacts::default(),
-    })
-}
-
-fn assert_no_inline_event_handlers(asset_name: &str, content: &str) {
-    let patterns = ["onclick=", "onchange=", "oninput="];
-    for pattern in patterns {
-        assert!(
-            !content.contains(pattern),
-            "{} unexpectedly contains inline event handler pattern '{}'",
-            asset_name,
-            pattern
-        );
-    }
-}
+use uuid::Uuid;
 
 #[test]
 fn test_build_turns_from_db_messages_complete() {
