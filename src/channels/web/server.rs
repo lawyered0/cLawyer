@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, State},
     http::{StatusCode, header},
     middleware,
     routing::{get, post},
@@ -27,9 +27,8 @@ use crate::db::{
     AuditSeverity, ClientType, ConflictClearanceRecord, ConflictDecision, ConflictHit,
     CreateClientParams, CreateDocumentVersionParams, CreateMatterDeadlineParams, ExpenseCategory,
     InvoiceLineItemRecord, InvoiceRecord, MatterDeadlineType, MatterDocumentCategory, MatterStatus,
-    MatterTaskStatus, TrustLedgerEntryRecord, UpdateClientParams, UpdateMatterDeadlineParams,
-    UpdateMatterParams, UpsertDocumentTemplateParams, UpsertMatterDocumentParams,
-    UpsertMatterParams,
+    MatterTaskStatus, TrustLedgerEntryRecord, UpsertDocumentTemplateParams,
+    UpsertMatterDocumentParams, UpsertMatterParams,
 };
 #[cfg(test)]
 use crate::llm::CompletionRequest;
@@ -42,7 +41,7 @@ use crate::channels::web::sse::SseManager;
 pub use crate::channels::web::state::{GatewayState, PromptQueue, RateLimiter};
 #[cfg(test)]
 use axum::{
-    extract::{Multipart, WebSocketUpgrade},
+    extract::{Multipart, Path, Query, WebSocketUpgrade},
     response::IntoResponse,
 };
 
@@ -78,43 +77,7 @@ pub async fn start_server(
     let protected = Router::new()
         .merge(crate::channels::web::handlers::routes::protected_feature_routes())
         // Matters
-        .route(
-            "/api/matters",
-            get(matters_list_handler).post(matters_create_handler),
-        )
-        .route(
-            "/api/clients",
-            get(clients_list_handler).post(clients_create_handler),
-        )
-        .route(
-            "/api/clients/{id}",
-            get(clients_get_handler)
-                .patch(clients_patch_handler)
-                .delete(clients_delete_handler),
-        )
-        .route(
-            "/api/matters/{id}",
-            get(matter_get_handler)
-                .patch(matter_patch_handler)
-                .delete(matter_delete_handler),
-        )
-        .route(
-            "/api/matters/active",
-            get(matters_active_get_handler).post(matters_active_set_handler),
-        )
-        .route(
-            "/api/matters/{id}/deadlines",
-            get(matter_deadlines_handler).post(matter_deadlines_create_handler),
-        )
-        .route(
-            "/api/matters/{id}/deadlines/{deadline_id}",
-            axum::routing::patch(matter_deadlines_patch_handler)
-                .delete(matter_deadlines_delete_handler),
-        )
-        .route(
-            "/api/matters/{id}/deadlines/compute",
-            post(matter_deadlines_compute_handler),
-        )
+        .route("/api/matters", post(matters_create_handler))
         // OpenAI-compatible API
         .route(
             "/v1/chat/completions",
@@ -495,7 +458,7 @@ async fn memory_upload_handler(
 /// Default workspace path prefix where matter directories live.
 const MATTER_ROOT: &str = "matters";
 /// Settings key used to persist the active matter ID.
-const MATTER_ACTIVE_SETTING: &str = "legal.active_matter";
+pub(crate) const MATTER_ACTIVE_SETTING: &str = "legal.active_matter";
 /// Maximum number of party names accepted by intake conflict endpoints.
 pub(crate) const MAX_INTAKE_CONFLICT_PARTIES: usize = 64;
 /// Maximum length for a single intake party name.
@@ -536,7 +499,7 @@ fn matter_prefix_for_gateway(state: &GatewayState, matter_id: &str) -> String {
     format!("{}/{matter_id}", matter_root_for_gateway(state))
 }
 
-fn matter_metadata_path_for_gateway(state: &GatewayState, matter_id: &str) -> String {
+pub(crate) fn matter_metadata_path_for_gateway(state: &GatewayState, matter_id: &str) -> String {
     format!(
         "{}/matter.yaml",
         matter_prefix_for_gateway(state, matter_id)
@@ -733,7 +696,9 @@ pub(crate) struct MatterInvoicesQuery {
     pub(crate) limit: Option<usize>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)]
 struct ClientsQuery {
     q: Option<String>,
 }
@@ -1321,7 +1286,10 @@ pub(crate) async fn read_workspace_matter_metadata_optional(
     serde_yml::from_str(&doc.content).ok()
 }
 
-async fn db_matter_to_info(state: &GatewayState, matter: crate::db::MatterRecord) -> MatterInfo {
+pub(crate) async fn db_matter_to_info(
+    state: &GatewayState,
+    matter: crate::db::MatterRecord,
+) -> MatterInfo {
     let matter_root = matter_root_for_gateway(state);
     let metadata = read_workspace_matter_metadata_optional(
         state.workspace.as_ref(),
@@ -1471,337 +1439,104 @@ pub(crate) async fn ensure_matter_db_row_from_workspace(
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matters_list_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<MattersListResponse>, (StatusCode, String)> {
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    if let Some(store) = state.store.as_ref() {
-        let matter_rows = store
-            .list_matters_db(&state.user_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let mut matters = Vec::with_capacity(matter_rows.len());
-        for matter in matter_rows {
-            matters.push(db_matter_to_info(state.as_ref(), matter).await);
-        }
-        matters.sort_by(|a, b| a.id.cmp(&b.id));
-        return Ok(Json(MattersListResponse { matters }));
-    }
-
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let entries = list_matters_root_entries(workspace.list(&matter_root).await)?;
-    let mut matters: Vec<MatterInfo> = Vec::new();
-    for entry in entries.into_iter().filter(|entry| entry.is_directory) {
-        let dir_name = entry.path.rsplit('/').next().unwrap_or("").to_string();
-        if dir_name.is_empty() || dir_name == "_template" {
-            continue;
-        }
-        let meta =
-            read_workspace_matter_metadata_optional(Some(workspace), &matter_root, &dir_name).await;
-        matters.push(MatterInfo {
-            id: dir_name,
-            client_id: None,
-            client: meta.as_ref().map(|m| m.client.clone()),
-            status: None,
-            stage: None,
-            confidentiality: meta.as_ref().map(|m| m.confidentiality.clone()),
-            team: meta.as_ref().map(|m| m.team.clone()).unwrap_or_default(),
-            adversaries: meta
-                .as_ref()
-                .map(|m| m.adversaries.clone())
-                .unwrap_or_default(),
-            retention: meta.as_ref().map(|m| m.retention.clone()),
-            jurisdiction: meta.as_ref().and_then(|m| m.jurisdiction.clone()),
-            practice_area: meta.as_ref().and_then(|m| m.practice_area.clone()),
-            opened_date: meta.as_ref().and_then(|m| m.opened_date.clone()),
-            opened_at: meta.as_ref().and_then(|m| m.opened_date.clone()),
-        });
-    }
-    matters.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(Json(MattersListResponse { matters }))
+    crate::channels::web::handlers::matters::core::matters_list_handler(State(state)).await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn clients_list_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<ClientsQuery>,
 ) -> Result<Json<ClientsListResponse>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let clients = store
-        .list_clients(&state.user_id, query.q.as_deref())
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .into_iter()
-        .map(client_record_to_info)
-        .collect();
-    Ok(Json(ClientsListResponse { clients }))
+    crate::channels::web::handlers::matters::core::clients_list_handler(
+        State(state),
+        Query(crate::channels::web::handlers::matters::core::ClientsQuery { q: query.q }),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn clients_create_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<CreateClientRequest>,
 ) -> Result<(StatusCode, Json<ClientInfo>), (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let name = parse_required_matter_field("name", &req.name)?;
-    let client_type = parse_client_type(&req.client_type)?;
-    let client = store
-        .create_client(
-            &state.user_id,
-            &CreateClientParams {
-                name,
-                client_type,
-                email: parse_optional_matter_field(req.email),
-                phone: parse_optional_matter_field(req.phone),
-                address: parse_optional_matter_field(req.address),
-                notes: parse_optional_matter_field(req.notes),
-            },
-        )
+    crate::channels::web::handlers::matters::core::clients_create_handler(State(state), Json(req))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok((StatusCode::CREATED, Json(client_record_to_info(client))))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn clients_get_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ClientInfo>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let client_id = parse_uuid(&id, "id")?;
-    let client = store
-        .get_client(&state.user_id, client_id)
+    crate::channels::web::handlers::matters::core::clients_get_handler(State(state), Path(id))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Client not found".to_string()))?;
-    Ok(Json(client_record_to_info(client)))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn clients_patch_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Json(req): Json<UpdateClientRequest>,
 ) -> Result<Json<ClientInfo>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let client_id = parse_uuid(&id, "id")?;
-    let input = UpdateClientParams {
-        name: req.name.map(|value| value.trim().to_string()),
-        client_type: req
-            .client_type
-            .as_deref()
-            .map(parse_client_type)
-            .transpose()?,
-        email: req
-            .email
-            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
-        phone: req
-            .phone
-            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
-        address: req
-            .address
-            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
-        notes: req
-            .notes
-            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
-    };
-
-    let client = store
-        .update_client(&state.user_id, client_id, &input)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Client not found".to_string()))?;
-    Ok(Json(client_record_to_info(client)))
+    crate::channels::web::handlers::matters::core::clients_patch_handler(
+        State(state),
+        Path(id),
+        Json(req),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn clients_delete_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let client_id = parse_uuid(&id, "id")?;
-    let deleted = store
-        .delete_client(&state.user_id, client_id)
+    crate::channels::web::handlers::matters::core::clients_delete_handler(State(state), Path(id))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if !deleted {
-        return Err((StatusCode::NOT_FOUND, "Client not found".to_string()));
-    }
-    Ok(StatusCode::NO_CONTENT)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_get_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<MatterInfo>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    let matter = store
-        .get_matter_db(&state.user_id, &matter_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Matter not found".to_string()))?;
-    Ok(Json(db_matter_to_info(state.as_ref(), matter).await))
+    crate::channels::web::handlers::matters::core::matter_get_handler(State(state), Path(id)).await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_patch_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Json(req): Json<UpdateMatterRequest>,
 ) -> Result<Json<MatterInfo>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    let client_id = req
-        .client_id
-        .as_deref()
-        .map(|value| parse_uuid(value, "client_id"))
-        .transpose()?;
-    if let Some(client_id) = client_id
-        && store
-            .get_client(&state.user_id, client_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .is_none()
-    {
-        return Err((StatusCode::NOT_FOUND, "Client not found".to_string()));
-    }
-    let status = req.status.as_deref().map(parse_matter_status).transpose()?;
-
-    let assigned_to = req.assigned_to.map(parse_matter_list);
-    let custom_fields = if let Some(value) = req.custom_fields {
-        if !value.is_object() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "'custom_fields' must be a JSON object".to_string(),
-            ));
-        }
-        Some(value)
-    } else {
-        None
-    };
-
-    let input = UpdateMatterParams {
-        client_id,
-        status,
-        stage: req
-            .stage
-            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
-        practice_area: req
-            .practice_area
-            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
-        jurisdiction: req
-            .jurisdiction
-            .map(|value| value.and_then(|inner| parse_optional_matter_field(Some(inner)))),
-        opened_at: parse_optional_datetime_patch("opened_at", req.opened_at)?,
-        closed_at: parse_optional_datetime_patch("closed_at", req.closed_at)?,
-        assigned_to,
-        custom_fields,
-    };
-
-    let matter = store
-        .update_matter(&state.user_id, &matter_id, &input)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Matter not found".to_string()))?;
-
-    if let Some(workspace) = state.workspace.as_ref() {
-        let metadata_path = matter_metadata_path_for_gateway(state.as_ref(), &matter_id);
-        if let Ok(doc) = workspace.read(&metadata_path).await
-            && let Ok(mut metadata) =
-                serde_yml::from_str::<crate::legal::matter::MatterMetadata>(&doc.content)
-        {
-            metadata.matter_id = matter.matter_id.clone();
-            metadata.team = matter.assigned_to.clone();
-            metadata.jurisdiction = matter.jurisdiction.clone();
-            metadata.practice_area = matter.practice_area.clone();
-            metadata.opened_date = matter.opened_at.map(|dt| dt.date_naive().to_string());
-            if let Ok(Some(client)) = store.get_client(&state.user_id, matter.client_id).await {
-                metadata.client = client.name;
-            }
-
-            if let Ok(rendered) = serde_yml::to_string(&metadata) {
-                let content = format!(
-                    "# Matter metadata schema\n# Required: matter_id, client, confidentiality, retention\n{}",
-                    rendered
-                );
-                if let Err(err) = workspace.write(&metadata_path, &content).await {
-                    tracing::warn!(
-                        matter_id = matter_id.as_str(),
-                        "failed to sync matter.yaml after matter update: {}",
-                        err
-                    );
-                }
-            }
-        }
-    }
-
-    if matches!(status, Some(MatterStatus::Closed)) {
-        record_legal_audit_event(
-            state.as_ref(),
-            "matter_closed",
-            state.user_id.as_str(),
-            Some(matter_id.as_str()),
-            AuditSeverity::Info,
-            serde_json::json!({
-                "matter_id": matter_id,
-                "status": MatterStatus::Closed.as_str(),
-            }),
-        )
-        .await;
-    }
-
-    Ok(Json(db_matter_to_info(state.as_ref(), matter).await))
+    crate::channels::web::handlers::matters::core::matter_patch_handler(
+        State(state),
+        Path(id),
+        Json(req),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_delete_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_id = sanitize_matter_id_for_route(&id)?;
-    let deleted = store
-        .delete_matter(&state.user_id, &matter_id)
+    crate::channels::web::handlers::matters::core::matter_delete_handler(State(state), Path(id))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if !deleted {
-        return Err((StatusCode::NOT_FOUND, "Matter not found".to_string()));
-    }
-    if let Some(active_value) = store
-        .get_setting(&state.user_id, MATTER_ACTIVE_SETTING)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .and_then(|value| value.as_str().map(str::to_string))
-        && crate::legal::policy::sanitize_matter_id(&active_value) == matter_id
-    {
-        store
-            .delete_setting(&state.user_id, MATTER_ACTIVE_SETTING)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
@@ -2158,7 +1893,9 @@ pub(crate) fn parse_optional_matter_field(value: Option<String>) -> Option<Strin
     })
 }
 
-fn parse_optional_matter_field_patch(value: Option<Option<String>>) -> Option<Option<String>> {
+pub(crate) fn parse_optional_matter_field_patch(
+    value: Option<Option<String>>,
+) -> Option<Option<String>> {
     match value {
         None => None,
         Some(None) => Some(None),
@@ -2204,7 +1941,7 @@ pub(crate) fn parse_matter_list(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn parse_client_type(value: &str) -> Result<ClientType, (StatusCode, String)> {
+pub(crate) fn parse_client_type(value: &str) -> Result<ClientType, (StatusCode, String)> {
     match value.trim().to_ascii_lowercase().as_str() {
         "individual" => Ok(ClientType::Individual),
         "entity" => Ok(ClientType::Entity),
@@ -2215,7 +1952,7 @@ fn parse_client_type(value: &str) -> Result<ClientType, (StatusCode, String)> {
     }
 }
 
-fn parse_matter_status(value: &str) -> Result<MatterStatus, (StatusCode, String)> {
+pub(crate) fn parse_matter_status(value: &str) -> Result<MatterStatus, (StatusCode, String)> {
     match value.trim().to_ascii_lowercase().as_str() {
         "intake" => Ok(MatterStatus::Intake),
         "active" => Ok(MatterStatus::Active),
@@ -2245,7 +1982,9 @@ pub(crate) fn parse_matter_task_status(
     }
 }
 
-fn parse_matter_deadline_type(value: &str) -> Result<MatterDeadlineType, (StatusCode, String)> {
+pub(crate) fn parse_matter_deadline_type(
+    value: &str,
+) -> Result<MatterDeadlineType, (StatusCode, String)> {
     match value.trim().to_ascii_lowercase().as_str() {
         "court_date" => Ok(MatterDeadlineType::CourtDate),
         "filing" => Ok(MatterDeadlineType::Filing),
@@ -2371,7 +2110,7 @@ fn infer_matter_document_category(path: &str) -> MatterDocumentCategory {
     }
 }
 
-fn normalize_reminder_days(values: &[i32]) -> Result<Vec<i32>, (StatusCode, String)> {
+pub(crate) fn normalize_reminder_days(values: &[i32]) -> Result<Vec<i32>, (StatusCode, String)> {
     use std::collections::BTreeSet;
 
     if values.len() > MAX_DEADLINE_REMINDERS {
@@ -2407,7 +2146,10 @@ fn normalize_reminder_days(values: &[i32]) -> Result<Vec<i32>, (StatusCode, Stri
     Ok(unique.into_iter().collect())
 }
 
-fn parse_datetime_value(field: &str, raw: &str) -> Result<DateTime<Utc>, (StatusCode, String)> {
+pub(crate) fn parse_datetime_value(
+    field: &str,
+    raw: &str,
+) -> Result<DateTime<Utc>, (StatusCode, String)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err((
@@ -2467,7 +2209,7 @@ pub(crate) fn parse_uuid(value: &str, field: &str) -> Result<Uuid, (StatusCode, 
     })
 }
 
-fn parse_optional_uuid_field(
+pub(crate) fn parse_optional_uuid_field(
     value: Option<String>,
     field: &str,
 ) -> Result<Option<Uuid>, (StatusCode, String)> {
@@ -2481,7 +2223,7 @@ fn parse_optional_uuid_field(
     parse_uuid(trimmed, field).map(Some)
 }
 
-fn parse_optional_uuid_patch_field(
+pub(crate) fn parse_optional_uuid_patch_field(
     value: Option<Option<String>>,
     field: &str,
 ) -> Result<Option<Option<Uuid>>, (StatusCode, String)> {
@@ -2498,7 +2240,9 @@ fn parse_optional_uuid_patch_field(
     parse_uuid(trimmed, field).map(|uuid| Some(Some(uuid)))
 }
 
-fn deadline_record_to_info(record: crate::db::MatterDeadlineRecord) -> MatterDeadlineRecordInfo {
+pub(crate) fn deadline_record_to_info(
+    record: crate::db::MatterDeadlineRecord,
+) -> MatterDeadlineRecordInfo {
     let today = Utc::now().date_naive();
     let due_date = record.due_at.date_naive();
     MatterDeadlineRecordInfo {
@@ -2536,7 +2280,7 @@ fn deadline_record_to_legacy_info(record: &crate::db::MatterDeadlineRecord) -> M
     }
 }
 
-fn deadline_compute_preview_from_params(
+pub(crate) fn deadline_compute_preview_from_params(
     params: &CreateMatterDeadlineParams,
 ) -> MatterDeadlineComputePreview {
     let today = Utc::now().date_naive();
@@ -2577,7 +2321,7 @@ fn deadline_reminder_schedule(run_at: DateTime<Utc>) -> String {
     )
 }
 
-async fn disable_deadline_reminder_routines(
+pub(crate) async fn disable_deadline_reminder_routines(
     state: &GatewayState,
     matter_id: &str,
     deadline_id: Uuid,
@@ -2606,7 +2350,7 @@ async fn disable_deadline_reminder_routines(
     Ok(())
 }
 
-async fn sync_deadline_reminder_routines_for_record(
+pub(crate) async fn sync_deadline_reminder_routines_for_record(
     state: &GatewayState,
     record: &crate::db::MatterDeadlineRecord,
 ) -> Result<(), (StatusCode, String)> {
@@ -2709,7 +2453,7 @@ pub(crate) fn parse_uuid_list(
         .collect()
 }
 
-fn client_record_to_info(client: crate::db::ClientRecord) -> ClientInfo {
+pub(crate) fn client_record_to_info(client: crate::db::ClientRecord) -> ClientInfo {
     ClientInfo {
         id: client.id.to_string(),
         name: client.name,
@@ -3289,117 +3033,25 @@ async fn matters_create_handler(
     ))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matters_active_get_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<ActiveMatterResponse>, (StatusCode, String)> {
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    let mut matter_id = if let Some(store) = state.store.as_ref() {
-        store
-            .get_setting(&state.user_id, MATTER_ACTIVE_SETTING)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .and_then(|v| v.as_str().map(crate::legal::policy::sanitize_matter_id))
-    } else {
-        None
-    };
-
-    if matter_id.as_deref().is_some_and(|id| id.is_empty()) {
-        matter_id = None;
-    }
-
-    if let Some(ref candidate) = matter_id
-        && let Some(workspace) = state.workspace.as_ref()
-    {
-        match crate::legal::matter::read_matter_metadata_for_root(
-            workspace.as_ref(),
-            &matter_root,
-            candidate,
-        )
-        .await
-        {
-            Ok(_) => {}
-            Err(crate::legal::matter::MatterMetadataValidationError::Missing { .. })
-            | Err(crate::legal::matter::MatterMetadataValidationError::Invalid { .. }) => {
-                matter_id = None;
-            }
-            Err(err @ crate::legal::matter::MatterMetadataValidationError::Storage { .. }) => {
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
-            }
-        }
-    }
-
-    Ok(Json(ActiveMatterResponse { matter_id }))
+    crate::channels::web::handlers::matters::core::matters_active_get_handler(State(state)).await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matters_active_set_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<SetActiveMatterRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let matter_root = matter_root_for_gateway(state.as_ref());
-
-    let trimmed = req
-        .matter_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    match trimmed {
-        None => {
-            // Clear active matter.
-            store
-                .delete_setting(&state.user_id, MATTER_ACTIVE_SETTING)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        }
-        Some(id) => {
-            let workspace = state.workspace.as_ref().ok_or((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Workspace not available".to_string(),
-            ))?;
-            let sanitized = crate::legal::policy::sanitize_matter_id(id);
-            if sanitized.is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "Matter ID is empty after sanitization".to_string(),
-                ));
-            }
-            match crate::legal::matter::read_matter_metadata_for_root(
-                workspace.as_ref(),
-                &matter_root,
-                &sanitized,
-            )
-            .await
-            {
-                Ok(_) => {}
-                Err(crate::legal::matter::MatterMetadataValidationError::Missing { path }) => {
-                    return Err((
-                        StatusCode::NOT_FOUND,
-                        format!("Matter '{}' not found (missing '{}')", sanitized, path),
-                    ));
-                }
-                Err(err @ crate::legal::matter::MatterMetadataValidationError::Invalid { .. }) => {
-                    return Err((StatusCode::UNPROCESSABLE_ENTITY, err.to_string()));
-                }
-                Err(err @ crate::legal::matter::MatterMetadataValidationError::Storage { .. }) => {
-                    return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
-                }
-            }
-            store
-                .set_setting(
-                    &state.user_id,
-                    MATTER_ACTIVE_SETTING,
-                    &serde_json::Value::String(sanitized),
-                )
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        }
-    }
-
-    Ok(StatusCode::NO_CONTENT)
+    crate::channels::web::handlers::matters::core::matters_active_set_handler(
+        State(state),
+        Json(req),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -3428,247 +3080,72 @@ async fn matter_dashboard_handler(
     .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_deadlines_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<MatterDeadlinesResponse>, (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
-    let matter_prefix = format!("{matter_root}/{matter_id}");
-    let deadlines = read_matter_deadlines_for_matter(
-        state.as_ref(),
-        &matter_id,
-        &matter_prefix,
-        Utc::now().date_naive(),
-    )
-    .await?;
-
-    Ok(Json(MatterDeadlinesResponse {
-        matter_id,
-        deadlines,
-    }))
+    crate::channels::web::handlers::matters::core::matter_deadlines_handler(State(state), Path(id))
+        .await
 }
 
-fn court_rule_to_info(rule: &crate::legal::calendar::CourtRule) -> CourtRuleInfo {
-    CourtRuleInfo {
-        id: rule.id.clone(),
-        citation: rule.citation.clone(),
-        deadline_type: rule.deadline_type.as_str().to_string(),
-        offset_days: rule.offset_days,
-        court_days: rule.court_days,
-    }
-}
-
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_deadlines_create_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Json(req): Json<CreateMatterDeadlineRequest>,
 ) -> Result<(StatusCode, Json<MatterDeadlineRecordInfo>), (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
-    ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
-
-    let title = req.title.trim();
-    if title.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "'title' is required".to_string()));
-    }
-    let deadline_type = parse_matter_deadline_type(&req.deadline_type)?;
-    let due_at = parse_datetime_value("due_at", &req.due_at)?;
-    let completed_at = parse_optional_datetime("completed_at", req.completed_at)?;
-    let reminder_days = normalize_reminder_days(&req.reminder_days)?;
-    let rule_ref = parse_optional_matter_field(req.rule_ref);
-    validate_optional_matter_field_length("rule_ref", &rule_ref)?;
-    let computed_from = parse_optional_uuid_field(req.computed_from, "computed_from")?;
-    let task_id = parse_optional_uuid_field(req.task_id, "task_id")?;
-
-    let created = store
-        .create_matter_deadline(
-            &state.user_id,
-            &matter_id,
-            &CreateMatterDeadlineParams {
-                title: title.to_string(),
-                deadline_type,
-                due_at,
-                completed_at,
-                reminder_days,
-                rule_ref,
-                computed_from,
-                task_id,
-            },
-        )
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-    sync_deadline_reminder_routines_for_record(state.as_ref(), &created).await?;
-
-    Ok((StatusCode::CREATED, Json(deadline_record_to_info(created))))
+    crate::channels::web::handlers::matters::core::matter_deadlines_create_handler(
+        State(state),
+        Path(id),
+        Json(req),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_deadlines_patch_handler(
     State(state): State<Arc<GatewayState>>,
     Path((id, deadline_id)): Path<(String, String)>,
     Json(req): Json<UpdateMatterDeadlineRequest>,
 ) -> Result<Json<MatterDeadlineRecordInfo>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
-    ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
-    let deadline_id = parse_uuid(deadline_id.trim(), "deadline_id")?;
-
-    let title = req.title.and_then(|value| {
-        let trimmed = value.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    });
-    let deadline_type = req
-        .deadline_type
-        .as_deref()
-        .map(parse_matter_deadline_type)
-        .transpose()?;
-    let due_at = req
-        .due_at
-        .as_deref()
-        .map(|value| parse_datetime_value("due_at", value))
-        .transpose()?;
-    let completed_at = parse_optional_datetime_patch("completed_at", req.completed_at)?;
-    let reminder_days = req
-        .reminder_days
-        .as_ref()
-        .map(|values| normalize_reminder_days(values))
-        .transpose()?;
-    let rule_ref = parse_optional_matter_field_patch(req.rule_ref);
-    if let Some(Some(ref value)) = rule_ref {
-        validate_optional_matter_field_length("rule_ref", &Some(value.clone()))?;
-    }
-    let computed_from = parse_optional_uuid_patch_field(req.computed_from, "computed_from")?;
-    let task_id = parse_optional_uuid_patch_field(req.task_id, "task_id")?;
-
-    let updated = store
-        .update_matter_deadline(
-            &state.user_id,
-            &matter_id,
-            deadline_id,
-            &UpdateMatterDeadlineParams {
-                title,
-                deadline_type,
-                due_at,
-                completed_at,
-                reminder_days,
-                rule_ref,
-                computed_from,
-                task_id,
-            },
-        )
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Deadline not found".to_string()))?;
-
-    sync_deadline_reminder_routines_for_record(state.as_ref(), &updated).await?;
-
-    Ok(Json(deadline_record_to_info(updated)))
+    crate::channels::web::handlers::matters::core::matter_deadlines_patch_handler(
+        State(state),
+        Path((id, deadline_id)),
+        Json(req),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_deadlines_delete_handler(
     State(state): State<Arc<GatewayState>>,
     Path((id, deadline_id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
-    ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id).await?;
-    let deadline_id = parse_uuid(deadline_id.trim(), "deadline_id")?;
-
-    let existing = store
-        .get_matter_deadline(&state.user_id, &matter_id, deadline_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Deadline not found".to_string()))?;
-
-    let deleted = store
-        .delete_matter_deadline(&state.user_id, &matter_id, deadline_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    if !deleted {
-        return Err((StatusCode::NOT_FOUND, "Deadline not found".to_string()));
-    }
-
-    disable_deadline_reminder_routines(state.as_ref(), &existing.matter_id, existing.id).await?;
-
-    Ok(StatusCode::NO_CONTENT)
+    crate::channels::web::handlers::matters::core::matter_deadlines_delete_handler(
+        State(state),
+        Path((id, deadline_id)),
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn matter_deadlines_compute_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Json(req): Json<MatterDeadlineComputeRequest>,
 ) -> Result<Json<MatterDeadlineComputeResponse>, (StatusCode, String)> {
-    let workspace = state.workspace.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Workspace not available".to_string(),
-    ))?;
-    let matter_root = matter_root_for_gateway(state.as_ref());
-    let matter_id = ensure_existing_matter_for_route(workspace.as_ref(), &matter_root, &id).await?;
-    let rule_id = req.rule_id.trim();
-    if rule_id.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "'rule_id' is required".to_string()));
-    }
-
-    let rule = crate::legal::calendar::get_court_rule(rule_id)
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?
-        .ok_or((
-            StatusCode::BAD_REQUEST,
-            format!("Unknown rule_id '{}'", rule_id),
-        ))?;
-    let trigger = parse_datetime_value("trigger_date", &req.trigger_date)?;
-    let reminder_days = normalize_reminder_days(&req.reminder_days)?;
-    let computed_from = parse_optional_uuid_field(req.computed_from, "computed_from")?;
-    let task_id = parse_optional_uuid_field(req.task_id, "task_id")?;
-    let title = parse_optional_matter_field(req.title)
-        .unwrap_or_else(|| format!("{} deadline", rule.citation));
-
-    let computed = crate::legal::calendar::deadline_from_rule(
-        &title,
-        &rule,
-        trigger,
-        reminder_days,
-        computed_from,
-        task_id,
-    );
-
-    Ok(Json(MatterDeadlineComputeResponse {
-        matter_id,
-        rule: court_rule_to_info(&rule),
-        deadline: deadline_compute_preview_from_params(&computed),
-    }))
+    crate::channels::web::handlers::matters::core::matter_deadlines_compute_handler(
+        State(state),
+        Path(id),
+        Json(req),
+    )
+    .await
 }
 
 #[cfg(test)]
