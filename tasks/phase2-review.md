@@ -108,3 +108,61 @@ Fix: introduced a reusable writer; parallelized 4-file curated-load path via
 | cargo fmt --all -- --check | ✅ |
 | cargo clippy --all-features --all-targets | ✅ 0 warnings |
 | cargo test -- --test-threads=1 | ✅ 1713 passed, 0 failed, 1 ignored |
+
+## Follow-on Backlog — Web Gateway Decomposition (post-`codex/web-server-feature-handler-split-v1`)
+
+Tracked from review after server decomposition landed (`server.rs` 12,534 → ~1.2k).
+
+### Priority order
+1. `common.rs` decomposition (highest)
+2. remove `#[cfg(test)]` server shims
+3. migrate `server_tests.rs` tests into feature modules
+
+### Item 1 — Split `handlers/common.rs` into focused helper modules
+
+Current issue: `src/channels/web/handlers/common.rs` is still a large mixed helper file
+with unrelated concerns.
+
+Target modules under `src/channels/web/handlers/helpers/`:
+- `legal_config.rs` (`legal_config_for_gateway*`, `matter_root_for_gateway`)
+- `paths.rs` (normalize/resolve memory-write paths, traversal/protected checks)
+- `audit.rs` (`record_legal_audit_event`, audit parse/mapping helpers)
+- `matter_validation.rs` (matter field/ID validators)
+- `parsers.rs` (date/decimal/uuid/enum parsers)
+- `documents.rs` (document/template backfill/list helpers)
+- `deadlines.rs` (deadline file/db mapping + reminder helpers)
+
+Success criteria:
+- `common.rs` reduced to minimal re-exports or removed.
+- No behavior change in route handlers.
+- Full gate green.
+
+### Item 2 — Remove `#[cfg(test)]` shim handlers from `server.rs`
+
+Current issue: test-only wrappers in `server.rs` forward to module handlers and keep
+test architecture coupled to `super::*`.
+
+Planned change:
+- Update `src/channels/web/server_tests.rs` imports to call handlers directly from
+  `crate::channels::web::handlers::*`.
+- Delete test-only forwarding wrappers from `server.rs`.
+
+Success criteria:
+- `server.rs` contains startup/server concerns only.
+- No test coverage loss.
+- Full gate green.
+
+### Item 3 — Move monolithic `server_tests.rs` coverage into handler-local tests
+
+Current issue: `src/channels/web/server_tests.rs` remains very large and centralizes
+feature tests.
+
+Planned change:
+- Migrate tests into `#[cfg(test)] mod tests` blocks colocated with feature handlers:
+  `handlers/chat.rs`, `handlers/memory.rs`, `handlers/matters/*`, `handlers/legal.rs`, etc.
+- Keep only true cross-feature gateway/bootstrap tests in `server_tests.rs`.
+
+Success criteria:
+- `server_tests.rs` becomes small and cross-cutting only.
+- Test names/coverage preserved (parity check before/after).
+- Full gate green.
