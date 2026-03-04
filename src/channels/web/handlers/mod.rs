@@ -5,6 +5,7 @@ pub mod chat;
 pub mod common;
 pub mod extensions;
 pub mod gateway;
+pub mod helpers;
 pub mod jobs;
 pub mod legal;
 pub mod logs;
