@@ -42,15 +42,38 @@ pub(crate) const MATTER_INVOICES_MAX_LIMIT: usize = 100;
 const PROTECTED_IDENTITY_FILES: &[&str] =
     &[paths::IDENTITY, paths::SOUL, paths::AGENTS, paths::USER];
 
-pub(crate) fn legal_config_for_gateway(state: &GatewayState) -> crate::config::LegalConfig {
-    state.legal_config.clone().unwrap_or_else(|| {
-        crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
-            .expect("default legal config should resolve")
+pub(crate) fn legal_config_for_gateway(
+    state: &GatewayState,
+) -> Result<crate::config::LegalConfig, crate::error::ConfigError> {
+    if let Some(config) = state.legal_config.clone() {
+        return Ok(config);
+    }
+    crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
+}
+
+pub(crate) fn legal_config_for_gateway_or_500(
+    state: &GatewayState,
+) -> Result<crate::config::LegalConfig, (StatusCode, String)> {
+    legal_config_for_gateway(state).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to resolve legal config: {err}"),
+        )
     })
 }
 
 pub(crate) fn matter_root_for_gateway(state: &GatewayState) -> String {
-    let configured = legal_config_for_gateway(state).matter_root;
+    let configured = match legal_config_for_gateway(state) {
+        Ok(config) => config.matter_root,
+        Err(err) => {
+            tracing::error!(
+                "Failed to resolve legal config for matter root; using default '{}': {}",
+                MATTER_ROOT,
+                err
+            );
+            MATTER_ROOT.to_string()
+        }
+    };
     let normalized = configured.trim_matches('/');
     if normalized.is_empty() {
         MATTER_ROOT.to_string()
@@ -116,7 +139,7 @@ pub(crate) async fn resolve_memory_write_path_for_gateway(
         ));
     }
 
-    let legal = legal_config_for_gateway(state);
+    let legal = legal_config_for_gateway_or_500(state)?;
     let resolved_path = if legal.enabled && legal.require_matter_context {
         let active_matter = if let Some(store) = state.store.as_ref() {
             match store

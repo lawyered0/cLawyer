@@ -55,7 +55,7 @@ pub(crate) async fn matters_conflict_check_handler(
         "Database not available".to_string(),
     ))?;
 
-    let legal = crate::channels::web::server::legal_config_for_gateway(state.as_ref());
+    let legal = crate::channels::web::server::legal_config_for_gateway_or_500(state.as_ref())?;
     if !legal.enabled || !legal.conflict_check_enabled {
         return Err((
             StatusCode::CONFLICT,
@@ -170,7 +170,7 @@ pub(crate) async fn matters_conflicts_check_handler(
         ));
     }
 
-    let mut legal = crate::channels::web::server::legal_config_for_gateway(state.as_ref());
+    let mut legal = crate::channels::web::server::legal_config_for_gateway_or_500(state.as_ref())?;
     if !legal.enabled || !legal.conflict_check_enabled {
         return Err((
             StatusCode::CONFLICT,
@@ -286,7 +286,7 @@ pub(crate) async fn matters_conflicts_reindex_handler(
         "Database not available".to_string(),
     ))?;
 
-    let legal = crate::channels::web::server::legal_config_for_gateway(state.as_ref());
+    let legal = crate::channels::web::server::legal_config_for_gateway_or_500(state.as_ref())?;
     if !legal.enabled || !legal.conflict_check_enabled {
         return Err((
             StatusCode::CONFLICT,

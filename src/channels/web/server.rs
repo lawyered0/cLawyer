@@ -8,7 +8,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    http::header,
+    http::{HeaderValue, header},
     middleware,
     routing::{get, post},
 };
@@ -67,9 +67,12 @@ pub async fn start_server(
         // OpenAI-compatible API
         .route(
             "/v1/chat/completions",
-            post(super::openai_compat::chat_completions_handler),
+            post(crate::channels::web::openai_compat::chat_completions_handler),
         )
-        .route("/v1/models", get(super::openai_compat::models_handler))
+        .route(
+            "/v1/models",
+            get(crate::channels::web::openai_compat::models_handler),
+        )
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,
@@ -83,15 +86,28 @@ pub async fn start_server(
 
     // CORS: restrict to same-origin by default. Only localhost/127.0.0.1
     // origins are allowed, since the gateway is a local-first service.
+    let gateway_origin_raw = format!("http://{}:{}", addr.ip(), addr.port());
+    let gateway_origin = gateway_origin_raw.parse::<HeaderValue>().map_err(|err| {
+        crate::error::ChannelError::StartupFailed {
+            name: "gateway".to_string(),
+            reason: format!(
+                "Failed to build CORS origin header '{}': {}",
+                gateway_origin_raw, err
+            ),
+        }
+    })?;
+    let localhost_origin_raw = format!("http://localhost:{}", addr.port());
+    let localhost_origin = localhost_origin_raw.parse::<HeaderValue>().map_err(|err| {
+        crate::error::ChannelError::StartupFailed {
+            name: "gateway".to_string(),
+            reason: format!(
+                "Failed to build CORS origin header '{}': {}",
+                localhost_origin_raw, err
+            ),
+        }
+    })?;
     let cors = CorsLayer::new()
-        .allow_origin([
-            format!("http://{}:{}", addr.ip(), addr.port())
-                .parse()
-                .expect("valid origin"),
-            format!("http://localhost:{}", addr.port())
-                .parse()
-                .expect("valid origin"),
-        ])
+        .allow_origin([gateway_origin, localhost_origin])
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,

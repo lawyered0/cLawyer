@@ -72,7 +72,7 @@ pub(crate) async fn backups_create_handler(
         Uuid::new_v4().simple()
     );
     let output_path = backup_dir.join(format!("{backup_id}.clawyerbak"));
-    let legal = crate::channels::web::server::legal_config_for_gateway(state.as_ref());
+    let legal = crate::channels::web::server::legal_config_for_gateway_or_500(state.as_ref())?;
 
     let result = crate::legal::backup::create_backup_file(
         store.as_ref(),
@@ -197,7 +197,7 @@ pub(crate) async fn backups_restore_handler(
         "Workspace not available".to_string(),
     ))?;
     let master_key = resolve_backup_master_key().await?;
-    let legal = crate::channels::web::server::legal_config_for_gateway(state.as_ref());
+    let legal = crate::channels::web::server::legal_config_for_gateway_or_500(state.as_ref())?;
 
     let mut apply = false;
     let mut strict = false;

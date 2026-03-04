@@ -45,7 +45,7 @@ pub(crate) async fn legal_audit_list_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<crate::channels::web::server::LegalAuditQuery>,
 ) -> Result<Json<LegalAuditListResponse>, (StatusCode, String)> {
-    let legal = crate::channels::web::server::legal_config_for_gateway(state.as_ref());
+    let legal = crate::channels::web::server::legal_config_for_gateway_or_500(state.as_ref())?;
     if !legal.audit.enabled {
         return Err((
             StatusCode::NOT_FOUND,
@@ -440,7 +440,7 @@ async fn build_compliance_status(
 pub(crate) async fn compliance_status_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<ComplianceStatusResponse>, (StatusCode, String)> {
-    let legal = crate::channels::web::server::legal_config_for_gateway(state.as_ref());
+    let legal = crate::channels::web::server::legal_config_for_gateway_or_500(state.as_ref())?;
     let status = build_compliance_status(state.as_ref(), &legal).await;
     let generated_at = Utc::now().to_rfc3339();
 
@@ -488,7 +488,7 @@ pub(crate) async fn compliance_letter_handler(
 ) -> Result<Json<ComplianceLetterResponse>, (StatusCode, String)> {
     let req = body.map(|Json(value)| value).unwrap_or_default();
     let framework = normalize_compliance_framework(req.framework.as_deref())?;
-    let legal = crate::channels::web::server::legal_config_for_gateway(state.as_ref());
+    let legal = crate::channels::web::server::legal_config_for_gateway_or_500(state.as_ref())?;
     let status = build_compliance_status(state.as_ref(), &legal).await;
     let llm = state.llm_provider.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,

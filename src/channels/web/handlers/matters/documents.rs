@@ -401,7 +401,7 @@ pub(crate) async fn matter_retrieval_export_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
     ))?;
-    let legal = crate::channels::web::server::legal_config_for_gateway(state.as_ref());
+    let legal = crate::channels::web::server::legal_config_for_gateway_or_500(state.as_ref())?;
     let matter_root = crate::channels::web::server::matter_root_for_gateway(state.as_ref());
     let matter_id = crate::channels::web::server::ensure_existing_matter_for_route(
         workspace.as_ref(),
