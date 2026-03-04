@@ -142,9 +142,47 @@ fn test_app_js_has_no_inline_event_handlers() {
     assert_no_inline_event_handlers("app.js", app_js);
 }
 
+fn client_feature_sources() -> String {
+    [
+        include_str!("static/app/features/globals.js"),
+        include_str!("static/app/features/utilities.js"),
+        include_str!("static/app/features/toasts.js"),
+        include_str!("static/app/features/activity.js"),
+        include_str!("static/app/features/chat.js"),
+        include_str!("static/app/features/auth_card.js"),
+        include_str!("static/app/features/threads.js"),
+        include_str!("static/app/features/tabs.js"),
+        include_str!("static/app/features/memory.js"),
+        include_str!("static/app/features/logs.js"),
+        include_str!("static/app/features/extensions.js"),
+        include_str!("static/app/features/pairing.js"),
+        include_str!("static/app/features/jobs.js"),
+        include_str!("static/app/features/job_activity.js"),
+        include_str!("static/app/features/routines.js"),
+        include_str!("static/app/features/gateway_status.js"),
+        include_str!("static/app/features/tee.js"),
+        include_str!("static/app/features/extension_install.js"),
+        include_str!("static/app/features/skills.js"),
+        include_str!("static/app/features/matters.js"),
+        include_str!("static/app/features/memory_upload.js"),
+        include_str!("static/app/features/settings.js"),
+        include_str!("static/app/features/routine_create.js"),
+        include_str!("static/app/features/shortcuts.js"),
+        include_str!("static/app/features/sse.js"),
+        include_str!("static/app/features/auth.js"),
+    ]
+    .join("\n")
+}
+
+#[test]
+fn test_feature_js_has_no_inline_event_handlers() {
+    let sources = client_feature_sources();
+    assert_no_inline_event_handlers("app/features/*.js", &sources);
+}
+
 #[test]
 fn test_app_js_contains_delegated_action_hooks() {
-    let app_js = include_str!("static/app.js");
+    let app_js = client_feature_sources();
     let required_markers = [
         "data-job-action",
         "data-routine-action",
@@ -167,7 +205,7 @@ fn test_app_js_contains_delegated_action_hooks() {
     for pattern in delegate_calls {
         let re = Regex::new(pattern).expect("valid delegate regex");
         assert!(
-            re.is_match(app_js),
+            re.is_match(&app_js),
             "missing delegate call matching {}",
             pattern
         );
@@ -196,14 +234,14 @@ fn test_index_html_contains_compliance_section_markers() {
 
 #[test]
 fn test_app_js_contains_compliance_api_calls() {
-    let app_js = include_str!("static/app.js");
+    let app_js = include_str!("static/app/features/settings.js");
     assert!(
         app_js.contains("/api/compliance/status"),
-        "app.js missing compliance status API call"
+        "settings.js missing compliance status API call"
     );
     assert!(
         app_js.contains("/api/compliance/letter"),
-        "app.js missing compliance letter API call"
+        "settings.js missing compliance letter API call"
     );
 }
 
