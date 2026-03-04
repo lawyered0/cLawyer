@@ -8402,6 +8402,7 @@ async fn backups_restore_handler(
     let legal = legal_config_for_gateway(state.as_ref());
 
     let mut apply = false;
+    let mut strict = false;
     let mut protect_identity_files = true;
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut uploaded_name: Option<String> = None;
@@ -8421,6 +8422,16 @@ async fn backups_restore_handler(
                 )
             })?;
             apply = parse_multipart_bool(&value);
+            continue;
+        }
+        if name == "strict" {
+            let value = field.text().await.map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid strict flag: {}", e),
+                )
+            })?;
+            strict = parse_multipart_bool(&value);
             continue;
         }
         if name == "protect_identity_files" {
@@ -8485,6 +8496,7 @@ async fn backups_restore_handler(
         &master_key,
         &crate::legal::backup::BackupRestoreOptions {
             apply,
+            strict,
             protect_identity_files,
             matter_root: legal.matter_root.clone(),
         },
@@ -8507,10 +8519,12 @@ async fn backups_restore_handler(
         serde_json::json!({
             "uploaded_name": uploaded_name,
             "apply": apply,
+            "strict": strict,
             "protect_identity_files": protect_identity_files,
             "restored_settings": report.restored_settings,
             "restored_workspace_files": report.restored_workspace_files,
             "skipped_workspace_files": report.skipped_workspace_files,
+            "critical_failure_count": report.critical_failures.len(),
             "warning_count": report.warnings.len(),
         }),
     )
@@ -8520,9 +8534,12 @@ async fn backups_restore_handler(
         valid: report.valid,
         dry_run: report.dry_run,
         applied: report.applied,
+        strict: report.strict,
         restored_settings: report.restored_settings,
         restored_workspace_files: report.restored_workspace_files,
         skipped_workspace_files: report.skipped_workspace_files,
+        integrity: serde_json::to_value(report.integrity).unwrap_or_default(),
+        critical_failures: report.critical_failures,
         warnings: report.warnings,
         manifest: serde_json::to_value(report.manifest).unwrap_or_default(),
     }))
