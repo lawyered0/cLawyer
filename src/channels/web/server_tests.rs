@@ -1,12 +1,55 @@
 use super::*;
 use std::sync::Arc;
 
+use crate::agent::SessionManager;
+use crate::channels::web::handlers::{
+    chat::{
+        chat_approval_handler, chat_history_handler, chat_new_thread_handler, chat_send_handler,
+        chat_threads_handler,
+    },
+    legal::{
+        compliance_letter_handler, compliance_status_handler, legal_audit_list_handler,
+        legal_court_rules_handler,
+    },
+    matters::{
+        conflicts::{
+            matters_conflict_check_handler, matters_conflicts_check_handler,
+            matters_conflicts_reindex_handler,
+        },
+        core::{
+            matter_deadlines_compute_handler, matter_deadlines_create_handler,
+            matter_deadlines_delete_handler, matter_deadlines_handler, matters_active_get_handler,
+            matters_active_set_handler, matters_create_handler, matters_list_handler,
+        },
+        documents::{
+            documents_generate_handler, matter_dashboard_handler, matter_documents_handler,
+            matter_filing_package_handler, matter_template_apply_handler, matter_templates_handler,
+        },
+        finance::{
+            invoices_finalize_handler, invoices_payment_handler, invoices_save_handler,
+            invoices_void_handler, matter_expenses_create_handler, matter_expenses_list_handler,
+            matter_invoices_list_handler, matter_time_create_handler, matter_time_delete_handler,
+            matter_time_list_handler, matter_time_summary_handler, matter_trust_deposit_handler,
+            matter_trust_ledger_handler,
+        },
+        work::{
+            matter_notes_create_handler, matter_notes_list_handler, matter_tasks_create_handler,
+            matter_tasks_list_handler,
+        },
+    },
+    memory::memory_write_handler,
+};
+use crate::channels::web::sse::SseManager;
 use crate::channels::web::test_support::{
     TestLlmProvider, assert_no_inline_event_handlers, minimal_test_gateway_state,
 };
 use crate::db::ConflictDecision;
 use crate::workspace::Workspace;
-use axum::http::StatusCode;
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+};
 use chrono::Utc;
 use regex::Regex;
 use uuid::Uuid;
