@@ -51,7 +51,13 @@ async fn js_handler() -> impl IntoResponse {
     )
 }
 
-const APP_MODULES: &[(&str, &str)] = &[("main.js", include_str!("../static/app/main.js"))];
+const APP_MODULES: &[(&str, &str)] = &[
+    ("main.js", include_str!("../static/app/main.js")),
+    ("core/dom.js", include_str!("../static/app/core/dom.js")),
+    ("core/http.js", include_str!("../static/app/core/http.js")),
+    ("core/state.js", include_str!("../static/app/core/state.js")),
+    ("core/tabs.js", include_str!("../static/app/core/tabs.js")),
+];
 
 fn resolve_app_module(path: &str) -> Option<&'static str> {
     APP_MODULES
@@ -116,6 +122,25 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
         assert!(content_type.contains("application/javascript"));
+    }
+
+    #[tokio::test]
+    async fn serves_core_module_from_allowlist() {
+        let state = crate::channels::web::test_support::minimal_test_gateway_state(None);
+        let app = routes().with_state(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app/core/dom.js")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]

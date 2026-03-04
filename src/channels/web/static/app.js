@@ -1,9 +1,30 @@
 // cLawyer Web Gateway - Client
 
-let token = '';
+const core = window.__clawyerCore || {};
+const appState = core.appState;
+const setAuthToken = core.setAuthToken;
+const setCurrentTab = core.setCurrentTab;
+const setCurrentSettingsSection = core.setCurrentSettingsSection;
+const byId = core.byId;
+const bindClick = core.bindClick;
+const bindChange = core.bindChange;
+const bindKeydown = core.bindKeydown;
+const delegate = core.delegate;
+const apiFetch = core.apiFetch;
+const beginRequest = core.beginRequest;
+const isCurrentRequest = core.isCurrentRequest;
+const PRIMARY_TABS = core.PRIMARY_TABS;
+const OVERFLOW_TABS = core.OVERFLOW_TABS;
+const SHORTCUT_TABS = core.SHORTCUT_TABS;
+
+if (!appState || !setAuthToken || !setCurrentTab || !setCurrentSettingsSection || !byId || !bindClick || !bindChange || !bindKeydown || !delegate || !apiFetch || !beginRequest || !isCurrentRequest || !PRIMARY_TABS || !OVERFLOW_TABS || !SHORTCUT_TABS) {
+  throw new Error('cLawyer core bootstrap missing (window.__clawyerCore)');
+}
+
+let token = appState.authToken || '';
 let eventSource = null;
 let logEventSource = null;
-let currentTab = 'chat';
+let currentTab = appState.currentTab || 'chat';
 let currentThreadId = null;
 let assistantThreadId = null;
 let hasMore = false;
@@ -15,71 +36,10 @@ let jobListRefreshTimer = null;
 const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
 let lastBackupId = null;
-const PRIMARY_TABS = ['chat', 'matters', 'memory', 'jobs'];
-const OVERFLOW_TABS = ['routines', 'extensions', 'skills', 'settings'];
-const SHORTCUT_TABS = PRIMARY_TABS.concat(OVERFLOW_TABS);
-let currentSettingsSection = 'general';
+let currentSettingsSection = appState.currentSettingsSection || 'general';
 let matterCreateModalLastFocus = null;
 let complianceStatusCache = null;
 let complianceExpanded = false;
-
-function byId(id) {
-  return document.getElementById(id);
-}
-
-function bindClick(id, handler) {
-  const el = byId(id);
-  if (el) el.addEventListener('click', handler);
-}
-
-function bindChange(id, handler) {
-  const el = byId(id);
-  if (el) el.addEventListener('change', handler);
-}
-
-function bindKeydown(id, handler) {
-  const el = byId(id);
-  if (el) el.addEventListener('keydown', handler);
-}
-
-function delegate(container, eventType, selector, handler) {
-  if (!container) return;
-  container.addEventListener(eventType, function(event) {
-    const target = event.target.closest(selector);
-    if (!target || !container.contains(target)) return;
-    handler(event, target);
-  });
-}
-
-const requestVersions = {
-  memoryTree: 0,
-  memorySearch: 0,
-  memoryRead: 0,
-  memoryDirectory: 0,
-  jobsList: 0,
-  jobDetail: 0,
-  routinesList: 0,
-  routineDetail: 0,
-  matters: 0,
-  matterDetail: 0,
-  matterDetailWork: 0,
-  matterDetailFinance: 0,
-  legalAudit: 0,
-  settings: 0,
-  complianceStatus: 0,
-  extensions: 0,
-  skills: 0,
-  gatewayStatus: 0,
-};
-
-function beginRequest(key) {
-  requestVersions[key] = (requestVersions[key] || 0) + 1;
-  return requestVersions[key];
-}
-
-function isCurrentRequest(key, version) {
-  return requestVersions[key] === version;
-}
 
 // --- Tool Activity State ---
 let _activeGroup = null;
@@ -90,6 +50,7 @@ let _activityThinking = null;
 
 function authenticate() {
   token = document.getElementById('token-input').value.trim();
+  setAuthToken(token);
   if (!token) {
     document.getElementById('auth-error').textContent = 'Token required';
     return;
@@ -123,6 +84,7 @@ function authenticate() {
       }
     })
     .catch(() => {
+      setAuthToken('');
       sessionStorage.removeItem('clawyer_token');
       document.getElementById('auth-screen').style.display = '';
       document.getElementById('app').style.display = 'none';
@@ -351,37 +313,6 @@ bindClick('auth-connect-btn', authenticate);
   window.addEventListener('scroll', positionTabOverflowMenu, true);
   syncMatterSelectOtherFields();
 })();
-
-// --- API helper ---
-
-function apiFetch(path, options) {
-  const opts = options || {};
-  opts.headers = opts.headers || {};
-  opts.headers['Authorization'] = 'Bearer ' + token;
-  if (opts.body instanceof FormData) {
-    // Let the browser set Content-Type + multipart boundary automatically.
-    // Do NOT set Content-Type manually or the boundary will be missing.
-  } else if (opts.body && typeof opts.body === 'object') {
-    opts.headers['Content-Type'] = 'application/json';
-    opts.body = JSON.stringify(opts.body);
-  }
-  return fetch(path, opts).then((res) => {
-    if (!res.ok) {
-      return res.text().then(function(body) {
-        throw new Error(body || (res.status + ' ' + res.statusText));
-      });
-    }
-    if (res.status === 204) return null;
-    return res.text().then(function(body) {
-      if (!body) return null;
-      try {
-        return JSON.parse(body);
-      } catch (_) {
-        return body;
-      }
-    });
-  });
-}
 
 // --- SSE ---
 
@@ -1399,6 +1330,7 @@ function handleDocumentClickForMenus(event) {
 function openSettingsSection(section) {
   var next = section === 'logs' ? 'logs' : 'general';
   currentSettingsSection = next;
+  setCurrentSettingsSection(next);
   var generalBtn = byId('settings-section-general-btn');
   var logsBtn = byId('settings-section-logs-btn');
   var generalSection = byId('settings-section-general');
@@ -1421,6 +1353,7 @@ function openSettingsSection(section) {
 function switchTab(tab, options) {
   if (!tab) return;
   currentTab = tab;
+  setCurrentTab(tab);
 
   var settingsSection = options && options.settingsSection
     ? options.settingsSection

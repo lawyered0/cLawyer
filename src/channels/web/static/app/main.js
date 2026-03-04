@@ -1,5 +1,16 @@
 // cLawyer Web Gateway - ESM bootstrap
-// Phase 1 keeps runtime behavior identical by loading the existing legacy app.js.
+// Phase 1/2 keep runtime behavior compatible by loading existing app.js
+// while moving shared primitives into browser ESM core modules.
+
+import { bindChange, bindClick, bindKeydown, byId, delegate } from '/app/core/dom.js';
+import { apiFetch, beginRequest, isCurrentRequest } from '/app/core/http.js';
+import {
+  appState,
+  setAuthToken,
+  setCurrentSettingsSection,
+  setCurrentTab,
+} from '/app/core/state.js';
+import { OVERFLOW_TABS, PRIMARY_TABS, SHORTCUT_TABS } from '/app/core/tabs.js';
 
 function loadLegacyScript(src) {
   return new Promise((resolve, reject) => {
@@ -29,6 +40,23 @@ function loadLegacyScript(src) {
 
 (async function bootstrap() {
   try {
+    window.__clawyerCore = {
+      appState,
+      setAuthToken,
+      setCurrentTab,
+      setCurrentSettingsSection,
+      byId,
+      bindClick,
+      bindChange,
+      bindKeydown,
+      delegate,
+      apiFetch,
+      beginRequest,
+      isCurrentRequest,
+      PRIMARY_TABS,
+      OVERFLOW_TABS,
+      SHORTCUT_TABS,
+    };
     await loadLegacyScript('/app.js');
   } catch (err) {
     console.error('cLawyer bootstrap failed:', err);
