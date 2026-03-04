@@ -20,3 +20,11 @@ jobs:
         cargo fmt --all -- --check
     - name: Check lints (cargo clippy)
       run: cargo clippy -- -D warnings
+    - name: Setup Node
+      uses: actions/setup-node@v5
+      with:
+        node-version: '22'
+    - name: Install web typecheck dependencies
+      run: npm ci
+    - name: Check web client types
+      run: npm run typecheck:web

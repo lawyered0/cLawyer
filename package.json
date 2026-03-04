@@ -1,0 +1,11 @@
+{
+  "name": "clawyer-web",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "typecheck:web": "tsc --project tsconfig.web.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "5.9.2"
+  }
+}

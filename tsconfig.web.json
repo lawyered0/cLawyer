@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "/app/*": [
+        "src/channels/web/static/app/*"
+      ]
+    },
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM"],
+    "strict": false,
+    "skipLibCheck": true
+  },
+  "include": [
+    "src/channels/web/static/app/core/**/*.js"
+  ]
+}
