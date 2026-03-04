@@ -157,6 +157,38 @@ fn decision_allows_matter_activation(decision: ConflictDecision) -> bool {
     matches!(decision, ConflictDecision::Clear | ConflictDecision::Waived)
 }
 
+fn conflict_hit_signature(hit: &ConflictHit) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        hit.matter_id.to_ascii_lowercase(),
+        hit.party.to_ascii_lowercase(),
+        hit.role.as_str(),
+        hit.matched_via.to_ascii_lowercase()
+    )
+}
+
+fn conflict_signature_for_hits(hits: &[ConflictHit]) -> Vec<String> {
+    let mut values: Vec<String> = hits.iter().map(conflict_hit_signature).collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn clearance_signature_matches_hits(
+    matter_id: &str,
+    hits: &[ConflictHit],
+    hits_json: &serde_json::Value,
+) -> bool {
+    let Ok(stored_hits) = serde_json::from_value::<Vec<ConflictHit>>(hits_json.clone()) else {
+        tracing::error!(
+            "failed to parse stored conflict clearance hits_json for matter '{}'",
+            matter_id
+        );
+        return false;
+    };
+    conflict_signature_for_hits(&stored_hits) == conflict_signature_for_hits(hits)
+}
+
 async fn persist_conflict_clearance_decision(
     state: &Arc<GatewayState>,
     matter_id: &str,
@@ -186,7 +218,14 @@ async fn persist_conflict_clearance_decision(
         },
         decision,
         note: note.clone(),
-        hits_json: serde_json::to_value(hits).unwrap_or_else(|_| serde_json::json!([])),
+        hits_json: serde_json::to_value(hits).unwrap_or_else(|err| {
+            tracing::error!(
+                "failed to serialize conflict hits for matter '{}': {}",
+                matter_id,
+                err
+            );
+            serde_json::json!([])
+        }),
         hit_count: hits.len() as i32,
     };
     store
@@ -1040,12 +1079,22 @@ pub(crate) async fn matters_active_set_handler(
                         let matching_clearance = latest.as_ref().is_some_and(|clearance| {
                             clearance.hit_count == hits.len() as i32
                                 && decision_allows_matter_activation(clearance.decision)
+                                && clearance_signature_matches_hits(
+                                    &sanitized,
+                                    &hits,
+                                    &clearance.hits_json,
+                                )
                         });
 
                         if !matching_clearance {
                             if latest.as_ref().is_some_and(|clearance| {
                                 clearance.hit_count == hits.len() as i32
                                     && matches!(clearance.decision, ConflictDecision::Declined)
+                                    && clearance_signature_matches_hits(
+                                        &sanitized,
+                                        &hits,
+                                        &clearance.hits_json,
+                                    )
                             }) {
                                 return Err(active_set_conflict_declined_error(&hits));
                             }

@@ -538,7 +538,7 @@ impl LegalConflictStore for LibSqlBackend {
         let conn = self.connect().await?;
         let mut rows = conn
             .query(
-                "SELECT matter_id, checked_by, cleared_by, decision, note, hit_count, created_at \
+                "SELECT matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count, created_at \
                  FROM conflict_clearances \
                  WHERE matter_id = ?1 \
                  ORDER BY created_at DESC \
@@ -553,7 +553,9 @@ impl LegalConflictStore for LibSqlBackend {
         let decision_raw = get_text(&row, 3);
         let decision = ConflictDecision::from_db_value(decision_raw.as_str())
             .ok_or_else(|| DatabaseError::Serialization("invalid conflict decision".to_string()))?;
-        let created_at = parse_timestamp(&get_text(&row, 6))
+        let hits_json: serde_json::Value = serde_json::from_str(&get_text(&row, 5))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let created_at = parse_timestamp(&get_text(&row, 7))
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
         Ok(Some(ConflictClearanceInfo {
@@ -562,7 +564,8 @@ impl LegalConflictStore for LibSqlBackend {
             cleared_by: get_opt_text(&row, 2),
             decision,
             note: get_opt_text(&row, 4),
-            hit_count: get_i64(&row, 5) as i32,
+            hits_json,
+            hit_count: get_i64(&row, 6) as i32,
             created_at,
         }))
     }

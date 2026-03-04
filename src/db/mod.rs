@@ -178,6 +178,7 @@ pub struct ConflictClearanceInfo {
     pub cleared_by: Option<String>,
     pub decision: ConflictDecision,
     pub note: Option<String>,
+    pub hits_json: serde_json::Value,
     pub hit_count: i32,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }

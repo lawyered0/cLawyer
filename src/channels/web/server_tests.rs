@@ -766,6 +766,61 @@ async fn matters_active_set_records_decision_and_reuses_latest_clearance() {
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
+async fn matters_active_set_requires_new_clearance_when_hit_set_changes_with_same_count() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    db.seed_matter_parties("existing-a", "Demo Client", &[], None)
+        .await
+        .expect("seed existing-a client");
+    db.seed_matter_parties("existing-b", "Example Co", &[], None)
+        .await
+        .expect("seed existing-b adversary");
+
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+    let status = matters_active_set_handler(
+        State(Arc::clone(&state)),
+        Json(SetActiveMatterRequest {
+            matter_id: Some("demo".to_string()),
+            conflict_decision: Some(ConflictDecision::Waived),
+            conflict_note: Some("Initial waiver".to_string()),
+        }),
+    )
+    .await
+    .expect("initial waived decision should set active matter");
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    db.reset_conflict_graph()
+        .await
+        .expect("reset conflict graph for changed hit set");
+    db.seed_matter_parties("existing-c", "Demo Client", &[], None)
+        .await
+        .expect("seed replacement client hit");
+    db.seed_matter_parties("existing-b", "Example Co", &[], None)
+        .await
+        .expect("re-seed adversary hit");
+
+    let err = matters_active_set_handler(
+        State(state),
+        Json(SetActiveMatterRequest {
+            matter_id: Some("demo".to_string()),
+            conflict_decision: None,
+            conflict_note: None,
+        }),
+    )
+    .await
+    .expect_err("changed hit set should require fresh clearance");
+
+    assert_eq!(err.0, StatusCode::CONFLICT);
+    let body: serde_json::Value =
+        serde_json::from_str(&err.1).expect("conflict body should be json");
+    assert_eq!(body["conflict_required"], true);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
 async fn matters_active_set_ignores_conflict_hits_for_same_matter() {
     let (db, _tmp) = crate::testing::test_db().await;
     db.seed_matter_parties("demo", "Demo Client", &[], None)

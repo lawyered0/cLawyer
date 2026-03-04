@@ -1335,7 +1335,7 @@ impl LegalConflictStore for PgBackend {
         let conn = self.store.conn().await?;
         let row = conn
             .query_opt(
-                "SELECT matter_id, checked_by, cleared_by, decision, note, hit_count, created_at \
+                "SELECT matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count, created_at \
                  FROM conflict_clearances \
                  WHERE matter_id = $1 \
                  ORDER BY created_at DESC \
@@ -1357,8 +1357,9 @@ impl LegalConflictStore for PgBackend {
             cleared_by: row.get(2),
             decision,
             note: row.get(4),
-            hit_count: row.get(5),
-            created_at: row.get(6),
+            hits_json: row.get(5),
+            hit_count: row.get(6),
+            created_at: row.get(7),
         }))
     }
 }
