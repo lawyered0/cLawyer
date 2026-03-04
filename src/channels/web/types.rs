@@ -655,6 +655,10 @@ pub struct ActiveMatterResponse {
 pub struct SetActiveMatterRequest {
     /// Pass `null` or omit to clear the active matter.
     pub matter_id: Option<String>,
+    #[serde(default)]
+    pub conflict_decision: Option<crate::db::ConflictDecision>,
+    #[serde(default)]
+    pub conflict_note: Option<String>,
 }
 
 /// Request body for `POST /api/matters`.

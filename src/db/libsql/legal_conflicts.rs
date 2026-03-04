@@ -5,12 +5,13 @@ use libsql::params;
 use uuid::Uuid;
 
 use crate::db::{
-    ConflictClearanceRecord, ConflictHit, LegalConflictStore, PartyRole, conflict_terms_from_text,
-    normalize_party_name, trigram_similarity,
+    ConflictClearanceInfo, ConflictClearanceRecord, ConflictDecision, ConflictHit,
+    LegalConflictStore, PartyRole, conflict_terms_from_text, normalize_party_name,
+    trigram_similarity,
 };
 use crate::error::DatabaseError;
 
-use super::{LibSqlBackend, get_text, opt_text};
+use super::{LibSqlBackend, get_i64, get_opt_text, get_text, opt_text, parse_timestamp};
 
 fn match_priority(matched_via: &str) -> u8 {
     if matched_via == "direct" {
@@ -528,6 +529,42 @@ impl LegalConflictStore for LibSqlBackend {
         )
         .await?;
         Ok(())
+    }
+
+    async fn latest_conflict_clearance(
+        &self,
+        matter_id: &str,
+    ) -> Result<Option<ConflictClearanceInfo>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT matter_id, checked_by, cleared_by, decision, note, hit_count, created_at \
+                 FROM conflict_clearances \
+                 WHERE matter_id = ?1 \
+                 ORDER BY created_at DESC \
+                 LIMIT 1",
+                params![matter_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+
+        let decision_raw = get_text(&row, 3);
+        let decision = ConflictDecision::from_db_value(decision_raw.as_str())
+            .ok_or_else(|| DatabaseError::Serialization("invalid conflict decision".to_string()))?;
+        let created_at = parse_timestamp(&get_text(&row, 6))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+
+        Ok(Some(ConflictClearanceInfo {
+            matter_id: get_text(&row, 0),
+            checked_by: get_text(&row, 1),
+            cleared_by: get_opt_text(&row, 2),
+            decision,
+            note: get_opt_text(&row, 4),
+            hit_count: get_i64(&row, 5) as i32,
+            created_at,
+        }))
     }
 }
 

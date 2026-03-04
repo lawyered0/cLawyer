@@ -118,6 +118,9 @@ For web-first firm workflows, matter detail now includes:
   - runs intake-time conflict review against the DB-backed party graph and returns structured `ConflictHit` rows.
 - `POST /api/matters`
   - server-hard-gated on conflict hits: `clear`/`waived` can proceed, `declined` blocks creation and records clearance.
+- `POST /api/matters/active`
+  - conflict hard gate for activation: when unresolved cross-matter hits are present, setting active matter is blocked until a clearance decision is recorded.
+  - request supports optional `conflict_decision` (`clear|waived|declined`) + `conflict_note` (required for `waived`/`declined`) to persist review decisions.
 - `POST /api/matters/conflicts/reindex`
   - rebuilds DB conflict graph from `matters/*/matter.yaml` plus workspace `conflicts.json`.
 - `POST /api/matters/{id}/exports/retrieval-packet`

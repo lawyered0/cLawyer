@@ -18,21 +18,21 @@ use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
     AppendAuditEventParams, AuditEventQuery, AuditEventRecord, AuditEventStore, AuditSeverity,
-    BillingStore, ClientRecord, ClientStore, ClientType, ConflictClearanceRecord, ConflictHit,
-    ConversationStore, CreateClientParams, CreateDocumentVersionParams, CreateExpenseEntryParams,
-    CreateInvoiceLineItemParams, CreateInvoiceParams, CreateMatterDeadlineParams,
-    CreateMatterNoteParams, CreateMatterTaskParams, CreateTimeEntryParams,
-    CreateTrustLedgerEntryParams, Database, DocumentTemplateRecord, DocumentTemplateStore,
-    DocumentVersionRecord, DocumentVersionStore, ExpenseCategory, ExpenseEntryRecord,
-    InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus, JobStore, LegalConflictStore,
-    MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType, MatterDocumentCategory,
-    MatterDocumentRecord, MatterDocumentStore, MatterNoteRecord, MatterNoteStore, MatterRecord,
-    MatterStatus, MatterStore, MatterTaskRecord, MatterTaskStatus, MatterTaskStore,
-    MatterTimeSummary, PartyRole, RoutineStore, SandboxStore, SettingsStore, TimeEntryRecord,
-    TimeExpenseStore, ToolFailureStore, TrustLedgerEntryRecord, TrustLedgerEntryType,
-    UpdateClientParams, UpdateDocumentTemplateParams, UpdateExpenseEntryParams,
-    UpdateMatterDeadlineParams, UpdateMatterDocumentParams, UpdateMatterNoteParams,
-    UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
+    BillingStore, ClientRecord, ClientStore, ClientType, ConflictClearanceInfo,
+    ConflictClearanceRecord, ConflictDecision, ConflictHit, ConversationStore, CreateClientParams,
+    CreateDocumentVersionParams, CreateExpenseEntryParams, CreateInvoiceLineItemParams,
+    CreateInvoiceParams, CreateMatterDeadlineParams, CreateMatterNoteParams,
+    CreateMatterTaskParams, CreateTimeEntryParams, CreateTrustLedgerEntryParams, Database,
+    DocumentTemplateRecord, DocumentTemplateStore, DocumentVersionRecord, DocumentVersionStore,
+    ExpenseCategory, ExpenseEntryRecord, InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus,
+    JobStore, LegalConflictStore, MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType,
+    MatterDocumentCategory, MatterDocumentRecord, MatterDocumentStore, MatterNoteRecord,
+    MatterNoteStore, MatterRecord, MatterStatus, MatterStore, MatterTaskRecord, MatterTaskStatus,
+    MatterTaskStore, MatterTimeSummary, PartyRole, RoutineStore, SandboxStore, SettingsStore,
+    TimeEntryRecord, TimeExpenseStore, ToolFailureStore, TrustLedgerEntryRecord,
+    TrustLedgerEntryType, UpdateClientParams, UpdateDocumentTemplateParams,
+    UpdateExpenseEntryParams, UpdateMatterDeadlineParams, UpdateMatterDocumentParams,
+    UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
     UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams, WorkspaceStore,
     conflict_terms_from_text, normalize_party_name,
 };
@@ -1326,6 +1326,40 @@ impl LegalConflictStore for PgBackend {
         )
         .await?;
         Ok(())
+    }
+
+    async fn latest_conflict_clearance(
+        &self,
+        matter_id: &str,
+    ) -> Result<Option<ConflictClearanceInfo>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT matter_id, checked_by, cleared_by, decision, note, hit_count, created_at \
+                 FROM conflict_clearances \
+                 WHERE matter_id = $1 \
+                 ORDER BY created_at DESC \
+                 LIMIT 1",
+                &[&matter_id],
+            )
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let decision_raw: String = row.get(3);
+        let decision = ConflictDecision::from_db_value(decision_raw.as_str())
+            .ok_or_else(|| DatabaseError::Serialization("invalid conflict decision".to_string()))?;
+
+        Ok(Some(ConflictClearanceInfo {
+            matter_id: row.get(0),
+            checked_by: row.get(1),
+            cleared_by: row.get(2),
+            decision,
+            note: row.get(4),
+            hit_count: row.get(5),
+            created_at: row.get(6),
+        }))
     }
 }
 

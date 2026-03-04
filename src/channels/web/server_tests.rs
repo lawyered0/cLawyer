@@ -583,6 +583,8 @@ async fn matters_active_set_rejects_missing_matter() {
         State(state),
         Json(SetActiveMatterRequest {
             matter_id: Some("does-not-exist".to_string()),
+            conflict_decision: None,
+            conflict_note: None,
         }),
     )
     .await;
@@ -613,6 +615,8 @@ async fn matters_active_set_rejects_invalid_metadata() {
         State(state),
         Json(SetActiveMatterRequest {
             matter_id: Some("demo".to_string()),
+            conflict_decision: None,
+            conflict_note: None,
         }),
     )
     .await;
@@ -642,6 +646,8 @@ async fn matters_active_set_accepts_valid_metadata() {
         State(Arc::clone(&state)),
         Json(SetActiveMatterRequest {
             matter_id: Some("demo".to_string()),
+            conflict_decision: None,
+            conflict_note: None,
         }),
     )
     .await
@@ -659,6 +665,127 @@ async fn matters_active_set_accepts_valid_metadata() {
         stored.and_then(|v| v.as_str().map(|s| s.to_string())),
         Some("demo".to_string())
     );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn matters_active_set_requires_conflict_decision_when_hits_exist() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    db.seed_matter_parties("existing-matter", "Demo Client", &[], None)
+        .await
+        .expect("seed existing conflict party");
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+    let err = matters_active_set_handler(
+        State(Arc::clone(&state)),
+        Json(SetActiveMatterRequest {
+            matter_id: Some("demo".to_string()),
+            conflict_decision: None,
+            conflict_note: None,
+        }),
+    )
+    .await
+    .expect_err("missing conflict decision should block active set");
+
+    assert_eq!(err.0, StatusCode::CONFLICT);
+    let body: serde_json::Value =
+        serde_json::from_str(&err.1).expect("conflict body should be json");
+    assert_eq!(body["conflict_required"], true);
+    assert!(body["hits"].as_array().is_some_and(|hits| !hits.is_empty()));
+
+    let stored = state
+        .store
+        .as_ref()
+        .expect("store")
+        .get_setting("test-user", MATTER_ACTIVE_SETTING)
+        .await
+        .expect("read setting");
+    assert!(stored.is_none(), "active matter should remain unset");
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn matters_active_set_records_decision_and_reuses_latest_clearance() {
+    let _audit_lock = crate::legal::audit::lock_test_event_scenario().await;
+    crate::legal::audit::clear_test_events();
+
+    let (db, _tmp) = crate::testing::test_db().await;
+    db.seed_matter_parties("existing-matter", "Demo Client", &[], None)
+        .await
+        .expect("seed existing conflict party");
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+
+    let status = matters_active_set_handler(
+        State(Arc::clone(&state)),
+        Json(SetActiveMatterRequest {
+            matter_id: Some("demo".to_string()),
+            conflict_decision: Some(ConflictDecision::Waived),
+            conflict_note: Some("Waived after attorney review".to_string()),
+        }),
+    )
+    .await
+    .expect("waived decision should allow active matter set");
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let clearance = state
+        .store
+        .as_ref()
+        .expect("store")
+        .latest_conflict_clearance("demo")
+        .await
+        .expect("latest conflict clearance query should succeed")
+        .expect("clearance should be recorded");
+    assert_eq!(clearance.decision, ConflictDecision::Waived);
+    assert_eq!(clearance.hit_count, 1);
+
+    let status = matters_active_set_handler(
+        State(Arc::clone(&state)),
+        Json(SetActiveMatterRequest {
+            matter_id: Some("demo".to_string()),
+            conflict_decision: None,
+            conflict_note: None,
+        }),
+    )
+    .await
+    .expect("existing matching clearance should allow active set");
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let events = crate::legal::audit::test_events_snapshot();
+    assert!(events.iter().any(|event| {
+        event.event_type == "conflict_clearance_decision"
+            && event.details["source"] == "active_set_flow"
+            && event.details["decision"] == "waived"
+    }));
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn matters_active_set_ignores_conflict_hits_for_same_matter() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    db.seed_matter_parties("demo", "Demo Client", &[], None)
+        .await
+        .expect("seed same-matter party row");
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state = test_gateway_state_with_store_and_workspace(db, workspace);
+
+    let status = matters_active_set_handler(
+        State(state),
+        Json(SetActiveMatterRequest {
+            matter_id: Some("demo".to_string()),
+            conflict_decision: None,
+            conflict_note: None,
+        }),
+    )
+    .await
+    .expect("same-matter hit should not require conflict decision");
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
 #[cfg(feature = "libsql")]
@@ -765,6 +892,8 @@ async fn matters_active_set_uses_configured_matter_root() {
         State(Arc::clone(&state)),
         Json(SetActiveMatterRequest {
             matter_id: Some("demo".to_string()),
+            conflict_decision: None,
+            conflict_note: None,
         }),
     )
     .await

@@ -170,6 +170,18 @@ pub struct ConflictClearanceRecord {
     pub hit_count: i32,
 }
 
+/// Latest persisted conflict-clearance decision metadata for a matter.
+#[derive(Debug, Clone)]
+pub struct ConflictClearanceInfo {
+    pub matter_id: String,
+    pub checked_by: String,
+    pub cleared_by: Option<String>,
+    pub decision: ConflictDecision,
+    pub note: Option<String>,
+    pub hit_count: i32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Client entity type for conflict and matter tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1272,6 +1284,10 @@ pub trait LegalConflictStore: Send + Sync {
         &self,
         row: &ConflictClearanceRecord,
     ) -> Result<(), DatabaseError>;
+    async fn latest_conflict_clearance(
+        &self,
+        matter_id: &str,
+    ) -> Result<Option<ConflictClearanceInfo>, DatabaseError>;
 }
 
 #[async_trait]
