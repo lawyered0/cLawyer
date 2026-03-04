@@ -166,3 +166,45 @@ Success criteria:
 - `server_tests.rs` becomes small and cross-cutting only.
 - Test names/coverage preserved (parity check before/after).
 - Full gate green.
+
+## Follow-on Backlog — Web Client Decomposition (post-`codex/web-client-feature-split-v1`)
+
+Tracked from review after client decomposition landed (`app.js` 6,875 → 15 lines).
+
+### Priority order
+1. split `features/matters.js` into sub-modules (highest)
+2. expand `tsconfig.web.json` include to feature scripts incrementally
+
+### Item 1 — Split `features/matters.js` into bounded sub-modules
+
+Current issue: `src/channels/web/static/app/features/matters.js` is ~1.8k lines and
+combines multiple domains (core/conflicts/documents/finance/work).
+
+Target modules under `src/channels/web/static/app/features/matters/`:
+- `core.js` (list/select/active matter/create/edit + overview wiring)
+- `conflicts.js` (intake conflict review/check UI)
+- `documents.js` (documents/templates/retrieval/filing actions)
+- `finance.js` (time/expenses/trust/invoice list/detail wiring)
+- `work.js` (tasks/notes/deadlines and related quick actions)
+
+Success criteria:
+- Existing endpoint behavior unchanged.
+- Existing delegated-action hooks and no-inline-handler guards remain green.
+- `features/matters.js` reduced to a small facade or removed.
+- Full gate green.
+
+### Item 2 — Expand JS typecheck coverage beyond `core/*`
+
+Current issue: `tsconfig.web.json` currently includes `main.js` + `core/**/*.js`;
+feature scripts are excluded from `tsc --noEmit`.
+
+Planned change:
+- Add feature files to `tsconfig.web.json` include in small batches, starting with
+  `features/matters/*.js` after Item 1 split.
+- Add/adjust JSDoc typedef usage as needed to satisfy `checkJs`.
+- Keep incremental rollout to avoid high-noise type debt spikes.
+
+Success criteria:
+- `npm run typecheck:web` covers extracted feature files and stays green.
+- No runtime behavior changes from type-only fixes.
+- CI `Code Style` workflow continues passing with the expanded include scope.
