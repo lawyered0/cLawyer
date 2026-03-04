@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use clawyer::legal::backup::{reencrypt_matter_files, scan_matter_encryption};
 use clawyer::workspace::{MockEmbeddings, SearchConfig, Workspace, paths};
 use clawyer::{secrets::SecretsCrypto, workspace::LegalContentPolicy};
 use secrecy::SecretString;
@@ -387,6 +388,54 @@ async fn test_workspace_matter_encryption_roundtrip_and_search_exclusion() {
     assert!(
         hits.is_empty(),
         "encrypted matter content should be excluded from search index"
+    );
+
+    cleanup_user(&pool, user_id).await;
+}
+
+#[tokio::test]
+async fn test_matter_encryption_scan_and_reencrypt() {
+    let pool = get_pool();
+    if try_connect(&pool).await.is_none() {
+        return;
+    }
+    let user_id = "test_matter_encryption_scan";
+    cleanup_user(&pool, user_id).await;
+
+    let master_key = SecretString::from("0123456789abcdef0123456789abcdef".to_string());
+    let crypto = Arc::new(SecretsCrypto::new(master_key.clone()).expect("crypto"));
+    let workspace = Workspace::new(user_id, pool.clone())
+        .with_legal_content_policy(LegalContentPolicy::new("matters", true, crypto));
+
+    workspace
+        .write("matters/demo/facts.md", "HighlySensitiveFact123")
+        .await
+        .expect("write failed");
+
+    let scan = scan_matter_encryption(&workspace, "matters", &master_key, Some("demo"))
+        .await
+        .expect("scan failed");
+    assert_eq!(scan.scanned_files, 1);
+    assert_eq!(scan.encrypted_files, 1);
+    assert_eq!(scan.invalid_envelopes, 0);
+
+    let stored_before = workspace
+        .read_stored("matters/demo/facts.md")
+        .await
+        .expect("stored read before failed")
+        .content;
+    let rewrite = reencrypt_matter_files(&workspace, "matters", &master_key, Some("demo"), true)
+        .await
+        .expect("reencrypt failed");
+    assert_eq!(rewrite.reencrypted_files, 1);
+    let stored_after = workspace
+        .read_stored("matters/demo/facts.md")
+        .await
+        .expect("stored read after failed")
+        .content;
+    assert_ne!(
+        stored_before, stored_after,
+        "reencrypt should refresh envelope"
     );
 
     cleanup_user(&pool, user_id).await;

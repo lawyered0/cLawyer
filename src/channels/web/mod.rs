@@ -20,6 +20,9 @@ pub mod log_layer;
 pub mod openai_compat;
 pub mod server;
 pub mod sse;
+pub mod state;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod types;
 pub mod ws;
 
@@ -44,8 +47,8 @@ use crate::workspace::Workspace;
 
 use self::log_layer::{LogBroadcaster, LogLevelHandle};
 
-use self::server::GatewayState;
 use self::sse::SseManager;
+use self::state::{GatewayState, RateLimiter};
 use self::types::SseEvent;
 
 /// Web gateway channel implementing the Channel trait.
@@ -89,7 +92,7 @@ impl GatewayChannel {
             llm_provider: None,
             skill_registry: None,
             skill_catalog: None,
-            chat_rate_limiter: server::RateLimiter::new(30, 60),
+            chat_rate_limiter: RateLimiter::new(30, 60),
             registry_entries: Vec::new(),
             cost_guard: None,
             startup_time: std::time::Instant::now(),
@@ -124,7 +127,7 @@ impl GatewayChannel {
             llm_provider: self.state.llm_provider.clone(),
             skill_registry: self.state.skill_registry.clone(),
             skill_catalog: self.state.skill_catalog.clone(),
-            chat_rate_limiter: server::RateLimiter::new(30, 60),
+            chat_rate_limiter: RateLimiter::new(30, 60),
             registry_entries: self.state.registry_entries.clone(),
             cost_guard: self.state.cost_guard.clone(),
             startup_time: self.state.startup_time,

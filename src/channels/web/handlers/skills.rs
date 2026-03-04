@@ -3,13 +3,22 @@
 use std::sync::Arc;
 
 use axum::{
-    Json,
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
+    routing::{delete, get, post},
 };
 
-use crate::channels::web::server::GatewayState;
+use crate::channels::web::state::GatewayState;
 use crate::channels::web::types::*;
+
+pub fn routes() -> Router<Arc<GatewayState>> {
+    Router::new()
+        .route("/api/skills", get(skills_list_handler))
+        .route("/api/skills/search", post(skills_search_handler))
+        .route("/api/skills/install", post(skills_install_handler))
+        .route("/api/skills/{name}", delete(skills_remove_handler))
+}
 
 pub async fn skills_list_handler(
     State(state): State<Arc<GatewayState>>,

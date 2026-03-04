@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 
@@ -27,7 +27,9 @@ use crate::workspace::{Workspace, paths};
 
 const BACKUP_FORMAT: &str = "clawyer-backup";
 const BACKUP_FORMAT_VERSION: u32 = 1;
-const BACKUP_SCHEMA_VERSION: u32 = 1;
+const BACKUP_SCHEMA_VERSION_V1: u32 = 1;
+const BACKUP_SCHEMA_VERSION_V2: u32 = 2;
+const BACKUP_SCHEMA_VERSION: u32 = BACKUP_SCHEMA_VERSION_V2;
 const BACKUP_MAX_FILE_BYTES: usize = 512 * 1024;
 const BACKUP_MAX_TOTAL_FILE_BYTES: usize = 64 * 1024 * 1024;
 const BACKUP_AUDIT_MAX_ROWS: usize = 10_000;
@@ -76,6 +78,7 @@ impl Default for BackupCreateOptions {
 #[derive(Debug, Clone)]
 pub struct BackupRestoreOptions {
     pub apply: bool,
+    pub strict: bool,
     pub protect_identity_files: bool,
     pub matter_root: String,
 }
@@ -84,6 +87,7 @@ impl Default for BackupRestoreOptions {
     fn default() -> Self {
         Self {
             apply: false,
+            strict: false,
             protect_identity_files: true,
             matter_root: "matters".to_string(),
         }
@@ -134,10 +138,13 @@ pub struct BackupRestoreResult {
     pub valid: bool,
     pub dry_run: bool,
     pub applied: bool,
+    pub strict: bool,
     pub restored_settings: usize,
     pub restored_workspace_files: usize,
     pub skipped_workspace_files: usize,
     pub entity_counts: BackupRestoreEntityCounts,
+    pub integrity: BackupRestoreIntegritySummary,
+    pub critical_failures: Vec<String>,
     pub warnings: Vec<String>,
     pub manifest: BackupManifest,
 }
@@ -160,6 +167,18 @@ pub struct BackupRestoreEntityCounts {
     pub audit_events: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackupRestoreIntegritySummary {
+    pub checked_documents: usize,
+    pub missing_documents: usize,
+    pub checked_document_versions: usize,
+    pub missing_document_versions: usize,
+    pub checked_invoice_line_items: usize,
+    pub missing_invoice_line_items: usize,
+    pub checked_trust_balances: usize,
+    pub mismatched_trust_balances: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatterRetrievalExportResult {
     pub matter_id: String,
@@ -169,9 +188,20 @@ pub struct MatterRetrievalExportResult {
     pub warning: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MatterEncryptionScanResult {
+    pub scanned_files: usize,
+    pub encrypted_files: usize,
+    pub plaintext_files: usize,
+    pub invalid_envelopes: usize,
+    pub reencrypted_files: usize,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
     pub format_version: u32,
+    #[serde(default = "default_backup_schema_version")]
     pub schema_version: u32,
     pub app_version: String,
     pub created_at: String,
@@ -180,6 +210,10 @@ pub struct BackupManifest {
     pub hash_algorithm: String,
     pub section_checksums: BTreeMap<String, String>,
     pub notes: Vec<String>,
+}
+
+fn default_backup_schema_version() -> u32 {
+    BACKUP_SCHEMA_VERSION_V1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +284,7 @@ struct WorkspaceBackupSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceFileSnapshot {
     path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     memory_document_id: Option<String>,
     content: String,
     original_bytes: usize,
@@ -263,6 +298,105 @@ struct WorkspaceFileSnapshot {
 struct AiPacketPreview {
     matter_id: String,
     brief_markdown: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BackupSnapshotV1 {
+    created_at: String,
+    user_id: String,
+    settings: HashMap<String, serde_json::Value>,
+    legal: LegalBackupSnapshotV1,
+    workspace: WorkspaceBackupSnapshotV1,
+    ai_packets: Vec<AiPacketPreview>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegalBackupSnapshotV1 {
+    clients: Vec<ClientRecord>,
+    matters: Vec<MatterRecord>,
+    tasks: Vec<MatterTaskRecord>,
+    notes: Vec<MatterNoteRecord>,
+    deadlines: Vec<MatterDeadlineRecord>,
+    documents: Vec<MatterDocumentRecord>,
+    templates: Vec<DocumentTemplateRecord>,
+    time_entries: Vec<TimeEntryRecord>,
+    expense_entries: Vec<ExpenseEntryRecord>,
+    time_summaries: Vec<MatterTimeSummaryRecord>,
+    trust_ledger: Vec<TrustLedgerEntryRecord>,
+    invoices: Vec<InvoiceRecord>,
+    invoice_line_items: Vec<InvoiceLineItemRecord>,
+    audit_events: Vec<AuditEventRecord>,
+    conflict_graph_summary: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceBackupSnapshotV1 {
+    files: Vec<WorkspaceFileSnapshotV1>,
+    total_original_bytes: usize,
+    total_stored_bytes: usize,
+    truncated_files: usize,
+    skipped_files: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceFileSnapshotV1 {
+    path: String,
+    content: String,
+    original_bytes: usize,
+    stored_bytes: usize,
+    truncated: bool,
+    skipped: bool,
+    sha256: String,
+}
+
+impl From<BackupSnapshotV1> for BackupSnapshot {
+    fn from(value: BackupSnapshotV1) -> Self {
+        Self {
+            created_at: value.created_at,
+            user_id: value.user_id,
+            settings: value.settings,
+            legal: LegalBackupSnapshot {
+                clients: value.legal.clients,
+                matters: value.legal.matters,
+                tasks: value.legal.tasks,
+                notes: value.legal.notes,
+                deadlines: value.legal.deadlines,
+                documents: value.legal.documents,
+                document_versions: Vec::new(),
+                templates: value.legal.templates,
+                time_entries: value.legal.time_entries,
+                expense_entries: value.legal.expense_entries,
+                time_summaries: value.legal.time_summaries,
+                trust_ledger: value.legal.trust_ledger,
+                invoices: value.legal.invoices,
+                invoice_line_items: value.legal.invoice_line_items,
+                audit_events: value.legal.audit_events,
+                conflict_graph_summary: value.legal.conflict_graph_summary,
+            },
+            workspace: WorkspaceBackupSnapshot {
+                files: value
+                    .workspace
+                    .files
+                    .into_iter()
+                    .map(|row| WorkspaceFileSnapshot {
+                        path: row.path,
+                        memory_document_id: None,
+                        content: row.content,
+                        original_bytes: row.original_bytes,
+                        stored_bytes: row.stored_bytes,
+                        truncated: row.truncated,
+                        skipped: row.skipped,
+                        sha256: row.sha256,
+                    })
+                    .collect(),
+                total_original_bytes: value.workspace.total_original_bytes,
+                total_stored_bytes: value.workspace.total_stored_bytes,
+                truncated_files: value.workspace.truncated_files,
+                skipped_files: value.workspace.skipped_files,
+            },
+            ai_packets: value.ai_packets,
+        }
+    }
 }
 
 pub async fn create_backup_file(
@@ -368,10 +502,12 @@ pub async fn restore_backup_file(
     let (manifest, snapshot, mut warnings) =
         decode_and_validate_backup(&envelope_bytes, master_key)?;
 
+    let mut critical_failures = Vec::new();
     let mut restored_settings = 0usize;
     let mut restored_workspace_files = 0usize;
     let mut skipped_workspace_files = 0usize;
     let mut entity_counts = BackupRestoreEntityCounts::default();
+    let mut integrity = BackupRestoreIntegritySummary::default();
 
     if options.apply {
         db.set_all_settings(user_id, &snapshot.settings)
@@ -379,6 +515,7 @@ pub async fn restore_backup_file(
             .map_err(|e| BackupError::Io(e.to_string()))?;
         restored_settings = snapshot.settings.len();
         let mut memory_doc_id_map: HashMap<uuid::Uuid, uuid::Uuid> = HashMap::new();
+        let mut restored_doc_id_by_path: HashMap<String, uuid::Uuid> = HashMap::new();
 
         for file in &snapshot.workspace.files {
             if file.skipped {
@@ -388,12 +525,18 @@ pub async fn restore_backup_file(
 
             let Some(normalized_path) = normalize_restore_path(&file.path) else {
                 skipped_workspace_files += 1;
-                warnings.push(format!("skipped unsafe path '{}'", file.path));
+                push_critical(
+                    &mut warnings,
+                    &mut critical_failures,
+                    format!("skipped unsafe path '{}'", file.path),
+                );
                 continue;
             };
 
             if options.protect_identity_files && is_protected_identity_path(&normalized_path) {
                 skipped_workspace_files += 1;
+                // This skip is expected in default restore posture and should not
+                // make strict mode fail by itself.
                 warnings.push(format!(
                     "skipped protected identity file '{}'",
                     normalized_path
@@ -403,10 +546,14 @@ pub async fn restore_backup_file(
 
             if !is_allowed_restore_path(&normalized_path, &options.matter_root) {
                 skipped_workspace_files += 1;
-                warnings.push(format!(
-                    "skipped path '{}' outside restore scope (matter_root='{}')",
-                    normalized_path, options.matter_root
-                ));
+                push_critical(
+                    &mut warnings,
+                    &mut critical_failures,
+                    format!(
+                        "skipped path '{}' outside restore scope (matter_root='{}')",
+                        normalized_path, options.matter_root
+                    ),
+                );
                 continue;
             }
 
@@ -427,8 +574,15 @@ pub async fn restore_backup_file(
             {
                 memory_doc_id_map.insert(old_id, restored_doc.id);
             }
+            restored_doc_id_by_path.insert(normalized_path.clone(), restored_doc.id);
             restored_workspace_files += 1;
         }
+
+        apply_legacy_memory_doc_path_fallback(
+            &mut memory_doc_id_map,
+            &restored_doc_id_by_path,
+            &snapshot.legal.documents,
+        );
 
         let mut client_id_map: HashMap<uuid::Uuid, uuid::Uuid> = HashMap::new();
         for client in &snapshot.legal.clients {
@@ -496,30 +650,42 @@ pub async fn restore_backup_file(
         for row in &snapshot.legal.tasks {
             match db.upsert_matter_task_record(row).await {
                 Ok(_) => entity_counts.tasks += 1,
-                Err(e) => warnings.push(format!(
-                    "failed to restore task {} (matter={}): {}",
-                    row.id, row.matter_id, e
-                )),
+                Err(e) => push_critical(
+                    &mut warnings,
+                    &mut critical_failures,
+                    format!(
+                        "failed to restore task {} (matter={}): {}",
+                        row.id, row.matter_id, e
+                    ),
+                ),
             }
         }
 
         for row in &snapshot.legal.notes {
             match db.upsert_matter_note_record(row).await {
                 Ok(_) => entity_counts.notes += 1,
-                Err(e) => warnings.push(format!(
-                    "failed to restore note {} (matter={}): {}",
-                    row.id, row.matter_id, e
-                )),
+                Err(e) => push_critical(
+                    &mut warnings,
+                    &mut critical_failures,
+                    format!(
+                        "failed to restore note {} (matter={}): {}",
+                        row.id, row.matter_id, e
+                    ),
+                ),
             }
         }
 
         for row in &snapshot.legal.deadlines {
             match db.upsert_matter_deadline_record(row).await {
                 Ok(_) => entity_counts.deadlines += 1,
-                Err(e) => warnings.push(format!(
-                    "failed to restore deadline {} (matter={}): {}",
-                    row.id, row.matter_id, e
-                )),
+                Err(e) => push_critical(
+                    &mut warnings,
+                    &mut critical_failures,
+                    format!(
+                        "failed to restore deadline {} (matter={}): {}",
+                        row.id, row.matter_id, e
+                    ),
+                ),
             }
         }
 
@@ -530,10 +696,14 @@ pub async fn restore_backup_file(
             }
             match db.upsert_matter_document_record(&adjusted).await {
                 Ok(_) => entity_counts.documents += 1,
-                Err(e) => warnings.push(format!(
-                    "failed to restore document {} (matter={} path='{}'): {}",
-                    row.id, row.matter_id, row.path, e
-                )),
+                Err(e) => push_critical(
+                    &mut warnings,
+                    &mut critical_failures,
+                    format!(
+                        "failed to restore document {} (matter={} path='{}'): {}",
+                        row.id, row.matter_id, row.path, e
+                    ),
+                ),
             }
         }
 
@@ -544,62 +714,88 @@ pub async fn restore_backup_file(
             }
             match db.upsert_document_version_record(&adjusted).await {
                 Ok(_) => entity_counts.document_versions += 1,
-                Err(e) => warnings.push(format!(
-                    "failed to restore document version {}: {}",
-                    row.id, e
-                )),
+                Err(e) => push_critical(
+                    &mut warnings,
+                    &mut critical_failures,
+                    format!("failed to restore document version {}: {}", row.id, e),
+                ),
             }
         }
 
         for row in &snapshot.legal.time_entries {
             match db.upsert_time_entry_record(row).await {
                 Ok(_) => entity_counts.time_entries += 1,
-                Err(e) => warnings.push(format!("failed to restore time entry {}: {}", row.id, e)),
+                Err(e) => push_critical(
+                    &mut warnings,
+                    &mut critical_failures,
+                    format!("failed to restore time entry {}: {}", row.id, e),
+                ),
             }
         }
 
         for row in &snapshot.legal.expense_entries {
             match db.upsert_expense_entry_record(row).await {
                 Ok(_) => entity_counts.expense_entries += 1,
-                Err(e) => {
-                    warnings.push(format!("failed to restore expense entry {}: {}", row.id, e))
-                }
+                Err(e) => push_critical(
+                    &mut warnings,
+                    &mut critical_failures,
+                    format!("failed to restore expense entry {}: {}", row.id, e),
+                ),
             }
         }
 
         for row in &snapshot.legal.invoices {
             match db.upsert_invoice_record(row).await {
                 Ok(_) => entity_counts.invoices += 1,
-                Err(e) => warnings.push(format!("failed to restore invoice {}: {}", row.id, e)),
+                Err(e) => push_critical(
+                    &mut warnings,
+                    &mut critical_failures,
+                    format!("failed to restore invoice {}: {}", row.id, e),
+                ),
             }
         }
 
         for row in &snapshot.legal.invoice_line_items {
             match db.upsert_invoice_line_item_record(row).await {
                 Ok(_) => entity_counts.invoice_line_items += 1,
-                Err(e) => warnings.push(format!(
-                    "failed to restore invoice line item {}: {}",
-                    row.id, e
-                )),
+                Err(e) => push_critical(
+                    &mut warnings,
+                    &mut critical_failures,
+                    format!("failed to restore invoice line item {}: {}", row.id, e),
+                ),
             }
         }
 
         for row in &snapshot.legal.trust_ledger {
             match db.upsert_trust_ledger_entry_record(row).await {
                 Ok(_) => entity_counts.trust_ledger += 1,
-                Err(e) => warnings.push(format!(
-                    "failed to restore trust ledger entry {}: {}",
-                    row.id, e
-                )),
+                Err(e) => push_critical(
+                    &mut warnings,
+                    &mut critical_failures,
+                    format!("failed to restore trust ledger entry {}: {}", row.id, e),
+                ),
             }
         }
 
         for row in &snapshot.legal.audit_events {
             match db.upsert_audit_event_record(row).await {
                 Ok(_) => entity_counts.audit_events += 1,
-                Err(e) => warnings.push(format!("failed to restore audit event {}: {}", row.id, e)),
+                Err(e) => push_critical(
+                    &mut warnings,
+                    &mut critical_failures,
+                    format!("failed to restore audit event {}: {}", row.id, e),
+                ),
             }
         }
+
+        integrity = verify_restore_integrity(
+            db,
+            user_id,
+            &snapshot,
+            &mut warnings,
+            &mut critical_failures,
+        )
+        .await;
 
         let _ = db
             .append_audit_event(
@@ -615,20 +811,39 @@ pub async fn restore_backup_file(
                         "restored_workspace_files": restored_workspace_files,
                         "skipped_workspace_files": skipped_workspace_files,
                         "entity_counts": entity_counts.clone(),
+                        "strict": options.strict,
+                        "critical_failure_count": critical_failures.len(),
+                        "integrity": serde_json::to_value(&integrity).unwrap_or_default(),
                     }),
                 },
             )
             .await;
     }
 
+    if options.apply && options.strict && !critical_failures.is_empty() {
+        return Err(BackupError::Validation(format!(
+            "strict restore failed with {} critical issue(s): {}",
+            critical_failures.len(),
+            critical_failures
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ")
+        )));
+    }
+
     Ok(BackupRestoreResult {
         valid: true,
         dry_run: !options.apply,
         applied: options.apply,
+        strict: options.strict,
         restored_settings,
         restored_workspace_files,
         skipped_workspace_files,
         entity_counts,
+        integrity,
+        critical_failures,
         warnings,
         manifest,
     })
@@ -1049,6 +1264,124 @@ pub async fn export_matter_retrieval_packet(
     })
 }
 
+pub async fn scan_matter_encryption(
+    workspace: &Workspace,
+    matter_root: &str,
+    master_key: &SecretString,
+    matter_filter: Option<&str>,
+) -> Result<MatterEncryptionScanResult, BackupError> {
+    scan_or_reencrypt_matter_files(workspace, matter_root, master_key, matter_filter, false).await
+}
+
+pub async fn reencrypt_matter_files(
+    workspace: &Workspace,
+    matter_root: &str,
+    master_key: &SecretString,
+    matter_filter: Option<&str>,
+    apply: bool,
+) -> Result<MatterEncryptionScanResult, BackupError> {
+    scan_or_reencrypt_matter_files(workspace, matter_root, master_key, matter_filter, apply).await
+}
+
+async fn scan_or_reencrypt_matter_files(
+    workspace: &Workspace,
+    matter_root: &str,
+    master_key: &SecretString,
+    matter_filter: Option<&str>,
+    apply: bool,
+) -> Result<MatterEncryptionScanResult, BackupError> {
+    let normalized_root = normalize_matter_root_path(matter_root)
+        .ok_or_else(|| BackupError::Validation(format!("invalid matter_root '{}'", matter_root)))?;
+    let filter = matter_filter
+        .map(sanitize_matter_id)
+        .filter(|id| !id.is_empty());
+    let crypto = crate::secrets::SecretsCrypto::new(master_key.clone())
+        .map_err(|e| BackupError::Crypto(e.to_string()))?;
+    let mut report = MatterEncryptionScanResult::default();
+
+    let all_paths = workspace.list_all().await?;
+    for raw_path in all_paths {
+        let Some(path) = normalize_restore_path(&raw_path) else {
+            continue;
+        };
+        if !is_path_within_root(&path, &normalized_root) {
+            continue;
+        }
+        let Some(matter_id) =
+            crate::legal::workspace_crypto::matter_id_for_path(&path, matter_root)
+        else {
+            continue;
+        };
+        if let Some(expected) = filter.as_ref()
+            && &matter_id != expected
+        {
+            continue;
+        }
+
+        report.scanned_files += 1;
+        let stored = match workspace.read_stored(&path).await {
+            Ok(doc) => doc.content,
+            Err(err) => {
+                report.invalid_envelopes += 1;
+                report
+                    .warnings
+                    .push(format!("failed to read '{}' during scan: {}", path, err));
+                continue;
+            }
+        };
+
+        if crate::legal::workspace_crypto::is_encrypted_payload(&stored) {
+            report.encrypted_files += 1;
+            match crate::legal::workspace_crypto::decrypt_matter_content(
+                &crypto, &matter_id, &stored,
+            ) {
+                Ok(Some(plaintext)) => {
+                    if apply {
+                        let rewritten = crate::legal::workspace_crypto::encrypt_matter_content(
+                            &crypto, &matter_id, &plaintext,
+                        )
+                        .map_err(BackupError::Crypto)?;
+                        workspace
+                            .write_stored(&path, &rewritten)
+                            .await
+                            .map_err(|e| BackupError::Io(e.to_string()))?;
+                        report.reencrypted_files += 1;
+                    }
+                }
+                Ok(None) => {
+                    report.invalid_envelopes += 1;
+                    report.warnings.push(format!(
+                        "file '{}' has unrecognized envelope format and could not be validated",
+                        path
+                    ));
+                }
+                Err(err) => {
+                    report.invalid_envelopes += 1;
+                    report.warnings.push(format!(
+                        "file '{}' failed envelope validation: {}",
+                        path, err
+                    ));
+                }
+            }
+        } else {
+            report.plaintext_files += 1;
+            if apply {
+                let encrypted = crate::legal::workspace_crypto::encrypt_matter_content(
+                    &crypto, &matter_id, &stored,
+                )
+                .map_err(BackupError::Crypto)?;
+                workspace
+                    .write_stored(&path, &encrypted)
+                    .await
+                    .map_err(|e| BackupError::Io(e.to_string()))?;
+                report.reencrypted_files += 1;
+            }
+        }
+    }
+
+    Ok(report)
+}
+
 pub fn default_backup_filename() -> String {
     let ts = Utc::now().format("%Y%m%d-%H%M%S").to_string();
     format!("clawyer-backup-{ts}.clawyerbak")
@@ -1079,6 +1412,223 @@ async fn read_optional_matter_metadata(
     read_matter_metadata_for_root(workspace, matter_root, matter_id)
         .await
         .ok()
+}
+
+fn push_critical(warnings: &mut Vec<String>, critical_failures: &mut Vec<String>, message: String) {
+    warnings.push(message.clone());
+    critical_failures.push(message);
+}
+
+fn apply_legacy_memory_doc_path_fallback(
+    memory_doc_id_map: &mut HashMap<Uuid, Uuid>,
+    restored_doc_id_by_path: &HashMap<String, Uuid>,
+    documents: &[MatterDocumentRecord],
+) {
+    for row in documents {
+        if memory_doc_id_map.contains_key(&row.memory_document_id) {
+            continue;
+        }
+        let normalized_path = normalize_restore_path(&row.path)
+            .or_else(|| normalize_restore_path(row.path.trim_start_matches('/')));
+        let Some(normalized_path) = normalized_path else {
+            continue;
+        };
+        if let Some(mapped_id) = restored_doc_id_by_path.get(&normalized_path).copied() {
+            memory_doc_id_map.insert(row.memory_document_id, mapped_id);
+        }
+    }
+}
+
+async fn verify_restore_integrity(
+    db: &dyn Database,
+    user_id: &str,
+    snapshot: &BackupSnapshot,
+    warnings: &mut Vec<String>,
+    critical_failures: &mut Vec<String>,
+) -> BackupRestoreIntegritySummary {
+    let mut summary = BackupRestoreIntegritySummary::default();
+    let mut matter_doc_ids_by_matter: HashMap<String, std::collections::HashSet<Uuid>> =
+        HashMap::new();
+
+    let unique_matter_ids: BTreeSet<String> = snapshot
+        .legal
+        .matters
+        .iter()
+        .map(|m| m.matter_id.clone())
+        .collect();
+
+    for matter_id in &unique_matter_ids {
+        match db.list_matter_documents_db(user_id, matter_id).await {
+            Ok(records) => {
+                let ids = records.into_iter().map(|d| d.id).collect();
+                matter_doc_ids_by_matter.insert(matter_id.clone(), ids);
+            }
+            Err(err) => push_critical(
+                warnings,
+                critical_failures,
+                format!(
+                    "integrity check failed to list matter documents for '{}': {}",
+                    matter_id, err
+                ),
+            ),
+        }
+    }
+
+    for row in &snapshot.legal.documents {
+        summary.checked_documents += 1;
+        let present = matter_doc_ids_by_matter
+            .get(&row.matter_id)
+            .map(|ids| ids.contains(&row.id))
+            .unwrap_or(false);
+        if !present {
+            summary.missing_documents += 1;
+            push_critical(
+                warnings,
+                critical_failures,
+                format!(
+                    "integrity mismatch: matter_document '{}' missing after restore",
+                    row.id
+                ),
+            );
+        }
+    }
+
+    let mut versions_by_document: HashMap<Uuid, std::collections::HashSet<Uuid>> = HashMap::new();
+    for row in &snapshot.legal.document_versions {
+        if versions_by_document.contains_key(&row.matter_document_id) {
+            continue;
+        }
+        match db
+            .list_document_versions(user_id, row.matter_document_id)
+            .await
+        {
+            Ok(records) => {
+                versions_by_document.insert(
+                    row.matter_document_id,
+                    records.into_iter().map(|d| d.id).collect(),
+                );
+            }
+            Err(err) => push_critical(
+                warnings,
+                critical_failures,
+                format!(
+                    "integrity check failed to list document versions for '{}': {}",
+                    row.matter_document_id, err
+                ),
+            ),
+        }
+    }
+
+    for row in &snapshot.legal.document_versions {
+        summary.checked_document_versions += 1;
+        let present = versions_by_document
+            .get(&row.matter_document_id)
+            .map(|ids| ids.contains(&row.id))
+            .unwrap_or(false);
+        if !present {
+            summary.missing_document_versions += 1;
+            push_critical(
+                warnings,
+                critical_failures,
+                format!(
+                    "integrity mismatch: document_version '{}' missing after restore",
+                    row.id
+                ),
+            );
+        }
+    }
+
+    let mut line_items_by_invoice: HashMap<Uuid, std::collections::HashSet<Uuid>> = HashMap::new();
+    for row in &snapshot.legal.invoice_line_items {
+        if line_items_by_invoice.contains_key(&row.invoice_id) {
+            continue;
+        }
+        match db.list_invoice_line_items(user_id, row.invoice_id).await {
+            Ok(records) => {
+                line_items_by_invoice
+                    .insert(row.invoice_id, records.into_iter().map(|d| d.id).collect());
+            }
+            Err(err) => push_critical(
+                warnings,
+                critical_failures,
+                format!(
+                    "integrity check failed to list invoice line items for '{}': {}",
+                    row.invoice_id, err
+                ),
+            ),
+        }
+    }
+
+    for row in &snapshot.legal.invoice_line_items {
+        summary.checked_invoice_line_items += 1;
+        let present = line_items_by_invoice
+            .get(&row.invoice_id)
+            .map(|ids| ids.contains(&row.id))
+            .unwrap_or(false);
+        if !present {
+            summary.missing_invoice_line_items += 1;
+            push_critical(
+                warnings,
+                critical_failures,
+                format!(
+                    "integrity mismatch: invoice_line_item '{}' missing after restore",
+                    row.id
+                ),
+            );
+        }
+    }
+
+    for matter_id in &unique_matter_ids {
+        let entries = match db.list_trust_ledger_entries(user_id, matter_id).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                push_critical(
+                    warnings,
+                    critical_failures,
+                    format!(
+                        "integrity check failed to list trust ledger entries for '{}': {}",
+                        matter_id, err
+                    ),
+                );
+                continue;
+            }
+        };
+        if entries.is_empty() {
+            continue;
+        }
+        summary.checked_trust_balances += 1;
+        let latest = entries
+            .iter()
+            .max_by_key(|row| row.created_at)
+            .map(|row| row.balance_after);
+        let current_balance = match db.current_trust_balance(user_id, matter_id).await {
+            Ok(balance) => balance,
+            Err(err) => {
+                push_critical(
+                    warnings,
+                    critical_failures,
+                    format!(
+                        "integrity check failed to compute trust balance for '{}': {}",
+                        matter_id, err
+                    ),
+                );
+                continue;
+            }
+        };
+        if latest != Some(current_balance) {
+            summary.mismatched_trust_balances += 1;
+            push_critical(
+                warnings,
+                critical_failures,
+                format!(
+                    "integrity mismatch: trust balance disagreement for matter '{}'",
+                    matter_id
+                ),
+            );
+        }
+    }
+
+    summary
 }
 
 fn normalize_restore_path(path: &str) -> Option<String> {
@@ -1570,6 +2120,12 @@ fn decode_and_validate_backup(
     let (manifest, snapshot) = parse_archive(&plaintext_bytes)?;
 
     let mut warnings = Vec::new();
+    if manifest.schema_version < BACKUP_SCHEMA_VERSION {
+        warnings.push(format!(
+            "backup schema_version {} was migrated to runtime schema {}",
+            manifest.schema_version, BACKUP_SCHEMA_VERSION
+        ));
+    }
     validate_manifest_checksums(&manifest, &snapshot, &mut warnings)?;
 
     Ok((manifest, snapshot, warnings))
@@ -1579,8 +2135,8 @@ fn parse_archive(archive_bytes: &[u8]) -> Result<(BackupManifest, BackupSnapshot
     let decoder = GzDecoder::new(Cursor::new(archive_bytes));
     let mut archive = Archive::new(decoder);
 
-    let mut manifest: Option<BackupManifest> = None;
-    let mut snapshot: Option<BackupSnapshot> = None;
+    let mut manifest_bytes: Option<Vec<u8>> = None;
+    let mut snapshot_bytes: Option<Vec<u8>> = None;
 
     let entries = archive
         .entries()
@@ -1601,26 +2157,45 @@ fn parse_archive(archive_bytes: &[u8]) -> Result<(BackupManifest, BackupSnapshot
 
         match path.as_str() {
             "manifest.json" => {
-                manifest = Some(
-                    serde_json::from_slice(&buf)
-                        .map_err(|e| BackupError::Serialization(e.to_string()))?,
-                );
+                manifest_bytes = Some(buf);
             }
             "snapshot.json" => {
-                snapshot = Some(
-                    serde_json::from_slice(&buf)
-                        .map_err(|e| BackupError::Serialization(e.to_string()))?,
-                );
+                snapshot_bytes = Some(buf);
             }
             _ => {}
         }
     }
 
-    let manifest =
-        manifest.ok_or_else(|| BackupError::Validation("manifest.json missing".to_string()))?;
-    let snapshot =
-        snapshot.ok_or_else(|| BackupError::Validation("snapshot.json missing".to_string()))?;
+    let manifest_bytes = manifest_bytes
+        .ok_or_else(|| BackupError::Validation("manifest.json missing".to_string()))?;
+    let snapshot_bytes = snapshot_bytes
+        .ok_or_else(|| BackupError::Validation("snapshot.json missing".to_string()))?;
+
+    let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| BackupError::Serialization(e.to_string()))?;
+    let snapshot = parse_snapshot_for_schema(manifest.schema_version, &snapshot_bytes)?;
+
     Ok((manifest, snapshot))
+}
+
+fn parse_snapshot_for_schema(
+    schema_version: u32,
+    bytes: &[u8],
+) -> Result<BackupSnapshot, BackupError> {
+    match schema_version {
+        0 | BACKUP_SCHEMA_VERSION_V1 => {
+            let parsed: BackupSnapshotV1 = serde_json::from_slice(bytes)
+                .map_err(|e| BackupError::Serialization(e.to_string()))?;
+            Ok(parsed.into())
+        }
+        BACKUP_SCHEMA_VERSION_V2 => {
+            serde_json::from_slice(bytes).map_err(|e| BackupError::Serialization(e.to_string()))
+        }
+        unsupported => Err(BackupError::Validation(format!(
+            "unsupported backup schema_version {}",
+            unsupported
+        ))),
+    }
 }
 
 fn validate_manifest_checksums(
@@ -1921,12 +2496,32 @@ mod tests {
         }
 
         #[derive(Serialize)]
+        struct LegacyWorkspaceFileSnapshot {
+            path: String,
+            content: String,
+            original_bytes: usize,
+            stored_bytes: usize,
+            truncated: bool,
+            skipped: bool,
+            sha256: String,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyWorkspaceBackupSnapshot {
+            files: Vec<LegacyWorkspaceFileSnapshot>,
+            total_original_bytes: usize,
+            total_stored_bytes: usize,
+            truncated_files: usize,
+            skipped_files: usize,
+        }
+
+        #[derive(Serialize)]
         struct LegacyBackupSnapshot {
             created_at: String,
             user_id: String,
             settings: HashMap<String, serde_json::Value>,
             legal: LegacyLegalBackupSnapshot,
-            workspace: WorkspaceBackupSnapshot,
+            workspace: LegacyWorkspaceBackupSnapshot,
             ai_packets: Vec<AiPacketPreview>,
         }
 
@@ -1951,8 +2546,16 @@ mod tests {
                 audit_events: vec![],
                 conflict_graph_summary: serde_json::json!({"present": false}),
             },
-            workspace: WorkspaceBackupSnapshot {
-                files: vec![],
+            workspace: LegacyWorkspaceBackupSnapshot {
+                files: vec![LegacyWorkspaceFileSnapshot {
+                    path: "matters/demo/facts.md".to_string(),
+                    content: "legacy".to_string(),
+                    original_bytes: 6,
+                    stored_bytes: 6,
+                    truncated: false,
+                    skipped: false,
+                    sha256: sha256_hex("legacy".as_bytes()),
+                }],
                 total_original_bytes: 0,
                 total_stored_bytes: 0,
                 truncated_files: 0,
@@ -1962,11 +2565,15 @@ mod tests {
         };
 
         let legacy_json = serde_json::to_vec(&legacy).expect("serialize legacy snapshot");
-        let snapshot: BackupSnapshot =
-            serde_json::from_slice(&legacy_json).expect("deserialize legacy snapshot");
+        let snapshot =
+            parse_snapshot_for_schema(BACKUP_SCHEMA_VERSION_V1, &legacy_json).expect("parse v1");
         assert!(
             snapshot.legal.document_versions.is_empty(),
             "legacy snapshots should default missing document_versions to empty"
+        );
+        assert!(
+            snapshot.workspace.files[0].memory_document_id.is_none(),
+            "legacy snapshots should default missing memory_document_id to None"
         );
 
         let mut checksums = BTreeMap::new();
@@ -1989,7 +2596,7 @@ mod tests {
 
         let manifest = BackupManifest {
             format_version: BACKUP_FORMAT_VERSION,
-            schema_version: BACKUP_SCHEMA_VERSION,
+            schema_version: BACKUP_SCHEMA_VERSION_V1,
             app_version: "test".to_string(),
             created_at: legacy.created_at,
             user_id: legacy.user_id,
@@ -2002,6 +2609,72 @@ mod tests {
         let mut warnings = Vec::new();
         validate_manifest_checksums(&manifest, &snapshot, &mut warnings)
             .expect("legacy checksum should validate with defaulted document_versions");
+    }
+
+    #[test]
+    fn parse_snapshot_for_schema_rejects_unknown_version() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "created_at": "2026-03-01T00:00:00Z",
+            "user_id": "u",
+            "settings": {},
+            "legal": {
+                "clients": [],
+                "matters": [],
+                "tasks": [],
+                "notes": [],
+                "deadlines": [],
+                "documents": [],
+                "templates": [],
+                "time_entries": [],
+                "expense_entries": [],
+                "time_summaries": [],
+                "trust_ledger": [],
+                "invoices": [],
+                "invoice_line_items": [],
+                "audit_events": [],
+                "conflict_graph_summary": {}
+            },
+            "workspace": {
+                "files": [],
+                "total_original_bytes": 0,
+                "total_stored_bytes": 0,
+                "truncated_files": 0,
+                "skipped_files": 0
+            },
+            "ai_packets": []
+        }))
+        .expect("serialize");
+
+        let err = parse_snapshot_for_schema(BACKUP_SCHEMA_VERSION_V2 + 1, &payload)
+            .expect_err("unsupported version should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported backup schema_version")
+        );
+    }
+
+    #[test]
+    fn legacy_restore_fallback_maps_document_memory_ids_by_path() {
+        let old_memory_doc_id = Uuid::new_v4();
+        let new_memory_doc_id = Uuid::new_v4();
+        let mut id_map = HashMap::new();
+        let restored_doc_id_by_path =
+            HashMap::from([("matters/demo/facts.md".to_string(), new_memory_doc_id)]);
+        let now = Utc::now();
+        let docs = vec![MatterDocumentRecord {
+            id: Uuid::new_v4(),
+            user_id: "u".to_string(),
+            matter_id: "demo".to_string(),
+            memory_document_id: old_memory_doc_id,
+            path: "/matters/demo/facts.md".to_string(),
+            display_name: "facts.md".to_string(),
+            category: crate::db::MatterDocumentCategory::Internal,
+            created_at: now,
+            updated_at: now,
+        }];
+
+        apply_legacy_memory_doc_path_fallback(&mut id_map, &restored_doc_id_by_path, &docs);
+        assert_eq!(id_map.get(&old_memory_doc_id), Some(&new_memory_doc_id));
     }
 
     #[test]

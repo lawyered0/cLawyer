@@ -22,7 +22,7 @@ use crate::llm::{
     ToolDefinition,
 };
 
-use super::server::GatewayState;
+use super::state::GatewayState;
 
 const MAX_MODEL_NAME_BYTES: usize = 256;
 

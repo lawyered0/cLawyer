@@ -1,6 +1,6 @@
 # cLawyer Backup and Recovery
 
-This guide documents the v1 encrypted backup workflow and restore behavior.
+This guide documents the encrypted backup workflow and restore behavior.
 
 ## Security defaults
 
@@ -41,6 +41,24 @@ Apply restore:
 clawyer backup restore --input /path/to/backup.clawyerbak --apply
 ```
 
+Apply restore in strict mode (fails when critical replay/integrity checks fail):
+
+```bash
+clawyer backup restore --input /path/to/backup.clawyerbak --apply --strict
+```
+
+Scan matter encryption health:
+
+```bash
+clawyer backup scan-matter-encryption --matter demo
+```
+
+Re-encrypt matter files in place (refresh envelope with current master key):
+
+```bash
+clawyer backup reencrypt-matter-files --matter demo
+```
+
 ## Web API usage
 
 - `POST /api/backups/create`
@@ -51,10 +69,11 @@ clawyer backup restore --input /path/to/backup.clawyerbak --apply
   - multipart fields:
     - `file` (backup file)
     - `apply` (`true|false`)
+    - `strict` (`true|false`)
     - `protect_identity_files` (`true|false`)
 - `GET /api/backups/{id}/download`
 
-## Restore behavior (v1)
+## Restore behavior
 
 Restore apply replays:
 
@@ -79,7 +98,19 @@ Restore apply replays:
   - invoice line items
   - audit events
 
-Restore apply returns per-entity restored/skipped counters for auditability.
+Restore apply returns:
+
+- per-entity restored/skipped counters
+- integrity summary (documents, document versions, invoice line items, trust balance checks)
+- critical failure list
+
+When strict mode is enabled, restore fails if critical failures are detected.
+
+## Backup schema compatibility
+
+- Current archive schema version: `2`.
+- Schema `1` archives remain supported through in-process migration during verify/restore.
+- Legacy fields are defaulted safely (`document_versions`, workspace `memory_document_id`) to keep older backups restorable.
 
 ## Rotation and storage
 

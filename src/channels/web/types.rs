@@ -881,6 +881,8 @@ pub struct BackupRestoreRequest {
     #[serde(default)]
     pub apply: bool,
     #[serde(default)]
+    pub strict: bool,
+    #[serde(default)]
     pub protect_identity_files: bool,
 }
 
@@ -889,9 +891,12 @@ pub struct BackupRestoreResponse {
     pub valid: bool,
     pub dry_run: bool,
     pub applied: bool,
+    pub strict: bool,
     pub restored_settings: usize,
     pub restored_workspace_files: usize,
     pub skipped_workspace_files: usize,
+    pub integrity: serde_json::Value,
+    pub critical_failures: Vec<String>,
     pub warnings: Vec<String>,
     pub manifest: serde_json::Value,
 }
