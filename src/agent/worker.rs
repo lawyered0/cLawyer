@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::agent::scheduler::WorkerMessage;
 use crate::agent::task::TaskOutput;
-use crate::context::{ContextManager, JobState};
+use crate::context::{ContextManager, JobContext, JobState};
 use crate::db::{AuditSeverity, Database};
 use crate::error::Error;
 use crate::hooks::HookRegistry;
@@ -56,6 +56,16 @@ struct SkepticalModeContext {
 }
 
 const LEGAL_ACTIVE_MATTER_SETTING_KEY: &str = "legal.active_matter";
+
+fn matter_id_from_job_metadata(job_ctx: &JobContext) -> Option<String> {
+    crate::legal::policy::matter_id_from_metadata(&job_ctx.metadata).or_else(|| {
+        job_ctx
+            .metadata
+            .get("active_matter")
+            .and_then(|value| value.as_str())
+            .and_then(crate::legal::policy::sanitize_optional_matter_id)
+    })
+}
 
 fn build_worker_system_prompt(
     title: &str,
@@ -115,18 +125,22 @@ impl Worker {
         self.deps.skeptical_mode_default
     }
 
-    async fn resolve_skeptical_mode_context(&self, user_id: &str) -> SkepticalModeContext {
+    async fn resolve_skeptical_mode_context(&self, job_ctx: &JobContext) -> SkepticalModeContext {
         let enabled = crate::legal::skeptical::resolve_for_user(
             self.store(),
-            user_id,
+            &job_ctx.user_id,
             self.skeptical_mode_default(),
         )
         .await;
 
-        let matter_id = self.load_active_matter_for_user(user_id).await;
+        let matter_id = if let Some(matter_id) = matter_id_from_job_metadata(job_ctx) {
+            Some(matter_id)
+        } else {
+            self.load_active_matter_for_user(&job_ctx.user_id).await
+        };
         SkepticalModeContext {
             enabled,
-            user_id: user_id.to_string(),
+            user_id: job_ctx.user_id.clone(),
             matter_id,
         }
     }
@@ -220,7 +234,7 @@ impl Worker {
 
         // Get job context
         let job_ctx = self.context_manager().get_context(self.job_id).await?;
-        let skeptical_mode = self.resolve_skeptical_mode_context(&job_ctx.user_id).await;
+        let skeptical_mode = self.resolve_skeptical_mode_context(&job_ctx).await;
 
         // Create reasoning engine
         let reasoning = Reasoning::new(self.llm().clone(), self.safety().clone());
@@ -1284,6 +1298,43 @@ mod tests {
             !prompt.contains("You are operating in Skeptical Mode."),
             "skeptical prompt addendum should be omitted when disabled"
         );
+    }
+
+    #[test]
+    fn skeptical_mode_matter_id_uses_job_metadata_matter_id() {
+        let mut job_ctx = JobContext::with_user("u1", "t", "d");
+        job_ctx.metadata = serde_json::json!({
+            "matter_id": "Acme v. Foo/2026"
+        });
+
+        assert_eq!(
+            super::matter_id_from_job_metadata(&job_ctx).as_deref(),
+            Some("acme-v--foo-2026")
+        );
+    }
+
+    #[test]
+    fn skeptical_mode_matter_id_uses_job_metadata_active_matter_fallback() {
+        let mut job_ctx = JobContext::with_user("u1", "t", "d");
+        job_ctx.metadata = serde_json::json!({
+            "active_matter": "Delta Matter!"
+        });
+
+        assert_eq!(
+            super::matter_id_from_job_metadata(&job_ctx).as_deref(),
+            Some("delta-matter")
+        );
+    }
+
+    #[test]
+    fn skeptical_mode_matter_id_ignores_invalid_job_metadata() {
+        let mut job_ctx = JobContext::with_user("u1", "t", "d");
+        job_ctx.metadata = serde_json::json!({
+            "matter_id": "!!!",
+            "active_matter": null
+        });
+
+        assert_eq!(super::matter_id_from_job_metadata(&job_ctx), None);
     }
 
     #[tokio::test]
