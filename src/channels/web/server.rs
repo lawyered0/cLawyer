@@ -17,9 +17,10 @@ use tokio::sync::oneshot;
 use tower_http::cors::{AllowHeaders, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::channels::web::auth::{AuthState, auth_middleware};
+use crate::channels::web::auth::{AuthPrincipal, AuthState, auth_middleware};
 pub use crate::channels::web::state::{GatewayState, PromptQueue, RateLimiter};
 use crate::channels::web::types::*;
+use crate::db::UserRole;
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
 
@@ -49,7 +50,11 @@ pub async fn start_server(
     let public = crate::channels::web::handlers::routes::public_routes();
 
     // Protected routes (require auth)
-    let auth_state = AuthState { token: auth_token };
+    let principal = resolve_gateway_principal(state.as_ref()).await?;
+    let auth_state = AuthState {
+        token: auth_token,
+        principal,
+    };
     let protected = Router::new()
         .merge(crate::channels::web::handlers::routes::protected_feature_routes())
         // OpenAI-compatible API
@@ -145,6 +150,30 @@ pub async fn start_server(
     });
 
     Ok(bound_addr)
+}
+
+async fn resolve_gateway_principal(
+    state: &GatewayState,
+) -> Result<AuthPrincipal, crate::error::ChannelError> {
+    let user_id = state.user_id.clone();
+    let fallback = AuthPrincipal::new(user_id.clone(), UserRole::Admin);
+    let Some(store) = state.store.as_ref() else {
+        return Ok(fallback);
+    };
+
+    let display_name = format!("Gateway User ({})", user_id);
+    let ensured = store
+        .ensure_user_account(&user_id, &display_name, UserRole::Admin)
+        .await
+        .map_err(|err| crate::error::ChannelError::StartupFailed {
+            name: "gateway".to_string(),
+            reason: format!(
+                "Failed to bootstrap gateway principal '{}': {}",
+                user_id, err
+            ),
+        })?;
+
+    Ok(AuthPrincipal::new(ensured.id, ensured.role))
 }
 
 // --- Static file handlers ---

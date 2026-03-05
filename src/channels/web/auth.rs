@@ -1,17 +1,37 @@
 //! Bearer token authentication middleware for the web gateway.
 
 use axum::{
-    extract::{Request, State},
-    http::{HeaderMap, StatusCode},
+    extract::{FromRequestParts, Request, State},
+    http::{HeaderMap, StatusCode, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
+
+use crate::db::UserRole;
+
+/// Authenticated request principal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthPrincipal {
+    pub user_id: String,
+    pub role: UserRole,
+}
+
+impl AuthPrincipal {
+    pub fn new(user_id: impl Into<String>, role: UserRole) -> Self {
+        Self {
+            user_id: user_id.into(),
+            role,
+        }
+    }
+}
 
 /// Shared auth state injected via axum middleware state.
 #[derive(Clone)]
 pub struct AuthState {
     pub token: String,
+    pub principal: AuthPrincipal,
 }
 
 /// Auth middleware that validates bearer token from header or query param.
@@ -21,7 +41,7 @@ pub struct AuthState {
 pub async fn auth_middleware(
     State(auth): State<AuthState>,
     headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     // Try Authorization header first (constant-time comparison)
@@ -30,6 +50,7 @@ pub async fn auth_middleware(
         && let Some(token) = value.strip_prefix("Bearer ")
         && bool::from(token.as_bytes().ct_eq(auth.token.as_bytes()))
     {
+        request.extensions_mut().insert(auth.principal.clone());
         return next.run(request).await;
     }
 
@@ -39,12 +60,33 @@ pub async fn auth_middleware(
             if let Some(token) = pair.strip_prefix("token=")
                 && bool::from(token.as_bytes().ct_eq(auth.token.as_bytes()))
             {
+                request.extensions_mut().insert(auth.principal.clone());
                 return next.run(request).await;
             }
         }
     }
 
     (StatusCode::UNAUTHORIZED, "Invalid or missing auth token").into_response()
+}
+
+/// Extractor for authenticated principal placed by [`auth_middleware`].
+#[derive(Clone, Debug)]
+pub struct RequestPrincipal(pub AuthPrincipal);
+
+impl<S> FromRequestParts<S> for RequestPrincipal
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let principal = parts
+            .extensions
+            .get::<AuthPrincipal>()
+            .cloned()
+            .ok_or((StatusCode::UNAUTHORIZED, "Missing auth principal"))?;
+        Ok(Self(principal))
+    }
 }
 
 #[cfg(test)]
@@ -55,8 +97,11 @@ mod tests {
     fn test_auth_state_clone() {
         let state = AuthState {
             token: "test-token".to_string(),
+            principal: AuthPrincipal::new("default", UserRole::Admin),
         };
         let cloned = state.clone();
         assert_eq!(cloned.token, "test-token");
+        assert_eq!(cloned.principal.user_id, "default");
+        assert_eq!(cloned.principal.role, UserRole::Admin);
     }
 }

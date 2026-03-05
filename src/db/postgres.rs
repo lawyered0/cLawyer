@@ -26,16 +26,17 @@ use crate::db::{
     DocumentTemplateRecord, DocumentTemplateStore, DocumentVersionRecord, DocumentVersionStore,
     ExpenseCategory, ExpenseEntryRecord, InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus,
     JobStore, LegalConflictStore, MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType,
-    MatterDocumentCategory, MatterDocumentRecord, MatterDocumentStore, MatterNoteRecord,
-    MatterNoteStore, MatterRecord, MatterStatus, MatterStore, MatterTaskRecord, MatterTaskStatus,
-    MatterTaskStore, MatterTimeSummary, PartyRole, RecordInvoicePaymentParams,
-    RecordInvoicePaymentResult, RoutineStore, SandboxStore, SettingsStore, TimeEntryRecord,
-    TimeExpenseStore, ToolFailureStore, TrustLedgerEntryRecord, TrustLedgerEntryType,
-    UpdateClientParams, UpdateDocumentTemplateParams, UpdateExpenseEntryParams,
-    UpdateMatterDeadlineParams, UpdateMatterDocumentParams, UpdateMatterNoteParams,
-    UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
-    UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams, WorkspaceStore,
-    conflict_terms_from_text, normalize_party_name,
+    MatterDocumentCategory, MatterDocumentRecord, MatterDocumentStore, MatterMemberRole,
+    MatterMembershipRecord, MatterNoteRecord, MatterNoteStore, MatterRecord, MatterStatus,
+    MatterStore, MatterTaskRecord, MatterTaskStatus, MatterTaskStore, MatterTimeSummary, PartyRole,
+    RbacStore, RecordInvoicePaymentParams, RecordInvoicePaymentResult, RoutineStore, SandboxStore,
+    SettingsStore, TimeEntryRecord, TimeExpenseStore, ToolFailureStore, TrustLedgerEntryRecord,
+    TrustLedgerEntryType, UpdateClientParams, UpdateDocumentTemplateParams,
+    UpdateExpenseEntryParams, UpdateMatterDeadlineParams, UpdateMatterDocumentParams,
+    UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
+    UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterMembershipParams,
+    UpsertMatterParams, UserRecord, UserRole, WorkspaceStore, conflict_terms_from_text,
+    normalize_party_name,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -216,6 +217,38 @@ fn parse_json_uuid_array(value: &serde_json::Value) -> Vec<Uuid> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn row_to_user_record(row: &tokio_postgres::Row) -> Result<UserRecord, DatabaseError> {
+    let role_raw: String = row.get("role");
+    let role = UserRole::from_db_value(&role_raw)
+        .ok_or_else(|| DatabaseError::Serialization(format!("invalid user role '{}'", role_raw)))?;
+    Ok(UserRecord {
+        id: row.get("id"),
+        display_name: row.get("display_name"),
+        role,
+        is_active: row.get("is_active"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_matter_membership_record(
+    row: &tokio_postgres::Row,
+) -> Result<MatterMembershipRecord, DatabaseError> {
+    let role_raw: String = row.get("role");
+    let role = MatterMemberRole::from_db_value(&role_raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid matter membership role '{}'", role_raw))
+    })?;
+    Ok(MatterMembershipRecord {
+        id: row.get("id"),
+        matter_owner_user_id: row.get("matter_owner_user_id"),
+        matter_id: row.get("matter_id"),
+        member_user_id: row.get("member_user_id"),
+        role,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
 }
 
 fn row_to_client_record(row: &tokio_postgres::Row) -> Result<ClientRecord, DatabaseError> {
@@ -1362,6 +1395,86 @@ impl LegalConflictStore for PgBackend {
             hit_count: row.get(6),
             created_at: row.get(7),
         }))
+    }
+}
+
+#[async_trait]
+impl RbacStore for PgBackend {
+    async fn ensure_user_account(
+        &self,
+        user_id: &str,
+        display_name: &str,
+        default_role: UserRole,
+    ) -> Result<UserRecord, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO users (id, display_name, role, is_active) \
+                 VALUES ($1, $2, $3, TRUE) \
+                 ON CONFLICT (id) DO UPDATE \
+                 SET display_name = EXCLUDED.display_name, \
+                     updated_at = NOW() \
+                 RETURNING id, display_name, role, is_active, created_at, updated_at",
+                &[&user_id, &display_name, &default_role.as_str()],
+            )
+            .await?;
+        row_to_user_record(&row)
+    }
+
+    async fn get_user_account(&self, user_id: &str) -> Result<Option<UserRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, display_name, role, is_active, created_at, updated_at \
+                 FROM users \
+                 WHERE id = $1",
+                &[&user_id],
+            )
+            .await?;
+        row.map(|row| row_to_user_record(&row)).transpose()
+    }
+
+    async fn upsert_matter_membership(
+        &self,
+        input: &UpsertMatterMembershipParams,
+    ) -> Result<MatterMembershipRecord, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                "INSERT INTO matter_memberships \
+                 (matter_owner_user_id, matter_id, member_user_id, role) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (matter_owner_user_id, matter_id, member_user_id) DO UPDATE \
+                 SET role = EXCLUDED.role, \
+                     updated_at = NOW() \
+                 RETURNING id, matter_owner_user_id, matter_id, member_user_id, role, created_at, updated_at",
+                &[
+                    &input.matter_owner_user_id,
+                    &input.matter_id,
+                    &input.member_user_id,
+                    &input.role.as_str(),
+                ],
+            )
+            .await?;
+        row_to_matter_membership_record(&row)
+    }
+
+    async fn list_matter_memberships(
+        &self,
+        matter_owner_user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterMembershipRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, matter_owner_user_id, matter_id, member_user_id, role, created_at, updated_at \
+                 FROM matter_memberships \
+                 WHERE matter_owner_user_id = $1 AND matter_id = $2 \
+                 ORDER BY created_at ASC, id ASC",
+                &[&matter_owner_user_id, &matter_id],
+            )
+            .await?;
+        rows.iter().map(row_to_matter_membership_record).collect()
     }
 }
 

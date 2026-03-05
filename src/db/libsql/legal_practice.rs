@@ -14,15 +14,15 @@ use crate::db::{
     DocumentTemplateRecord, DocumentTemplateStore, DocumentVersionRecord, DocumentVersionStore,
     ExpenseCategory, ExpenseEntryRecord, InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus,
     LegalRestoreStore, MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType,
-    MatterDocumentCategory, MatterDocumentRecord, MatterDocumentStore, MatterNoteRecord,
-    MatterNoteStore, MatterRecord, MatterStatus, MatterStore, MatterTaskRecord, MatterTaskStatus,
-    MatterTaskStore, MatterTimeSummary, RecordInvoicePaymentParams, RecordInvoicePaymentResult,
-    TimeEntryRecord, TimeExpenseStore, TrustLedgerEntryRecord, TrustLedgerEntryType,
-    UpdateClientParams, UpdateDocumentTemplateParams, UpdateExpenseEntryParams,
-    UpdateMatterDeadlineParams, UpdateMatterDocumentParams, UpdateMatterNoteParams,
-    UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
-    UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams,
-    normalize_party_name,
+    MatterDocumentCategory, MatterDocumentRecord, MatterDocumentStore, MatterMemberRole,
+    MatterMembershipRecord, MatterNoteRecord, MatterNoteStore, MatterRecord, MatterStatus,
+    MatterStore, MatterTaskRecord, MatterTaskStatus, MatterTaskStore, MatterTimeSummary, RbacStore,
+    RecordInvoicePaymentParams, RecordInvoicePaymentResult, TimeEntryRecord, TimeExpenseStore,
+    TrustLedgerEntryRecord, TrustLedgerEntryType, UpdateClientParams, UpdateDocumentTemplateParams,
+    UpdateExpenseEntryParams, UpdateMatterDeadlineParams, UpdateMatterDocumentParams,
+    UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
+    UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterMembershipParams,
+    UpsertMatterParams, UserRecord, UserRole, normalize_party_name,
 };
 use crate::error::DatabaseError;
 
@@ -84,6 +84,17 @@ fn parse_expense_category(raw: &str) -> Result<ExpenseCategory, DatabaseError> {
 fn parse_invoice_status(raw: &str) -> Result<InvoiceStatus, DatabaseError> {
     InvoiceStatus::from_db_value(raw)
         .ok_or_else(|| DatabaseError::Serialization(format!("invalid invoice status '{}'", raw)))
+}
+
+fn parse_user_role(raw: &str) -> Result<UserRole, DatabaseError> {
+    UserRole::from_db_value(raw)
+        .ok_or_else(|| DatabaseError::Serialization(format!("invalid user role '{}'", raw)))
+}
+
+fn parse_matter_member_role(raw: &str) -> Result<MatterMemberRole, DatabaseError> {
+    MatterMemberRole::from_db_value(raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid matter membership role '{}'", raw))
+    })
 }
 
 fn parse_trust_ledger_entry_type(raw: &str) -> Result<TrustLedgerEntryType, DatabaseError> {
@@ -451,6 +462,37 @@ fn row_to_audit_event_record(row: &libsql::Row) -> Result<AuditEventRecord, Data
     })
 }
 
+fn row_to_user_record(row: &libsql::Row) -> Result<UserRecord, DatabaseError> {
+    let role_raw = get_text(row, 2);
+    Ok(UserRecord {
+        id: get_text(row, 0),
+        display_name: get_text(row, 1),
+        role: parse_user_role(&role_raw)?,
+        is_active: get_i64(row, 3) != 0,
+        created_at: parse_timestamp(&get_text(row, 4))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+        updated_at: parse_timestamp(&get_text(row, 5))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+    })
+}
+
+fn row_to_matter_membership_record(
+    row: &libsql::Row,
+) -> Result<MatterMembershipRecord, DatabaseError> {
+    let role_raw = get_text(row, 4);
+    Ok(MatterMembershipRecord {
+        id: parse_uuid(&get_text(row, 0), "matter_memberships.id")?,
+        matter_owner_user_id: get_text(row, 1),
+        matter_id: get_text(row, 2),
+        member_user_id: get_text(row, 3),
+        role: parse_matter_member_role(&role_raw)?,
+        created_at: parse_timestamp(&get_text(row, 5))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+        updated_at: parse_timestamp(&get_text(row, 6))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+    })
+}
+
 fn parse_json_object_or_array(raw: &str) -> Result<serde_json::Value, DatabaseError> {
     if raw.trim().is_empty() {
         return Ok(serde_json::json!([]));
@@ -461,6 +503,122 @@ fn parse_json_object_or_array(raw: &str) -> Result<serde_json::Value, DatabaseEr
         Ok(value)
     } else {
         Ok(serde_json::json!([]))
+    }
+}
+
+#[async_trait::async_trait]
+impl RbacStore for LibSqlBackend {
+    async fn ensure_user_account(
+        &self,
+        user_id: &str,
+        display_name: &str,
+        default_role: UserRole,
+    ) -> Result<UserRecord, DatabaseError> {
+        let conn = self.connect().await?;
+        conn.execute(
+            "INSERT INTO users (id, display_name, role, is_active) \
+             VALUES (?1, ?2, ?3, 1) \
+             ON CONFLICT(id) DO UPDATE SET \
+                display_name = excluded.display_name, \
+                updated_at = datetime('now')",
+            params![user_id, display_name, default_role.as_str()],
+        )
+        .await?;
+
+        let row = conn
+            .query(
+                "SELECT id, display_name, role, is_active, created_at, updated_at \
+                 FROM users \
+                 WHERE id = ?1 \
+                 LIMIT 1",
+                params![user_id],
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| DatabaseError::Query("failed to load ensured user".to_string()))?;
+        row_to_user_record(&row)
+    }
+
+    async fn get_user_account(&self, user_id: &str) -> Result<Option<UserRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let row = conn
+            .query(
+                "SELECT id, display_name, role, is_active, created_at, updated_at \
+                 FROM users \
+                 WHERE id = ?1 \
+                 LIMIT 1",
+                params![user_id],
+            )
+            .await?
+            .next()
+            .await?;
+        row.map(|row| row_to_user_record(&row)).transpose()
+    }
+
+    async fn upsert_matter_membership(
+        &self,
+        input: &UpsertMatterMembershipParams,
+    ) -> Result<MatterMembershipRecord, DatabaseError> {
+        let conn = self.connect().await?;
+        let id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO matter_memberships (id, matter_owner_user_id, matter_id, member_user_id, role) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(matter_owner_user_id, matter_id, member_user_id) DO UPDATE SET \
+                role = excluded.role, \
+                updated_at = datetime('now')",
+            params![
+                id.as_str(),
+                input.matter_owner_user_id.as_str(),
+                input.matter_id.as_str(),
+                input.member_user_id.as_str(),
+                input.role.as_str(),
+            ],
+        )
+        .await?;
+
+        let row = conn
+            .query(
+                "SELECT id, matter_owner_user_id, matter_id, member_user_id, role, created_at, updated_at \
+                 FROM matter_memberships \
+                 WHERE matter_owner_user_id = ?1 AND matter_id = ?2 AND member_user_id = ?3 \
+                 LIMIT 1",
+                params![
+                    input.matter_owner_user_id.as_str(),
+                    input.matter_id.as_str(),
+                    input.member_user_id.as_str(),
+                ],
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| {
+                DatabaseError::Query("failed to load upserted matter membership".to_string())
+            })?;
+        row_to_matter_membership_record(&row)
+    }
+
+    async fn list_matter_memberships(
+        &self,
+        matter_owner_user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterMembershipRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id, matter_owner_user_id, matter_id, member_user_id, role, created_at, updated_at \
+                 FROM matter_memberships \
+                 WHERE matter_owner_user_id = ?1 AND matter_id = ?2 \
+                 ORDER BY created_at ASC, id ASC",
+                params![matter_owner_user_id, matter_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row_to_matter_membership_record(&row)?);
+        }
+        Ok(out)
     }
 }
 
