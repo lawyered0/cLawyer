@@ -1397,6 +1397,7 @@ pub trait LegalConflictStore: Send + Sync {
 
 #[async_trait]
 pub trait RbacStore: Send + Sync {
+    /// Ensure a user row exists. Existing roles are preserved; only display_name is refreshed.
     async fn ensure_user_account(
         &self,
         user_id: &str,
@@ -1404,6 +1405,15 @@ pub trait RbacStore: Send + Sync {
         default_role: UserRole,
     ) -> Result<UserRecord, DatabaseError>;
     async fn get_user_account(&self, user_id: &str) -> Result<Option<UserRecord>, DatabaseError>;
+    async fn upsert_user_token_hash(
+        &self,
+        user_id: &str,
+        token_hash: &str,
+    ) -> Result<(), DatabaseError>;
+    async fn get_user_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<UserRecord>, DatabaseError>;
     async fn upsert_matter_membership(
         &self,
         input: &UpsertMatterMembershipParams,

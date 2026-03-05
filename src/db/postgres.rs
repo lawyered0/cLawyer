@@ -1434,6 +1434,42 @@ impl RbacStore for PgBackend {
         row.map(|row| row_to_user_record(&row)).transpose()
     }
 
+    async fn upsert_user_token_hash(
+        &self,
+        user_id: &str,
+        token_hash: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "INSERT INTO user_tokens (user_id, token_hash) \
+             VALUES ($1, $2) \
+             ON CONFLICT (user_id) DO UPDATE \
+             SET token_hash = EXCLUDED.token_hash, \
+                 updated_at = NOW()",
+            &[&user_id, &token_hash],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn get_user_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<UserRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT u.id, u.display_name, u.role, u.is_active, u.created_at, u.updated_at \
+                 FROM user_tokens t \
+                 JOIN users u ON u.id = t.user_id \
+                 WHERE t.token_hash = $1 AND u.is_active = TRUE \
+                 LIMIT 1",
+                &[&token_hash],
+            )
+            .await?;
+        row.map(|row| row_to_user_record(&row)).transpose()
+    }
+
     async fn upsert_matter_membership(
         &self,
         input: &UpsertMatterMembershipParams,

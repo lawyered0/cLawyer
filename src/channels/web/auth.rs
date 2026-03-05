@@ -1,5 +1,7 @@
 //! Bearer token authentication middleware for the web gateway.
 
+use std::sync::Arc;
+
 use axum::{
     extract::{FromRequestParts, Request, State},
     http::{HeaderMap, StatusCode, request::Parts},
@@ -7,9 +9,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::db::UserRole;
+use crate::db::{Database, UserRole};
 
 /// Authenticated request principal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,7 +34,8 @@ impl AuthPrincipal {
 #[derive(Clone)]
 pub struct AuthState {
     pub token: String,
-    pub principal: AuthPrincipal,
+    pub fallback_principal: AuthPrincipal,
+    pub store: Option<Arc<dyn Database>>,
 }
 
 /// Auth middleware that validates bearer token from header or query param.
@@ -44,29 +48,63 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // Try Authorization header first (constant-time comparison)
-    if let Some(auth_header) = headers.get("authorization")
-        && let Ok(value) = auth_header.to_str()
-        && let Some(token) = value.strip_prefix("Bearer ")
-        && bool::from(token.as_bytes().ct_eq(auth.token.as_bytes()))
-    {
-        request.extensions_mut().insert(auth.principal.clone());
-        return next.run(request).await;
-    }
+    let token = match extract_token(&headers, request.uri().query()) {
+        Some(token) => token,
+        None => {
+            return (StatusCode::UNAUTHORIZED, "Invalid or missing auth token").into_response();
+        }
+    };
 
-    // Fall back to query parameter for SSE EventSource (constant-time comparison)
-    if let Some(query) = request.uri().query() {
-        for pair in query.split('&') {
-            if let Some(token) = pair.strip_prefix("token=")
-                && bool::from(token.as_bytes().ct_eq(auth.token.as_bytes()))
-            {
-                request.extensions_mut().insert(auth.principal.clone());
+    // Resolve principal from persisted token hash first.
+    if let Some(store) = auth.store.as_ref() {
+        let token_hash = hash_auth_token(&token);
+        match store.get_user_by_token_hash(&token_hash).await {
+            Ok(Some(user)) => {
+                request
+                    .extensions_mut()
+                    .insert(AuthPrincipal::new(user.id, user.role));
                 return next.run(request).await;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!("Failed to resolve auth principal from token hash: {}", err);
             }
         }
     }
 
+    // Backward-compatible fallback for shared gateway token mode.
+    if bool::from(token.as_bytes().ct_eq(auth.token.as_bytes())) {
+        request
+            .extensions_mut()
+            .insert(auth.fallback_principal.clone());
+        return next.run(request).await;
+    }
+
     (StatusCode::UNAUTHORIZED, "Invalid or missing auth token").into_response()
+}
+
+fn extract_token(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
+    if let Some(auth_header) = headers.get("authorization")
+        && let Ok(value) = auth_header.to_str()
+        && let Some(token) = value.strip_prefix("Bearer ")
+    {
+        return Some(token.to_string());
+    }
+
+    // SSE EventSource path: token is passed via query parameter.
+    let query = query?;
+    for pair in query.split('&') {
+        if let Some(token) = pair.strip_prefix("token=") {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+pub fn hash_auth_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Extractor for authenticated principal placed by [`auth_middleware`].
@@ -97,11 +135,22 @@ mod tests {
     fn test_auth_state_clone() {
         let state = AuthState {
             token: "test-token".to_string(),
-            principal: AuthPrincipal::new("default", UserRole::Admin),
+            fallback_principal: AuthPrincipal::new("default", UserRole::Admin),
+            store: None,
         };
         let cloned = state.clone();
         assert_eq!(cloned.token, "test-token");
-        assert_eq!(cloned.principal.user_id, "default");
-        assert_eq!(cloned.principal.role, UserRole::Admin);
+        assert_eq!(cloned.fallback_principal.user_id, "default");
+        assert_eq!(cloned.fallback_principal.role, UserRole::Admin);
+        assert!(cloned.store.is_none());
+    }
+
+    #[test]
+    fn test_hash_auth_token_deterministic() {
+        let first = hash_auth_token("abc123");
+        let second = hash_auth_token("abc123");
+        let third = hash_auth_token("abc124");
+        assert_eq!(first, second);
+        assert_ne!(first, third);
     }
 }
