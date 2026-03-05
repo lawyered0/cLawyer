@@ -2602,35 +2602,73 @@ impl BillingStore for LibSqlBackend {
         amount: Decimal,
     ) -> Result<Option<InvoiceRecord>, DatabaseError> {
         let conn = self.connect().await?;
-        let Some(invoice) = self.get_invoice(user_id, invoice_id).await? else {
-            return Ok(None);
-        };
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let result = async {
+            let invoice_row = conn
+                .query(
+                    "SELECT id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at \
+                     FROM invoices \
+                     WHERE user_id = ?1 AND id = ?2 \
+                     LIMIT 1",
+                    params![user_id, invoice_id.to_string()],
+                )
+                .await?
+                .next()
+                .await?;
+            let Some(invoice_row) = invoice_row else {
+                return Ok(None);
+            };
+            let invoice = row_to_invoice_record(&invoice_row)?;
+            let mut new_paid_amount = (invoice.paid_amount + amount).round_dp(2);
+            if new_paid_amount > invoice.total {
+                new_paid_amount = invoice.total;
+            }
+            let new_status = if new_paid_amount >= invoice.total {
+                InvoiceStatus::Paid
+            } else {
+                invoice.status
+            };
 
-        let mut new_paid_amount = (invoice.paid_amount + amount).round_dp(2);
-        if new_paid_amount > invoice.total {
-            new_paid_amount = invoice.total;
+            conn.execute(
+                "UPDATE invoices SET \
+                    paid_amount = ?3, \
+                    status = ?4, \
+                    updated_at = datetime('now') \
+                 WHERE user_id = ?1 AND id = ?2",
+                params![
+                    user_id,
+                    invoice_id.to_string(),
+                    new_paid_amount.to_string(),
+                    new_status.as_str()
+                ],
+            )
+            .await?;
+            let row = conn
+                .query(
+                    "SELECT id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at \
+                     FROM invoices \
+                     WHERE user_id = ?1 AND id = ?2 \
+                     LIMIT 1",
+                    params![user_id, invoice_id.to_string()],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_else(|| DatabaseError::Query("invoice disappeared after update".to_string()))?;
+            Ok(Some(row_to_invoice_record(&row)?))
         }
-        let new_status = if new_paid_amount >= invoice.total {
-            InvoiceStatus::Paid
-        } else {
-            invoice.status
-        };
+        .await;
 
-        conn.execute(
-            "UPDATE invoices SET \
-                paid_amount = ?3, \
-                status = ?4, \
-                updated_at = datetime('now') \
-             WHERE user_id = ?1 AND id = ?2",
-            params![
-                user_id,
-                invoice_id.to_string(),
-                new_paid_amount.to_string(),
-                new_status.as_str()
-            ],
-        )
-        .await?;
-        self.get_invoice(user_id, invoice_id).await
+        match result {
+            Ok(record) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(record)
+            }
+            Err(err) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(err)
+            }
+        }
     }
 
     async fn record_invoice_payment(
