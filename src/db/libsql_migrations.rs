@@ -564,6 +564,15 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE INDEX IF NOT EXISTS idx_users_role_active ON users(role, is_active);
 
+CREATE TABLE IF NOT EXISTS user_tokens (
+    user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_tokens_hash ON user_tokens(token_hash);
+
 -- ==================== Matter/client core ====================
 
 CREATE TABLE IF NOT EXISTS clients (

@@ -2,6 +2,7 @@ use super::*;
 use std::sync::Arc;
 
 use crate::agent::SessionManager;
+use crate::channels::web::auth::hash_auth_token;
 use crate::channels::web::handlers::{
     chat::{
         chat_approval_handler, chat_history_handler, chat_new_thread_handler, chat_send_handler,
@@ -307,6 +308,57 @@ async fn resolve_gateway_principal_bootstraps_admin_user_in_store() {
     assert_eq!(persisted.id, state.user_id);
     assert_eq!(persisted.role, UserRole::Admin);
     assert!(persisted.is_active);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn rbac_token_hash_lookup_returns_bootstrapped_user() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    let state = test_gateway_state_with_store_and_workspace(Arc::clone(&db), workspace);
+    let principal = resolve_gateway_principal(state.as_ref())
+        .await
+        .expect("principal should resolve");
+
+    let token_hash = hash_auth_token("gateway-token");
+    db.upsert_user_token_hash(&principal.user_id, &token_hash)
+        .await
+        .expect("token hash upsert should succeed");
+
+    let resolved = db
+        .get_user_by_token_hash(&token_hash)
+        .await
+        .expect("token hash lookup should succeed")
+        .expect("user should resolve from token hash");
+    assert_eq!(resolved.id, principal.user_id);
+    assert_eq!(resolved.role, principal.role);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn rbac_token_hash_reassignment_does_not_fail_when_user_id_changes() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    db.ensure_user_account("old-user", "Old User", UserRole::Admin)
+        .await
+        .expect("old user bootstrap");
+    db.ensure_user_account("new-user", "New User", UserRole::Admin)
+        .await
+        .expect("new user bootstrap");
+
+    let token_hash = hash_auth_token("shared-gateway-token");
+    db.upsert_user_token_hash("old-user", &token_hash)
+        .await
+        .expect("old mapping insert");
+    db.upsert_user_token_hash("new-user", &token_hash)
+        .await
+        .expect("reassignment should not fail");
+
+    let resolved = db
+        .get_user_by_token_hash(&token_hash)
+        .await
+        .expect("token lookup should succeed")
+        .expect("user should resolve");
+    assert_eq!(resolved.id, "new-user");
 }
 
 #[cfg(feature = "libsql")]

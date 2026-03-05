@@ -166,3 +166,60 @@ Success criteria:
 - `server_tests.rs` becomes small and cross-cutting only.
 - Test names/coverage preserved (parity check before/after).
 - Full gate green.
+
+## Follow-on Backlog — RBAC/Auth Principal Resolution (post-`codex/rbac-principal-per-request-v1`)
+
+Tracked from review after per-request principal lookup landed in PR #52.
+
+### Priority order
+1. token-hash hardening model for multi-user token issuance
+2. robust URL-decoding for query token extraction
+3. end-to-end middleware DB-principal path test
+
+### Item 1 — Harden token hash strategy for multi-user issuance
+
+Current issue: `hash_auth_token` uses unsalted SHA-256. This is acceptable for
+today's high-entropy generated gateway tokens, but should be hardened before
+multi-user/user-generated token issuance is added.
+
+Planned change:
+- Switch to keyed hashing (HMAC-SHA256 with server secret) or equivalent
+  KDF-backed design for token-at-rest hashing.
+- Keep deterministic lookup semantics for `user_tokens` while preventing
+  offline precomputation usefulness.
+
+Success criteria:
+- Stored token material remains non-reversible and keyed.
+- Existing per-request DB lookup flow remains O(1)/indexed.
+- Full gate green.
+
+### Item 2 — URL-decode query token extraction in auth middleware
+
+Current issue: query token extraction currently reads raw `token=` pairs and
+does not URL-decode values. Percent-encoded tokens can fail auth unexpectedly.
+
+Planned change:
+- Parse query params using a URL-decoding parser (`form_urlencoded`/equivalent).
+- Preserve header-first then query-fallback semantics.
+
+Success criteria:
+- Percent-encoded query token values authenticate correctly.
+- Invalid header token still falls back to valid query token.
+- Full gate green.
+
+### Item 3 — Add full middleware DB-principal integration test
+
+Current issue: DB token-hash lookup is tested at store level, and middleware is
+tested for fallback behavior, but there is no end-to-end middleware test for
+header/query token -> DB lookup -> principal injection.
+
+Planned change:
+- Add integration test covering:
+  1. seeded user + token hash in DB,
+  2. authenticated request through middleware,
+  3. downstream handler assertion on `RequestPrincipal` user_id/role.
+
+Success criteria:
+- DB-principal resolution path is exercised end-to-end.
+- Test fails on regression in lookup/injection chain.
+- Full gate green.

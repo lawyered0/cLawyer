@@ -17,7 +17,7 @@ use tokio::sync::oneshot;
 use tower_http::cors::{AllowHeaders, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::channels::web::auth::{AuthPrincipal, AuthState, auth_middleware};
+use crate::channels::web::auth::{AuthPrincipal, AuthState, auth_middleware, hash_auth_token};
 pub use crate::channels::web::state::{GatewayState, PromptQueue, RateLimiter};
 use crate::channels::web::types::*;
 use crate::db::UserRole;
@@ -51,9 +51,23 @@ pub async fn start_server(
 
     // Protected routes (require auth)
     let principal = resolve_gateway_principal(state.as_ref()).await?;
+    if let Some(store) = state.store.as_ref() {
+        let token_hash = hash_auth_token(&auth_token);
+        store
+            .upsert_user_token_hash(&principal.user_id, &token_hash)
+            .await
+            .map_err(|err| crate::error::ChannelError::StartupFailed {
+                name: "gateway".to_string(),
+                reason: format!(
+                    "Failed to persist gateway auth token mapping for user '{}': {}",
+                    principal.user_id, err
+                ),
+            })?;
+    }
     let auth_state = AuthState {
         token: auth_token,
-        principal,
+        fallback_principal: principal,
+        store: state.store.clone(),
     };
     let protected = Router::new()
         .merge(crate::channels::web::handlers::routes::protected_feature_routes())
