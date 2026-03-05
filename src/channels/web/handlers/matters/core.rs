@@ -124,6 +124,135 @@ fn conflict_declined_error(hits: &[ConflictHit]) -> (StatusCode, String) {
     )
 }
 
+fn active_set_conflict_required_error(hits: &[ConflictHit]) -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        json_error_string(serde_json::json!({
+            "error": "Potential conflicts detected for this matter. Review and submit a conflict decision before setting it active.",
+            "conflict_required": true,
+            "hits": hits,
+        })),
+    )
+}
+
+fn active_set_conflict_declined_error(hits: &[ConflictHit]) -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        json_error_string(serde_json::json!({
+            "error": "Active-matter selection declined due to conflict review decision.",
+            "decision": "declined",
+            "hits": hits,
+        })),
+    )
+}
+
+fn decision_requires_note(decision: ConflictDecision) -> bool {
+    matches!(
+        decision,
+        ConflictDecision::Waived | ConflictDecision::Declined
+    )
+}
+
+fn decision_allows_matter_activation(decision: ConflictDecision) -> bool {
+    matches!(decision, ConflictDecision::Clear | ConflictDecision::Waived)
+}
+
+fn conflict_hit_signature(hit: &ConflictHit) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        hit.matter_id.to_ascii_lowercase(),
+        hit.party.to_ascii_lowercase(),
+        hit.role.as_str(),
+        hit.matched_via.to_ascii_lowercase()
+    )
+}
+
+fn conflict_signature_for_hits(hits: &[ConflictHit]) -> Vec<String> {
+    let mut values: Vec<String> = hits.iter().map(conflict_hit_signature).collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn clearance_signature_matches_hits(
+    matter_id: &str,
+    hits: &[ConflictHit],
+    hits_json: &serde_json::Value,
+) -> bool {
+    let Ok(stored_hits) = serde_json::from_value::<Vec<ConflictHit>>(hits_json.clone()) else {
+        tracing::error!(
+            "failed to parse stored conflict clearance hits_json for matter '{}'",
+            matter_id
+        );
+        return false;
+    };
+    conflict_signature_for_hits(&stored_hits) == conflict_signature_for_hits(hits)
+}
+
+async fn persist_conflict_clearance_decision(
+    state: &Arc<GatewayState>,
+    matter_id: &str,
+    decision: ConflictDecision,
+    note: Option<String>,
+    hits: &[ConflictHit],
+    source: &str,
+) -> Result<(), (StatusCode, String)> {
+    if decision_requires_note(decision) && note.as_deref().is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'conflict_note' is required for waived or declined decisions".to_string(),
+        ));
+    }
+
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let clearance = ConflictClearanceRecord {
+        matter_id: matter_id.to_string(),
+        checked_by: state.user_id.clone(),
+        cleared_by: if matches!(decision, ConflictDecision::Declined) {
+            None
+        } else {
+            Some(state.user_id.clone())
+        },
+        decision,
+        note: note.clone(),
+        hits_json: serde_json::to_value(hits).unwrap_or_else(|err| {
+            tracing::error!(
+                "failed to serialize conflict hits for matter '{}': {}",
+                matter_id,
+                err
+            );
+            serde_json::json!([])
+        }),
+        hit_count: hits.len() as i32,
+    };
+    store
+        .record_conflict_clearance(&clearance)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    crate::channels::web::server::record_legal_audit_event(
+        state.as_ref(),
+        "conflict_clearance_decision",
+        state.user_id.as_str(),
+        Some(matter_id),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "matter_id": matter_id,
+            "decision": decision.as_str(),
+            "checked_by": state.user_id.clone(),
+            "cleared_by_present": clearance.cleared_by.is_some(),
+            "hit_count": clearance.hit_count,
+            "source": source,
+        }),
+    )
+    .await;
+
+    Ok(())
+}
+
 pub(crate) async fn matters_create_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<CreateMatterRequest>,
@@ -228,53 +357,15 @@ pub(crate) async fn matters_create_handler(
             Some(decision) => decision,
             None => return Err(conflict_required_error(&conflict_hits)),
         };
-
-        if matches!(
+        persist_conflict_clearance_decision(
+            &state,
+            &sanitized,
             decision,
-            ConflictDecision::Waived | ConflictDecision::Declined
-        ) && conflict_note.as_deref().is_none()
-        {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "'conflict_note' is required for waived or declined decisions".to_string(),
-            ));
-        }
-
-        let clearance = ConflictClearanceRecord {
-            matter_id: sanitized.clone(),
-            checked_by: state.user_id.clone(),
-            cleared_by: if matches!(decision, ConflictDecision::Declined) {
-                None
-            } else {
-                Some(state.user_id.clone())
-            },
-            decision,
-            note: conflict_note.clone(),
-            hits_json: serde_json::to_value(&conflict_hits)
-                .unwrap_or_else(|_| serde_json::json!([])),
-            hit_count: conflict_hits.len() as i32,
-        };
-        store
-            .record_conflict_clearance(&clearance)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        crate::channels::web::server::record_legal_audit_event(
-            state.as_ref(),
-            "conflict_clearance_decision",
-            state.user_id.as_str(),
-            Some(sanitized.as_str()),
-            AuditSeverity::Info,
-            serde_json::json!({
-                "matter_id": sanitized.clone(),
-                "decision": decision.as_str(),
-                "checked_by": state.user_id.clone(),
-                "cleared_by_present": clearance.cleared_by.is_some(),
-                "hit_count": clearance.hit_count,
-                "source": "create_flow",
-            }),
+            conflict_note.clone(),
+            &conflict_hits,
+            "create_flow",
         )
-        .await;
+        .await?;
 
         if matches!(decision, ConflictDecision::Declined) {
             return Err(conflict_declined_error(&conflict_hits));
@@ -931,14 +1022,14 @@ pub(crate) async fn matters_active_set_handler(
                     "Matter ID is empty after sanitization".to_string(),
                 ));
             }
-            match crate::legal::matter::read_matter_metadata_for_root(
+            let metadata = match crate::legal::matter::read_matter_metadata_for_root(
                 workspace.as_ref(),
                 &matter_root,
                 &sanitized,
             )
             .await
             {
-                Ok(_) => {}
+                Ok(metadata) => metadata,
                 Err(crate::legal::matter::MatterMetadataValidationError::Missing { path }) => {
                     return Err((
                         StatusCode::NOT_FOUND,
@@ -950,6 +1041,66 @@ pub(crate) async fn matters_active_set_handler(
                 }
                 Err(err @ crate::legal::matter::MatterMetadataValidationError::Storage { .. }) => {
                     return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+                }
+            };
+
+            let checked_parties = build_checked_parties(&metadata.client, &metadata.adversaries);
+            if !checked_parties.is_empty() {
+                let mut hits = store
+                    .find_conflict_hits_for_names(&checked_parties, 50)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                hits.retain(|hit| hit.matter_id != sanitized);
+
+                if !hits.is_empty() {
+                    let requested_decision = req.conflict_decision;
+                    let requested_note = crate::channels::web::server::parse_optional_matter_field(
+                        req.conflict_note,
+                    );
+
+                    if let Some(decision) = requested_decision {
+                        persist_conflict_clearance_decision(
+                            &state,
+                            &sanitized,
+                            decision,
+                            requested_note,
+                            &hits,
+                            "active_set_flow",
+                        )
+                        .await?;
+                        if matches!(decision, ConflictDecision::Declined) {
+                            return Err(active_set_conflict_declined_error(&hits));
+                        }
+                    } else {
+                        let latest = store
+                            .latest_conflict_clearance(&sanitized)
+                            .await
+                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                        let matching_clearance = latest.as_ref().is_some_and(|clearance| {
+                            clearance.hit_count == hits.len() as i32
+                                && decision_allows_matter_activation(clearance.decision)
+                                && clearance_signature_matches_hits(
+                                    &sanitized,
+                                    &hits,
+                                    &clearance.hits_json,
+                                )
+                        });
+
+                        if !matching_clearance {
+                            if latest.as_ref().is_some_and(|clearance| {
+                                clearance.hit_count == hits.len() as i32
+                                    && matches!(clearance.decision, ConflictDecision::Declined)
+                                    && clearance_signature_matches_hits(
+                                        &sanitized,
+                                        &hits,
+                                        &clearance.hits_json,
+                                    )
+                            }) {
+                                return Err(active_set_conflict_declined_error(&hits));
+                            }
+                            return Err(active_set_conflict_required_error(&hits));
+                        }
+                    }
                 }
             }
             store

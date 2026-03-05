@@ -5,12 +5,13 @@ use libsql::params;
 use uuid::Uuid;
 
 use crate::db::{
-    ConflictClearanceRecord, ConflictHit, LegalConflictStore, PartyRole, conflict_terms_from_text,
-    normalize_party_name, trigram_similarity,
+    ConflictClearanceInfo, ConflictClearanceRecord, ConflictDecision, ConflictHit,
+    LegalConflictStore, PartyRole, conflict_terms_from_text, normalize_party_name,
+    trigram_similarity,
 };
 use crate::error::DatabaseError;
 
-use super::{LibSqlBackend, get_text, opt_text};
+use super::{LibSqlBackend, get_i64, get_opt_text, get_text, opt_text, parse_timestamp};
 
 fn match_priority(matched_via: &str) -> u8 {
     if matched_via == "direct" {
@@ -529,6 +530,45 @@ impl LegalConflictStore for LibSqlBackend {
         .await?;
         Ok(())
     }
+
+    async fn latest_conflict_clearance(
+        &self,
+        matter_id: &str,
+    ) -> Result<Option<ConflictClearanceInfo>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count, created_at \
+                 FROM conflict_clearances \
+                 WHERE matter_id = ?1 \
+                 ORDER BY created_at DESC, rowid DESC \
+                 LIMIT 1",
+                params![matter_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+
+        let decision_raw = get_text(&row, 3);
+        let decision = ConflictDecision::from_db_value(decision_raw.as_str())
+            .ok_or_else(|| DatabaseError::Serialization("invalid conflict decision".to_string()))?;
+        let hits_json: serde_json::Value = serde_json::from_str(&get_text(&row, 5))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let created_at = parse_timestamp(&get_text(&row, 7))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+
+        Ok(Some(ConflictClearanceInfo {
+            matter_id: get_text(&row, 0),
+            checked_by: get_text(&row, 1),
+            cleared_by: get_opt_text(&row, 2),
+            decision,
+            note: get_opt_text(&row, 4),
+            hits_json,
+            hit_count: get_i64(&row, 6) as i32,
+            created_at,
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -959,5 +999,59 @@ mod tests {
         assert_eq!(table_count(&fixture.backend, "matter_parties").await, 2);
         assert_eq!(table_count(&fixture.backend, "party_aliases").await, 1);
         assert_eq!(table_count(&fixture.backend, "parties").await, 2);
+    }
+
+    #[tokio::test]
+    async fn latest_conflict_clearance_prefers_latest_rowid_on_created_at_tie() {
+        let fixture = setup_backend().await;
+        let matter_id = "matter-clearance-order";
+
+        fixture
+            .backend
+            .record_conflict_clearance(&ConflictClearanceRecord {
+                matter_id: matter_id.to_string(),
+                checked_by: "reviewer-a".to_string(),
+                cleared_by: Some("reviewer-a".to_string()),
+                decision: ConflictDecision::Waived,
+                note: Some("initial waiver".to_string()),
+                hits_json: serde_json::json!([{ "party": "Acme" }]),
+                hit_count: 1,
+            })
+            .await
+            .expect("insert first clearance");
+
+        fixture
+            .backend
+            .record_conflict_clearance(&ConflictClearanceRecord {
+                matter_id: matter_id.to_string(),
+                checked_by: "reviewer-b".to_string(),
+                cleared_by: None,
+                decision: ConflictDecision::Declined,
+                note: Some("superseding decline".to_string()),
+                hits_json: serde_json::json!([{ "party": "Acme" }]),
+                hit_count: 1,
+            })
+            .await
+            .expect("insert second clearance");
+
+        // Force identical timestamps to exercise tie behavior deterministically.
+        let conn = fixture.backend.connect().await.expect("connect");
+        conn.execute(
+            "UPDATE conflict_clearances \
+             SET created_at = '2026-03-04T18:21:11Z' \
+             WHERE matter_id = ?1",
+            params![matter_id],
+        )
+        .await
+        .expect("normalize timestamps");
+
+        let latest = fixture
+            .backend
+            .latest_conflict_clearance(matter_id)
+            .await
+            .expect("load latest clearance")
+            .expect("latest clearance should exist");
+        assert_eq!(latest.decision, ConflictDecision::Declined);
+        assert_eq!(latest.checked_by, "reviewer-b");
     }
 }
