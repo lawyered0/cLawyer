@@ -541,7 +541,7 @@ impl LegalConflictStore for LibSqlBackend {
                 "SELECT matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count, created_at \
                  FROM conflict_clearances \
                  WHERE matter_id = ?1 \
-                 ORDER BY created_at DESC \
+                 ORDER BY created_at DESC, rowid DESC \
                  LIMIT 1",
                 params![matter_id],
             )
@@ -999,5 +999,59 @@ mod tests {
         assert_eq!(table_count(&fixture.backend, "matter_parties").await, 2);
         assert_eq!(table_count(&fixture.backend, "party_aliases").await, 1);
         assert_eq!(table_count(&fixture.backend, "parties").await, 2);
+    }
+
+    #[tokio::test]
+    async fn latest_conflict_clearance_prefers_latest_rowid_on_created_at_tie() {
+        let fixture = setup_backend().await;
+        let matter_id = "matter-clearance-order";
+
+        fixture
+            .backend
+            .record_conflict_clearance(&ConflictClearanceRecord {
+                matter_id: matter_id.to_string(),
+                checked_by: "reviewer-a".to_string(),
+                cleared_by: Some("reviewer-a".to_string()),
+                decision: ConflictDecision::Waived,
+                note: Some("initial waiver".to_string()),
+                hits_json: serde_json::json!([{ "party": "Acme" }]),
+                hit_count: 1,
+            })
+            .await
+            .expect("insert first clearance");
+
+        fixture
+            .backend
+            .record_conflict_clearance(&ConflictClearanceRecord {
+                matter_id: matter_id.to_string(),
+                checked_by: "reviewer-b".to_string(),
+                cleared_by: None,
+                decision: ConflictDecision::Declined,
+                note: Some("superseding decline".to_string()),
+                hits_json: serde_json::json!([{ "party": "Acme" }]),
+                hit_count: 1,
+            })
+            .await
+            .expect("insert second clearance");
+
+        // Force identical timestamps to exercise tie behavior deterministically.
+        let conn = fixture.backend.connect().await.expect("connect");
+        conn.execute(
+            "UPDATE conflict_clearances \
+             SET created_at = '2026-03-04T18:21:11Z' \
+             WHERE matter_id = ?1",
+            params![matter_id],
+        )
+        .await
+        .expect("normalize timestamps");
+
+        let latest = fixture
+            .backend
+            .latest_conflict_clearance(matter_id)
+            .await
+            .expect("load latest clearance")
+            .expect("latest clearance should exist");
+        assert_eq!(latest.decision, ConflictDecision::Declined);
+        assert_eq!(latest.checked_by, "reviewer-b");
     }
 }
