@@ -2760,12 +2760,37 @@ impl SetupWizard {
         }
 
         if quickstart_used {
+            let gateway_host = std::env::var("GATEWAY_HOST")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            let gateway_port = std::env::var("GATEWAY_PORT")
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(3000);
+            let gateway_auth_token = self
+                .bootstrap_gateway_auth_token
+                .clone()
+                .or_else(|| std::env::var("GATEWAY_AUTH_TOKEN").ok())
+                .filter(|v| !v.trim().is_empty());
+
             println!();
             print_success("You are ready.");
             println!("Next commands:");
             println!("  1) clawyer run");
-            println!("  2) Open http://127.0.0.1:3000");
+            println!("  2) Open http://{}:{}", gateway_host, gateway_port);
             println!("  3) Create a matter, then ask for a cited first draft");
+            match gateway_auth_token {
+                Some(token) => {
+                    println!(
+                        "  Auth token: {} (stored as GATEWAY_AUTH_TOKEN in ~/.clawyer/.env)",
+                        mask_api_key(&token)
+                    );
+                }
+                None => {
+                    println!("  Auth token: stored in ~/.clawyer/.env as GATEWAY_AUTH_TOKEN");
+                }
+            }
 
             match self.settings.llm_backend.as_deref() {
                 Some("ollama") => {
