@@ -48,23 +48,30 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let token = match extract_token(&headers, request.uri().query()) {
-        Some(token) => token,
-        None => {
-            return (StatusCode::UNAUTHORIZED, "Invalid or missing auth token").into_response();
-        }
-    };
+    if let Some(token) = extract_header_token(&headers)
+        && let Some(principal) = resolve_principal_for_token(&auth, &token).await
+    {
+        request.extensions_mut().insert(principal);
+        return next.run(request).await;
+    }
 
+    // Fall back to query token for EventSource and compatibility with mixed proxy headers.
+    if let Some(token) = extract_query_token(request.uri().query())
+        && let Some(principal) = resolve_principal_for_token(&auth, &token).await
+    {
+        request.extensions_mut().insert(principal);
+        return next.run(request).await;
+    }
+
+    (StatusCode::UNAUTHORIZED, "Invalid or missing auth token").into_response()
+}
+
+async fn resolve_principal_for_token(auth: &AuthState, token: &str) -> Option<AuthPrincipal> {
     // Resolve principal from persisted token hash first.
     if let Some(store) = auth.store.as_ref() {
-        let token_hash = hash_auth_token(&token);
+        let token_hash = hash_auth_token(token);
         match store.get_user_by_token_hash(&token_hash).await {
-            Ok(Some(user)) => {
-                request
-                    .extensions_mut()
-                    .insert(AuthPrincipal::new(user.id, user.role));
-                return next.run(request).await;
-            }
+            Ok(Some(user)) => return Some(AuthPrincipal::new(user.id, user.role)),
             Ok(None) => {}
             Err(err) => {
                 tracing::warn!("Failed to resolve auth principal from token hash: {}", err);
@@ -74,23 +81,23 @@ pub async fn auth_middleware(
 
     // Backward-compatible fallback for shared gateway token mode.
     if bool::from(token.as_bytes().ct_eq(auth.token.as_bytes())) {
-        request
-            .extensions_mut()
-            .insert(auth.fallback_principal.clone());
-        return next.run(request).await;
+        return Some(auth.fallback_principal.clone());
     }
 
-    (StatusCode::UNAUTHORIZED, "Invalid or missing auth token").into_response()
+    None
 }
 
-fn extract_token(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
+fn extract_header_token(headers: &HeaderMap) -> Option<String> {
     if let Some(auth_header) = headers.get("authorization")
         && let Ok(value) = auth_header.to_str()
         && let Some(token) = value.strip_prefix("Bearer ")
     {
         return Some(token.to_string());
     }
+    None
+}
 
+fn extract_query_token(query: Option<&str>) -> Option<String> {
     // SSE EventSource path: token is passed via query parameter.
     let query = query?;
     for pair in query.split('&') {
@@ -130,6 +137,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::http::{Request, StatusCode};
+    use axum::middleware;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use tower::ServiceExt;
 
     #[test]
     fn test_auth_state_clone() {
@@ -152,5 +165,31 @@ mod tests {
         let third = hash_auth_token("abc124");
         assert_eq!(first, second);
         assert_ne!(first, third);
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_falls_back_to_query_token_when_header_invalid() {
+        let auth_state = AuthState {
+            token: "good-token".to_string(),
+            fallback_principal: AuthPrincipal::new("default", UserRole::Admin),
+            store: None,
+        };
+
+        async fn ok_handler() -> impl IntoResponse {
+            StatusCode::OK
+        }
+
+        let app = Router::new()
+            .route("/", get(ok_handler))
+            .route_layer(middleware::from_fn_with_state(auth_state, auth_middleware));
+
+        let req = Request::builder()
+            .uri("/?token=good-token")
+            .header("authorization", "Bearer bad-token")
+            .body(axum::body::Body::empty())
+            .expect("valid request");
+
+        let response = app.oneshot(req).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

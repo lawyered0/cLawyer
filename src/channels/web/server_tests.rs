@@ -335,6 +335,33 @@ async fn rbac_token_hash_lookup_returns_bootstrapped_user() {
 }
 
 #[cfg(feature = "libsql")]
+#[tokio::test]
+async fn rbac_token_hash_reassignment_does_not_fail_when_user_id_changes() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    db.ensure_user_account("old-user", "Old User", UserRole::Admin)
+        .await
+        .expect("old user bootstrap");
+    db.ensure_user_account("new-user", "New User", UserRole::Admin)
+        .await
+        .expect("new user bootstrap");
+
+    let token_hash = hash_auth_token("shared-gateway-token");
+    db.upsert_user_token_hash("old-user", &token_hash)
+        .await
+        .expect("old mapping insert");
+    db.upsert_user_token_hash("new-user", &token_hash)
+        .await
+        .expect("reassignment should not fail");
+
+    let resolved = db
+        .get_user_by_token_hash(&token_hash)
+        .await
+        .expect("token lookup should succeed")
+        .expect("user should resolve");
+    assert_eq!(resolved.id, "new-user");
+}
+
+#[cfg(feature = "libsql")]
 fn test_legal_config() -> crate::config::LegalConfig {
     crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
         .expect("default legal config should resolve")

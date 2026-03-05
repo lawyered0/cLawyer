@@ -563,11 +563,13 @@ impl RbacStore for LibSqlBackend {
     ) -> Result<(), DatabaseError> {
         let conn = self.connect().await?;
         conn.execute(
+            "DELETE FROM user_tokens WHERE user_id = ?1 OR token_hash = ?2",
+            params![user_id, token_hash],
+        )
+        .await?;
+        conn.execute(
             "INSERT INTO user_tokens (user_id, token_hash) \
-             VALUES (?1, ?2) \
-             ON CONFLICT(user_id) DO UPDATE SET \
-                token_hash = excluded.token_hash, \
-                updated_at = datetime('now')",
+             VALUES (?1, ?2)",
             params![user_id, token_hash],
         )
         .await?;

@@ -1441,11 +1441,11 @@ impl RbacStore for PgBackend {
     ) -> Result<(), DatabaseError> {
         let conn = self.store.conn().await?;
         conn.execute(
-            "INSERT INTO user_tokens (user_id, token_hash) \
-             VALUES ($1, $2) \
-             ON CONFLICT (user_id) DO UPDATE \
-             SET token_hash = EXCLUDED.token_hash, \
-                 updated_at = NOW()",
+            "WITH cleared AS ( \
+                DELETE FROM user_tokens WHERE user_id = $1 OR token_hash = $2 \
+             ) \
+             INSERT INTO user_tokens (user_id, token_hash) \
+             VALUES ($1, $2)",
             &[&user_id, &token_hash],
         )
         .await?;
