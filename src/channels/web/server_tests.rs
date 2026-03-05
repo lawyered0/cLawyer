@@ -3466,6 +3466,93 @@ async fn invoices_payment_rejects_amount_above_remaining_balance() {
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
+async fn invoices_payment_exact_remaining_marks_invoice_paid() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync matter row");
+    let store = state.store.as_ref().expect("store should exist");
+
+    store
+        .create_expense_entry(
+            &state.user_id,
+            "demo",
+            &crate::db::CreateExpenseEntryParams {
+                submitted_by: "Lead".to_string(),
+                description: "Precision test service".to_string(),
+                amount: rust_decimal::Decimal::new(3000, 2),
+                category: crate::db::ExpenseCategory::Other,
+                entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 10).expect("valid date"),
+                receipt_path: None,
+                billable: true,
+            },
+        )
+        .await
+        .expect("seed expense entry");
+
+    let (_status, Json(created)) = invoices_save_handler(
+        State(Arc::clone(&state)),
+        Json(DraftInvoiceRequest {
+            matter_id: "demo".to_string(),
+            invoice_number: "INV-EXACT-PAID".to_string(),
+            due_date: Some("2026-06-10".to_string()),
+            notes: None,
+        }),
+    )
+    .await
+    .expect("save draft should succeed");
+    let invoice_id = created.invoice.id.clone();
+    let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
+        .await
+        .expect("finalize should succeed");
+
+    let _ = invoices_payment_handler(
+        State(Arc::clone(&state)),
+        Path(invoice_id.clone()),
+        Json(RecordInvoicePaymentRequest {
+            amount: "29.99".to_string(),
+            recorded_by: "Lead".to_string(),
+            draw_from_trust: false,
+            description: Some("Primary payment".to_string()),
+        }),
+    )
+    .await
+    .expect("first payment should succeed");
+
+    let _ = invoices_payment_handler(
+        State(Arc::clone(&state)),
+        Path(invoice_id.clone()),
+        Json(RecordInvoicePaymentRequest {
+            amount: "0.01".to_string(),
+            recorded_by: "Lead".to_string(),
+            draw_from_trust: false,
+            description: Some("Exact remaining payment".to_string()),
+        }),
+    )
+    .await
+    .expect("second payment should succeed");
+
+    let invoice_after = store
+        .get_invoice(
+            &state.user_id,
+            Uuid::parse_str(&invoice_id).expect("invoice uuid"),
+        )
+        .await
+        .expect("load invoice")
+        .expect("invoice exists");
+    assert_eq!(
+        invoice_after.paid_amount,
+        rust_decimal::Decimal::new(3000, 2)
+    );
+    assert_eq!(invoice_after.status, crate::db::InvoiceStatus::Paid);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
 async fn invoices_finalize_rejects_line_items_already_billed_elsewhere() {
     let (db, _tmp) = crate::testing::test_db().await;
     let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));

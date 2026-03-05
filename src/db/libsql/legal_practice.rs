@@ -2602,16 +2602,32 @@ impl BillingStore for LibSqlBackend {
         amount: Decimal,
     ) -> Result<Option<InvoiceRecord>, DatabaseError> {
         let conn = self.connect().await?;
+        let Some(invoice) = self.get_invoice(user_id, invoice_id).await? else {
+            return Ok(None);
+        };
+
+        let mut new_paid_amount = (invoice.paid_amount + amount).round_dp(2);
+        if new_paid_amount > invoice.total {
+            new_paid_amount = invoice.total;
+        }
+        let new_status = if new_paid_amount >= invoice.total {
+            InvoiceStatus::Paid
+        } else {
+            invoice.status
+        };
+
         conn.execute(
             "UPDATE invoices SET \
-                paid_amount = printf('%.2f', MIN(CAST(paid_amount AS REAL) + CAST(?3 AS REAL), CAST(total AS REAL))), \
-                status = CASE \
-                    WHEN MIN(CAST(paid_amount AS REAL) + CAST(?3 AS REAL), CAST(total AS REAL)) >= CAST(total AS REAL) THEN 'paid' \
-                    ELSE status \
-                END, \
+                paid_amount = ?3, \
+                status = ?4, \
                 updated_at = datetime('now') \
              WHERE user_id = ?1 AND id = ?2",
-            params![user_id, invoice_id.to_string(), amount.to_string()],
+            params![
+                user_id,
+                invoice_id.to_string(),
+                new_paid_amount.to_string(),
+                new_status.as_str()
+            ],
         )
         .await?;
         self.get_invoice(user_id, invoice_id).await
@@ -2667,6 +2683,15 @@ impl BillingStore for LibSqlBackend {
                     remaining
                 )));
             }
+            let mut new_paid_amount = (invoice.paid_amount + input.amount).round_dp(2);
+            if new_paid_amount > invoice.total {
+                new_paid_amount = invoice.total;
+            }
+            let new_status = if new_paid_amount >= invoice.total {
+                InvoiceStatus::Paid
+            } else {
+                invoice.status
+            };
 
             let mut trust_entry = None;
             if input.draw_from_trust {
@@ -2733,14 +2758,16 @@ impl BillingStore for LibSqlBackend {
 
             conn.execute(
                 "UPDATE invoices SET \
-                    paid_amount = printf('%.2f', CAST(paid_amount AS REAL) + CAST(?3 AS REAL)), \
-                    status = CASE \
-                        WHEN CAST(paid_amount AS REAL) + CAST(?3 AS REAL) >= CAST(total AS REAL) THEN 'paid' \
-                        ELSE status \
-                    END, \
+                    paid_amount = ?3, \
+                    status = ?4, \
                     updated_at = datetime('now') \
                  WHERE user_id = ?1 AND id = ?2",
-                params![user_id, invoice_id.to_string(), input.amount.to_string()],
+                params![
+                    user_id,
+                    invoice_id.to_string(),
+                    new_paid_amount.to_string(),
+                    new_status.as_str(),
+                ],
             )
             .await?;
 
