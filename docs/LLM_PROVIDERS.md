@@ -20,6 +20,23 @@ configurations.
 
 ---
 
+## Lawyer decision table
+
+Use this quick rule of thumb during onboarding:
+
+| Priority | Recommended provider path | Tradeoff |
+|---|---|---|
+| Privacy-first local operation | Ollama (`ollama`) | Slowest on weaker hardware, but strongest local data posture |
+| Fastest first setup | NEAR AI (`nearai`) | Requires hosted access and OAuth |
+| Cost-conscious flexible routing | OpenAI-compatible (`openai_compatible`) | Requires choosing/maintaining endpoint and model |
+
+If one path does not work in your environment, rerun onboarding and choose the fallback:
+
+- Hosted provider unavailable -> switch to Ollama local mode.
+- Local model too slow -> switch to NEAR AI or another hosted OpenAI-compatible provider.
+
+---
+
 ## NEAR AI (default)
 
 No additional configuration required. On first run, `clawyer onboard` opens a browser
