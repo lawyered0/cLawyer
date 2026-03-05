@@ -126,9 +126,28 @@ impl Agent {
             None
         };
 
+        let effective_legal_config = self.effective_legal_config_for(message);
+        let skeptical_mode_enabled = crate::legal::skeptical::resolve_for_user(
+            self.store(),
+            &message.user_id,
+            crate::legal::skeptical::default_enabled_for_legal(&effective_legal_config),
+        )
+        .await;
+        let system_prompt = {
+            let base_prompt = system_prompt.unwrap_or_default();
+            let augmented_prompt = crate::legal::skeptical::append_prompt_addendum(
+                base_prompt,
+                skeptical_mode_enabled,
+            );
+            if augmented_prompt.is_empty() {
+                None
+            } else {
+                Some(augmented_prompt)
+            }
+        };
+
         // Select and prepare active skills (if skills system is enabled)
         let active_skills = self.select_active_skills(&message.content);
-        let effective_legal_config = self.effective_legal_config_for(message);
         let thread_id_str = thread_id.to_string();
         let active_matter_context =
             if effective_legal_config.enabled && effective_legal_config.active_matter.is_some() {

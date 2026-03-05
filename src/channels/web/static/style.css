@@ -303,6 +303,20 @@ body {
   white-space: nowrap;
 }
 
+.skeptical-chip {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  color: var(--warning, #f39c12);
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(245, 166, 35, 0.35);
+  background: rgba(245, 166, 35, 0.12);
+  font-weight: 600;
+  margin-right: 8px;
+  white-space: nowrap;
+}
+
 .tee-popover {
   display: none;
   position: absolute;
@@ -4217,6 +4231,24 @@ mark {
   flex-direction: column;
   height: 100%;
   min-height: 0;
+}
+
+.settings-toggle-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.settings-toggle-row input[type="checkbox"] {
+  margin-top: 2px;
+}
+
+.settings-toggle-meta {
+  margin-top: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
 }
 
 .settings-section-tabs {

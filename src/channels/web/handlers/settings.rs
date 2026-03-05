@@ -12,6 +12,15 @@ use axum::{
 use crate::channels::web::state::GatewayState;
 use crate::channels::web::types::*;
 
+fn validate_setting_write(key: &str, value: &serde_json::Value) -> Result<(), StatusCode> {
+    if key == crate::legal::skeptical::SKEPTICAL_MODE_SETTING_KEY
+        && crate::legal::skeptical::parse_setting_value(value).is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
 pub fn routes() -> Router<Arc<GatewayState>> {
     Router::new()
         .route("/api/settings", get(settings_list_handler))
@@ -81,6 +90,8 @@ async fn settings_set_handler(
     Path(key): Path<String>,
     Json(body): Json<SettingWriteRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    validate_setting_write(&key, &body.value)?;
+
     let store = state
         .store
         .as_ref()

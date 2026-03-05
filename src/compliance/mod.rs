@@ -111,6 +111,7 @@ pub struct ComplianceInputs {
     pub redaction_pii: bool,
     pub redaction_phi: bool,
     pub redaction_financial: bool,
+    pub skeptical_mode_enabled: bool,
     pub matters_total: usize,
     pub matters_classified: usize,
     pub tools_total: usize,
@@ -292,6 +293,19 @@ pub fn evaluate_nist_rmf(inputs: &ComplianceInputs) -> ComplianceStatus {
             format!(
                 "legal.network.deny_by_default={}",
                 inputs.network_deny_by_default
+            ),
+        ),
+        check(
+            "skeptical_mode_enabled",
+            "Skeptical mode enabled",
+            if inputs.skeptical_mode_enabled || inputs.hardening_max_lockdown {
+                ComplianceState::Compliant
+            } else {
+                ComplianceState::Partial
+            },
+            format!(
+                "skeptical_mode_enabled={}, hardening_max_lockdown={}",
+                inputs.skeptical_mode_enabled, inputs.hardening_max_lockdown
             ),
         ),
         check(
@@ -548,6 +562,7 @@ mod tests {
             redaction_pii: true,
             redaction_phi: true,
             redaction_financial: true,
+            skeptical_mode_enabled: true,
             matters_total: 2,
             matters_classified: 2,
             tools_total: 3,
@@ -605,5 +620,20 @@ mod tests {
             .find(|check| check.id == "matter_classification_coverage")
             .expect("coverage check");
         assert_eq!(coverage.status, ComplianceState::Partial);
+    }
+
+    #[test]
+    fn evaluate_nist_marks_skeptical_mode_partial_when_disabled_outside_lockdown() {
+        let mut inputs = base_inputs();
+        inputs.skeptical_mode_enabled = false;
+        inputs.hardening_max_lockdown = false;
+        let result = evaluate_nist_rmf(&inputs);
+        let check = result
+            .measure
+            .checks
+            .iter()
+            .find(|item| item.id == "skeptical_mode_enabled")
+            .expect("skeptical_mode_enabled check");
+        assert_eq!(check.status, ComplianceState::Partial);
     }
 }

@@ -196,6 +196,19 @@ fn test_index_html_contains_compliance_section_markers() {
 }
 
 #[test]
+fn test_index_html_contains_skeptical_mode_markers() {
+    let index = include_str!("static/index.html");
+    assert!(
+        index.contains("settings-skeptical-toggle"),
+        "index.html is missing skeptical mode toggle marker"
+    );
+    assert!(
+        index.contains("chat-skeptical-chip"),
+        "index.html is missing chat skeptical mode chip marker"
+    );
+}
+
+#[test]
 fn test_app_js_contains_compliance_api_calls() {
     let app_js = include_str!("static/app.js");
     assert!(
@@ -205,6 +218,19 @@ fn test_app_js_contains_compliance_api_calls() {
     assert!(
         app_js.contains("/api/compliance/letter"),
         "app.js missing compliance letter API call"
+    );
+}
+
+#[test]
+fn test_app_js_contains_skeptical_mode_setting_calls() {
+    let app_js = include_str!("static/app.js");
+    assert!(
+        app_js.contains("SKEPTICAL_MODE_SETTING_KEY"),
+        "app.js missing skeptical mode key constant"
+    );
+    assert!(
+        app_js.contains("/api/settings/"),
+        "app.js missing settings API usage for skeptical mode"
     );
 }
 

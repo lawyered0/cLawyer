@@ -223,3 +223,59 @@ Success criteria:
 - DB-principal resolution path is exercised end-to-end.
 - Test fails on regression in lookup/injection chain.
 - Full gate green.
+
+## Follow-on Backlog — Skeptical Mode Hardening (post-`codex/skeptical-mode-v1`)
+
+Tracked from final review after Skeptical Mode architecture and blocker fix landed.
+
+### Priority order
+1. audit event payload cleanup (`active: true` dead field)
+2. improve skeptical-mode audit matter attribution for metadata-scoped jobs
+3. simplify web resolved-state fetch path for skeptical mode
+
+### Item 1 — Remove dead `active: true` field from skeptical-mode audit event
+
+Current issue: `record_skeptical_mode_audit_event` returns early when mode is disabled,
+so emitted events always have `"active": true`. This field adds no signal and can
+confuse downstream audit consumers.
+
+Planned change:
+- Remove `active` from event details, or replace with a meaningful static marker
+  (for example `"mode": "skeptical"`).
+
+Success criteria:
+- Event payload contains only meaningful fields.
+- No regression in audit event ingestion/display.
+- Full gate green.
+
+### Item 2 — Use job metadata as secondary source for `matter_id` in worker audit
+
+Current issue: worker audit currently derives `matter_id` from persisted
+`legal.active_matter` setting. Metadata-scoped jobs may not persist that setting,
+which can yield `matter_id: null` for matter-scoped executions.
+
+Planned change:
+- Resolve `matter_id` from job context metadata when available.
+- Fall back to persisted setting only when metadata is absent.
+
+Success criteria:
+- `skeptical_mode_response` audit events include matter ID for metadata-scoped jobs.
+- Existing setting-based behavior remains unchanged when metadata is missing.
+- Full gate green.
+
+### Item 3 — Add resolved skeptical-mode settings endpoint to reduce JS fallback chain
+
+Current issue: `refreshSkepticalModeState` uses a 3-tier fallback
+(settings endpoint -> compliance cache -> live compliance fetch), which is functional
+but adds client complexity.
+
+Planned change:
+- Add a small resolved-state endpoint (for example
+  `/api/settings/skeptical_mode/resolved`) that returns effective state after applying
+  stored override + max-lockdown default.
+- Update frontend to use the single resolved response path.
+
+Success criteria:
+- Frontend skeptical-state refresh uses one primary fetch path.
+- Behavior remains identical for DB-available and degraded modes.
+- Full gate green.
