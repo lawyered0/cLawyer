@@ -551,6 +551,19 @@ CREATE TABLE IF NOT EXISTS conflict_clearances (
 CREATE INDEX IF NOT EXISTS idx_conflict_clearances_matter_created_at
     ON conflict_clearances(matter_id, created_at DESC);
 
+-- ==================== RBAC foundation ====================
+
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'attorney', 'staff', 'viewer')),
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_role_active ON users(role, is_active);
+
 -- ==================== Matter/client core ====================
 
 CREATE TABLE IF NOT EXISTS clients (
@@ -591,6 +604,24 @@ CREATE TABLE IF NOT EXISTS matters (
 
 CREATE INDEX IF NOT EXISTS idx_matters_user_status ON matters(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_matters_client ON matters(client_id);
+
+CREATE TABLE IF NOT EXISTS matter_memberships (
+    id TEXT PRIMARY KEY,
+    matter_owner_user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    member_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('owner', 'collaborator', 'viewer')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (matter_owner_user_id, matter_id)
+        REFERENCES matters(user_id, matter_id) ON DELETE CASCADE,
+    UNIQUE (matter_owner_user_id, matter_id, member_user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_matter_memberships_owner_matter
+    ON matter_memberships(matter_owner_user_id, matter_id);
+CREATE INDEX IF NOT EXISTS idx_matter_memberships_member
+    ON matter_memberships(member_user_id);
 
 CREATE TABLE IF NOT EXISTS matter_tasks (
     id TEXT PRIMARY KEY,

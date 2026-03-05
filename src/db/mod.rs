@@ -183,6 +183,96 @@ pub struct ConflictClearanceInfo {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Role assigned to a gateway user identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserRole {
+    Admin,
+    Attorney,
+    Staff,
+    Viewer,
+}
+
+impl UserRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Attorney => "attorney",
+            Self::Staff => "staff",
+            Self::Viewer => "viewer",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "admin" => Some(Self::Admin),
+            "attorney" => Some(Self::Attorney),
+            "staff" => Some(Self::Staff),
+            "viewer" => Some(Self::Viewer),
+            _ => None,
+        }
+    }
+}
+
+/// Persisted user identity for gateway authorization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserRecord {
+    pub id: String,
+    pub display_name: String,
+    pub role: UserRole,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Role a user has on a specific matter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatterMemberRole {
+    Owner,
+    Collaborator,
+    Viewer,
+}
+
+impl MatterMemberRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Collaborator => "collaborator",
+            Self::Viewer => "viewer",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "owner" => Some(Self::Owner),
+            "collaborator" => Some(Self::Collaborator),
+            "viewer" => Some(Self::Viewer),
+            _ => None,
+        }
+    }
+}
+
+/// Membership row linking a user to a matter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterMembershipRecord {
+    pub id: Uuid,
+    pub matter_owner_user_id: String,
+    pub matter_id: String,
+    pub member_user_id: String,
+    pub role: MatterMemberRole,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertMatterMembershipParams {
+    pub matter_owner_user_id: String,
+    pub matter_id: String,
+    pub member_user_id: String,
+    pub role: MatterMemberRole,
+}
+
 /// Client entity type for conflict and matter tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1306,6 +1396,26 @@ pub trait LegalConflictStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait RbacStore: Send + Sync {
+    async fn ensure_user_account(
+        &self,
+        user_id: &str,
+        display_name: &str,
+        default_role: UserRole,
+    ) -> Result<UserRecord, DatabaseError>;
+    async fn get_user_account(&self, user_id: &str) -> Result<Option<UserRecord>, DatabaseError>;
+    async fn upsert_matter_membership(
+        &self,
+        input: &UpsertMatterMembershipParams,
+    ) -> Result<MatterMembershipRecord, DatabaseError>;
+    async fn list_matter_memberships(
+        &self,
+        matter_owner_user_id: &str,
+        matter_id: &str,
+    ) -> Result<Vec<MatterMembershipRecord>, DatabaseError>;
+}
+
+#[async_trait]
 pub trait ClientStore: Send + Sync {
     async fn create_client(
         &self,
@@ -1845,6 +1955,7 @@ pub trait Database:
     + RoutineStore
     + ToolFailureStore
     + LegalConflictStore
+    + RbacStore
     + ClientStore
     + MatterStore
     + MatterTaskStore

@@ -43,7 +43,7 @@ use crate::channels::web::sse::SseManager;
 use crate::channels::web::test_support::{
     TestLlmProvider, assert_no_inline_event_handlers, minimal_test_gateway_state,
 };
-use crate::db::ConflictDecision;
+use crate::db::{ConflictDecision, UserRole};
 use crate::workspace::Workspace;
 use axum::{
     Json,
@@ -275,6 +275,38 @@ async fn compliance_letter_handler_appends_disclaimer() {
             .markdown
             .contains("Configuration summary only; not legal advice.")
     );
+}
+
+#[tokio::test]
+async fn resolve_gateway_principal_defaults_to_admin_without_store() {
+    let state = minimal_test_gateway_state(None);
+    let principal = resolve_gateway_principal(state.as_ref())
+        .await
+        .expect("principal should resolve");
+    assert_eq!(principal.user_id, state.user_id);
+    assert_eq!(principal.role, UserRole::Admin);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn resolve_gateway_principal_bootstraps_admin_user_in_store() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    let state = test_gateway_state_with_store_and_workspace(Arc::clone(&db), workspace);
+    let principal = resolve_gateway_principal(state.as_ref())
+        .await
+        .expect("principal should resolve");
+    assert_eq!(principal.user_id, state.user_id);
+    assert_eq!(principal.role, UserRole::Admin);
+
+    let persisted = db
+        .get_user_account(&state.user_id)
+        .await
+        .expect("read user account")
+        .expect("user account should exist");
+    assert_eq!(persisted.id, state.user_id);
+    assert_eq!(persisted.role, UserRole::Admin);
+    assert!(persisted.is_active);
 }
 
 #[cfg(feature = "libsql")]
