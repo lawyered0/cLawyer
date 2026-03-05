@@ -31,9 +31,9 @@ use crate::db::{
     MatterTaskStore, MatterTimeSummary, PartyRole, RecordInvoicePaymentParams,
     RecordInvoicePaymentResult, RoutineStore, SandboxStore, SettingsStore, TimeEntryRecord,
     TimeExpenseStore, ToolFailureStore, TrustLedgerEntryRecord, TrustLedgerEntryType,
-    UpdateClientParams, UpdateDocumentTemplateParams,
-    UpdateExpenseEntryParams, UpdateMatterDeadlineParams, UpdateMatterDocumentParams,
-    UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
+    UpdateClientParams, UpdateDocumentTemplateParams, UpdateExpenseEntryParams,
+    UpdateMatterDeadlineParams, UpdateMatterDocumentParams, UpdateMatterNoteParams,
+    UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
     UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams, WorkspaceStore,
     conflict_terms_from_text, normalize_party_name,
 };
