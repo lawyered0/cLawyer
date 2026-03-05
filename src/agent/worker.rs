@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::agent::scheduler::WorkerMessage;
 use crate::agent::task::TaskOutput;
 use crate::context::{ContextManager, JobState};
-use crate::db::Database;
+use crate::db::{AuditSeverity, Database};
 use crate::error::Error;
 use crate::hooks::HookRegistry;
 use crate::llm::{
@@ -34,6 +34,7 @@ pub struct WorkerDeps {
     pub hooks: Arc<HookRegistry>,
     pub timeout: Duration,
     pub use_planning: bool,
+    pub skeptical_mode_default: bool,
 }
 
 /// Worker that executes a single job.
@@ -45,6 +46,34 @@ pub struct Worker {
 /// Result of a tool execution with metadata for context building.
 struct ToolExecResult {
     result: Result<String, Error>,
+}
+
+#[derive(Debug, Clone)]
+struct SkepticalModeContext {
+    enabled: bool,
+    user_id: String,
+    matter_id: Option<String>,
+}
+
+const LEGAL_ACTIVE_MATTER_SETTING_KEY: &str = "legal.active_matter";
+
+fn build_worker_system_prompt(
+    title: &str,
+    description: &str,
+    skeptical_mode_enabled: bool,
+) -> String {
+    let base = format!(
+        r#"You are an autonomous agent working on a job.
+
+Job: {}
+Description: {}
+
+You have access to tools to complete this job. Plan your approach and execute tools as needed.
+You may request multiple tools at once if they can be executed in parallel.
+Report when the job is complete or if you encounter issues you cannot resolve."#,
+        title, description
+    );
+    crate::legal::skeptical::append_prompt_addendum(base, skeptical_mode_enabled)
 }
 
 impl Worker {
@@ -80,6 +109,69 @@ impl Worker {
 
     fn use_planning(&self) -> bool {
         self.deps.use_planning
+    }
+
+    fn skeptical_mode_default(&self) -> bool {
+        self.deps.skeptical_mode_default
+    }
+
+    async fn resolve_skeptical_mode_context(&self, user_id: &str) -> SkepticalModeContext {
+        let enabled = crate::legal::skeptical::resolve_for_user(
+            self.store(),
+            user_id,
+            self.skeptical_mode_default(),
+        )
+        .await;
+
+        let matter_id = self.load_active_matter_for_user(user_id).await;
+        SkepticalModeContext {
+            enabled,
+            user_id: user_id.to_string(),
+            matter_id,
+        }
+    }
+
+    async fn load_active_matter_for_user(&self, user_id: &str) -> Option<String> {
+        let store = self.store()?;
+        let setting = store
+            .get_setting(user_id, LEGAL_ACTIVE_MATTER_SETTING_KEY)
+            .await
+            .ok()??;
+        let raw = setting.as_str()?;
+        let sanitized = crate::legal::policy::sanitize_matter_id(raw);
+        if sanitized.is_empty() {
+            None
+        } else {
+            Some(sanitized)
+        }
+    }
+
+    async fn record_skeptical_mode_audit_event(&self, context: &SkepticalModeContext) {
+        if !context.enabled {
+            return;
+        }
+
+        let details = serde_json::json!({
+            "job_id": self.job_id.to_string(),
+            "matter_id": context.matter_id,
+            "active": true,
+        });
+
+        if let Some(store) = self.store() {
+            crate::legal::audit::record_with_db(
+                crate::legal::audit::EVENT_SKEPTICAL_MODE_RESPONSE,
+                "worker",
+                context.matter_id.as_deref(),
+                AuditSeverity::Info,
+                details,
+                store.as_ref(),
+                &context.user_id,
+            )
+            .await;
+            return;
+        }
+
+        crate::legal::audit::record(crate::legal::audit::EVENT_SKEPTICAL_MODE_RESPONSE, details);
     }
 
     /// Fire-and-forget persistence of job status.
@@ -128,6 +220,7 @@ impl Worker {
 
         // Get job context
         let job_ctx = self.context_manager().get_context(self.job_id).await?;
+        let skeptical_mode = self.resolve_skeptical_mode_context(&job_ctx.user_id).await;
 
         // Create reasoning engine
         let reasoning = Reasoning::new(self.llm().clone(), self.safety().clone());
@@ -136,21 +229,17 @@ impl Worker {
         let mut reason_ctx = ReasoningContext::new().with_job(&job_ctx.description);
 
         // Add system message
-        reason_ctx.messages.push(ChatMessage::system(format!(
-            r#"You are an autonomous agent working on a job.
-
-Job: {}
-Description: {}
-
-You have access to tools to complete this job. Plan your approach and execute tools as needed.
-You may request multiple tools at once if they can be executed in parallel.
-Report when the job is complete or if you encounter issues you cannot resolve."#,
-            job_ctx.title, job_ctx.description
-        )));
+        reason_ctx
+            .messages
+            .push(ChatMessage::system(build_worker_system_prompt(
+                &job_ctx.title,
+                &job_ctx.description,
+                skeptical_mode.enabled,
+            )));
 
         // Main execution loop with timeout
         let result = tokio::time::timeout(self.timeout(), async {
-            self.execution_loop(&mut rx, &reasoning, &mut reason_ctx)
+            self.execution_loop(&mut rx, &reasoning, &mut reason_ctx, &skeptical_mode)
                 .await
         })
         .await;
@@ -177,6 +266,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         rx: &mut mpsc::Receiver<WorkerMessage>,
         reasoning: &Reasoning,
         reason_ctx: &mut ReasoningContext,
+        skeptical_mode: &SkepticalModeContext,
     ) -> Result<(), Error> {
         const MAX_WORKER_ITERATIONS: usize = 500;
         let max_iterations = self
@@ -240,7 +330,9 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
         // If we have a plan, execute it
         if let Some(ref plan) = plan {
-            return self.execute_plan(rx, reasoning, reason_ctx, plan).await;
+            return self
+                .execute_plan(rx, reasoning, reason_ctx, plan, skeptical_mode)
+                .await;
         }
 
         // Otherwise, use direct tool selection loop
@@ -290,7 +382,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         // "not done", or "unfinished". Only the LLM's own response
                         // (not tool output) can trigger this.
                         if crate::util::llm_signals_completion(&response) {
-                            self.mark_completed().await?;
+                            self.mark_completed(skeptical_mode).await?;
                             return Ok(());
                         }
 
@@ -806,6 +898,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         reasoning: &Reasoning,
         reason_ctx: &mut ReasoningContext,
         plan: &ActionPlan,
+        skeptical_mode: &SkepticalModeContext,
     ) -> Result<(), Error> {
         for (i, action) in plan.actions.iter().enumerate() {
             // Check for stop signal
@@ -872,7 +965,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         reason_ctx.messages.push(ChatMessage::assistant(&response));
 
         if crate::util::llm_signals_completion(&response) {
-            self.mark_completed().await?;
+            self.mark_completed(skeptical_mode).await?;
         } else {
             // Job not complete, could re-plan or fall back to direct selection
             tracing::info!(
@@ -895,7 +988,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         Self::execute_tool_inner(&self.deps, self.job_id, tool_name, params).await
     }
 
-    async fn mark_completed(&self) -> Result<(), Error> {
+    async fn mark_completed(&self, skeptical_mode: &SkepticalModeContext) -> Result<(), Error> {
         self.context_manager()
             .update_context(self.job_id, |ctx| {
                 ctx.transition_to(
@@ -920,6 +1013,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             JobState::Completed,
             Some("Job completed successfully".to_string()),
         );
+        self.record_skeptical_mode_audit_event(skeptical_mode).await;
         Ok(())
     }
 
@@ -1075,6 +1169,7 @@ mod tests {
             hooks: Arc::new(crate::hooks::HookRegistry::new()),
             timeout: Duration::from_secs(30),
             use_planning: false,
+            skeptical_mode_default: false,
         };
 
         Worker::new(job_id, deps)
@@ -1155,6 +1250,40 @@ mod tests {
         assert!(!llm_signals_completion(
             "The tool returned: TASK_COMPLETE signal"
         ));
+    }
+
+    #[test]
+    fn skeptical_mode_setting_defaults_false() {
+        let enabled = crate::legal::skeptical::resolve_from_setting_row(None, false);
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn skeptical_mode_defaults_true_for_max_lockdown() {
+        let enabled = crate::legal::skeptical::resolve_from_setting_row(None, true);
+        assert!(enabled);
+    }
+
+    #[test]
+    fn skeptical_mode_system_prompt_contains_footer_instructions() {
+        let prompt = build_worker_system_prompt("Legal memo", "Draft first pass", true);
+        assert!(
+            prompt.contains("You are operating in Skeptical Mode."),
+            "skeptical prompt addendum missing"
+        );
+        assert!(
+            prompt.contains("**⚠ Skeptical Mode**"),
+            "skeptical footer heading missing"
+        );
+    }
+
+    #[test]
+    fn skeptical_mode_system_prompt_omitted_when_disabled() {
+        let prompt = build_worker_system_prompt("Legal memo", "Draft first pass", false);
+        assert!(
+            !prompt.contains("You are operating in Skeptical Mode."),
+            "skeptical prompt addendum should be omitted when disabled"
+        );
     }
 
     #[tokio::test]

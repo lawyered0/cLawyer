@@ -272,6 +272,18 @@ async fn collect_compliance_tool_count(state: &GatewayState) -> (usize, Vec<Stri
     (count, data_gaps)
 }
 
+async fn resolve_compliance_skeptical_mode(
+    state: &GatewayState,
+    legal: &crate::config::LegalConfig,
+) -> bool {
+    crate::legal::skeptical::resolve_for_user(
+        state.store.as_ref(),
+        &state.user_id,
+        crate::legal::skeptical::default_enabled_for_legal(legal),
+    )
+    .await
+}
+
 async fn collect_compliance_audit_metrics(
     state: &GatewayState,
 ) -> (
@@ -410,6 +422,7 @@ async fn build_compliance_status(
     data_gaps.extend(matter_gaps);
     data_gaps.extend(tool_gaps);
     data_gaps.extend(audit_gaps);
+    let skeptical_mode_enabled = resolve_compliance_skeptical_mode(state, legal).await;
 
     let inputs = crate::compliance::ComplianceInputs {
         audit_enabled: legal.audit.enabled,
@@ -423,6 +436,7 @@ async fn build_compliance_status(
         redaction_pii: legal.redaction.pii,
         redaction_phi: legal.redaction.phi,
         redaction_financial: legal.redaction.financial,
+        skeptical_mode_enabled,
         matters_total,
         matters_classified,
         tools_total,

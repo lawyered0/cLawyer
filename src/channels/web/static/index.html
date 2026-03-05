@@ -60,6 +60,9 @@
         <span id="tee-shield-label">TEE Verified</span>
         <div class="tee-popover" id="tee-popover"></div>
       </div>
+      <div class="skeptical-chip is-hidden" id="chat-skeptical-chip" title="Skeptical Mode enabled">
+        ⚠ Skeptical
+      </div>
       <div class="status" id="gateway-status-trigger">
         <div class="dot" id="sse-dot"></div>
         <span id="sse-status">Connected</span>
@@ -262,6 +265,18 @@
               </div>
               <div id="settings-list">
                 <div class="empty-state">Loading…</div>
+              </div>
+            </div>
+            <div class="extensions-section">
+              <div class="section-header-row">
+                <h3>Legal AI Behavior</h3>
+              </div>
+              <label class="settings-toggle-row" for="settings-skeptical-toggle">
+                <input type="checkbox" id="settings-skeptical-toggle">
+                <span>Skeptical Mode - Model flags assumptions and suggests manual checks</span>
+              </label>
+              <div id="settings-skeptical-meta" class="settings-toggle-meta">
+                Loading skeptical mode status…
               </div>
             </div>
             <div class="extensions-section">

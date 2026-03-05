@@ -45,6 +45,7 @@ struct ScheduledSubtask {
 /// Schedules and manages parallel job execution.
 pub struct Scheduler {
     config: AgentConfig,
+    skeptical_mode_default: bool,
     context_manager: Arc<ContextManager>,
     llm: Arc<dyn LlmProvider>,
     safety: Arc<SafetyLayer>,
@@ -59,8 +60,10 @@ pub struct Scheduler {
 
 impl Scheduler {
     /// Create a new scheduler.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: AgentConfig,
+        skeptical_mode_default: bool,
         context_manager: Arc<ContextManager>,
         llm: Arc<dyn LlmProvider>,
         safety: Arc<SafetyLayer>,
@@ -70,6 +73,7 @@ impl Scheduler {
     ) -> Self {
         Self {
             config,
+            skeptical_mode_default,
             context_manager,
             llm,
             safety,
@@ -169,6 +173,7 @@ impl Scheduler {
                 hooks: self.hooks.clone(),
                 timeout: self.config.job_timeout,
                 use_planning: self.config.use_planning,
+                skeptical_mode_default: self.skeptical_mode_default,
             };
             let worker = Worker::new(job_id, deps);
 

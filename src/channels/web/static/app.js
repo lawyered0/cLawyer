@@ -22,6 +22,9 @@ let currentSettingsSection = 'general';
 let matterCreateModalLastFocus = null;
 let complianceStatusCache = null;
 let complianceExpanded = false;
+const SKEPTICAL_MODE_SETTING_KEY = 'skeptical_mode';
+let skepticalModeActive = false;
+let skepticalModeLoaded = false;
 
 function byId(id) {
   return document.getElementById(id);
@@ -66,6 +69,7 @@ const requestVersions = {
   matterDetailFinance: 0,
   legalAudit: 0,
   settings: 0,
+  skepticalMode: 0,
   complianceStatus: 0,
   extensions: 0,
   skills: 0,
@@ -115,6 +119,7 @@ function authenticate() {
       loadMemoryTree();
       loadJobs();
       refreshActiveMatterState();
+      refreshSkepticalModeState();
       // Apply URL log_level param if present, otherwise just sync the dropdown
       if (urlLogLevel) {
         setServerLogLevel(urlLogLevel);
@@ -178,6 +183,7 @@ bindClick('auth-connect-btn', authenticate);
   bindClick('backups-restore-btn', triggerBackupRestoreInput);
   bindClick('settings-section-general-btn', function() { openSettingsSection('general'); });
   bindClick('settings-section-logs-btn', function() { openSettingsSection('logs'); });
+  bindChange('settings-skeptical-toggle', handleSkepticalModeToggleChange);
   bindClick('settings-compliance-refresh-btn', loadComplianceStatus);
   bindClick('settings-compliance-letter-btn', generateComplianceLetter);
   bindClick('settings-compliance-toggle', toggleComplianceBreakdown);
@@ -1411,6 +1417,7 @@ function openSettingsSection(section) {
 
   if (next === 'general') {
     loadSettings();
+    refreshSkepticalModeState();
     loadComplianceStatus();
     return;
   }
@@ -5901,6 +5908,113 @@ function formatDate(isoString) {
 
 // --- Settings ---
 
+function normalizeSkepticalModeValue(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    var normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
+  }
+  return null;
+}
+
+function extractSkepticalModeFromCompliance(data) {
+  var measure = data && data.measure;
+  var checks = measure && Array.isArray(measure.checks) ? measure.checks : null;
+  if (!checks) return null;
+  for (var i = 0; i < checks.length; i++) {
+    var check = checks[i];
+    if (check && check.id === 'skeptical_mode_enabled') {
+      return String(check.status || '').toLowerCase() === 'compliant';
+    }
+  }
+  return null;
+}
+
+function updateSkepticalModeUi() {
+  var toggle = byId('settings-skeptical-toggle');
+  if (toggle) {
+    toggle.checked = !!skepticalModeActive;
+  }
+
+  var chip = byId('chat-skeptical-chip');
+  if (chip) {
+    chip.classList.toggle('is-hidden', !skepticalModeActive);
+  }
+
+  var meta = byId('settings-skeptical-meta');
+  if (!meta) return;
+  if (!skepticalModeLoaded) {
+    meta.textContent = 'Loading skeptical mode status…';
+    return;
+  }
+  meta.textContent = skepticalModeActive
+    ? 'Skeptical Mode is active. Substantive responses include assumptions, low-confidence flags, and manual checks.'
+    : 'Skeptical Mode is off.';
+}
+
+function refreshSkepticalModeState() {
+  var requestVersion = beginRequest('skepticalMode');
+  skepticalModeLoaded = false;
+  updateSkepticalModeUi();
+  var settingPath = '/api/settings/' + encodeURIComponent(SKEPTICAL_MODE_SETTING_KEY);
+
+  return apiFetch(settingPath).then(function(setting) {
+    if (!isCurrentRequest('skepticalMode', requestVersion)) return;
+    var parsed = normalizeSkepticalModeValue(setting && setting.value);
+    if (parsed === null) {
+      throw new Error('Invalid skeptical_mode value');
+    }
+    skepticalModeActive = parsed;
+    skepticalModeLoaded = true;
+    updateSkepticalModeUi();
+  }).catch(function() {
+    var useCached = extractSkepticalModeFromCompliance(complianceStatusCache);
+    if (useCached !== null) {
+      if (!isCurrentRequest('skepticalMode', requestVersion)) return;
+      skepticalModeActive = useCached;
+      skepticalModeLoaded = true;
+      updateSkepticalModeUi();
+      return;
+    }
+    apiFetch('/api/compliance/status').then(function(data) {
+      if (!isCurrentRequest('skepticalMode', requestVersion)) return;
+      var resolved = extractSkepticalModeFromCompliance(data);
+      skepticalModeActive = resolved === null ? false : resolved;
+      skepticalModeLoaded = true;
+      updateSkepticalModeUi();
+    }).catch(function() {
+      if (!isCurrentRequest('skepticalMode', requestVersion)) return;
+      skepticalModeActive = false;
+      skepticalModeLoaded = true;
+      updateSkepticalModeUi();
+    });
+  });
+}
+
+function handleSkepticalModeToggleChange(event) {
+  var toggle = event && event.target ? event.target : byId('settings-skeptical-toggle');
+  if (!toggle) return;
+  var next = !!toggle.checked;
+  toggle.disabled = true;
+  apiFetch('/api/settings/' + encodeURIComponent(SKEPTICAL_MODE_SETTING_KEY), {
+    method: 'PUT',
+    body: { value: next },
+  }).then(function() {
+    skepticalModeActive = next;
+    skepticalModeLoaded = true;
+    updateSkepticalModeUi();
+    showToast(next ? 'Skeptical Mode enabled' : 'Skeptical Mode disabled', 'success');
+    loadSettings();
+    loadComplianceStatus();
+  }).catch(function(err) {
+    toggle.checked = !!skepticalModeActive;
+    showToast('Failed to update Skeptical Mode: ' + err.message, 'error');
+  }).finally(function() {
+    toggle.disabled = false;
+  });
+}
+
 function complianceStateClass(state) {
   var normalized = (state || 'partial').toLowerCase();
   if (normalized === 'compliant') return 'state-compliant';
@@ -6012,6 +6126,12 @@ function loadComplianceStatus() {
   apiFetch('/api/compliance/status').then(function(data) {
     if (!isCurrentRequest('complianceStatus', requestVersion)) return;
     complianceStatusCache = data;
+    var skepticalResolved = extractSkepticalModeFromCompliance(data);
+    if (skepticalResolved !== null) {
+      skepticalModeActive = skepticalResolved;
+      skepticalModeLoaded = true;
+      updateSkepticalModeUi();
+    }
     renderComplianceStatus(data);
   }).catch(function(err) {
     if (!isCurrentRequest('complianceStatus', requestVersion)) return;

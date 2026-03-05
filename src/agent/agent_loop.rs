@@ -118,6 +118,7 @@ impl Agent {
 
         let scheduler = Arc::new(Scheduler::new(
             config.clone(),
+            crate::legal::policy::is_max_lockdown(&deps.legal_config),
             context_manager.clone(),
             deps.llm.clone(),
             deps.safety.clone(),

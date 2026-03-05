@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use crate::config::LegalAuditConfig;
 use crate::db::{AppendAuditEventParams, AuditEventStore, AuditSeverity};
 
+pub const EVENT_SKEPTICAL_MODE_RESPONSE: &str = "skeptical_mode_response";
+
 #[derive(Debug, Default, Clone, Serialize)]
 struct SecurityMetrics {
     blocked_actions: u64,
