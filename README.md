@@ -16,11 +16,15 @@
 
 <p align="center">
   <a href="#about">About</a> •
+  <a href="#for-lawyers-non-dev-quickstart">Lawyer Quickstart</a> •
+  <a href="#practical-use-cases">Use Cases</a> •
   <a href="#features">Features</a> •
   <a href="#installation">Installation</a> •
+  <a href="#for-risk-partners-and-it">Risk/IT</a> •
   <a href="#configuration">Configuration</a> •
   <a href="#security">Security</a> •
-  <a href="#architecture">Architecture</a>
+  <a href="#architecture">Architecture</a> •
+  <a href="#roadmap-next-36-months">Roadmap</a>
 </p>
 
 ---
@@ -31,12 +35,68 @@ cLawyer is a hardened, local-first fork of IronClaw/OpenClaw built for legal tea
 
 Version 1 defaults to a U.S.-general legal profile with max-lockdown guardrails so law firm staff can run secure workflows for intake, chronology, contract review, litigation support, and research synthesis.
 
+### Why cLawyer for lawyers
+
+- **No cross-matter leakage by design** - Legal conversations are matter-bound and blocked from cross-matter reuse.
+- **Citations and uncertainty are first-class** - Legal outputs are expected to include source references plus risk/uncertainty sections.
+- **Runs on your infrastructure** - Local-first architecture, firm-controlled secrets, and audit logging without SaaS telemetry.
+
 - **Matter-first by default** - Work is scoped to `matters/<matter_id>/...` with matter metadata and conflict-check hooks
 - **Citation discipline** - Legal outputs require source references and uncertainty/risk sections
 - **Max-lockdown hardening** - Deny-by-default network, approval-gated sensitive actions, and strict write boundaries
 - **Auditability built in** - Append-only legal audit log with hash-chain integrity and security counters
 
 cLawyer is designed for confidential, defensible legal work product on a single-tenant local deployment.
+
+## For Lawyers (Non-Dev) Quickstart
+
+If you are a lawyer or legal ops lead and want a fast proof of value, use this path.
+
+### 15-minute outcome target
+
+In one session, you should be able to:
+
+1. install cLawyer,
+2. run `onboard --quickstart`,
+3. create a matter,
+4. generate a first cited draft.
+
+### Install (copy/paste)
+
+macOS, Linux, WSL:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/lawyered0/cLawyer/releases/latest/download/clawyer-installer.sh | sh
+clawyer onboard --quickstart
+clawyer run
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://github.com/lawyered0/cLawyer/releases/latest/download/clawyer-installer.ps1 | iex
+clawyer onboard --quickstart
+clawyer run
+```
+
+Next: open [docs/LAWYER_QUICKSTART.md](docs/LAWYER_QUICKSTART.md) for expected hardware, timing, and troubleshooting.
+
+## Practical Use Cases
+
+### 1) NDA first-pass review
+
+- Prompt: "Review this NDA for one-way indemnity, broad IP assignment, and unusual termination exposure."
+- Expected output: issue table with clause citations, severity, fallback language suggestions, and uncertainty notes.
+
+### 2) Issue-spotting memo
+
+- Prompt: "Draft an issue-spotting memo for this commercial dispute. Separate facts, open legal questions, and immediate risks."
+- Expected output: structured memo with cited support, missing facts section, and next research actions.
+
+### 3) Client interview outline
+
+- Prompt: "Build a 30-minute intake interview outline from matter facts and known adversaries."
+- Expected output: sectioned interview checklist with follow-up questions, document requests, and conflict-sensitive notes.
 
 ## Features
 
@@ -76,6 +136,8 @@ cLawyer is designed for confidential, defensible legal work product on a single-
 - Rust 1.85+
 - PostgreSQL 15+ with [pgvector](https://github.com/pgvector/pgvector) extension
 - NEAR AI account (authentication handled via setup wizard)
+
+If you use the installer scripts above, you can skip source compilation and start directly with `clawyer onboard --quickstart`.
 
 ## Download or Build
 
@@ -196,6 +258,25 @@ Key references:
 - [Migration Guide](docs/MIGRATION_TO_CLAWYER.md)
 - [Firm Rollout Guide](docs/FIRM_ROLLOUT.md)
 
+## For Risk Partners and IT
+
+### Data residency
+
+- Matter data, audit artifacts, and workspace files stay on the machine or server you control.
+- cLawyer is local-first and single-tenant by deployment design.
+
+### Network egress behavior
+
+- Legal max-lockdown mode defaults to deny-by-default outbound network rules.
+- You explicitly allow domains required for your workflow.
+- Model calls go only to your configured provider or local runtime.
+
+### Audit and deletion model
+
+- Legal and tool events are written to auditable logs with hash-chain support.
+- Matter artifacts are file-backed and can be archived/exported/deleted through controlled workflows.
+- Backup and retrieval exports support firm retention/offboarding policies.
+
 ## Security
 
 cLawyer implements defense in depth to protect your data and prevent misuse.
@@ -233,6 +314,18 @@ External content passes through multiple security layers:
 - Full audit log of all tool executions
 
 ## Architecture
+
+### Simple mental model
+
+```text
+Browser UI
+   ->
+Local web gateway (auth + policy + legal checks)
+   ->
+LLM provider (local or configured endpoint) + legal tools
+   ->
+Local DB + matter files (matters/<id>/...)
+```
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
@@ -336,6 +429,27 @@ Key differences:
 - **WASM sandbox vs Docker** - Lightweight, capability-based security
 - **PostgreSQL vs SQLite** - Production-ready persistence
 - **Security-first design** - Multiple defense layers, credential protection
+
+## Deployment Patterns for Firms
+
+- **Solo / 1-2 lawyers** - single high-spec workstation with local model or one hosted provider.
+- **Small firm / 2-5 lawyers** - one shared host with centralized audit operations and staged RBAC/membership rollout.
+- **Pilot / 10-50 lawyers** - firm-managed server deployment, staged onboarding by practice group, and controlled provider policy.
+
+## Who Built cLawyer
+
+cLawyer is built by **Lawyered** ([x.com/BitGrateful](https://x.com/BitGrateful/)), with a legal-first focus on confidentiality, matter isolation, and practical daily workflows for lawyers.
+
+## Roadmap (next 3-6 months)
+
+Current focus is lawyer adoption for solo and small firms:
+
+1. Lawyer quickstart clarity and onboarding polish.
+2. Matter-level collaboration and access enforcement (RBAC).
+3. Mobile usability for chat + matters workflows.
+4. Maintainability upgrades in high-change client modules.
+
+Track progress in the [issue tracker](https://github.com/lawyered0/cLawyer/issues).
 
 ## License
 

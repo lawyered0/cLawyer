@@ -161,6 +161,7 @@ impl SetupWizard {
     /// connection, so users don't have to re-enter everything.
     pub async fn run(&mut self) -> Result<(), SetupError> {
         print_header("cLawyer Setup Wizard");
+        let mut quickstart_used = false;
 
         if self.config.channels_only {
             // Channels-only mode: reconnect to existing DB and load settings
@@ -170,14 +171,17 @@ impl SetupWizard {
             self.step_channels().await?;
         } else {
             match self.resolve_setup_mode()? {
-                SetupMode::Quickstart => self.run_quickstart_flow().await?,
+                SetupMode::Quickstart => {
+                    self.run_quickstart_flow().await?;
+                    quickstart_used = true;
+                }
                 SetupMode::Advanced => self.run_advanced_flow().await?,
                 SetupMode::Auto => unreachable!("Auto mode must be resolved"),
             }
         }
 
         // Save settings and print summary
-        self.save_and_summarize().await?;
+        self.save_and_summarize(quickstart_used).await?;
 
         Ok(())
     }
@@ -399,7 +403,8 @@ impl SetupWizard {
 
     /// Quickstart Step 1: choose practical local storage defaults.
     async fn quickstart_step_data_storage(&mut self) -> Result<(), SetupError> {
-        print_info("Quickstart configures storage with safe defaults for daily legal work.");
+        print_info("Quickstart uses lawyer-friendly defaults and keeps setup minimal.");
+        print_info("Recommended: local embedded storage (no separate database server needed).");
         println!();
 
         #[cfg(all(feature = "postgres", feature = "libsql"))]
@@ -408,7 +413,7 @@ impl SetupWizard {
                 "Choose data storage:",
                 &[
                     "Local embedded database (recommended)",
-                    "PostgreSQL (advanced deployment)",
+                    "PostgreSQL (for firms with an existing DB server)",
                 ],
             )
             .map_err(SetupError::Io)?;
@@ -457,16 +462,16 @@ impl SetupWizard {
 
     /// Quickstart Step 3: minimal provider setup for lawyers.
     async fn quickstart_step_model_provider(&mut self) -> Result<(), SetupError> {
-        print_info("Choose your model provider.");
-        print_info("You can switch providers later with `clawyer onboard --advanced`.");
+        print_info("Choose how cLawyer should run model requests.");
+        print_info("Recommended default is hosted setup for faster first run.");
         println!();
 
         let choice = select_one(
             "Provider:",
             &[
-                "NEAR AI (recommended)",
-                "OpenAI-compatible endpoint",
-                "Ollama (local models)",
+                "NEAR AI (recommended, fastest setup)",
+                "OpenAI-compatible endpoint (hosted or self-hosted)",
+                "Ollama (local-only, privacy-first)",
             ],
         )
         .map_err(SetupError::Io)?;
@@ -532,6 +537,15 @@ impl SetupWizard {
         }
 
         print_success("Provider configured");
+        if self.settings.llm_backend.as_deref() == Some("ollama") {
+            print_info(
+                "Fallback note: if local model performance is too slow, rerun onboarding and pick a hosted provider.",
+            );
+        } else {
+            print_info(
+                "Fallback note: if hosted access is unavailable, rerun onboarding and pick Ollama for local-only inference.",
+            );
+        }
         Ok(())
     }
 
@@ -2608,7 +2622,7 @@ impl SetupWizard {
     }
 
     /// Save settings to the database and `~/.clawyer/.env`, then print summary.
-    async fn save_and_summarize(&mut self) -> Result<(), SetupError> {
+    async fn save_and_summarize(&mut self, quickstart_used: bool) -> Result<(), SetupError> {
         self.settings.onboard_completed = true;
 
         // Final persist (idempotent — earlier incremental saves already wrote
@@ -2743,6 +2757,29 @@ impl SetupWizard {
             println!("  Audit log: {}", self.settings.legal.audit.path);
         } else {
             println!("  Legal profile: disabled");
+        }
+
+        if quickstart_used {
+            println!();
+            print_success("You are ready.");
+            println!("Next commands:");
+            println!("  1) clawyer run");
+            println!("  2) Open http://127.0.0.1:3000");
+            println!("  3) Create a matter, then ask for a cited first draft");
+
+            match self.settings.llm_backend.as_deref() {
+                Some("ollama") => {
+                    print_info(
+                        "Using local inference (Ollama). If responses are too slow, rerun onboarding and choose a hosted provider.",
+                    );
+                }
+                Some("openai_compatible" | "nearai" | "openai" | "anthropic") => {
+                    print_info(
+                        "Using hosted inference. If provider access is blocked, rerun onboarding and choose Ollama local mode.",
+                    );
+                }
+                _ => {}
+            }
         }
 
         println!();
