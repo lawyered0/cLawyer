@@ -1,13 +1,11 @@
-use std::collections::HashSet;
-
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::{
     CreateInvoiceLineItemParams, CreateInvoiceParams, CreateTrustLedgerEntryParams, Database,
-    InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus, TrustLedgerEntryRecord,
-    TrustLedgerEntryType,
+    InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus, RecordInvoicePaymentParams,
+    TrustLedgerEntryRecord, TrustLedgerEntryType,
 };
 use crate::error::DatabaseError;
 
@@ -100,6 +98,7 @@ pub async fn save_draft(
     user_id: &str,
     draft: &DraftInvoiceResult,
 ) -> Result<(InvoiceRecord, Vec<InvoiceLineItemRecord>), DatabaseError> {
+    validate_invoice_totals(&draft.invoice, &draft.line_items)?;
     db.save_invoice_draft(user_id, &draft.invoice, &draft.line_items)
         .await
 }
@@ -109,57 +108,10 @@ pub async fn finalize_invoice(
     user_id: &str,
     invoice_id: Uuid,
 ) -> Result<InvoiceRecord, String> {
-    let invoice = db
-        .get_invoice(user_id, invoice_id)
+    db.finalize_invoice_atomic(user_id, invoice_id)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Invoice not found".to_string())?;
-    if invoice.status != InvoiceStatus::Draft {
-        return Err("Only draft invoices can be finalized".to_string());
-    }
-
-    let line_items = db
-        .list_invoice_line_items(user_id, invoice_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut time_ids = Vec::new();
-    let mut expense_ids = Vec::new();
-    let mut seen_time = HashSet::new();
-    let mut seen_expense = HashSet::new();
-
-    for item in line_items {
-        if let Some(time_id) = item.time_entry_id
-            && seen_time.insert(time_id)
-        {
-            time_ids.push(time_id);
-        }
-        if let Some(expense_id) = item.expense_entry_id
-            && seen_expense.insert(expense_id)
-        {
-            expense_ids.push(expense_id);
-        }
-    }
-
-    if !time_ids.is_empty() {
-        db.mark_time_entries_billed(user_id, &time_ids, &invoice_id.to_string())
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    if !expense_ids.is_empty() {
-        db.mark_expense_entries_billed(user_id, &expense_ids, &invoice_id.to_string())
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    db.set_invoice_status(
-        user_id,
-        invoice_id,
-        InvoiceStatus::Sent,
-        Some(Utc::now().date_naive()),
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "Invoice not found".to_string())
+        .ok_or_else(|| "Invoice not found".to_string())
 }
 
 pub async fn record_payment(
@@ -174,70 +126,31 @@ pub async fn record_payment(
     if amount <= Decimal::ZERO {
         return Err("Payment amount must be greater than 0".to_string());
     }
-
-    let invoice = db
-        .get_invoice(user_id, invoice_id)
+    let result = db
+        .record_invoice_payment(
+            user_id,
+            invoice_id,
+            &RecordInvoicePaymentParams {
+                amount,
+                draw_from_trust,
+                recorded_by: recorded_by.trim().to_string(),
+                description: description.map(|value| value.trim().to_string()),
+            },
+        )
         .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Invoice not found".to_string())?;
-    if !matches!(invoice.status, InvoiceStatus::Sent) {
-        return Err(format!(
-            "Cannot record payment for invoice with status '{}'",
-            invoice.status.as_str()
-        ));
-    }
-    let remaining = (invoice.total - invoice.paid_amount).round_dp(2);
-    if remaining <= Decimal::ZERO {
-        return Err("Invoice has no remaining balance".to_string());
-    }
-    if amount > remaining {
-        return Err(format!(
-            "Payment amount {} exceeds remaining balance {}",
-            amount.round_dp(2),
-            remaining
-        ));
-    }
-
-    let trust_entry = if draw_from_trust {
-        let entry = db
-            .append_trust_ledger_entry(
-                user_id,
-                &invoice.matter_id,
-                &CreateTrustLedgerEntryParams {
-                    entry_type: TrustLedgerEntryType::InvoicePayment,
-                    amount,
-                    delta: -amount,
-                    description: description
-                        .unwrap_or("Invoice payment from trust")
-                        .trim()
-                        .to_string(),
-                    invoice_id: Some(invoice_id),
-                    recorded_by: recorded_by.trim().to_string(),
-                },
-            )
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg
+        .map_err(|e| match e {
+            DatabaseError::Constraint(message)
+                if message
                     .to_ascii_lowercase()
-                    .contains("insufficient trust balance")
-                {
-                    "Trust balance is insufficient for this payment".to_string()
-                } else {
-                    msg
-                }
-            })?;
-        Some(entry)
-    } else {
-        None
-    };
-
-    let updated = db
-        .apply_invoice_payment(user_id, invoice_id, amount)
-        .await
-        .map_err(|e| e.to_string())?
+                    .contains("insufficient trust balance") =>
+            {
+                "Trust balance is insufficient for this payment".to_string()
+            }
+            DatabaseError::Constraint(message) => message,
+            other => other.to_string(),
+        })?
         .ok_or_else(|| "Invoice not found".to_string())?;
-    Ok((updated, trust_entry))
+    Ok((result.invoice, result.trust_entry))
 }
 
 pub async fn record_trust_deposit(
@@ -265,4 +178,30 @@ pub async fn record_trust_deposit(
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+fn validate_invoice_totals(
+    invoice: &CreateInvoiceParams,
+    line_items: &[CreateInvoiceLineItemParams],
+) -> Result<(), DatabaseError> {
+    let computed_subtotal = line_items
+        .iter()
+        .fold(Decimal::ZERO, |acc, item| acc + item.amount)
+        .round_dp(2);
+    if computed_subtotal != invoice.subtotal.round_dp(2) {
+        return Err(DatabaseError::Constraint(format!(
+            "invoice subtotal {} does not match line-item sum {}",
+            invoice.subtotal.round_dp(2),
+            computed_subtotal
+        )));
+    }
+    let computed_total = (invoice.subtotal + invoice.tax).round_dp(2);
+    if computed_total != invoice.total.round_dp(2) {
+        return Err(DatabaseError::Constraint(format!(
+            "invoice total {} does not equal subtotal + tax {}",
+            invoice.total.round_dp(2),
+            computed_total
+        )));
+    }
+    Ok(())
 }

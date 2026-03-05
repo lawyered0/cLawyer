@@ -877,6 +877,20 @@ pub struct CreateTrustLedgerEntryParams {
     pub recorded_by: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecordInvoicePaymentParams {
+    pub amount: Decimal,
+    pub draw_from_trust: bool,
+    pub recorded_by: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordInvoicePaymentResult {
+    pub invoice: InvoiceRecord,
+    pub trust_entry: Option<TrustLedgerEntryRecord>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AuditSeverity {
@@ -1631,12 +1645,23 @@ pub trait BillingStore: Send + Sync {
         status: InvoiceStatus,
         issued_date: Option<NaiveDate>,
     ) -> Result<Option<InvoiceRecord>, DatabaseError>;
+    async fn finalize_invoice_atomic(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError>;
     async fn apply_invoice_payment(
         &self,
         user_id: &str,
         invoice_id: Uuid,
         amount: Decimal,
     ) -> Result<Option<InvoiceRecord>, DatabaseError>;
+    async fn record_invoice_payment(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+        input: &RecordInvoicePaymentParams,
+    ) -> Result<Option<RecordInvoicePaymentResult>, DatabaseError>;
     async fn append_trust_ledger_entry(
         &self,
         user_id: &str,

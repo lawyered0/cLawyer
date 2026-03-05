@@ -3466,6 +3466,323 @@ async fn invoices_payment_rejects_amount_above_remaining_balance() {
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
+async fn invoices_finalize_rejects_line_items_already_billed_elsewhere() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync matter row");
+    let store = state.store.as_ref().expect("store should exist");
+
+    store
+        .create_expense_entry(
+            &state.user_id,
+            "demo",
+            &crate::db::CreateExpenseEntryParams {
+                submitted_by: "Lead".to_string(),
+                description: "Shared charge".to_string(),
+                amount: rust_decimal::Decimal::new(10000, 2),
+                category: crate::db::ExpenseCategory::Other,
+                entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 9).expect("valid date"),
+                receipt_path: None,
+                billable: true,
+            },
+        )
+        .await
+        .expect("seed expense entry");
+
+    let (_, Json(first)) = invoices_save_handler(
+        State(Arc::clone(&state)),
+        Json(DraftInvoiceRequest {
+            matter_id: "demo".to_string(),
+            invoice_number: "INV-SHARED-1".to_string(),
+            due_date: Some("2026-06-09".to_string()),
+            notes: None,
+        }),
+    )
+    .await
+    .expect("save first draft");
+    let (_, Json(second)) = invoices_save_handler(
+        State(Arc::clone(&state)),
+        Json(DraftInvoiceRequest {
+            matter_id: "demo".to_string(),
+            invoice_number: "INV-SHARED-2".to_string(),
+            due_date: Some("2026-06-10".to_string()),
+            notes: None,
+        }),
+    )
+    .await
+    .expect("save second draft");
+    assert_eq!(first.line_items.len(), 1);
+    assert_eq!(second.line_items.len(), 1);
+
+    let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(first.invoice.id.clone()))
+        .await
+        .expect("first finalize should succeed");
+
+    let err = invoices_finalize_handler(State(Arc::clone(&state)), Path(second.invoice.id.clone()))
+        .await
+        .expect_err("second finalize should be blocked");
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert!(err.1.contains("already billed"));
+
+    let second_invoice = store
+        .get_invoice(
+            &state.user_id,
+            Uuid::parse_str(&second.invoice.id).expect("invoice uuid"),
+        )
+        .await
+        .expect("load second invoice")
+        .expect("second invoice exists");
+    assert_eq!(second_invoice.status, crate::db::InvoiceStatus::Draft);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn invoices_payment_concurrent_requests_allow_single_winner() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync matter row");
+    let store = state.store.as_ref().expect("store should exist");
+
+    store
+        .create_expense_entry(
+            &state.user_id,
+            "demo",
+            &crate::db::CreateExpenseEntryParams {
+                submitted_by: "Lead".to_string(),
+                description: "Concurrent payable".to_string(),
+                amount: rust_decimal::Decimal::new(10000, 2),
+                category: crate::db::ExpenseCategory::Other,
+                entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 10).expect("valid date"),
+                receipt_path: None,
+                billable: true,
+            },
+        )
+        .await
+        .expect("seed expense entry");
+
+    let (_, Json(created)) = invoices_save_handler(
+        State(Arc::clone(&state)),
+        Json(DraftInvoiceRequest {
+            matter_id: "demo".to_string(),
+            invoice_number: "INV-CONCURRENT-1".to_string(),
+            due_date: Some("2026-06-10".to_string()),
+            notes: None,
+        }),
+    )
+    .await
+    .expect("save draft");
+    let invoice_id = created.invoice.id.clone();
+    let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
+        .await
+        .expect("finalize should succeed");
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let barrier_a = Arc::clone(&barrier);
+    let state_a = Arc::clone(&state);
+    let invoice_a = invoice_id.clone();
+    let task_a = tokio::spawn(async move {
+        barrier_a.wait().await;
+        invoices_payment_handler(
+            State(state_a),
+            Path(invoice_a),
+            Json(RecordInvoicePaymentRequest {
+                amount: "80.00".to_string(),
+                recorded_by: "Lead A".to_string(),
+                draw_from_trust: false,
+                description: Some("Concurrent payment A".to_string()),
+            }),
+        )
+        .await
+    });
+
+    let barrier_b = Arc::clone(&barrier);
+    let state_b = Arc::clone(&state);
+    let invoice_b = invoice_id.clone();
+    let task_b = tokio::spawn(async move {
+        barrier_b.wait().await;
+        invoices_payment_handler(
+            State(state_b),
+            Path(invoice_b),
+            Json(RecordInvoicePaymentRequest {
+                amount: "80.00".to_string(),
+                recorded_by: "Lead B".to_string(),
+                draw_from_trust: false,
+                description: Some("Concurrent payment B".to_string()),
+            }),
+        )
+        .await
+    });
+
+    barrier.wait().await;
+    let result_a = task_a.await.expect("task A joined");
+    let result_b = task_b.await.expect("task B joined");
+    let success_count = usize::from(result_a.is_ok()) + usize::from(result_b.is_ok());
+    assert_eq!(
+        success_count, 1,
+        "exactly one concurrent payment should succeed"
+    );
+
+    let invoice_after = store
+        .get_invoice(
+            &state.user_id,
+            Uuid::parse_str(&invoice_id).expect("invoice uuid"),
+        )
+        .await
+        .expect("load invoice")
+        .expect("invoice exists");
+    assert_eq!(
+        invoice_after.paid_amount,
+        rust_decimal::Decimal::new(8000, 2),
+        "paid_amount should reflect only one successful concurrent payment"
+    );
+    assert_eq!(invoice_after.status, crate::db::InvoiceStatus::Sent);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn invoices_payment_concurrent_trust_draw_creates_single_debit_entry() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync matter row");
+    let store = state.store.as_ref().expect("store should exist");
+
+    store
+        .create_expense_entry(
+            &state.user_id,
+            "demo",
+            &crate::db::CreateExpenseEntryParams {
+                submitted_by: "Lead".to_string(),
+                description: "Concurrent trust payable".to_string(),
+                amount: rust_decimal::Decimal::new(10000, 2),
+                category: crate::db::ExpenseCategory::Other,
+                entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 11).expect("valid date"),
+                receipt_path: None,
+                billable: true,
+            },
+        )
+        .await
+        .expect("seed expense entry");
+
+    let (_, Json(created)) = invoices_save_handler(
+        State(Arc::clone(&state)),
+        Json(DraftInvoiceRequest {
+            matter_id: "demo".to_string(),
+            invoice_number: "INV-CONCURRENT-TRUST-1".to_string(),
+            due_date: Some("2026-06-11".to_string()),
+            notes: None,
+        }),
+    )
+    .await
+    .expect("save draft");
+    let invoice_id = created.invoice.id.clone();
+    let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
+        .await
+        .expect("finalize should succeed");
+
+    let _ = matter_trust_deposit_handler(
+        State(Arc::clone(&state)),
+        Path("demo".to_string()),
+        Json(TrustDepositRequest {
+            amount: "100.00".to_string(),
+            recorded_by: "Lead".to_string(),
+            description: Some("Concurrent trust funding".to_string()),
+        }),
+    )
+    .await
+    .expect("trust deposit should succeed");
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let barrier_a = Arc::clone(&barrier);
+    let state_a = Arc::clone(&state);
+    let invoice_a = invoice_id.clone();
+    let task_a = tokio::spawn(async move {
+        barrier_a.wait().await;
+        invoices_payment_handler(
+            State(state_a),
+            Path(invoice_a),
+            Json(RecordInvoicePaymentRequest {
+                amount: "60.00".to_string(),
+                recorded_by: "Lead A".to_string(),
+                draw_from_trust: true,
+                description: Some("Concurrent trust payment A".to_string()),
+            }),
+        )
+        .await
+    });
+
+    let barrier_b = Arc::clone(&barrier);
+    let state_b = Arc::clone(&state);
+    let invoice_b = invoice_id.clone();
+    let task_b = tokio::spawn(async move {
+        barrier_b.wait().await;
+        invoices_payment_handler(
+            State(state_b),
+            Path(invoice_b),
+            Json(RecordInvoicePaymentRequest {
+                amount: "60.00".to_string(),
+                recorded_by: "Lead B".to_string(),
+                draw_from_trust: true,
+                description: Some("Concurrent trust payment B".to_string()),
+            }),
+        )
+        .await
+    });
+
+    barrier.wait().await;
+    let result_a = task_a.await.expect("task A joined");
+    let result_b = task_b.await.expect("task B joined");
+    let success_count = usize::from(result_a.is_ok()) + usize::from(result_b.is_ok());
+    assert_eq!(
+        success_count, 1,
+        "exactly one concurrent trust draw should succeed"
+    );
+
+    let invoice_after = store
+        .get_invoice(
+            &state.user_id,
+            Uuid::parse_str(&invoice_id).expect("invoice uuid"),
+        )
+        .await
+        .expect("load invoice")
+        .expect("invoice exists");
+    assert_eq!(
+        invoice_after.paid_amount,
+        rust_decimal::Decimal::new(6000, 2)
+    );
+
+    let ledger = store
+        .list_trust_ledger_entries(&state.user_id, "demo")
+        .await
+        .expect("load trust ledger");
+    let invoice_payment_count = ledger
+        .iter()
+        .filter(|entry| entry.entry_type == crate::db::TrustLedgerEntryType::InvoicePayment)
+        .count();
+    assert_eq!(invoice_payment_count, 1);
+    let balance = store
+        .current_trust_balance(&state.user_id, "demo")
+        .await
+        .expect("current trust balance");
+    assert_eq!(balance, rust_decimal::Decimal::new(4000, 2));
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
 async fn invoices_void_rejects_paid_invoice_status() {
     let (db, _tmp) = crate::testing::test_db().await;
     let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));

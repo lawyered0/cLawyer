@@ -28,9 +28,10 @@ use crate::db::{
     JobStore, LegalConflictStore, MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType,
     MatterDocumentCategory, MatterDocumentRecord, MatterDocumentStore, MatterNoteRecord,
     MatterNoteStore, MatterRecord, MatterStatus, MatterStore, MatterTaskRecord, MatterTaskStatus,
-    MatterTaskStore, MatterTimeSummary, PartyRole, RoutineStore, SandboxStore, SettingsStore,
-    TimeEntryRecord, TimeExpenseStore, ToolFailureStore, TrustLedgerEntryRecord,
-    TrustLedgerEntryType, UpdateClientParams, UpdateDocumentTemplateParams,
+    MatterTaskStore, MatterTimeSummary, PartyRole, RecordInvoicePaymentParams,
+    RecordInvoicePaymentResult, RoutineStore, SandboxStore, SettingsStore, TimeEntryRecord,
+    TimeExpenseStore, ToolFailureStore, TrustLedgerEntryRecord, TrustLedgerEntryType,
+    UpdateClientParams, UpdateDocumentTemplateParams,
     UpdateExpenseEntryParams, UpdateMatterDeadlineParams, UpdateMatterDocumentParams,
     UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
     UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams, WorkspaceStore,
@@ -2878,6 +2879,16 @@ impl BillingStore for PgBackend {
         invoice: &CreateInvoiceParams,
         line_items: &[CreateInvoiceLineItemParams],
     ) -> Result<(InvoiceRecord, Vec<InvoiceLineItemRecord>), DatabaseError> {
+        if (invoice.subtotal + invoice.tax).round_dp(2) != invoice.total.round_dp(2) {
+            return Err(DatabaseError::Constraint(
+                "invoice total must equal subtotal + tax".to_string(),
+            ));
+        }
+        if invoice.paid_amount > invoice.total {
+            return Err(DatabaseError::Constraint(
+                "invoice paid_amount cannot exceed total".to_string(),
+            ));
+        }
         let mut conn = self.store.conn().await?;
         let tx = conn.transaction().await?;
 
@@ -3021,6 +3032,150 @@ impl BillingStore for PgBackend {
         row.map(|row| row_to_invoice_record(&row)).transpose()
     }
 
+    async fn finalize_invoice_atomic(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+    ) -> Result<Option<InvoiceRecord>, DatabaseError> {
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+
+        let invoice_row = tx
+            .query_opt(
+                "SELECT id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at \
+                 FROM invoices \
+                 WHERE user_id = $1 AND id = $2 \
+                 FOR UPDATE",
+                &[&user_id, &invoice_id],
+            )
+            .await?;
+        let Some(invoice_row) = invoice_row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let invoice = row_to_invoice_record(&invoice_row)?;
+        if invoice.status != InvoiceStatus::Draft {
+            return Err(DatabaseError::Constraint(
+                "Only draft invoices can be finalized".to_string(),
+            ));
+        }
+
+        let line_item_rows = tx
+            .query(
+                "SELECT time_entry_id, expense_entry_id \
+                 FROM invoice_line_items \
+                 WHERE user_id = $1 AND invoice_id = $2 \
+                 ORDER BY sort_order ASC, created_at ASC",
+                &[&user_id, &invoice_id],
+            )
+            .await?;
+        let mut time_ids = Vec::new();
+        let mut expense_ids = Vec::new();
+        let mut seen_time = HashSet::new();
+        let mut seen_expense = HashSet::new();
+        for row in line_item_rows {
+            let time_id: Option<Uuid> = row.get("time_entry_id");
+            let expense_id: Option<Uuid> = row.get("expense_entry_id");
+            if let Some(time_id) = time_id
+                && seen_time.insert(time_id)
+            {
+                time_ids.push(time_id);
+            }
+            if let Some(expense_id) = expense_id
+                && seen_expense.insert(expense_id)
+            {
+                expense_ids.push(expense_id);
+            }
+        }
+
+        if !time_ids.is_empty() {
+            let rows = tx
+                .query(
+                    "SELECT id, billed_invoice_id \
+                     FROM time_entries \
+                     WHERE user_id = $1 AND id = ANY($2) \
+                     FOR UPDATE",
+                    &[&user_id, &time_ids],
+                )
+                .await?;
+            if rows.len() != time_ids.len() {
+                return Err(DatabaseError::Constraint(
+                    "Invoice references missing time entries".to_string(),
+                ));
+            }
+            let invoice_id_str = invoice_id.to_string();
+            for row in rows {
+                let billed_invoice_id: Option<String> = row.get("billed_invoice_id");
+                if let Some(existing) = billed_invoice_id
+                    && existing != invoice_id_str
+                {
+                    return Err(DatabaseError::Constraint(
+                        "Invoice includes time entries already billed on another invoice"
+                            .to_string(),
+                    ));
+                }
+            }
+            tx.execute(
+                "UPDATE time_entries \
+                 SET billed_invoice_id = $3, updated_at = NOW() \
+                 WHERE user_id = $1 AND id = ANY($2) AND billed_invoice_id IS NULL",
+                &[&user_id, &time_ids, &invoice_id_str],
+            )
+            .await?;
+        }
+
+        if !expense_ids.is_empty() {
+            let rows = tx
+                .query(
+                    "SELECT id, billed_invoice_id \
+                     FROM expense_entries \
+                     WHERE user_id = $1 AND id = ANY($2) \
+                     FOR UPDATE",
+                    &[&user_id, &expense_ids],
+                )
+                .await?;
+            if rows.len() != expense_ids.len() {
+                return Err(DatabaseError::Constraint(
+                    "Invoice references missing expense entries".to_string(),
+                ));
+            }
+            let invoice_id_str = invoice_id.to_string();
+            for row in rows {
+                let billed_invoice_id: Option<String> = row.get("billed_invoice_id");
+                if let Some(existing) = billed_invoice_id
+                    && existing != invoice_id_str
+                {
+                    return Err(DatabaseError::Constraint(
+                        "Invoice includes expenses already billed on another invoice".to_string(),
+                    ));
+                }
+            }
+            tx.execute(
+                "UPDATE expense_entries \
+                 SET billed_invoice_id = $3, updated_at = NOW() \
+                 WHERE user_id = $1 AND id = ANY($2) AND billed_invoice_id IS NULL",
+                &[&user_id, &expense_ids, &invoice_id_str],
+            )
+            .await?;
+        }
+
+        let issued_date = Utc::now().date_naive();
+        let row = tx
+            .query_one(
+                "UPDATE invoices \
+                 SET status = 'sent', \
+                     issued_date = COALESCE(issued_date, $3), \
+                     updated_at = NOW() \
+                 WHERE user_id = $1 AND id = $2 \
+                 RETURNING id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at",
+                &[&user_id, &invoice_id, &issued_date],
+            )
+            .await?;
+        let finalized = row_to_invoice_record(&row)?;
+        tx.commit().await?;
+        Ok(Some(finalized))
+    }
+
     async fn apply_invoice_payment(
         &self,
         user_id: &str,
@@ -3040,6 +3195,131 @@ impl BillingStore for PgBackend {
             )
             .await?;
         row.map(|row| row_to_invoice_record(&row)).transpose()
+    }
+
+    async fn record_invoice_payment(
+        &self,
+        user_id: &str,
+        invoice_id: Uuid,
+        input: &RecordInvoicePaymentParams,
+    ) -> Result<Option<RecordInvoicePaymentResult>, DatabaseError> {
+        if input.amount <= Decimal::ZERO {
+            return Err(DatabaseError::Constraint(
+                "Payment amount must be greater than 0".to_string(),
+            ));
+        }
+
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+        let invoice_row = tx
+            .query_opt(
+                "SELECT id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at \
+                 FROM invoices \
+                 WHERE user_id = $1 AND id = $2 \
+                 FOR UPDATE",
+                &[&user_id, &invoice_id],
+            )
+            .await?;
+        let Some(invoice_row) = invoice_row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let invoice = row_to_invoice_record(&invoice_row)?;
+        if invoice.status != InvoiceStatus::Sent {
+            return Err(DatabaseError::Constraint(format!(
+                "Cannot record payment for invoice with status '{}'",
+                invoice.status.as_str()
+            )));
+        }
+
+        let remaining = (invoice.total - invoice.paid_amount).round_dp(2);
+        if remaining <= Decimal::ZERO {
+            return Err(DatabaseError::Constraint(
+                "Invoice has no remaining balance".to_string(),
+            ));
+        }
+        if input.amount > remaining {
+            return Err(DatabaseError::Constraint(format!(
+                "Payment amount {} exceeds remaining balance {}",
+                input.amount.round_dp(2),
+                remaining
+            )));
+        }
+
+        let mut trust_entry = None;
+        if input.draw_from_trust {
+            tx.query(
+                "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+                &[&user_id, &invoice.matter_id],
+            )
+            .await?;
+            let current_row = tx
+                .query_opt(
+                    "SELECT balance_after \
+                     FROM trust_ledger \
+                     WHERE user_id = $1 AND matter_id = $2 \
+                     ORDER BY created_at DESC, id DESC \
+                     LIMIT 1 \
+                     FOR UPDATE",
+                    &[&user_id, &invoice.matter_id],
+                )
+                .await?;
+            let current_balance = current_row
+                .as_ref()
+                .map(|row| row.get::<_, Decimal>("balance_after"))
+                .unwrap_or(Decimal::ZERO);
+            let balance_after = (current_balance - input.amount).round_dp(2);
+            if balance_after < Decimal::ZERO {
+                return Err(DatabaseError::Constraint(
+                    "insufficient trust balance for requested entry".to_string(),
+                ));
+            }
+
+            let description = input
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Invoice payment from trust")
+                .to_string();
+            let row = tx
+                .query_one(
+                    "INSERT INTO trust_ledger (id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                     RETURNING id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at",
+                    &[
+                        &Uuid::new_v4(),
+                        &user_id,
+                        &invoice.matter_id,
+                        &TrustLedgerEntryType::InvoicePayment.as_str(),
+                        &input.amount,
+                        &balance_after,
+                        &description,
+                        &Some(invoice_id),
+                        &input.recorded_by,
+                    ],
+                )
+                .await?;
+            trust_entry = Some(row_to_trust_ledger_entry_record(&row)?);
+        }
+
+        let row = tx
+            .query_one(
+                "UPDATE invoices \
+                 SET paid_amount = paid_amount + $3, \
+                     status = CASE WHEN paid_amount + $3 >= total THEN 'paid' ELSE status END, \
+                     updated_at = NOW() \
+                 WHERE user_id = $1 AND id = $2 \
+                 RETURNING id, user_id, matter_id, invoice_number, status, issued_date, due_date, subtotal, tax, total, paid_amount, notes, created_at, updated_at",
+                &[&user_id, &invoice_id, &input.amount],
+            )
+            .await?;
+        let updated_invoice = row_to_invoice_record(&row)?;
+        tx.commit().await?;
+        Ok(Some(RecordInvoicePaymentResult {
+            invoice: updated_invoice,
+            trust_entry,
+        }))
     }
 
     async fn append_trust_ledger_entry(
@@ -3503,6 +3783,16 @@ impl crate::db::LegalRestoreStore for PgBackend {
     }
 
     async fn upsert_invoice_record(&self, row: &InvoiceRecord) -> Result<(), DatabaseError> {
+        if (row.subtotal + row.tax).round_dp(2) != row.total.round_dp(2) {
+            return Err(DatabaseError::Constraint(
+                "invoice total must equal subtotal + tax".to_string(),
+            ));
+        }
+        if row.paid_amount > row.total {
+            return Err(DatabaseError::Constraint(
+                "invoice paid_amount cannot exceed total".to_string(),
+            ));
+        }
         let conn = self.store.conn().await?;
         conn.execute(
             "INSERT INTO invoices \
