@@ -175,11 +175,19 @@ async fn settings_import_handler(
 async fn skeptical_mode_resolved_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Json<SkepticalModeResolvedResponse> {
-    let default_enabled = state
-        .legal_config
-        .as_ref()
-        .map(crate::legal::skeptical::default_enabled_for_legal)
-        .unwrap_or(false);
+    let default_enabled =
+        match crate::channels::web::handlers::helpers::legal::legal_config_for_gateway(
+            state.as_ref(),
+        ) {
+            Ok(config) => crate::legal::skeptical::default_enabled_for_legal(&config),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to resolve legal config for skeptical_mode default; using false: {}",
+                    err
+                );
+                false
+            }
+        };
 
     let enabled = crate::legal::skeptical::resolve_for_user(
         state.store.as_ref(),

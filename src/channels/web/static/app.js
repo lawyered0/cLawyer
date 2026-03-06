@@ -25,6 +25,7 @@ let complianceExpanded = false;
 const SKEPTICAL_MODE_SETTING_KEY = 'skeptical_mode';
 let skepticalModeActive = false;
 let skepticalModeLoaded = false;
+let skepticalModeLoadError = false;
 
 function byId(id) {
   return document.getElementById(id);
@@ -5934,6 +5935,10 @@ function updateSkepticalModeUi() {
 
   var meta = byId('settings-skeptical-meta');
   if (!meta) return;
+  if (skepticalModeLoadError) {
+    meta.textContent = 'Unable to refresh Skeptical Mode status. Showing last known state.';
+    return;
+  }
   if (!skepticalModeLoaded) {
     meta.textContent = 'Loading skeptical mode status…';
     return;
@@ -5945,18 +5950,31 @@ function updateSkepticalModeUi() {
 
 function refreshSkepticalModeState() {
   var requestVersion = beginRequest('skepticalMode');
+  var previousActive = skepticalModeActive;
+  var previousLoaded = skepticalModeLoaded;
+  skepticalModeLoadError = false;
   skepticalModeLoaded = false;
   updateSkepticalModeUi();
 
   return apiFetch('/api/settings/skeptical_mode/resolved').then(function(data) {
     if (!isCurrentRequest('skepticalMode', requestVersion)) return;
     skepticalModeActive = !!data.enabled;
+    skepticalModeLoadError = false;
     skepticalModeLoaded = true;
     updateSkepticalModeUi();
   }).catch(function() {
     if (!isCurrentRequest('skepticalMode', requestVersion)) return;
-    skepticalModeActive = false;
-    skepticalModeLoaded = true;
+    var resolved = extractSkepticalModeFromCompliance(complianceStatusCache);
+    if (resolved !== null) {
+      skepticalModeActive = resolved;
+      skepticalModeLoaded = true;
+      skepticalModeLoadError = false;
+      updateSkepticalModeUi();
+      return;
+    }
+    skepticalModeActive = previousActive;
+    skepticalModeLoaded = previousLoaded;
+    skepticalModeLoadError = true;
     updateSkepticalModeUi();
   });
 }
@@ -5971,6 +5989,7 @@ function handleSkepticalModeToggleChange(event) {
     body: { value: next },
   }).then(function() {
     skepticalModeActive = next;
+    skepticalModeLoadError = false;
     skepticalModeLoaded = true;
     updateSkepticalModeUi();
     showToast(next ? 'Skeptical Mode enabled' : 'Skeptical Mode disabled', 'success');
