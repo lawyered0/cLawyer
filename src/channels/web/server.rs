@@ -17,7 +17,9 @@ use tokio::sync::oneshot;
 use tower_http::cors::{AllowHeaders, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::channels::web::auth::{AuthPrincipal, AuthState, auth_middleware, hash_auth_token};
+use crate::channels::web::auth::{
+    AuthPrincipal, AuthState, auth_middleware, compute_token_hash, derive_token_hmac_key,
+};
 pub use crate::channels::web::state::{GatewayState, PromptQueue, RateLimiter};
 use crate::channels::web::types::*;
 use crate::db::UserRole;
@@ -51,8 +53,13 @@ pub async fn start_server(
 
     // Protected routes (require auth)
     let principal = resolve_gateway_principal(state.as_ref()).await?;
+    // Derive a stable HMAC-SHA256 key from the gateway auth token. The key is
+    // deterministic (same token → same key) so no extra configuration is needed.
+    // Rotating the auth token automatically invalidates stored hashes; the
+    // upsert below immediately writes the new HMAC hash on startup.
+    let hmac_key = derive_token_hmac_key(&auth_token);
     if let Some(store) = state.store.as_ref() {
-        let token_hash = hash_auth_token(&auth_token);
+        let token_hash = compute_token_hash(&auth_token, Some(&hmac_key));
         store
             .upsert_user_token_hash(&principal.user_id, &token_hash)
             .await
@@ -68,6 +75,7 @@ pub async fn start_server(
         token: auth_token,
         fallback_principal: principal,
         store: state.store.clone(),
+        hmac_key: Some(hmac_key),
     };
     let protected = Router::new()
         .merge(crate::channels::web::handlers::routes::protected_feature_routes())

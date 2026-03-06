@@ -6118,6 +6118,7 @@ function loadComplianceStatus() {
     if (skepticalResolved !== null) {
       skepticalModeActive = skepticalResolved;
       skepticalModeLoaded = true;
+      skepticalModeLoadError = false;
       updateSkepticalModeUi();
     }
     renderComplianceStatus(data);
