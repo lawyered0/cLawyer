@@ -5908,16 +5908,6 @@ function formatDate(isoString) {
 
 // --- Settings ---
 
-function normalizeSkepticalModeValue(value) {
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'string') {
-    var normalized = value.trim().toLowerCase();
-    if (normalized === 'true') return true;
-    if (normalized === 'false') return false;
-  }
-  return null;
-}
-
 function extractSkepticalModeFromCompliance(data) {
   var measure = data && data.measure;
   var checks = measure && Array.isArray(measure.checks) ? measure.checks : null;
@@ -5957,38 +5947,17 @@ function refreshSkepticalModeState() {
   var requestVersion = beginRequest('skepticalMode');
   skepticalModeLoaded = false;
   updateSkepticalModeUi();
-  var settingPath = '/api/settings/' + encodeURIComponent(SKEPTICAL_MODE_SETTING_KEY);
 
-  return apiFetch(settingPath).then(function(setting) {
+  return apiFetch('/api/settings/skeptical_mode/resolved').then(function(data) {
     if (!isCurrentRequest('skepticalMode', requestVersion)) return;
-    var parsed = normalizeSkepticalModeValue(setting && setting.value);
-    if (parsed === null) {
-      throw new Error('Invalid skeptical_mode value');
-    }
-    skepticalModeActive = parsed;
+    skepticalModeActive = !!data.enabled;
     skepticalModeLoaded = true;
     updateSkepticalModeUi();
   }).catch(function() {
-    var useCached = extractSkepticalModeFromCompliance(complianceStatusCache);
-    if (useCached !== null) {
-      if (!isCurrentRequest('skepticalMode', requestVersion)) return;
-      skepticalModeActive = useCached;
-      skepticalModeLoaded = true;
-      updateSkepticalModeUi();
-      return;
-    }
-    apiFetch('/api/compliance/status').then(function(data) {
-      if (!isCurrentRequest('skepticalMode', requestVersion)) return;
-      var resolved = extractSkepticalModeFromCompliance(data);
-      skepticalModeActive = resolved === null ? false : resolved;
-      skepticalModeLoaded = true;
-      updateSkepticalModeUi();
-    }).catch(function() {
-      if (!isCurrentRequest('skepticalMode', requestVersion)) return;
-      skepticalModeActive = false;
-      skepticalModeLoaded = true;
-      updateSkepticalModeUi();
-    });
+    if (!isCurrentRequest('skepticalMode', requestVersion)) return;
+    skepticalModeActive = false;
+    skepticalModeLoaded = true;
+    updateSkepticalModeUi();
   });
 }
 

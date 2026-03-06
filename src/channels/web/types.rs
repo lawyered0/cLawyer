@@ -1610,6 +1610,11 @@ pub struct SettingsImportRequest {
 }
 
 #[derive(Debug, Serialize)]
+pub struct SkepticalModeResolvedResponse {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
 pub struct SettingsExportResponse {
     pub settings: std::collections::HashMap<String, serde_json::Value>,
 }

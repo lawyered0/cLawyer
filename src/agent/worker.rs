@@ -168,7 +168,6 @@ impl Worker {
         let details = serde_json::json!({
             "job_id": self.job_id.to_string(),
             "matter_id": context.matter_id,
-            "active": true,
         });
 
         if let Some(store) = self.store() {

@@ -26,6 +26,11 @@ pub fn routes() -> Router<Arc<GatewayState>> {
         .route("/api/settings", get(settings_list_handler))
         .route("/api/settings/export", get(settings_export_handler))
         .route("/api/settings/import", post(settings_import_handler))
+        // Static sub-resource routes must be declared before the `{key}` catch-all.
+        .route(
+            "/api/settings/skeptical_mode/resolved",
+            get(skeptical_mode_resolved_handler),
+        )
         .route("/api/settings/{key}", get(settings_get_handler))
         .route(
             "/api/settings/{key}",
@@ -158,4 +163,30 @@ async fn settings_import_handler(
         })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/settings/skeptical_mode/resolved`
+///
+/// Returns the effective Skeptical Mode state for the authenticated user after
+/// applying the per-user setting override and the legal-hardening default.
+/// Always returns 200 with `{ "enabled": bool }` — never 404 or 503 — so the
+/// frontend can use this as its single authoritative source without a fallback
+/// cascade.
+async fn skeptical_mode_resolved_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Json<SkepticalModeResolvedResponse> {
+    let default_enabled = state
+        .legal_config
+        .as_ref()
+        .map(crate::legal::skeptical::default_enabled_for_legal)
+        .unwrap_or(false);
+
+    let enabled = crate::legal::skeptical::resolve_for_user(
+        state.store.as_ref(),
+        &state.user_id,
+        default_enabled,
+    )
+    .await;
+
+    Json(SkepticalModeResolvedResponse { enabled })
 }
