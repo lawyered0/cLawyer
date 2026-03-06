@@ -974,6 +974,7 @@ dependencies = [
  "fs4",
  "futures",
  "hkdf",
+ "hmac",
  "html-to-markdown-rs",
  "http-body-util",
  "hyper 1.8.1",
