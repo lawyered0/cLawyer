@@ -25,6 +25,7 @@ let complianceExpanded = false;
 const SKEPTICAL_MODE_SETTING_KEY = 'skeptical_mode';
 let skepticalModeActive = false;
 let skepticalModeLoaded = false;
+let skepticalModeLoadError = false;
 
 function byId(id) {
   return document.getElementById(id);
@@ -5908,16 +5909,6 @@ function formatDate(isoString) {
 
 // --- Settings ---
 
-function normalizeSkepticalModeValue(value) {
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'string') {
-    var normalized = value.trim().toLowerCase();
-    if (normalized === 'true') return true;
-    if (normalized === 'false') return false;
-  }
-  return null;
-}
-
 function extractSkepticalModeFromCompliance(data) {
   var measure = data && data.measure;
   var checks = measure && Array.isArray(measure.checks) ? measure.checks : null;
@@ -5944,6 +5935,10 @@ function updateSkepticalModeUi() {
 
   var meta = byId('settings-skeptical-meta');
   if (!meta) return;
+  if (skepticalModeLoadError) {
+    meta.textContent = 'Unable to refresh Skeptical Mode status. Showing last known state.';
+    return;
+  }
   if (!skepticalModeLoaded) {
     meta.textContent = 'Loading skeptical mode status…';
     return;
@@ -5955,40 +5950,32 @@ function updateSkepticalModeUi() {
 
 function refreshSkepticalModeState() {
   var requestVersion = beginRequest('skepticalMode');
+  var previousActive = skepticalModeActive;
+  var previousLoaded = skepticalModeLoaded;
+  skepticalModeLoadError = false;
   skepticalModeLoaded = false;
   updateSkepticalModeUi();
-  var settingPath = '/api/settings/' + encodeURIComponent(SKEPTICAL_MODE_SETTING_KEY);
 
-  return apiFetch(settingPath).then(function(setting) {
+  return apiFetch('/api/settings/skeptical_mode/resolved').then(function(data) {
     if (!isCurrentRequest('skepticalMode', requestVersion)) return;
-    var parsed = normalizeSkepticalModeValue(setting && setting.value);
-    if (parsed === null) {
-      throw new Error('Invalid skeptical_mode value');
-    }
-    skepticalModeActive = parsed;
+    skepticalModeActive = !!data.enabled;
+    skepticalModeLoadError = false;
     skepticalModeLoaded = true;
     updateSkepticalModeUi();
   }).catch(function() {
-    var useCached = extractSkepticalModeFromCompliance(complianceStatusCache);
-    if (useCached !== null) {
-      if (!isCurrentRequest('skepticalMode', requestVersion)) return;
-      skepticalModeActive = useCached;
+    if (!isCurrentRequest('skepticalMode', requestVersion)) return;
+    var resolved = extractSkepticalModeFromCompliance(complianceStatusCache);
+    if (resolved !== null) {
+      skepticalModeActive = resolved;
       skepticalModeLoaded = true;
+      skepticalModeLoadError = false;
       updateSkepticalModeUi();
       return;
     }
-    apiFetch('/api/compliance/status').then(function(data) {
-      if (!isCurrentRequest('skepticalMode', requestVersion)) return;
-      var resolved = extractSkepticalModeFromCompliance(data);
-      skepticalModeActive = resolved === null ? false : resolved;
-      skepticalModeLoaded = true;
-      updateSkepticalModeUi();
-    }).catch(function() {
-      if (!isCurrentRequest('skepticalMode', requestVersion)) return;
-      skepticalModeActive = false;
-      skepticalModeLoaded = true;
-      updateSkepticalModeUi();
-    });
+    skepticalModeActive = previousActive;
+    skepticalModeLoaded = previousLoaded;
+    skepticalModeLoadError = true;
+    updateSkepticalModeUi();
   });
 }
 
@@ -6002,6 +5989,7 @@ function handleSkepticalModeToggleChange(event) {
     body: { value: next },
   }).then(function() {
     skepticalModeActive = next;
+    skepticalModeLoadError = false;
     skepticalModeLoaded = true;
     updateSkepticalModeUi();
     showToast(next ? 'Skeptical Mode enabled' : 'Skeptical Mode disabled', 'success');
