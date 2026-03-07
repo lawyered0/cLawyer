@@ -51,10 +51,7 @@ fn fmt_decimal(value: Decimal) -> String {
 }
 
 fn sanitize_field(value: &str) -> String {
-    value
-        .replace(['|', '\n', '\r'], " ")
-        .trim()
-        .to_string()
+    value.replace(['|', '\n', '\r'], " ").trim().to_string()
 }
 
 pub fn export_ledes98b(
