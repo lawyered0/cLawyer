@@ -24,11 +24,15 @@ edition = "2024"
 rust-version = "1.92"
 autobins = false
 default-run = "clawyer"
-description = "Experimental local-first legal AI assistant (not safe for production; use at your own risk)"
-authors = ["NEAR AI <support@near.ai>"]
+description = "Local-first legal AI assistant: matter-scoped, citation-required, and auditable. For law firms."
+authors = ["Lawyered <https://github.com/lawyered0>"]
 license = "MIT OR Apache-2.0"
+readme = "README.md"
 homepage = "https://github.com/lawyered0/cLawyer"
 repository = "https://github.com/lawyered0/cLawyer"
+documentation = "https://github.com/lawyered0/cLawyer#readme"
+keywords = ["legal", "ai", "law", "llm", "legal-tech"]
+categories = ["command-line-utilities", "web-programming"]
 
 [[bin]]
 name = "clawyer"

@@ -12,6 +12,7 @@ Thank you for helping make cLawyer better. This guide covers everything you need
 - [Getting Started](#getting-started)
 - [Development Setup](#development-setup)
 - [The Ship Checklist](#the-ship-checklist)
+- [Writing Tests](#writing-tests)
 - [Opening Issues](#opening-issues)
 - [Opening Pull Requests](#opening-pull-requests)
 - [Commit Conventions](#commit-conventions)
@@ -124,6 +125,97 @@ grep -rn 'super::' src/
 
 # If you fixed a pattern bug, check for other instances
 grep -rn '<the-pattern>' src/
+```
+
+---
+
+## Writing Tests
+
+Tests live in `mod tests {}` blocks at the bottom of each source file. All test-only helpers belong in `src/channels/web/test_support.rs` (compiled only in `#[cfg(test)]` mode).
+
+### Handler test pattern
+
+Every web handler test needs a `GatewayState` and, for RBAC-gated endpoints, a `RequestPrincipal`. Use the shared builders rather than constructing `GatewayState` by hand:
+
+```rust
+use crate::channels::web::test_support::{
+    owner_principal,
+    seed_valid_matter,
+    test_gateway_state_with_store_and_workspace,
+    test_gateway_state_for_user,
+    TestLlmProvider,
+};
+```
+
+| Helper | When to use |
+|--------|-------------|
+| `minimal_test_gateway_state(llm)` | Unit tests that only need an LLM provider (no DB, no workspace) |
+| `test_gateway_state_with_store_and_workspace(db, ws)` | Handler tests that read/write the database and workspace |
+| `test_gateway_state_with_store_workspace_and_chat(db, ws)` | Chat handler tests that require an active `SessionManager` |
+| `test_gateway_state_for_user(db, ws, user_id)` | RBAC negative-path tests — simulates a request from a user who is *not* the matter owner |
+| `owner_principal()` | Returns `RequestPrincipal` as `"test-user"` (the gateway owner); grants full access through the owner short-circuit path |
+| `seed_valid_matter(workspace, matter_id)` | Seeds a minimal `matters/{id}/` directory structure with `matter.yaml`, two templates, and `notes.md` |
+
+### Typical handler test skeleton
+
+```rust
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn test_matter_get_returns_200_for_owner() {
+    let db = crate::testing::test_db().await;
+    let ws = crate::testing::test_workspace().await;
+    let state = test_gateway_state_with_store_and_workspace(
+        Arc::clone(&db), Arc::clone(&ws),
+    );
+
+    seed_valid_matter(&ws, "acme-v-foo").await;
+
+    let response = matter_get_handler(
+        State(state),
+        owner_principal(),
+        Path("acme-v-foo".to_string()),
+    ).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+```
+
+### RBAC negative-path test skeleton
+
+```rust
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn test_matter_delete_blocks_non_owner() {
+    let db = crate::testing::test_db().await;
+    let ws = crate::testing::test_workspace().await;
+
+    // State has user_id = "test-user" (owner), but request comes from "other-user"
+    let state = test_gateway_state_for_user(
+        Arc::clone(&db), Arc::clone(&ws), "other-user",
+    );
+
+    seed_valid_matter(&ws, "acme-v-foo").await;
+
+    // other-user is not a member → expect 403
+    let response = matter_delete_handler(
+        State(state),
+        owner_principal(),  // principal.user_id = "test-user" != state.user_id = "other-user"
+        Path("acme-v-foo".to_string()),
+    ).await;
+
+    // Note: flip state.user_id, not the principal, to simulate a different gateway owner
+    assert_eq!(response.unwrap_err(), StatusCode::FORBIDDEN);
+}
+```
+
+> **Feature gate**: All tests that use a real database must be wrapped in `#[cfg(feature = "libsql")]`. Run them with `cargo test --features libsql`.
+
+### Inline event handler check
+
+Static assets (HTML/JS) must not use inline event handlers (`onclick=`, `onchange=`, etc.). Use the provided helper after loading asset bytes:
+
+```rust
+assert_no_inline_event_handlers("my_widget.js", &asset_bytes);
 ```
 
 ---
@@ -363,9 +455,11 @@ See `src/tools/README.md` for full details and the WASM vs. built-in decision gu
 
 ### Adding a new API endpoint
 
-1. Add the handler function in `src/channels/web/server.rs`
-2. Add request/response types in `src/channels/web/types.rs`
-3. Register the route in the `Router` builder in `server.rs`
+1. Add request/response types in `src/channels/web/types.rs`
+2. Add the handler function in the relevant module under `src/channels/web/handlers/` (or create a new `handlers/<domain>.rs`)
+3. Register the route in `src/channels/web/handlers/routes.rs`
+4. Declare the module in `src/channels/web/handlers/mod.rs` if it's a new file
+5. Write a handler test using the helpers in `src/channels/web/test_support.rs` (see [Writing Tests](#writing-tests))
 
 ### Adding a new database method
 
