@@ -211,6 +211,7 @@ pub(crate) async fn list_matter_documents_recursive(
                 path: entry.path.clone(),
                 is_dir: entry.is_directory,
                 category: None,
+                readiness_state: None,
                 updated_at: entry.updated_at.map(|dt| dt.to_rfc3339()),
             });
 
@@ -494,6 +495,7 @@ pub(crate) fn matter_document_record_to_info(
         path: record.path,
         is_dir: false,
         category: Some(record.category.as_str().to_string()),
+        readiness_state: Some(record.readiness_state.as_str().to_string()),
         updated_at: Some(record.updated_at.to_rfc3339()),
     }
 }
@@ -558,6 +560,7 @@ pub(crate) async fn backfill_matter_documents_from_workspace(
                     path: doc.path.clone(),
                     display_name: entry.name.clone(),
                     category: infer_matter_document_category(&entry.path),
+                    readiness_state: None,
                 },
             )
             .await

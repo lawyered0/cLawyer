@@ -53,8 +53,14 @@ pub(crate) fn time_entry_record_to_info(entry: crate::db::TimeEntryRecord) -> Ti
         description: entry.description,
         hours: entry.hours.to_string(),
         hourly_rate: entry.hourly_rate.map(|value| value.to_string()),
+        task_code: entry.task_code,
+        activity_code: entry.activity_code,
+        resolved_rate: entry.resolved_rate.map(|value| value.to_string()),
+        rate_source: entry.rate_source.map(|value| value.as_str().to_string()),
         entry_date: entry.entry_date.to_string(),
         billable: entry.billable,
+        block_billing_flag: entry.block_billing_flag,
+        block_billing_reason: entry.block_billing_reason,
         billed_invoice_id: entry.billed_invoice_id,
         created_at: entry.created_at.to_rfc3339(),
         updated_at: entry.updated_at.to_rfc3339(),
@@ -132,6 +138,11 @@ pub(crate) fn invoice_line_item_record_to_info(item: InvoiceLineItemRecord) -> I
         amount: item.amount.to_string(),
         time_entry_id: item.time_entry_id.map(|value| value.to_string()),
         expense_entry_id: item.expense_entry_id.map(|value| value.to_string()),
+        task_code: item.task_code,
+        activity_code: item.activity_code,
+        timekeeper: item.timekeeper,
+        resolved_rate: item.resolved_rate.map(|value| value.to_string()),
+        rate_source: item.rate_source.map(|value| value.as_str().to_string()),
         sort_order: item.sort_order,
     }
 }
@@ -147,6 +158,11 @@ pub(crate) fn invoice_line_item_params_to_info(
         amount: item.amount.to_string(),
         time_entry_id: item.time_entry_id.map(|value| value.to_string()),
         expense_entry_id: item.expense_entry_id.map(|value| value.to_string()),
+        task_code: item.task_code.clone(),
+        activity_code: item.activity_code.clone(),
+        timekeeper: item.timekeeper.clone(),
+        resolved_rate: item.resolved_rate.map(|value| value.to_string()),
+        rate_source: item.rate_source.map(|value| value.as_str().to_string()),
         sort_order: item.sort_order,
     }
 }
@@ -157,13 +173,180 @@ pub(crate) fn trust_ledger_entry_record_to_info(
     TrustLedgerEntryInfo {
         id: entry.id.to_string(),
         matter_id: entry.matter_id,
+        trust_account_id: entry.trust_account_id.map(|value| value.to_string()),
         entry_type: entry.entry_type.as_str().to_string(),
         amount: entry.amount.to_string(),
+        delta: entry.delta.to_string(),
         balance_after: entry.balance_after.to_string(),
         description: entry.description,
+        reference_number: entry.reference_number,
+        source: entry.source.as_str().to_string(),
         invoice_id: entry.invoice_id.map(|value| value.to_string()),
         recorded_by: entry.recorded_by,
         created_at: entry.created_at.to_rfc3339(),
+    }
+}
+
+pub(crate) fn trust_account_record_to_info(
+    account: crate::db::TrustAccountRecord,
+    current_balance: Option<rust_decimal::Decimal>,
+) -> TrustAccountInfo {
+    TrustAccountInfo {
+        id: account.id.to_string(),
+        name: account.name,
+        bank_name: account.bank_name,
+        account_number_last4: account.account_number_last4,
+        is_primary: account.is_primary,
+        current_balance: current_balance.map(|value| value.to_string()),
+        created_at: account.created_at.to_rfc3339(),
+        updated_at: account.updated_at.to_rfc3339(),
+    }
+}
+
+pub(crate) fn trust_statement_import_record_to_info(
+    record: crate::db::TrustStatementImportRecord,
+) -> TrustStatementImportInfo {
+    TrustStatementImportInfo {
+        id: record.id.to_string(),
+        trust_account_id: record.trust_account_id.to_string(),
+        statement_date: record.statement_date.to_string(),
+        starting_balance: record.starting_balance.to_string(),
+        ending_balance: record.ending_balance.to_string(),
+        imported_by: record.imported_by,
+        row_count: record.row_count,
+        created_at: record.created_at.to_rfc3339(),
+    }
+}
+
+pub(crate) fn trust_statement_line_record_to_info(
+    record: crate::db::TrustStatementLineRecord,
+) -> TrustStatementLineInfo {
+    TrustStatementLineInfo {
+        id: record.id.to_string(),
+        entry_date: record.entry_date.to_string(),
+        description: record.description,
+        debit: record.debit.to_string(),
+        credit: record.credit.to_string(),
+        running_balance: record.running_balance.to_string(),
+        reference_number: record.reference_number,
+    }
+}
+
+pub(crate) fn trust_reconciliation_record_to_info(
+    record: crate::db::TrustReconciliationRecord,
+    report_markdown: Option<String>,
+) -> TrustReconciliationInfo {
+    TrustReconciliationInfo {
+        id: record.id.to_string(),
+        trust_account_id: record.trust_account_id.to_string(),
+        statement_import_id: record.statement_import_id.to_string(),
+        statement_ending_balance: record.statement_ending_balance.to_string(),
+        book_balance: record.book_balance.to_string(),
+        client_balance_total: record.client_balance_total.to_string(),
+        difference: record.difference.to_string(),
+        exceptions_json: record.exceptions_json,
+        status: record.status.as_str().to_string(),
+        signed_off_by: record.signed_off_by,
+        signed_off_at: record.signed_off_at.map(|value| value.to_rfc3339()),
+        created_at: record.created_at.to_rfc3339(),
+        updated_at: record.updated_at.to_rfc3339(),
+        report_markdown,
+    }
+}
+
+pub(crate) fn billing_rate_schedule_record_to_info(
+    record: crate::db::BillingRateScheduleRecord,
+) -> BillingRateScheduleInfo {
+    BillingRateScheduleInfo {
+        id: record.id.to_string(),
+        matter_id: record.matter_id,
+        timekeeper: record.timekeeper,
+        rate: record.rate.to_string(),
+        effective_start: record.effective_start.to_string(),
+        effective_end: record.effective_end.map(|value| value.to_string()),
+        created_at: record.created_at.to_rfc3339(),
+        updated_at: record.updated_at.to_rfc3339(),
+    }
+}
+
+pub(crate) fn matter_party_record_to_info(record: crate::db::MatterPartyRecord) -> MatterPartyInfo {
+    MatterPartyInfo {
+        id: record.id.to_string(),
+        matter_id: record.matter_id,
+        party_id: record.party_id.to_string(),
+        name: record.name,
+        role: record.role.as_str().to_string(),
+        aliases: record.aliases,
+        notes: record.notes,
+        opened_at: record.opened_at.map(|value| value.to_rfc3339()),
+        closed_at: record.closed_at.map(|value| value.to_rfc3339()),
+        created_at: record.created_at.to_rfc3339(),
+        updated_at: record.updated_at.to_rfc3339(),
+    }
+}
+
+pub(crate) fn party_relationship_record_to_info(
+    record: crate::db::PartyRelationshipRecord,
+) -> PartyRelationshipInfo {
+    PartyRelationshipInfo {
+        id: record.id.to_string(),
+        parent_party_id: record.parent_party_id.to_string(),
+        parent_name: record.parent_name,
+        child_party_id: record.child_party_id.to_string(),
+        child_name: record.child_name,
+        kind: record.kind,
+        created_at: record.created_at.to_rfc3339(),
+        updated_at: record.updated_at.to_rfc3339(),
+    }
+}
+
+pub(crate) fn conflict_clearance_info_to_response(
+    info: crate::db::ConflictClearanceInfo,
+) -> ConflictClearanceInfoResponse {
+    ConflictClearanceInfoResponse {
+        matter_id: info.matter_id,
+        checked_by: info.checked_by,
+        cleared_by: info.cleared_by,
+        decision: info.decision.as_str().to_string(),
+        note: info.note,
+        hit_count: info.hit_count,
+        reviewing_attorney: info.reviewing_attorney,
+        report_hash: info.report_hash,
+        signed_at: info.signed_at.map(|value| value.to_rfc3339()),
+        created_at: info.created_at.to_rfc3339(),
+    }
+}
+
+pub(crate) fn citation_verification_run_record_to_info(
+    record: crate::db::CitationVerificationRunRecord,
+) -> CitationVerificationRunInfo {
+    CitationVerificationRunInfo {
+        id: record.id.to_string(),
+        matter_id: record.matter_id,
+        matter_document_id: record.matter_document_id.to_string(),
+        provider: record.provider,
+        document_hash: record.document_hash,
+        created_by: record.created_by,
+        created_at: record.created_at.to_rfc3339(),
+    }
+}
+
+pub(crate) fn citation_verification_result_record_to_info(
+    record: crate::db::CitationVerificationResultRecord,
+) -> CitationVerificationResultInfo {
+    CitationVerificationResultInfo {
+        id: record.id.to_string(),
+        citation_text: record.citation_text,
+        normalized_citation: record.normalized_citation,
+        status: record.status.as_str().to_string(),
+        provider_reference: record.provider_reference,
+        provider_title: record.provider_title,
+        detail: record.detail,
+        waived_by: record.waived_by,
+        waiver_reason: record.waiver_reason,
+        waived_at: record.waived_at.map(|value| value.to_rfc3339()),
+        created_at: record.created_at.to_rfc3339(),
+        updated_at: record.updated_at.to_rfc3339(),
     }
 }
 

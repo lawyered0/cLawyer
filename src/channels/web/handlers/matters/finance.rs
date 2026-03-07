@@ -15,8 +15,9 @@ use crate::channels::web::server::MatterInvoicesQuery;
 use crate::channels::web::state::GatewayState;
 use crate::channels::web::types::*;
 use crate::db::{
-    AuditSeverity, CreateExpenseEntryParams, CreateTimeEntryParams, InvoiceStatus,
-    MatterMemberRole, UpdateExpenseEntryParams, UpdateTimeEntryParams,
+    AuditSeverity, CreateBillingRateScheduleParams, CreateExpenseEntryParams,
+    CreateTimeEntryParams, InvoiceStatus, MatterMemberRole, UpdateBillingRateScheduleParams,
+    UpdateExpenseEntryParams, UpdateTimeEntryParams, UpsertTrustAccountParams,
 };
 
 pub fn routes() -> Router<Arc<GatewayState>> {
@@ -63,6 +64,31 @@ pub fn routes() -> Router<Arc<GatewayState>> {
             "/api/matters/{id}/trust/ledger",
             get(matter_trust_ledger_handler),
         )
+        .route(
+            "/api/trust/account",
+            get(trust_account_get_handler).put(trust_account_put_handler),
+        )
+        .route(
+            "/api/trust/statements/import",
+            post(trust_statements_import_handler),
+        )
+        .route(
+            "/api/trust/reconciliations/compute",
+            post(trust_reconciliations_compute_handler),
+        )
+        .route(
+            "/api/trust/reconciliations/{id}/signoff",
+            post(trust_reconciliations_signoff_handler),
+        )
+        .route(
+            "/api/billing/rates",
+            get(billing_rates_list_handler).post(billing_rates_create_handler),
+        )
+        .route(
+            "/api/billing/rates/{id}",
+            axum::routing::patch(billing_rates_patch_handler),
+        )
+        .route("/api/invoices/{id}/ledes", get(invoice_ledes_handler))
 }
 
 pub(crate) async fn matter_time_list_handler(
@@ -134,6 +160,30 @@ pub(crate) async fn matter_time_create_handler(
         crate::channels::web::server::parse_optional_decimal_field("hourly_rate", req.hourly_rate)?;
     let entry_date = crate::channels::web::server::parse_date_only("entry_date", &req.entry_date)?;
     let billable = req.billable.unwrap_or(true);
+    let task_code = crate::legal::billing::normalize_task_code(req.task_code)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    let activity_code = crate::legal::billing::normalize_activity_code(req.activity_code)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    let (resolved_rate, rate_source) = crate::legal::billing::resolve_time_entry_rate(
+        store.as_ref(),
+        &state.user_id,
+        &matter_id,
+        &timekeeper,
+        entry_date,
+        hourly_rate,
+    )
+    .await
+    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let auto_block_reason = crate::legal::billing::detect_block_billing(&description);
+    let block_billing_flag = req
+        .block_billing_flag
+        .unwrap_or_else(|| auto_block_reason.is_some());
+    let block_billing_reason = if !block_billing_flag {
+        None
+    } else {
+        crate::channels::web::server::parse_optional_matter_field(req.block_billing_reason)
+            .or(auto_block_reason)
+    };
 
     let created = store
         .create_time_entry(
@@ -144,8 +194,14 @@ pub(crate) async fn matter_time_create_handler(
                 description,
                 hours,
                 hourly_rate,
+                task_code,
+                activity_code,
+                resolved_rate,
+                rate_source,
                 entry_date,
                 billable,
+                block_billing_flag,
+                block_billing_reason,
             },
         )
         .await
@@ -181,6 +237,11 @@ pub(crate) async fn matter_time_patch_handler(
     .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let entry_id = crate::channels::web::server::parse_uuid(&entry_id, "entry_id")?;
+    let existing = store
+        .get_time_entry(&state.user_id, &matter_id, entry_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Time entry not found".to_string()))?;
 
     let timekeeper = req.timekeeper.map(|value| value.trim().to_string());
     if let Some(ref value) = timekeeper {
@@ -214,6 +275,60 @@ pub(crate) async fn matter_time_patch_handler(
         .as_deref()
         .map(|value| crate::channels::web::server::parse_date_only("entry_date", value))
         .transpose()?;
+    let task_code = match req.task_code {
+        None => None,
+        Some(value) => Some(
+            crate::legal::billing::normalize_task_code(value)
+                .map_err(|err| (StatusCode::BAD_REQUEST, err))?,
+        ),
+    };
+    let activity_code = match req.activity_code {
+        None => None,
+        Some(value) => Some(
+            crate::legal::billing::normalize_activity_code(value)
+                .map_err(|err| (StatusCode::BAD_REQUEST, err))?,
+        ),
+    };
+    let merged_timekeeper = timekeeper
+        .clone()
+        .unwrap_or_else(|| existing.timekeeper.clone());
+    let merged_entry_date = entry_date.unwrap_or(existing.entry_date);
+    let merged_hourly_rate = hourly_rate.unwrap_or(existing.hourly_rate);
+    let merged_description = description
+        .clone()
+        .unwrap_or_else(|| existing.description.clone());
+    let (resolved_rate, rate_source) = crate::legal::billing::resolve_time_entry_rate(
+        store.as_ref(),
+        &state.user_id,
+        &matter_id,
+        &merged_timekeeper,
+        merged_entry_date,
+        merged_hourly_rate,
+    )
+    .await
+    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let auto_block_reason = crate::legal::billing::detect_block_billing(&merged_description);
+    let requested_block_reason =
+        crate::channels::web::server::parse_optional_matter_field_patch(req.block_billing_reason);
+    let block_billing_flag = req
+        .block_billing_flag
+        .or_else(|| {
+            if requested_block_reason.is_some() {
+                Some(true)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(existing.block_billing_flag || auto_block_reason.is_some());
+    let block_billing_reason = if !block_billing_flag {
+        Some(None)
+    } else {
+        Some(
+            requested_block_reason
+                .unwrap_or(existing.block_billing_reason)
+                .or(auto_block_reason),
+        )
+    };
 
     let updated = store
         .update_time_entry(
@@ -225,8 +340,14 @@ pub(crate) async fn matter_time_patch_handler(
                 description,
                 hours,
                 hourly_rate,
+                task_code,
+                activity_code,
+                resolved_rate: Some(resolved_rate),
+                rate_source: Some(rate_source),
                 entry_date,
                 billable: req.billable,
+                block_billing_flag: Some(block_billing_flag),
+                block_billing_reason,
             },
         )
         .await
@@ -986,6 +1107,7 @@ pub(crate) async fn matter_trust_deposit_handler(
         amount,
         &recorded_by,
         &description,
+        crate::channels::web::server::parse_optional_matter_field(req.reference_number),
     )
     .await
     .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
@@ -1037,12 +1159,574 @@ pub(crate) async fn matter_trust_ledger_handler(
         .current_trust_balance(&state.user_id, &matter_id)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let account = match store.get_primary_trust_account(&state.user_id).await {
+        Ok(Some(account)) => {
+            let account_balance = store
+                .current_trust_account_balance(&state.user_id, account.id)
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+            Some((account, account_balance))
+        }
+        Ok(None) => None,
+        Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    };
+    let latest_reconciliation = if let Some((account_record, _)) = account.as_ref() {
+        store
+            .latest_trust_reconciliation_for_account(&state.user_id, account_record.id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+            .map(|record| {
+                crate::channels::web::server::trust_reconciliation_record_to_info(record, None)
+            })
+    } else {
+        None
+    };
     Ok(Json(TrustLedgerResponse {
         matter_id,
         balance: balance.to_string(),
+        account: account.as_ref().map(|(record, balance)| {
+            crate::channels::web::server::trust_account_record_to_info(
+                record.clone(),
+                Some(*balance),
+            )
+        }),
+        account_balance: account.as_ref().map(|(_, balance)| balance.to_string()),
+        latest_reconciliation,
         entries: entries
             .into_iter()
             .map(crate::channels::web::server::trust_ledger_entry_record_to_info)
             .collect(),
+    }))
+}
+
+async fn trust_reconciliation_info_for_response(
+    state: &GatewayState,
+    record: crate::db::TrustReconciliationRecord,
+    include_report: bool,
+) -> Result<TrustReconciliationInfo, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let statement = store
+        .get_trust_statement_import(&state.user_id, record.statement_import_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Trust statement import not found".to_string(),
+        ))?;
+    let report_markdown = if include_report {
+        let account = store
+            .get_primary_trust_account(&state.user_id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        let lines = store
+            .list_trust_statement_lines(&state.user_id, statement.id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        let ledger = store
+            .list_trust_ledger_entries_for_account(&state.user_id, record.trust_account_id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        account.map(|account| {
+            crate::legal::trust::render_examiner_report(
+                &account, &statement, &lines, &record, &ledger,
+            )
+        })
+    } else {
+        None
+    };
+
+    Ok(crate::channels::web::server::trust_reconciliation_record_to_info(record, report_markdown))
+}
+
+pub(crate) async fn trust_account_get_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<TrustAccountInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let account = store
+        .get_primary_trust_account(&state.user_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Primary trust account not configured".to_string(),
+        ))?;
+    let balance = store
+        .current_trust_account_balance(&state.user_id, account.id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(
+        crate::channels::web::server::trust_account_record_to_info(account, Some(balance)),
+    ))
+}
+
+pub(crate) async fn trust_account_put_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<UpdateTrustAccountRequest>,
+) -> Result<Json<TrustAccountInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let name = crate::channels::web::server::parse_required_matter_field("name", &req.name)?;
+    let bank_name = crate::channels::web::server::parse_optional_matter_field(req.bank_name);
+    let account_number_last4 =
+        crate::channels::web::server::parse_optional_matter_field(req.account_number_last4);
+    let account = store
+        .upsert_primary_trust_account(
+            &state.user_id,
+            &UpsertTrustAccountParams {
+                name,
+                bank_name,
+                account_number_last4,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let balance = store
+        .current_trust_account_balance(&state.user_id, account.id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(
+        crate::channels::web::server::trust_account_record_to_info(account, Some(balance)),
+    ))
+}
+
+pub(crate) async fn trust_statements_import_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<ImportTrustStatementRequest>,
+) -> Result<(StatusCode, Json<ImportTrustStatementResponse>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let account = store
+        .get_primary_trust_account(&state.user_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((
+            StatusCode::CONFLICT,
+            "Primary trust account must be configured before importing statements".to_string(),
+        ))?;
+    let imported_by =
+        crate::channels::web::server::parse_required_matter_field("imported_by", &req.imported_by)?;
+    let statement_date = req
+        .statement_date
+        .as_deref()
+        .map(|value| crate::channels::web::server::parse_date_only("statement_date", value))
+        .transpose()?;
+    let parsed = crate::legal::trust::parse_statement_csv(&req.csv, statement_date)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    let (statement, lines) = store
+        .import_trust_statement(
+            &state.user_id,
+            &crate::db::CreateTrustStatementImportParams {
+                trust_account_id: account.id,
+                statement_date: parsed.statement_date,
+                starting_balance: parsed.starting_balance,
+                ending_balance: parsed.ending_balance,
+                imported_by: imported_by.clone(),
+            },
+            &parsed
+                .lines
+                .iter()
+                .map(|line| crate::db::CreateTrustStatementLineParams {
+                    entry_date: line.entry_date,
+                    description: line.description.clone(),
+                    debit: line.debit,
+                    credit: line.credit,
+                    running_balance: line.running_balance,
+                    reference_number: line.reference_number.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    crate::channels::web::server::record_legal_audit_event(
+        state.as_ref(),
+        "trust_statement_imported",
+        state.user_id.as_str(),
+        None,
+        AuditSeverity::Info,
+        serde_json::json!({
+            "trust_account_id": account.id.to_string(),
+            "statement_import_id": statement.id.to_string(),
+            "row_count": statement.row_count,
+            "imported_by": imported_by,
+        }),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(ImportTrustStatementResponse {
+            statement: crate::channels::web::server::trust_statement_import_record_to_info(
+                statement,
+            ),
+            lines: lines
+                .into_iter()
+                .map(crate::channels::web::server::trust_statement_line_record_to_info)
+                .collect(),
+        }),
+    ))
+}
+
+pub(crate) async fn trust_reconciliations_compute_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<ComputeTrustReconciliationRequest>,
+) -> Result<(StatusCode, Json<TrustReconciliationInfo>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let statement_import_id =
+        crate::channels::web::server::parse_uuid(&req.statement_import_id, "statement_import_id")?;
+    let statement = store
+        .get_trust_statement_import(&state.user_id, statement_import_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Trust statement import not found".to_string(),
+        ))?;
+    let reconciliation = store
+        .compute_trust_reconciliation(
+            &state.user_id,
+            &crate::db::ComputeTrustReconciliationParams {
+                trust_account_id: statement.trust_account_id,
+                statement_import_id,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    crate::channels::web::server::record_legal_audit_event(
+        state.as_ref(),
+        "trust_reconciliation_computed",
+        state.user_id.as_str(),
+        None,
+        AuditSeverity::Info,
+        serde_json::json!({
+            "statement_import_id": statement_import_id.to_string(),
+            "trust_account_id": statement.trust_account_id.to_string(),
+            "reconciliation_id": reconciliation.id.to_string(),
+            "difference": reconciliation.difference.to_string(),
+        }),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(trust_reconciliation_info_for_response(state.as_ref(), reconciliation, true).await?),
+    ))
+}
+
+pub(crate) async fn trust_reconciliations_signoff_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SignoffTrustReconciliationRequest>,
+) -> Result<Json<TrustReconciliationInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let reconciliation_id = crate::channels::web::server::parse_uuid(&id, "reconciliation_id")?;
+    let signed_off_by = crate::channels::web::server::parse_required_matter_field(
+        "signed_off_by",
+        &req.signed_off_by,
+    )?;
+    let reconciliation = store
+        .signoff_trust_reconciliation(&state.user_id, reconciliation_id, &signed_off_by)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Trust reconciliation not found".to_string(),
+        ))?;
+    crate::channels::web::server::record_legal_audit_event(
+        state.as_ref(),
+        "trust_reconciliation_signed_off",
+        state.user_id.as_str(),
+        None,
+        AuditSeverity::Info,
+        serde_json::json!({
+            "reconciliation_id": reconciliation.id.to_string(),
+            "signed_off_by": signed_off_by,
+        }),
+    )
+    .await;
+    Ok(Json(
+        trust_reconciliation_info_for_response(state.as_ref(), reconciliation, true).await?,
+    ))
+}
+
+pub(crate) async fn billing_rates_list_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<BillingRateSchedulesResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let schedules = store
+        .list_billing_rate_schedules(&state.user_id, None, None)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(BillingRateSchedulesResponse {
+        schedules: schedules
+            .into_iter()
+            .map(crate::channels::web::server::billing_rate_schedule_record_to_info)
+            .collect(),
+    }))
+}
+
+pub(crate) async fn billing_rates_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<CreateBillingRateScheduleRequest>,
+) -> Result<(StatusCode, Json<BillingRateScheduleInfo>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = req
+        .matter_id
+        .map(|value| crate::channels::web::server::sanitize_matter_id_for_route(&value))
+        .transpose()?;
+    if let Some(ref matter_id) = matter_id {
+        crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), matter_id).await?;
+    }
+    let timekeeper =
+        crate::channels::web::server::parse_required_matter_field("timekeeper", &req.timekeeper)?;
+    let rate = crate::channels::web::server::parse_decimal_field("rate", &req.rate)?;
+    let effective_start =
+        crate::channels::web::server::parse_date_only("effective_start", &req.effective_start)?;
+    let effective_end = req
+        .effective_end
+        .as_deref()
+        .map(|value| crate::channels::web::server::parse_date_only("effective_end", value))
+        .transpose()?;
+    let schedule = store
+        .create_billing_rate_schedule(
+            &state.user_id,
+            &CreateBillingRateScheduleParams {
+                matter_id,
+                timekeeper,
+                rate,
+                effective_start,
+                effective_end,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(crate::channels::web::server::billing_rate_schedule_record_to_info(schedule)),
+    ))
+}
+
+pub(crate) async fn billing_rates_patch_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateBillingRateScheduleRequest>,
+) -> Result<Json<BillingRateScheduleInfo>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let schedule_id = crate::channels::web::server::parse_uuid(&id, "schedule_id")?;
+    let matter_id = match req.matter_id {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(value)) => Some(Some(
+            crate::channels::web::server::sanitize_matter_id_for_route(&value)?,
+        )),
+    };
+    if let Some(Some(ref matter_id)) = matter_id {
+        crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), matter_id).await?;
+    }
+    let timekeeper = req
+        .timekeeper
+        .map(|value| {
+            crate::channels::web::server::parse_required_matter_field("timekeeper", &value)
+        })
+        .transpose()?;
+    let rate = req
+        .rate
+        .as_deref()
+        .map(|value| crate::channels::web::server::parse_decimal_field("rate", value))
+        .transpose()?;
+    let effective_start = req
+        .effective_start
+        .as_deref()
+        .map(|value| crate::channels::web::server::parse_date_only("effective_start", value))
+        .transpose()?;
+    let effective_end = match req.effective_end {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(value)) => Some(Some(crate::channels::web::server::parse_date_only(
+            "effective_end",
+            &value,
+        )?)),
+    };
+    let updated = store
+        .update_billing_rate_schedule(
+            &state.user_id,
+            schedule_id,
+            &UpdateBillingRateScheduleParams {
+                matter_id,
+                timekeeper,
+                rate,
+                effective_start,
+                effective_end,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Billing rate schedule not found".to_string(),
+        ))?;
+    Ok(Json(
+        crate::channels::web::server::billing_rate_schedule_record_to_info(updated),
+    ))
+}
+
+pub(crate) async fn invoice_ledes_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path(id): Path<String>,
+    Query(query): Query<InvoiceLedesQuery>,
+) -> Result<Json<InvoiceLedesResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let invoice_id = crate::channels::web::server::parse_uuid(&id, "invoice_id")?;
+    let format = query
+        .format
+        .unwrap_or_else(|| "98b".to_string())
+        .to_ascii_lowercase();
+    if format != "98b" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Only LEDES 98B export is supported in this phase".to_string(),
+        ));
+    }
+    let invoice = store
+        .get_invoice(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &invoice.matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
+
+    let matter = store
+        .get_matter_db(&state.user_id, &invoice.matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Matter not found".to_string()))?;
+    let line_items = store
+        .list_invoice_line_items(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let invoice_date = invoice
+        .issued_date
+        .unwrap_or_else(|| invoice.created_at.date_naive());
+    let mut service_dates = Vec::new();
+    let mut ledes_items = Vec::new();
+    for (index, item) in line_items.iter().enumerate() {
+        let mut line_item_date = invoice_date;
+        if let Some(time_entry_id) = item.time_entry_id
+            && let Some(entry) = store
+                .get_time_entry(&state.user_id, &invoice.matter_id, time_entry_id)
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        {
+            line_item_date = entry.entry_date;
+        }
+        if let Some(expense_entry_id) = item.expense_entry_id
+            && let Some(entry) = store
+                .get_expense_entry(&state.user_id, &invoice.matter_id, expense_entry_id)
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        {
+            line_item_date = entry.entry_date;
+        }
+        service_dates.push(line_item_date);
+        ledes_items.push(crate::legal::ledes::Ledes98BLineItem {
+            line_item_number: index + 1,
+            line_item_type: if item.expense_entry_id.is_some() {
+                "EXP".to_string()
+            } else {
+                "FEE".to_string()
+            },
+            units: item.quantity,
+            adjustment_amount: rust_decimal::Decimal::ZERO,
+            total: item.amount,
+            line_item_date,
+            task_code: item.task_code.clone(),
+            expense_code: None,
+            activity_code: item.activity_code.clone(),
+            timekeeper_id: item.timekeeper.clone(),
+            description: item.description.clone(),
+            unit_cost: item.unit_price,
+            timekeeper_name: item.timekeeper.clone(),
+            timekeeper_classification: Some("OT".to_string()),
+        });
+    }
+    let billing_start_date = service_dates.iter().min().copied().unwrap_or(invoice_date);
+    let billing_end_date = service_dates.iter().max().copied().unwrap_or(invoice_date);
+    let client_matter_id = matter
+        .custom_fields
+        .get("client_matter_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(matter.matter_id.as_str())
+        .to_string();
+    let po_number = matter
+        .custom_fields
+        .get("po_number")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let content = crate::legal::ledes::export_ledes98b(
+        &crate::legal::ledes::Ledes98BInvoiceContext {
+            invoice_date,
+            invoice_number: invoice.invoice_number.clone(),
+            client_id: matter.client_id.to_string(),
+            law_firm_matter_id: matter.matter_id.clone(),
+            invoice_total: invoice.total,
+            billing_start_date,
+            billing_end_date,
+            law_firm_id: state.user_id.clone(),
+            client_matter_id,
+            po_number,
+        },
+        &ledes_items,
+    );
+    crate::channels::web::server::record_legal_audit_event(
+        state.as_ref(),
+        "invoice_ledes_exported",
+        state.user_id.as_str(),
+        Some(invoice.matter_id.as_str()),
+        AuditSeverity::Info,
+        serde_json::json!({
+            "invoice_id": invoice_id.to_string(),
+            "format": "98b",
+            "line_item_count": ledes_items.len(),
+        }),
+    )
+    .await;
+    Ok(Json(InvoiceLedesResponse {
+        invoice_id: invoice_id.to_string(),
+        format,
+        content,
     }))
 }

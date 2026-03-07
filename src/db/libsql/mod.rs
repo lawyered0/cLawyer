@@ -9,6 +9,7 @@
 mod conversations;
 mod jobs;
 mod legal_conflicts;
+mod legal_hardening;
 mod legal_practice;
 mod routines;
 mod sandbox;
@@ -324,7 +325,275 @@ impl Database for LibSqlBackend {
                 e
             ))
         })?;
+
+        let hardening_schema = r#"
+CREATE TABLE IF NOT EXISTS billing_rate_schedules (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT,
+    timekeeper TEXT NOT NULL,
+    rate TEXT NOT NULL,
+    effective_start TEXT NOT NULL,
+    effective_end TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_billing_rate_schedules_user_matter_timekeeper
+    ON billing_rate_schedules(user_id, matter_id, timekeeper, effective_start DESC);
+
+CREATE TABLE IF NOT EXISTS citation_verification_runs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    matter_id TEXT NOT NULL,
+    matter_document_id TEXT NOT NULL REFERENCES matter_documents(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    document_hash TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_citation_verification_runs_document
+    ON citation_verification_runs(user_id, matter_document_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS citation_verification_results (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES citation_verification_runs(id) ON DELETE CASCADE,
+    citation_text TEXT NOT NULL,
+    normalized_citation TEXT NOT NULL,
+    status TEXT NOT NULL,
+    provider_reference TEXT,
+    provider_title TEXT,
+    detail TEXT,
+    waived_by TEXT,
+    waiver_reason TEXT,
+    waived_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_citation_verification_results_run
+    ON citation_verification_results(run_id, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS trust_accounts (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    bank_name TEXT,
+    account_number_last4 TEXT,
+    is_primary INTEGER NOT NULL DEFAULT 1 CHECK (is_primary IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trust_accounts_primary_user
+    ON trust_accounts(user_id)
+    WHERE is_primary = 1;
+
+CREATE TABLE IF NOT EXISTS trust_statement_imports (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    trust_account_id TEXT NOT NULL REFERENCES trust_accounts(id) ON DELETE CASCADE,
+    statement_date TEXT NOT NULL,
+    starting_balance TEXT NOT NULL,
+    ending_balance TEXT NOT NULL,
+    imported_by TEXT NOT NULL,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_trust_statement_imports_account
+    ON trust_statement_imports(user_id, trust_account_id, statement_date DESC);
+
+CREATE TABLE IF NOT EXISTS trust_statement_lines (
+    id TEXT PRIMARY KEY,
+    statement_import_id TEXT NOT NULL REFERENCES trust_statement_imports(id) ON DELETE CASCADE,
+    entry_date TEXT NOT NULL,
+    description TEXT NOT NULL,
+    debit TEXT NOT NULL,
+    credit TEXT NOT NULL,
+    running_balance TEXT NOT NULL,
+    reference_number TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_trust_statement_lines_import
+    ON trust_statement_lines(statement_import_id, entry_date ASC);
+
+CREATE TABLE IF NOT EXISTS trust_reconciliations (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    trust_account_id TEXT NOT NULL REFERENCES trust_accounts(id) ON DELETE CASCADE,
+    statement_import_id TEXT NOT NULL REFERENCES trust_statement_imports(id) ON DELETE CASCADE,
+    statement_ending_balance TEXT NOT NULL,
+    book_balance TEXT NOT NULL,
+    client_balance_total TEXT NOT NULL,
+    exceptions_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'unbalanced',
+    difference TEXT NOT NULL,
+    signed_off_by TEXT,
+    signed_off_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_trust_reconciliations_account
+    ON trust_reconciliations(user_id, trust_account_id, created_at DESC);
+"#;
+        conn.execute_batch(hardening_schema).await.map_err(|e| {
+            DatabaseError::Migration(format!(
+                "failed to ensure legal hardening schema objects: {}",
+                e
+            ))
+        })?;
+
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE matter_parties ADD COLUMN role_detail TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE conflict_clearances ADD COLUMN reviewing_attorney TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE conflict_clearances ADD COLUMN report_hash TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE conflict_clearances ADD COLUMN signed_at TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE matter_documents ADD COLUMN readiness_state TEXT NOT NULL DEFAULT 'draft'",
+        )
+        .await?;
+        ensure_libsql_column(&conn, "ALTER TABLE time_entries ADD COLUMN task_code TEXT").await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE time_entries ADD COLUMN activity_code TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE time_entries ADD COLUMN resolved_rate TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE time_entries ADD COLUMN rate_source TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE time_entries ADD COLUMN block_billing_flag INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE time_entries ADD COLUMN block_billing_reason TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE invoice_line_items ADD COLUMN task_code TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE invoice_line_items ADD COLUMN activity_code TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE invoice_line_items ADD COLUMN timekeeper TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE invoice_line_items ADD COLUMN resolved_rate TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE invoice_line_items ADD COLUMN rate_source TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE trust_ledger ADD COLUMN trust_account_id TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE trust_ledger ADD COLUMN entry_detail TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE trust_ledger ADD COLUMN delta TEXT NOT NULL DEFAULT '0'",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE trust_ledger ADD COLUMN reference_number TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE trust_ledger ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trust_ledger_account_created \
+             ON trust_ledger(user_id, trust_account_id, created_at DESC)",
+            (),
+        )
+        .await
+        .map_err(|e| {
+            DatabaseError::Migration(format!(
+                "failed to ensure trust ledger account index: {}",
+                e
+            ))
+        })?;
+        conn.execute(
+            "UPDATE trust_ledger \
+             SET delta = CASE \
+                WHEN entry_type IN ('withdrawal', 'invoice_payment', 'refund') THEN '-' || amount \
+                ELSE amount \
+             END \
+             WHERE delta IS NULL OR delta = '0'",
+            (),
+        )
+        .await
+        .map_err(|e| {
+            DatabaseError::Migration(format!(
+                "failed to backfill trust ledger delta values: {}",
+                e
+            ))
+        })?;
         Ok(())
+    }
+}
+
+async fn ensure_libsql_column(conn: &Connection, sql: &str) -> Result<(), DatabaseError> {
+    match conn.execute(sql, ()).await {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let msg = err.to_string().to_ascii_lowercase();
+            if msg.contains("duplicate column name") {
+                Ok(())
+            } else {
+                Err(DatabaseError::Migration(format!(
+                    "failed to apply migration '{}': {}",
+                    sql, err
+                )))
+            }
+        }
     }
 }
 

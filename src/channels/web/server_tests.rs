@@ -13,8 +13,9 @@ use crate::channels::web::handlers::{
     },
     matters::{
         conflicts::{
-            matters_conflict_check_handler, matters_conflicts_check_handler,
-            matters_conflicts_reindex_handler,
+            matter_conflicts_clearance_handler, matter_conflicts_report_handler,
+            matter_parties_upsert_handler, matters_conflict_check_handler,
+            matters_conflicts_check_handler, matters_conflicts_reindex_handler,
         },
         core::{
             matter_deadlines_compute_handler, matter_deadlines_create_handler,
@@ -22,15 +23,19 @@ use crate::channels::web::handlers::{
             matters_active_set_handler, matters_create_handler, matters_list_handler,
         },
         documents::{
-            documents_generate_handler, matter_dashboard_handler, matter_documents_handler,
+            document_citations_handler, document_ready_handler, documents_generate_handler,
+            matter_citations_verify_handler, matter_dashboard_handler, matter_documents_handler,
             matter_filing_package_handler, matter_template_apply_handler, matter_templates_handler,
         },
         finance::{
-            invoices_finalize_handler, invoices_payment_handler, invoices_save_handler,
-            invoices_void_handler, matter_expenses_create_handler, matter_expenses_list_handler,
+            billing_rates_create_handler, invoice_ledes_handler, invoices_finalize_handler,
+            invoices_payment_handler, invoices_save_handler, invoices_void_handler,
+            matter_expenses_create_handler, matter_expenses_list_handler,
             matter_invoices_list_handler, matter_time_create_handler, matter_time_delete_handler,
             matter_time_list_handler, matter_time_summary_handler, matter_trust_deposit_handler,
-            matter_trust_ledger_handler,
+            matter_trust_ledger_handler, trust_account_put_handler,
+            trust_reconciliations_compute_handler, trust_reconciliations_signoff_handler,
+            trust_statements_import_handler,
         },
         work::{
             matter_notes_create_handler, matter_notes_list_handler, matter_tasks_create_handler,
@@ -1859,6 +1864,89 @@ async fn matters_create_waived_records_and_proceeds() {
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
+async fn matter_conflict_report_and_clearance_round_trip() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    db.seed_matter_parties("existing-matter", "Acme Corp", &[], None)
+        .await
+        .expect("seed existing matter parties");
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync matter row");
+
+    let (_status, Json(party)) = matter_parties_upsert_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(UpsertMatterPartyRequest {
+            name: "Acme Corp".to_string(),
+            role: "adverse".to_string(),
+            aliases: vec!["Acme Corporation".to_string()],
+            notes: Some("Named defendant".to_string()),
+            opened_at: None,
+            closed_at: None,
+        }),
+    )
+    .await
+    .expect("upsert adverse party");
+    assert_eq!(party.role, "adverse");
+
+    let Json(report) = matter_conflicts_report_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+    )
+    .await
+    .expect("conflict report should succeed");
+    assert!(
+        report
+            .hits
+            .iter()
+            .any(|hit| hit.matter_id == "existing-matter")
+    );
+    assert!(report.latest_clearance.is_none());
+
+    let Json(clearance) = matter_conflicts_clearance_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(MatterConflictClearanceRequest {
+            decision: ConflictDecision::Waived,
+            note: Some("Waived after attorney review".to_string()),
+            reviewing_attorney: Some("Lead".to_string()),
+        }),
+    )
+    .await
+    .expect("clearance should be recorded");
+    assert_eq!(clearance.decision, "waived");
+    assert!(clearance.hit_count >= 1);
+    assert_eq!(
+        clearance.latest_clearance.reviewing_attorney.as_deref(),
+        Some("Lead")
+    );
+
+    let Json(report_after) = matter_conflicts_report_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+    )
+    .await
+    .expect("report after clearance should succeed");
+    assert_eq!(
+        report_after
+            .latest_clearance
+            .as_ref()
+            .expect("latest clearance should exist")
+            .decision,
+        "waived"
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
 async fn matters_create_rejects_excessive_adversaries() {
     let (db, _tmp) = crate::testing::test_db().await;
     let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
@@ -2946,6 +3034,125 @@ async fn matter_filing_package_creates_export_index() {
     assert!(exported.content.contains("Template Inventory"));
 }
 
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn matter_citation_workflow_requires_ready_filing_document_before_export() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync matter row");
+    let store = state.store.as_ref().expect("store should exist");
+
+    let written = workspace
+        .write(
+            "matters/demo/filings/brief.md",
+            "Draft brief cites Roe v. Wade, 410 U.S. 113 (1973).\n",
+        )
+        .await
+        .expect("seed filing document");
+    let matter_document = store
+        .upsert_matter_document(
+            &state.user_id,
+            "demo",
+            &crate::db::UpsertMatterDocumentParams {
+                memory_document_id: written.id,
+                path: written.path.clone(),
+                display_name: "Draft Brief".to_string(),
+                category: crate::db::MatterDocumentCategory::Filing,
+                readiness_state: Some(crate::db::DocumentReadinessState::Draft),
+            },
+        )
+        .await
+        .expect("link filing document");
+    crate::channels::web::server::backfill_matter_documents_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("backfill matter documents");
+    let docs = store
+        .list_matter_documents_db(&state.user_id, "demo")
+        .await
+        .expect("list matter documents");
+    let blocking_doc = docs
+        .iter()
+        .find(|doc| doc.id == matter_document.id)
+        .expect("filing document should be present in db");
+    assert_eq!(
+        blocking_doc.category,
+        crate::db::MatterDocumentCategory::Filing
+    );
+    assert_eq!(
+        blocking_doc.readiness_state,
+        crate::db::DocumentReadinessState::Draft
+    );
+
+    let err = matter_filing_package_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+    )
+    .await
+    .expect_err("unready filing document should block export");
+    assert_eq!(err.0, StatusCode::CONFLICT);
+    assert!(err.1.contains("not ready to file"));
+
+    let Json(verification) = matter_citations_verify_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(VerifyMatterCitationsRequest {
+            matter_document_id: matter_document.id.to_string(),
+            waivers: vec![CitationWaiverRequest {
+                citation_text: "410 U.S. 113 (1973)".to_string(),
+                waived_by: "Lead".to_string(),
+                reason: "Manual cite verification documented separately".to_string(),
+            }],
+        }),
+    )
+    .await
+    .expect("citation verification should succeed");
+    assert_eq!(verification.readiness_state, "waived");
+    assert_eq!(verification.results.len(), 1);
+    assert_eq!(verification.results[0].status, "waived");
+
+    let Json(citations) = document_citations_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(matter_document.id.to_string()),
+    )
+    .await
+    .expect("document citations should load");
+    assert_eq!(citations.readiness_state, "waived");
+    assert_eq!(citations.results.len(), 1);
+
+    let Json(ready) = document_ready_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(matter_document.id.to_string()),
+        Json(MarkDocumentReadyRequest {
+            attorney: Some("Lead".to_string()),
+        }),
+    )
+    .await
+    .expect("ready-to-file transition should succeed");
+    assert_eq!(
+        ready.document.readiness_state.as_deref(),
+        Some("ready_to_file")
+    );
+
+    let (status, Json(resp)) = matter_filing_package_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+    )
+    .await
+    .expect("filing package should succeed once document is ready");
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(resp.path.contains("filing-package-"));
+}
+
 #[test]
 fn list_matters_root_entries_returns_500_for_storage_errors() {
     let err = list_matters_root_entries(Err(crate::error::WorkspaceError::SearchFailed {
@@ -3109,8 +3316,14 @@ async fn invoices_finalize_marks_entries_billed_and_supports_trust_payment() {
                 description: "Motion draft".to_string(),
                 hours: rust_decimal::Decimal::new(150, 2),
                 hourly_rate: Some(rust_decimal::Decimal::new(20000, 2)),
+                task_code: None,
+                activity_code: None,
+                resolved_rate: None,
+                rate_source: None,
                 entry_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("valid date"),
                 billable: true,
+                block_billing_flag: false,
+                block_billing_reason: None,
             },
         )
         .await
@@ -3187,6 +3400,7 @@ async fn invoices_finalize_marks_entries_billed_and_supports_trust_payment() {
             amount: "500.00".to_string(),
             recorded_by: "Lead".to_string(),
             description: Some("Retainer deposit".to_string()),
+            reference_number: None,
         }),
     )
     .await
@@ -3303,6 +3517,7 @@ async fn invoices_payment_rejects_trust_overdraw() {
             amount: "10.00".to_string(),
             recorded_by: "Lead".to_string(),
             description: Some("Small deposit".to_string()),
+            reference_number: None,
         }),
     )
     .await
@@ -3328,6 +3543,103 @@ async fn invoices_payment_rejects_trust_overdraw() {
         events
             .iter()
             .any(|event| event.event_type == "trust_withdrawal_rejected")
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn trust_statement_import_compute_and_signoff_round_trip() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync matter row");
+
+    let Json(account) = trust_account_put_handler(
+        State(Arc::clone(&state)),
+        Json(UpdateTrustAccountRequest {
+            name: "Primary IOLTA".to_string(),
+            bank_name: Some("Bar Bank".to_string()),
+            account_number_last4: Some("1234".to_string()),
+        }),
+    )
+    .await
+    .expect("configure trust account");
+    assert_eq!(account.name, "Primary IOLTA");
+
+    let _ = matter_trust_deposit_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(TrustDepositRequest {
+            amount: "500.00".to_string(),
+            recorded_by: "Lead".to_string(),
+            description: Some("Initial retainer".to_string()),
+            reference_number: Some("DEP-001".to_string()),
+        }),
+    )
+    .await
+    .expect("seed trust deposit");
+
+    let (_status, Json(imported)) = trust_statements_import_handler(
+        State(Arc::clone(&state)),
+        Json(ImportTrustStatementRequest {
+            imported_by: "Lead".to_string(),
+            statement_date: Some("2026-04-30".to_string()),
+            csv: "date,description,debit,credit,balance,reference\n2026-04-12,Initial retainer,,500.00,500.00,DEP-001\n"
+                .to_string(),
+        }),
+    )
+    .await
+    .expect("statement import should succeed");
+    assert_eq!(imported.statement.row_count, 1);
+
+    let (_status, Json(reconciliation)) = trust_reconciliations_compute_handler(
+        State(Arc::clone(&state)),
+        Json(ComputeTrustReconciliationRequest {
+            statement_import_id: imported.statement.id.clone(),
+        }),
+    )
+    .await
+    .expect("reconciliation compute should succeed");
+    assert_eq!(reconciliation.status, "draft");
+    assert_eq!(
+        reconciliation
+            .difference
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse reconciliation difference"),
+        rust_decimal::Decimal::ZERO
+    );
+
+    let Json(signed_off) = trust_reconciliations_signoff_handler(
+        State(Arc::clone(&state)),
+        Path(reconciliation.id.clone()),
+        Json(SignoffTrustReconciliationRequest {
+            signed_off_by: "Lead".to_string(),
+        }),
+    )
+    .await
+    .expect("reconciliation signoff should succeed");
+    assert_eq!(signed_off.status, "signed_off");
+    assert_eq!(signed_off.signed_off_by.as_deref(), Some("Lead"));
+
+    let Json(ledger) = matter_trust_ledger_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+    )
+    .await
+    .expect("trust ledger should load");
+    assert_eq!(
+        ledger
+            .latest_reconciliation
+            .as_ref()
+            .expect("latest reconciliation should exist")
+            .id,
+        reconciliation.id
     );
 }
 
@@ -3852,6 +4164,7 @@ async fn invoices_payment_concurrent_trust_draw_creates_single_debit_entry() {
             amount: "100.00".to_string(),
             recorded_by: "Lead".to_string(),
             description: Some("Concurrent trust funding".to_string()),
+            reference_number: None,
         }),
     )
     .await
@@ -4048,6 +4361,7 @@ async fn trust_deposits_concurrently_update_balance_atomically() {
             rust_decimal::Decimal::new(5000, 2),
             "Lead A",
             "Concurrent deposit A",
+            None,
         )
         .await
     });
@@ -4064,6 +4378,7 @@ async fn trust_deposits_concurrently_update_balance_atomically() {
             rust_decimal::Decimal::new(5000, 2),
             "Lead B",
             "Concurrent deposit B",
+            None,
         )
         .await
     });
@@ -4116,8 +4431,12 @@ async fn matter_time_create_rejects_non_positive_hours() {
             description: "Prepare draft".to_string(),
             hours: "0".to_string(),
             hourly_rate: Some("200".to_string()),
+            task_code: None,
+            activity_code: None,
             entry_date: "2026-04-10".to_string(),
             billable: Some(true),
+            block_billing_flag: None,
+            block_billing_reason: None,
         }),
     )
     .await;
@@ -4182,8 +4501,14 @@ async fn matter_time_delete_rejects_billed_entry() {
                 description: "Billed work".to_string(),
                 hours: rust_decimal::Decimal::new(150, 2),
                 hourly_rate: Some(rust_decimal::Decimal::new(30000, 2)),
+                task_code: None,
+                activity_code: None,
+                resolved_rate: None,
+                rate_source: None,
                 entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 9).expect("valid date"),
                 billable: true,
+                block_billing_flag: false,
+                block_billing_reason: None,
             },
         )
         .await
@@ -4197,8 +4522,14 @@ async fn matter_time_delete_rejects_billed_entry() {
                 description: "Unbilled work".to_string(),
                 hours: rust_decimal::Decimal::new(50, 2),
                 hourly_rate: Some(rust_decimal::Decimal::new(30000, 2)),
+                task_code: None,
+                activity_code: None,
+                resolved_rate: None,
+                rate_source: None,
                 entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 10).expect("valid date"),
                 billable: true,
+                block_billing_flag: false,
+                block_billing_reason: None,
             },
         )
         .await
@@ -4265,8 +4596,14 @@ async fn matter_time_summary_aggregates_hours_and_expenses() {
                 description: "Billable review".to_string(),
                 hours: rust_decimal::Decimal::new(150, 2),
                 hourly_rate: Some(rust_decimal::Decimal::new(35000, 2)),
+                task_code: None,
+                activity_code: None,
+                resolved_rate: None,
+                rate_source: None,
                 entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 11).expect("valid date"),
                 billable: true,
+                block_billing_flag: false,
+                block_billing_reason: None,
             },
         )
         .await
@@ -4280,8 +4617,14 @@ async fn matter_time_summary_aggregates_hours_and_expenses() {
                 description: "Internal prep".to_string(),
                 hours: rust_decimal::Decimal::new(50, 2),
                 hourly_rate: None,
+                task_code: None,
+                activity_code: None,
+                resolved_rate: None,
+                rate_source: None,
                 entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 11).expect("valid date"),
                 billable: false,
+                block_billing_flag: false,
+                block_billing_reason: None,
             },
         )
         .await
@@ -4367,6 +4710,112 @@ async fn matter_time_summary_aggregates_hours_and_expenses() {
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
+async fn billing_rates_apply_matter_override_and_export_ledes() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync matter row");
+
+    let (_status, Json(default_rate)) = billing_rates_create_handler(
+        State(Arc::clone(&state)),
+        Json(CreateBillingRateScheduleRequest {
+            matter_id: None,
+            timekeeper: "Lead".to_string(),
+            rate: "425.00".to_string(),
+            effective_start: "2026-01-01".to_string(),
+            effective_end: None,
+        }),
+    )
+    .await
+    .expect("create timekeeper default rate");
+    assert_eq!(default_rate.rate, "425.00");
+
+    let (_status, Json(matter_rate)) = billing_rates_create_handler(
+        State(Arc::clone(&state)),
+        Json(CreateBillingRateScheduleRequest {
+            matter_id: Some("demo".to_string()),
+            timekeeper: "Lead".to_string(),
+            rate: "375.00".to_string(),
+            effective_start: "2026-01-01".to_string(),
+            effective_end: None,
+        }),
+    )
+    .await
+    .expect("create matter override rate");
+    assert_eq!(matter_rate.matter_id.as_deref(), Some("demo"));
+
+    let (_status, Json(entry)) = matter_time_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(CreateTimeEntryRequest {
+            timekeeper: "Lead".to_string(),
+            description: "Draft motion for summary judgment".to_string(),
+            hours: "1.50".to_string(),
+            hourly_rate: None,
+            task_code: Some("b110".to_string()),
+            activity_code: Some("a101".to_string()),
+            entry_date: "2026-04-10".to_string(),
+            billable: Some(true),
+            block_billing_flag: None,
+            block_billing_reason: None,
+        }),
+    )
+    .await
+    .expect("create rate-managed time entry");
+    assert_eq!(entry.rate_source.as_deref(), Some("matter_override"));
+    assert_eq!(
+        entry
+            .resolved_rate
+            .as_deref()
+            .expect("resolved rate should exist")
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse resolved rate"),
+        rust_decimal::Decimal::new(37500, 2)
+    );
+
+    let (_status, Json(invoice)) = invoices_save_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Json(DraftInvoiceRequest {
+            matter_id: "demo".to_string(),
+            invoice_number: "INV-LEDES-100".to_string(),
+            due_date: Some("2026-05-10".to_string()),
+            notes: None,
+        }),
+    )
+    .await
+    .expect("draft invoice should succeed");
+    let _ = invoices_finalize_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(invoice.invoice.id.clone()),
+    )
+    .await
+    .expect("finalize invoice should succeed");
+
+    let Json(ledes) = invoice_ledes_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(invoice.invoice.id.clone()),
+        Query(InvoiceLedesQuery {
+            format: Some("98b".to_string()),
+        }),
+    )
+    .await
+    .expect("LEDES export should succeed");
+    assert_eq!(ledes.format, "98b");
+    assert!(ledes.content.starts_with("LEDES1998B[]\n"));
+    assert!(ledes.content.contains("|B110||A101|"));
+    assert!(ledes.content.contains("|375.00|Lead|OT|"));
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
 async fn matter_detail_work_and_finance_endpoints_return_expected_data() {
     let (db, _tmp) = crate::testing::test_db().await;
     let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
@@ -4415,8 +4864,12 @@ async fn matter_detail_work_and_finance_endpoints_return_expected_data() {
             description: "Case strategy review".to_string(),
             hours: "1.25".to_string(),
             hourly_rate: Some("300".to_string()),
+            task_code: None,
+            activity_code: None,
             entry_date: "2026-04-12".to_string(),
             billable: Some(true),
+            block_billing_flag: None,
+            block_billing_reason: None,
         }),
     )
     .await
@@ -4447,6 +4900,7 @@ async fn matter_detail_work_and_finance_endpoints_return_expected_data() {
             amount: "500.00".to_string(),
             recorded_by: "Lead".to_string(),
             description: Some("Initial retainer".to_string()),
+            reference_number: None,
         }),
     )
     .await

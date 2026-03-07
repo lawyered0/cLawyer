@@ -2669,6 +2669,7 @@ mod tests {
             path: "/matters/demo/facts.md".to_string(),
             display_name: "facts.md".to_string(),
             category: crate::db::MatterDocumentCategory::Internal,
+            readiness_state: crate::db::DocumentReadinessState::Draft,
             created_at: now,
             updated_at: now,
         }];

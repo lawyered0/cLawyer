@@ -127,6 +127,7 @@ pub async fn start_server(
             axum::http::Method::GET,
             axum::http::Method::POST,
             axum::http::Method::PUT,
+            axum::http::Method::PATCH,
             axum::http::Method::DELETE,
         ])
         .allow_headers(AllowHeaders::list([
