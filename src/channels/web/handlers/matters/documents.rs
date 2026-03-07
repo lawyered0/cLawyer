@@ -912,6 +912,8 @@ pub(crate) async fn document_citations_handler(
     let matter_document_id = crate::channels::web::server::parse_uuid(&id, "matter_document_id")?;
     let (document, content) =
         load_document_for_citation_workflow(state.as_ref(), matter_document_id).await?;
+    // Normalize RBAC failure to 404: callers must not be able to use a 403 response
+    // to confirm that a document UUID exists across matters they cannot access.
     require_matter_access(
         &state.store,
         &state.user_id,
@@ -920,7 +922,7 @@ pub(crate) async fn document_citations_handler(
         MatterMemberRole::Viewer,
     )
     .await
-    .map_err(|s| (s, String::new()))?;
+    .map_err(|_| (StatusCode::NOT_FOUND, "Document not found".to_string()))?;
     Ok(Json(
         build_document_citations_response(state.as_ref(), document, &content).await?,
     ))
@@ -939,6 +941,8 @@ pub(crate) async fn document_ready_handler(
     let matter_document_id = crate::channels::web::server::parse_uuid(&id, "matter_document_id")?;
     let (document, content) =
         load_document_for_citation_workflow(state.as_ref(), matter_document_id).await?;
+    // Normalize RBAC failure to 404: callers must not be able to use a 403 response
+    // to confirm that a document UUID exists across matters they cannot access.
     require_matter_access(
         &state.store,
         &state.user_id,
@@ -947,7 +951,7 @@ pub(crate) async fn document_ready_handler(
         MatterMemberRole::Collaborator,
     )
     .await
-    .map_err(|s| (s, String::new()))?;
+    .map_err(|_| (StatusCode::NOT_FOUND, "Document not found".to_string()))?;
     let extracted = crate::legal::citations::extract_citations(&content);
     if !extracted.is_empty() {
         let latest_run = store

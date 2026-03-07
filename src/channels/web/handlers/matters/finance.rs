@@ -17,7 +17,7 @@ use crate::channels::web::types::*;
 use crate::db::{
     AuditSeverity, CreateBillingRateScheduleParams, CreateExpenseEntryParams,
     CreateTimeEntryParams, InvoiceStatus, MatterMemberRole, UpdateBillingRateScheduleParams,
-    UpdateExpenseEntryParams, UpdateTimeEntryParams, UpsertTrustAccountParams,
+    UpdateExpenseEntryParams, UpdateTimeEntryParams, UpsertTrustAccountParams, UserRole,
 };
 
 pub fn routes() -> Router<Arc<GatewayState>> {
@@ -1267,8 +1267,16 @@ pub(crate) async fn trust_account_get_handler(
 
 pub(crate) async fn trust_account_put_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Json(req): Json<UpdateTrustAccountRequest>,
 ) -> Result<Json<TrustAccountInfo>, (StatusCode, String)> {
+    // Trust account is a firm-wide resource; only Admins may modify it.
+    if state.store.is_some() && principal.role != UserRole::Admin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Only administrators can update trust account settings".to_string(),
+        ));
+    }
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),

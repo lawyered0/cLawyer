@@ -3560,6 +3560,7 @@ async fn trust_statement_import_compute_and_signoff_round_trip() {
 
     let Json(account) = trust_account_put_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(UpdateTrustAccountRequest {
             name: "Primary IOLTA".to_string(),
             bank_name: Some("Bar Bank".to_string()),

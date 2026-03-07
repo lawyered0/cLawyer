@@ -434,9 +434,10 @@ async fn build_matter_conflict_report(
         .list_matter_party_relationships(matter_id)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    // Include aliases alongside canonical names so alias-only matches are not missed.
     let checked_parties = parties
         .iter()
-        .map(|party| party.name.clone())
+        .flat_map(|party| std::iter::once(party.name.clone()).chain(party.aliases.iter().cloned()))
         .collect::<Vec<_>>();
     let mut hits = store
         .find_conflict_hits_for_names(&checked_parties, 100)
