@@ -1615,8 +1615,14 @@ async fn matter_member_upsert_handler(
         })
         .await
         .map_err(|e| {
-            tracing::error!("upsert_matter_membership failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            let msg = e.to_string();
+            // FK violation means the supplied member_user_id does not exist in the users table.
+            if msg.contains("FOREIGN KEY constraint") || msg.contains("foreign key constraint") {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                tracing::error!("upsert_matter_membership failed: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         })?;
     Ok(Json(MatterMemberResponse {
         user_id: record.member_user_id,

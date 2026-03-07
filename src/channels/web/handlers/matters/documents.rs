@@ -524,13 +524,19 @@ pub(crate) async fn documents_generate_handler(
     RequestPrincipal(principal): RequestPrincipal,
     Json(req): Json<GenerateDocumentRequest>,
 ) -> Result<(StatusCode, Json<GenerateDocumentResponse>), (StatusCode, String)> {
-    // matter_id comes from request body, not path — fall back to owner-only guard.
-    if state.store.is_some() && principal.user_id != state.user_id {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Insufficient permissions".to_string(),
-        ));
-    }
+    // matter_id comes from the request body; sanitize it first so we can use it for the
+    // RBAC check before acquiring any other resources.
+    let matter_id_rbac =
+        crate::channels::web::server::sanitize_matter_id_for_route(&req.matter_id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id_rbac,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),

@@ -610,17 +610,20 @@ pub(crate) async fn invoices_draft_handler(
     RequestPrincipal(principal): RequestPrincipal,
     Json(req): Json<DraftInvoiceRequest>,
 ) -> Result<Json<InvoiceDraftResponse>, (StatusCode, String)> {
-    if state.store.is_some() && principal.user_id != state.user_id {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Insufficient permissions".to_string(),
-        ));
-    }
+    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&req.matter_id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
-    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&req.matter_id)?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let invoice_number = crate::channels::web::server::parse_required_matter_field(
         "invoice_number",
@@ -658,17 +661,20 @@ pub(crate) async fn invoices_save_handler(
     RequestPrincipal(principal): RequestPrincipal,
     Json(req): Json<DraftInvoiceRequest>,
 ) -> Result<(StatusCode, Json<InvoiceDetailResponse>), (StatusCode, String)> {
-    if state.store.is_some() && principal.user_id != state.user_id {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Insufficient permissions".to_string(),
-        ));
-    }
+    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&req.matter_id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
-    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&req.matter_id)?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let invoice_number = crate::channels::web::server::parse_required_matter_field(
         "invoice_number",
@@ -724,22 +730,26 @@ pub(crate) async fn invoices_get_handler(
     RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
-    if state.store.is_some() && principal.user_id != state.user_id {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Insufficient permissions".to_string(),
-        ));
-    }
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
     let invoice_id = crate::channels::web::server::parse_uuid(&id, "invoice_id")?;
+    // Fetch the invoice first so we can derive its matter_id for the RBAC check.
     let invoice = store
         .get_invoice(&state.user_id, invoice_id)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &invoice.matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
     let line_items = store
         .list_invoice_line_items(&state.user_id, invoice_id)
         .await
@@ -758,17 +768,26 @@ pub(crate) async fn invoices_finalize_handler(
     RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
-    if state.store.is_some() && principal.user_id != state.user_id {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Insufficient permissions".to_string(),
-        ));
-    }
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
     let invoice_id = crate::channels::web::server::parse_uuid(&id, "invoice_id")?;
+    // Pre-fetch the invoice to derive its matter_id for the RBAC check before mutating state.
+    let preview = store
+        .get_invoice(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &preview.matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
     let invoice =
         crate::legal::billing::finalize_invoice(store.as_ref(), &state.user_id, invoice_id)
             .await
@@ -804,12 +823,6 @@ pub(crate) async fn invoices_void_handler(
     RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
-    if state.store.is_some() && principal.user_id != state.user_id {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Insufficient permissions".to_string(),
-        ));
-    }
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
@@ -820,6 +833,16 @@ pub(crate) async fn invoices_void_handler(
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    // Voiding is irreversible — require Owner access on the matter.
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &existing.matter_id,
+        &principal.user_id,
+        MatterMemberRole::Owner,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
     if !matches!(existing.status, InvoiceStatus::Draft | InvoiceStatus::Sent) {
         return Err((
             StatusCode::CONFLICT,
@@ -854,17 +877,26 @@ pub(crate) async fn invoices_payment_handler(
     Path(id): Path<String>,
     Json(req): Json<RecordInvoicePaymentRequest>,
 ) -> Result<Json<RecordInvoicePaymentResponse>, (StatusCode, String)> {
-    if state.store.is_some() && principal.user_id != state.user_id {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Insufficient permissions".to_string(),
-        ));
-    }
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
     let invoice_id = crate::channels::web::server::parse_uuid(&id, "invoice_id")?;
+    // Pre-fetch the invoice to derive its matter_id for the RBAC check before mutating state.
+    let invoice_preview = store
+        .get_invoice(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &invoice_preview.matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
     let amount = crate::channels::web::server::parse_decimal_field("amount", &req.amount)?;
     let recorded_by =
         crate::channels::web::server::parse_required_matter_field("recorded_by", &req.recorded_by)?;
