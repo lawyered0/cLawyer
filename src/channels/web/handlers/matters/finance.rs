@@ -9,12 +9,14 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::channels::web::auth::RequestPrincipal;
+use crate::channels::web::handlers::helpers::matter::require_matter_access;
 use crate::channels::web::server::MatterInvoicesQuery;
 use crate::channels::web::state::GatewayState;
 use crate::channels::web::types::*;
 use crate::db::{
     AuditSeverity, CreateExpenseEntryParams, CreateTimeEntryParams, InvoiceStatus,
-    UpdateExpenseEntryParams, UpdateTimeEntryParams,
+    MatterMemberRole, UpdateExpenseEntryParams, UpdateTimeEntryParams,
 };
 
 pub fn routes() -> Router<Arc<GatewayState>> {
@@ -65,6 +67,7 @@ pub fn routes() -> Router<Arc<GatewayState>> {
 
 pub(crate) async fn matter_time_list_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<MatterTimeEntriesResponse>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -72,6 +75,15 @@ pub(crate) async fn matter_time_list_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let entries = store
         .list_time_entries(&state.user_id, &matter_id)
@@ -85,6 +97,7 @@ pub(crate) async fn matter_time_list_handler(
 
 pub(crate) async fn matter_time_create_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Json(req): Json<CreateTimeEntryRequest>,
 ) -> Result<(StatusCode, Json<TimeEntryInfo>), (StatusCode, String)> {
@@ -93,6 +106,15 @@ pub(crate) async fn matter_time_create_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
 
     let timekeeper =
@@ -139,6 +161,7 @@ pub(crate) async fn matter_time_create_handler(
 
 pub(crate) async fn matter_time_patch_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path((id, entry_id)): Path<(String, String)>,
     Json(req): Json<UpdateTimeEntryRequest>,
 ) -> Result<Json<TimeEntryInfo>, (StatusCode, String)> {
@@ -147,6 +170,15 @@ pub(crate) async fn matter_time_patch_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let entry_id = crate::channels::web::server::parse_uuid(&entry_id, "entry_id")?;
 
@@ -208,6 +240,7 @@ pub(crate) async fn matter_time_patch_handler(
 
 pub(crate) async fn matter_time_delete_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path((id, entry_id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -215,6 +248,15 @@ pub(crate) async fn matter_time_delete_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let entry_id = crate::channels::web::server::parse_uuid(&entry_id, "entry_id")?;
 
@@ -242,6 +284,7 @@ pub(crate) async fn matter_time_delete_handler(
 
 pub(crate) async fn matter_expenses_list_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<MatterExpenseEntriesResponse>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -249,6 +292,15 @@ pub(crate) async fn matter_expenses_list_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let entries = store
         .list_expense_entries(&state.user_id, &matter_id)
@@ -262,6 +314,7 @@ pub(crate) async fn matter_expenses_list_handler(
 
 pub(crate) async fn matter_expenses_create_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Json(req): Json<CreateExpenseEntryRequest>,
 ) -> Result<(StatusCode, Json<ExpenseEntryInfo>), (StatusCode, String)> {
@@ -270,6 +323,15 @@ pub(crate) async fn matter_expenses_create_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
 
     let submitted_by = crate::channels::web::server::parse_required_matter_field(
@@ -323,6 +385,7 @@ pub(crate) async fn matter_expenses_create_handler(
 
 pub(crate) async fn matter_expenses_patch_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path((id, entry_id)): Path<(String, String)>,
     Json(req): Json<UpdateExpenseEntryRequest>,
 ) -> Result<Json<ExpenseEntryInfo>, (StatusCode, String)> {
@@ -331,6 +394,15 @@ pub(crate) async fn matter_expenses_patch_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let entry_id = crate::channels::web::server::parse_uuid(&entry_id, "entry_id")?;
 
@@ -406,6 +478,7 @@ pub(crate) async fn matter_expenses_patch_handler(
 
 pub(crate) async fn matter_expenses_delete_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path((id, entry_id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -413,6 +486,15 @@ pub(crate) async fn matter_expenses_delete_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let entry_id = crate::channels::web::server::parse_uuid(&entry_id, "entry_id")?;
 
@@ -440,6 +522,7 @@ pub(crate) async fn matter_expenses_delete_handler(
 
 pub(crate) async fn matter_time_summary_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<MatterTimeSummaryResponse>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -447,6 +530,15 @@ pub(crate) async fn matter_time_summary_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let summary = store
         .matter_time_summary(&state.user_id, &matter_id)
@@ -459,6 +551,7 @@ pub(crate) async fn matter_time_summary_handler(
 
 pub(crate) async fn matter_invoices_list_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Query(query): Query<MatterInvoicesQuery>,
 ) -> Result<Json<MatterInvoicesResponse>, (StatusCode, String)> {
@@ -467,6 +560,15 @@ pub(crate) async fn matter_invoices_list_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
 
     let limit = query
@@ -505,13 +607,23 @@ pub(crate) async fn matter_invoices_list_handler(
 
 pub(crate) async fn invoices_draft_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Json(req): Json<DraftInvoiceRequest>,
 ) -> Result<Json<InvoiceDraftResponse>, (StatusCode, String)> {
+    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&req.matter_id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
-    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&req.matter_id)?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let invoice_number = crate::channels::web::server::parse_required_matter_field(
         "invoice_number",
@@ -546,13 +658,23 @@ pub(crate) async fn invoices_draft_handler(
 
 pub(crate) async fn invoices_save_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Json(req): Json<DraftInvoiceRequest>,
 ) -> Result<(StatusCode, Json<InvoiceDetailResponse>), (StatusCode, String)> {
+    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&req.matter_id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
-    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&req.matter_id)?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let invoice_number = crate::channels::web::server::parse_required_matter_field(
         "invoice_number",
@@ -605,6 +727,7 @@ pub(crate) async fn invoices_save_handler(
 
 pub(crate) async fn invoices_get_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -612,11 +735,21 @@ pub(crate) async fn invoices_get_handler(
         "Database not available".to_string(),
     ))?;
     let invoice_id = crate::channels::web::server::parse_uuid(&id, "invoice_id")?;
+    // Fetch the invoice first so we can derive its matter_id for the RBAC check.
     let invoice = store
         .get_invoice(&state.user_id, invoice_id)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &invoice.matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
     let line_items = store
         .list_invoice_line_items(&state.user_id, invoice_id)
         .await
@@ -632,6 +765,7 @@ pub(crate) async fn invoices_get_handler(
 
 pub(crate) async fn invoices_finalize_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -639,6 +773,21 @@ pub(crate) async fn invoices_finalize_handler(
         "Database not available".to_string(),
     ))?;
     let invoice_id = crate::channels::web::server::parse_uuid(&id, "invoice_id")?;
+    // Pre-fetch the invoice to derive its matter_id for the RBAC check before mutating state.
+    let preview = store
+        .get_invoice(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &preview.matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
     let invoice =
         crate::legal::billing::finalize_invoice(store.as_ref(), &state.user_id, invoice_id)
             .await
@@ -671,6 +820,7 @@ pub(crate) async fn invoices_finalize_handler(
 
 pub(crate) async fn invoices_void_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<InvoiceDetailResponse>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -683,6 +833,16 @@ pub(crate) async fn invoices_void_handler(
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    // Voiding is irreversible — require Owner access on the matter.
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &existing.matter_id,
+        &principal.user_id,
+        MatterMemberRole::Owner,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
     if !matches!(existing.status, InvoiceStatus::Draft | InvoiceStatus::Sent) {
         return Err((
             StatusCode::CONFLICT,
@@ -713,6 +873,7 @@ pub(crate) async fn invoices_void_handler(
 
 pub(crate) async fn invoices_payment_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Json(req): Json<RecordInvoicePaymentRequest>,
 ) -> Result<Json<RecordInvoicePaymentResponse>, (StatusCode, String)> {
@@ -721,6 +882,21 @@ pub(crate) async fn invoices_payment_handler(
         "Database not available".to_string(),
     ))?;
     let invoice_id = crate::channels::web::server::parse_uuid(&id, "invoice_id")?;
+    // Pre-fetch the invoice to derive its matter_id for the RBAC check before mutating state.
+    let invoice_preview = store
+        .get_invoice(&state.user_id, invoice_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &invoice_preview.matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|sc| (sc, "Insufficient permissions".to_string()))?;
     let amount = crate::channels::web::server::parse_decimal_field("amount", &req.amount)?;
     let recorded_by =
         crate::channels::web::server::parse_required_matter_field("recorded_by", &req.recorded_by)?;
@@ -779,6 +955,7 @@ pub(crate) async fn invoices_payment_handler(
 
 pub(crate) async fn matter_trust_deposit_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Json(req): Json<TrustDepositRequest>,
 ) -> Result<(StatusCode, Json<TrustLedgerEntryInfo>), (StatusCode, String)> {
@@ -787,6 +964,15 @@ pub(crate) async fn matter_trust_deposit_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Owner,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let amount = crate::channels::web::server::parse_decimal_field("amount", &req.amount)?;
     let recorded_by =
@@ -825,6 +1011,7 @@ pub(crate) async fn matter_trust_deposit_handler(
 
 pub(crate) async fn matter_trust_ledger_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<TrustLedgerResponse>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -832,6 +1019,15 @@ pub(crate) async fn matter_trust_ledger_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let entries = store
         .list_trust_ledger_entries(&state.user_id, &matter_id)

@@ -1,7 +1,6 @@
 use super::*;
 use std::sync::Arc;
 
-use crate::agent::SessionManager;
 use crate::channels::web::auth::hash_auth_token;
 use crate::channels::web::handlers::{
     chat::{
@@ -40,10 +39,7 @@ use crate::channels::web::handlers::{
     },
     memory::memory_write_handler,
 };
-use crate::channels::web::sse::SseManager;
-use crate::channels::web::test_support::{
-    TestLlmProvider, assert_no_inline_event_handlers, minimal_test_gateway_state,
-};
+use crate::channels::web::test_support::*;
 use crate::db::{ConflictDecision, UserRole};
 use crate::workspace::Workspace;
 use axum::{
@@ -388,120 +384,6 @@ async fn rbac_token_hash_reassignment_does_not_fail_when_user_id_changes() {
 }
 
 #[cfg(feature = "libsql")]
-fn test_legal_config() -> crate::config::LegalConfig {
-    crate::config::LegalConfig::resolve(&crate::settings::Settings::default())
-        .expect("default legal config should resolve")
-}
-
-#[cfg(feature = "libsql")]
-fn test_gateway_state_with_store_workspace_and_legal(
-    store: Arc<dyn crate::db::Database>,
-    workspace: Arc<Workspace>,
-    legal_config: crate::config::LegalConfig,
-) -> Arc<GatewayState> {
-    Arc::new(GatewayState {
-        msg_tx: tokio::sync::RwLock::new(None),
-        sse: SseManager::new(),
-        workspace: Some(workspace),
-        session_manager: None,
-        log_broadcaster: None,
-        log_level_handle: None,
-        extension_manager: None,
-        tool_registry: None,
-        store: Some(store),
-        job_manager: None,
-        prompt_queue: None,
-        user_id: "test-user".to_string(),
-        shutdown_tx: tokio::sync::RwLock::new(None),
-        ws_tracker: Some(Arc::new(
-            crate::channels::web::ws::WsConnectionTracker::new(),
-        )),
-        llm_provider: None,
-        skill_registry: None,
-        skill_catalog: None,
-        chat_rate_limiter: RateLimiter::new(30, 60),
-        registry_entries: Vec::new(),
-        cost_guard: None,
-        startup_time: std::time::Instant::now(),
-        legal_config: Some(legal_config),
-        runtime_facts: crate::compliance::ComplianceRuntimeFacts::default(),
-    })
-}
-
-#[cfg(feature = "libsql")]
-fn test_gateway_state_with_store_and_workspace(
-    store: Arc<dyn crate::db::Database>,
-    workspace: Arc<Workspace>,
-) -> Arc<GatewayState> {
-    test_gateway_state_with_store_workspace_and_legal(store, workspace, test_legal_config())
-}
-
-#[cfg(feature = "libsql")]
-fn test_gateway_state_with_store_workspace_and_chat(
-    store: Arc<dyn crate::db::Database>,
-    workspace: Arc<Workspace>,
-) -> Arc<GatewayState> {
-    Arc::new(GatewayState {
-        msg_tx: tokio::sync::RwLock::new(None),
-        sse: SseManager::new(),
-        workspace: Some(workspace),
-        session_manager: Some(Arc::new(SessionManager::new())),
-        log_broadcaster: None,
-        log_level_handle: None,
-        extension_manager: None,
-        tool_registry: None,
-        store: Some(store),
-        job_manager: None,
-        prompt_queue: None,
-        user_id: "test-user".to_string(),
-        shutdown_tx: tokio::sync::RwLock::new(None),
-        ws_tracker: Some(Arc::new(
-            crate::channels::web::ws::WsConnectionTracker::new(),
-        )),
-        llm_provider: None,
-        skill_registry: None,
-        skill_catalog: None,
-        chat_rate_limiter: RateLimiter::new(30, 60),
-        registry_entries: Vec::new(),
-        cost_guard: None,
-        startup_time: std::time::Instant::now(),
-        legal_config: Some(test_legal_config()),
-        runtime_facts: crate::compliance::ComplianceRuntimeFacts::default(),
-    })
-}
-
-#[cfg(feature = "libsql")]
-async fn seed_valid_matter(workspace: &Workspace, matter_id: &str) {
-    let metadata = format!(
-        "matter_id: {matter_id}\nclient: Demo Client\nteam:\n  - Lead Counsel\nconfidentiality: attorney-client-privileged\nadversaries:\n  - Example Co\nretention: follow-firm-policy\n"
-    );
-    workspace
-        .write(&format!("matters/{matter_id}/matter.yaml"), &metadata)
-        .await
-        .expect("seed matter metadata");
-    workspace
-        .write(
-            &format!("matters/{matter_id}/templates/research_memo.md"),
-            "# Research Memo Template\n",
-        )
-        .await
-        .expect("seed research template");
-    workspace
-        .write(
-            &format!("matters/{matter_id}/templates/chronology.md"),
-            "# Chronology Template\n",
-        )
-        .await
-        .expect("seed chronology template");
-    workspace
-        .write(
-            &format!("matters/{matter_id}/notes.md"),
-            "matter notes content",
-        )
-        .await
-        .expect("seed notes document");
-}
-
 #[cfg(feature = "libsql")]
 #[tokio::test]
 async fn chat_history_rejects_limit_zero() {
@@ -1354,6 +1236,7 @@ async fn matters_create_creates_scaffold_and_sets_active() {
 
     let (status, Json(response)) = matters_create_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(CreateMatterRequest {
             matter_id: "Acme v. Foo".to_string(),
             client: "Acme Corp".to_string(),
@@ -1443,6 +1326,7 @@ async fn matters_list_includes_optional_metadata_fields() {
 
     let _ = matters_create_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(CreateMatterRequest {
             matter_id: "Acme v. Foo".to_string(),
             client: "Acme Corp".to_string(),
@@ -1461,7 +1345,7 @@ async fn matters_list_includes_optional_metadata_fields() {
     .await
     .expect("create matter should succeed");
 
-    let Json(list) = matters_list_handler(State(state))
+    let Json(list) = matters_list_handler(State(state), owner_principal())
         .await
         .expect("matters list should succeed");
     assert_eq!(list.matters.len(), 1);
@@ -1485,6 +1369,7 @@ async fn matters_create_rejects_duplicate() {
 
     let _created = matters_create_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(CreateMatterRequest {
             matter_id: "demo".to_string(),
             client: "Demo".to_string(),
@@ -1505,6 +1390,7 @@ async fn matters_create_rejects_duplicate() {
 
     let err = matters_create_handler(
         State(state),
+        owner_principal(),
         Json(CreateMatterRequest {
             matter_id: "demo".to_string(),
             client: "Demo".to_string(),
@@ -1536,6 +1422,7 @@ async fn matters_create_rejects_invalid_opened_date() {
 
     let err = matters_create_handler(
         State(state),
+        owner_principal(),
         Json(CreateMatterRequest {
             matter_id: "demo".to_string(),
             client: "Demo".to_string(),
@@ -1567,6 +1454,7 @@ async fn matters_create_rejects_overlong_optional_metadata_fields() {
 
     let err = matters_create_handler(
         State(state),
+        owner_principal(),
         Json(CreateMatterRequest {
             matter_id: "demo".to_string(),
             client: "Demo".to_string(),
@@ -1599,6 +1487,7 @@ async fn matters_create_rejects_empty_after_sanitize() {
 
     let err = matters_create_handler(
         State(state),
+        owner_principal(),
         Json(CreateMatterRequest {
             matter_id: "!!!".to_string(),
             client: "Demo".to_string(),
@@ -1833,6 +1722,7 @@ async fn matters_create_requires_conflict_decision_when_hits_exist() {
 
     let err = matters_create_handler(
         State(state),
+        owner_principal(),
         Json(CreateMatterRequest {
             matter_id: "new-matter".to_string(),
             client: "Acme Corp".to_string(),
@@ -1873,6 +1763,7 @@ async fn matters_create_declined_records_audit_and_blocks_creation() {
 
     let err = matters_create_handler(
         State(state),
+        owner_principal(),
         Json(CreateMatterRequest {
             matter_id: "new-matter".to_string(),
             client: "Acme Corp".to_string(),
@@ -1925,6 +1816,7 @@ async fn matters_create_waived_records_and_proceeds() {
 
     let (status, Json(resp)) = matters_create_handler(
         State(state),
+        owner_principal(),
         Json(CreateMatterRequest {
             matter_id: "new-matter".to_string(),
             client: "Acme Corp".to_string(),
@@ -1977,6 +1869,7 @@ async fn matters_create_rejects_excessive_adversaries() {
 
     let err = matters_create_handler(
         State(state),
+        owner_principal(),
         Json(CreateMatterRequest {
             matter_id: "new-matter".to_string(),
             client: "Acme Corp".to_string(),
@@ -2384,6 +2277,7 @@ async fn matters_documents_excludes_templates_by_default() {
 
     let Json(resp) = matter_documents_handler(
         State(state),
+        owner_principal(),
         Path("demo".to_string()),
         Query(MatterDocumentsQuery::default()),
     )
@@ -2419,6 +2313,7 @@ async fn matters_documents_includes_templates_when_requested() {
 
     let Json(resp) = matter_documents_handler(
         State(state),
+        owner_principal(),
         Path("demo".to_string()),
         Query(MatterDocumentsQuery {
             include_templates: Some(true),
@@ -2442,9 +2337,10 @@ async fn matters_templates_list_returns_expected_entries() {
     seed_valid_matter(workspace.as_ref(), "demo").await;
     let state = test_gateway_state_with_store_and_workspace(db, workspace);
 
-    let Json(resp) = matter_templates_handler(State(state), Path("demo".to_string()))
-        .await
-        .expect("templates request should succeed");
+    let Json(resp) =
+        matter_templates_handler(State(state), owner_principal(), Path("demo".to_string()))
+            .await
+            .expect("templates request should succeed");
 
     assert_eq!(resp.matter_id, "demo");
     assert_eq!(resp.templates.len(), 2);
@@ -2463,6 +2359,7 @@ async fn matters_documents_backfill_incrementally_syncs_new_workspace_files() {
 
     let Json(initial) = matter_documents_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Query(MatterDocumentsQuery::default()),
     )
@@ -2485,6 +2382,7 @@ async fn matters_documents_backfill_incrementally_syncs_new_workspace_files() {
 
     let Json(updated) = matter_documents_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Query(MatterDocumentsQuery::default()),
     )
@@ -2517,10 +2415,13 @@ async fn matters_templates_backfill_incrementally_syncs_new_workspace_templates(
     let state =
         test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
 
-    let Json(initial) =
-        matter_templates_handler(State(Arc::clone(&state)), Path("demo".to_string()))
-            .await
-            .expect("initial templates request should succeed");
+    let Json(initial) = matter_templates_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+    )
+    .await
+    .expect("initial templates request should succeed");
     assert_eq!(initial.templates.len(), 2);
 
     workspace
@@ -2531,10 +2432,13 @@ async fn matters_templates_backfill_incrementally_syncs_new_workspace_templates(
         .await
         .expect("seed new workspace template");
 
-    let Json(updated) =
-        matter_templates_handler(State(Arc::clone(&state)), Path("demo".to_string()))
-            .await
-            .expect("updated templates request should succeed");
+    let Json(updated) = matter_templates_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+    )
+    .await
+    .expect("updated templates request should succeed");
     assert!(
         updated
             .templates
@@ -2554,6 +2458,7 @@ async fn matters_documents_backfill_does_not_duplicate_initial_versions() {
 
     let _ = matter_documents_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Query(MatterDocumentsQuery::default()),
     )
@@ -2570,6 +2475,7 @@ async fn matters_documents_backfill_does_not_duplicate_initial_versions() {
 
     let _ = matter_documents_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Query(MatterDocumentsQuery::default()),
     )
@@ -2578,6 +2484,7 @@ async fn matters_documents_backfill_does_not_duplicate_initial_versions() {
 
     let _ = matter_documents_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Query(MatterDocumentsQuery::default()),
     )
@@ -2613,6 +2520,7 @@ async fn matters_template_apply_creates_timestamped_draft() {
 
     let (status, Json(resp)) = matter_template_apply_handler(
         State(state),
+        owner_principal(),
         Path("demo".to_string()),
         Json(MatterTemplateApplyRequest {
             template_name: "chronology.md".to_string(),
@@ -2689,10 +2597,13 @@ async fn documents_generate_creates_matter_link_and_version() {
         .await
         .expect("sync matter row");
 
-    let Json(templates_resp) =
-        matter_templates_handler(State(Arc::clone(&state)), Path("demo".to_string()))
-            .await
-            .expect("templates request should succeed");
+    let Json(templates_resp) = matter_templates_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+    )
+    .await
+    .expect("templates request should succeed");
     let template_id = templates_resp
         .templates
         .iter()
@@ -2702,6 +2613,7 @@ async fn documents_generate_creates_matter_link_and_version() {
 
     let (status, Json(resp)) = documents_generate_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(GenerateDocumentRequest {
             template_id,
             matter_id: "demo".to_string(),
@@ -2767,9 +2679,10 @@ async fn matter_deadlines_handler_parses_calendar_rows() {
 
     let state = test_gateway_state_with_store_and_workspace(db, workspace);
 
-    let Json(resp) = matter_deadlines_handler(State(state), Path("demo".to_string()))
-        .await
-        .expect("deadlines handler should succeed");
+    let Json(resp) =
+        matter_deadlines_handler(State(state), owner_principal(), Path("demo".to_string()))
+            .await
+            .expect("deadlines handler should succeed");
 
     assert_eq!(resp.matter_id, "demo");
     assert_eq!(resp.deadlines.len(), 3);
@@ -2804,6 +2717,7 @@ async fn matter_deadlines_db_entries_prefer_over_workspace_calendar() {
     let due_at = (Utc::now() + chrono::TimeDelta::days(7)).to_rfc3339();
     let (status, Json(created)) = matter_deadlines_create_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Json(CreateMatterDeadlineRequest {
             title: "File opposition brief".to_string(),
@@ -2821,9 +2735,10 @@ async fn matter_deadlines_db_entries_prefer_over_workspace_calendar() {
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(created.title, "File opposition brief");
 
-    let Json(resp) = matter_deadlines_handler(State(state), Path("demo".to_string()))
-        .await
-        .expect("deadlines handler should succeed");
+    let Json(resp) =
+        matter_deadlines_handler(State(state), owner_principal(), Path("demo".to_string()))
+            .await
+            .expect("deadlines handler should succeed");
     assert_eq!(resp.deadlines.len(), 1);
     assert_eq!(resp.deadlines[0].title, "File opposition brief");
     assert_eq!(resp.deadlines[0].source.as_deref(), Some("FRCP 56(c)(1)"));
@@ -2844,6 +2759,7 @@ async fn legal_court_rules_and_compute_deadline() {
 
     let Json(computed) = matter_deadlines_compute_handler(
         State(state),
+        owner_principal(),
         Path("demo".to_string()),
         Json(MatterDeadlineComputeRequest {
             rule_id: "frcp_12_a_1".to_string(),
@@ -2877,6 +2793,7 @@ async fn matter_deadline_delete_disables_reminder_routines() {
     let due_at = (Utc::now() + chrono::TimeDelta::days(10)).to_rfc3339();
     let (_status, Json(created)) = matter_deadlines_create_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Json(CreateMatterDeadlineRequest {
             title: "Serve discovery requests".to_string(),
@@ -2907,6 +2824,7 @@ async fn matter_deadline_delete_disables_reminder_routines() {
 
     let status = matter_deadlines_delete_handler(
         State(state),
+        owner_principal(),
         Path(("demo".to_string(), created.id.clone())),
     )
     .await
@@ -2964,9 +2882,10 @@ async fn matter_dashboard_reports_workflow_scorecard() {
             .expect("seed deadlines");
 
     let state = test_gateway_state_with_store_and_workspace(db, workspace);
-    let Json(resp) = matter_dashboard_handler(State(state), Path("demo".to_string()))
-        .await
-        .expect("dashboard handler should succeed");
+    let Json(resp) =
+        matter_dashboard_handler(State(state), owner_principal(), Path("demo".to_string()))
+            .await
+            .expect("dashboard handler should succeed");
 
     assert_eq!(resp.matter_id, "demo");
     assert_eq!(resp.template_count, 2);
@@ -3007,7 +2926,7 @@ async fn matter_filing_package_creates_export_index() {
         test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
 
     let (status, Json(resp)) =
-        matter_filing_package_handler(State(state), Path("demo".to_string()))
+        matter_filing_package_handler(State(state), owner_principal(), Path("demo".to_string()))
             .await
             .expect("filing package should be generated");
 
@@ -3082,6 +3001,7 @@ async fn matter_invoices_list_returns_recent_limited_rows() {
 
     let Json(resp) = matter_invoices_list_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Query(MatterInvoicesQuery { limit: Some(2) }),
     )
@@ -3117,6 +3037,7 @@ async fn matter_invoices_list_rejects_invalid_limit_values() {
 
     let err = matter_invoices_list_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Query(MatterInvoicesQuery { limit: Some(0) }),
     )
@@ -3126,6 +3047,7 @@ async fn matter_invoices_list_rejects_invalid_limit_values() {
 
     let err = matter_invoices_list_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Query(MatterInvoicesQuery { limit: Some(101) }),
     )
@@ -3146,42 +3068,21 @@ async fn matter_invoices_list_blocks_non_owner_access() {
         .await
         .expect("sync matter row");
 
-    let other_state = Arc::new(GatewayState {
-        msg_tx: tokio::sync::RwLock::new(None),
-        sse: SseManager::new(),
-        workspace: Some(Arc::clone(&workspace)),
-        session_manager: None,
-        log_broadcaster: None,
-        log_level_handle: None,
-        extension_manager: None,
-        tool_registry: None,
-        store: Some(Arc::clone(&db)),
-        job_manager: None,
-        prompt_queue: None,
-        user_id: "other-user".to_string(),
-        shutdown_tx: tokio::sync::RwLock::new(None),
-        ws_tracker: Some(Arc::new(
-            crate::channels::web::ws::WsConnectionTracker::new(),
-        )),
-        llm_provider: None,
-        skill_registry: None,
-        skill_catalog: None,
-        chat_rate_limiter: RateLimiter::new(30, 60),
-        registry_entries: Vec::new(),
-        cost_guard: None,
-        startup_time: std::time::Instant::now(),
-        legal_config: Some(test_legal_config()),
-        runtime_facts: crate::compliance::ComplianceRuntimeFacts::default(),
-    });
+    // Build a state whose owner is "other-user" — a different user than the
+    // matter owner ("test-user") so the RBAC guard rejects the request.
+    let other_state =
+        test_gateway_state_for_user(Arc::clone(&db), Arc::clone(&workspace), "other-user");
 
     let err = matter_invoices_list_handler(
         State(other_state),
+        owner_principal(),
         Path("demo".to_string()),
         Query(MatterInvoicesQuery { limit: Some(10) }),
     )
     .await
     .expect_err("non-owner should not access matter invoices");
-    assert_eq!(err.0, StatusCode::NOT_FOUND);
+    // RBAC guard fires before matter lookup: returns FORBIDDEN (not NOT_FOUND).
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
 }
 
 #[cfg(feature = "libsql")]
@@ -3233,6 +3134,7 @@ async fn invoices_finalize_marks_entries_billed_and_supports_trust_payment() {
 
     let (created_status, Json(created)) = invoices_save_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(DraftInvoiceRequest {
             matter_id: "demo".to_string(),
             invoice_number: "INV-1001".to_string(),
@@ -3247,10 +3149,13 @@ async fn invoices_finalize_marks_entries_billed_and_supports_trust_payment() {
     assert_eq!(created.line_items.len(), 2);
     let invoice_id = created.invoice.id.clone();
 
-    let Json(finalized) =
-        invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
-            .await
-            .expect("finalize should succeed");
+    let Json(finalized) = invoices_finalize_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(invoice_id.clone()),
+    )
+    .await
+    .expect("finalize should succeed");
     assert_eq!(finalized.invoice.status, "sent");
 
     let invoice_uuid = Uuid::parse_str(&invoice_id).expect("invoice uuid");
@@ -3276,6 +3181,7 @@ async fn invoices_finalize_marks_entries_billed_and_supports_trust_payment() {
 
     let (deposit_status, _deposit_body) = matter_trust_deposit_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Json(TrustDepositRequest {
             amount: "500.00".to_string(),
@@ -3289,6 +3195,7 @@ async fn invoices_finalize_marks_entries_billed_and_supports_trust_payment() {
 
     let Json(payment) = invoices_payment_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path(invoice_id.clone()),
         Json(RecordInvoicePaymentRequest {
             amount: "50.00".to_string(),
@@ -3307,9 +3214,10 @@ async fn invoices_finalize_marks_entries_billed_and_supports_trust_payment() {
     assert_eq!(paid, rust_decimal::Decimal::new(5000, 2));
     assert!(payment.trust_entry.is_some());
 
-    let Json(ledger) = matter_trust_ledger_handler(State(state), Path("demo".to_string()))
-        .await
-        .expect("ledger should load");
+    let Json(ledger) =
+        matter_trust_ledger_handler(State(state), owner_principal(), Path("demo".to_string()))
+            .await
+            .expect("ledger should load");
     let balance = ledger
         .balance
         .parse::<rust_decimal::Decimal>()
@@ -3369,6 +3277,7 @@ async fn invoices_payment_rejects_trust_overdraw() {
 
     let (_status, Json(created)) = invoices_save_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(DraftInvoiceRequest {
             matter_id: "demo".to_string(),
             invoice_number: "INV-2001".to_string(),
@@ -3378,12 +3287,17 @@ async fn invoices_payment_rejects_trust_overdraw() {
     )
     .await
     .expect("save draft should succeed");
-    let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(created.invoice.id.clone()))
-        .await
-        .expect("finalize should succeed");
+    let _ = invoices_finalize_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(created.invoice.id.clone()),
+    )
+    .await
+    .expect("finalize should succeed");
 
     let (_deposit_status, _deposit_body) = matter_trust_deposit_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Json(TrustDepositRequest {
             amount: "10.00".to_string(),
@@ -3396,6 +3310,7 @@ async fn invoices_payment_rejects_trust_overdraw() {
 
     let result = invoices_payment_handler(
         State(state),
+        owner_principal(),
         Path(created.invoice.id),
         Json(RecordInvoicePaymentRequest {
             amount: "20.00".to_string(),
@@ -3448,6 +3363,7 @@ async fn invoices_payment_rejects_draft_invoice_status() {
 
     let (_status, Json(created)) = invoices_save_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(DraftInvoiceRequest {
             matter_id: "demo".to_string(),
             invoice_number: "INV-DRAFT-100".to_string(),
@@ -3460,6 +3376,7 @@ async fn invoices_payment_rejects_draft_invoice_status() {
 
     let err = invoices_payment_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path(created.invoice.id.clone()),
         Json(RecordInvoicePaymentRequest {
             amount: "25.00".to_string(),
@@ -3517,6 +3434,7 @@ async fn invoices_payment_rejects_amount_above_remaining_balance() {
 
     let (_status, Json(created)) = invoices_save_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(DraftInvoiceRequest {
             matter_id: "demo".to_string(),
             invoice_number: "INV-REM-100".to_string(),
@@ -3527,12 +3445,17 @@ async fn invoices_payment_rejects_amount_above_remaining_balance() {
     .await
     .expect("save draft should succeed");
     let invoice_id = created.invoice.id.clone();
-    let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
-        .await
-        .expect("finalize should succeed");
+    let _ = invoices_finalize_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(invoice_id.clone()),
+    )
+    .await
+    .expect("finalize should succeed");
 
     let _ = invoices_payment_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path(invoice_id.clone()),
         Json(RecordInvoicePaymentRequest {
             amount: "60.00".to_string(),
@@ -3546,6 +3469,7 @@ async fn invoices_payment_rejects_amount_above_remaining_balance() {
 
     let err = invoices_payment_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path(invoice_id.clone()),
         Json(RecordInvoicePaymentRequest {
             amount: "50.00".to_string(),
@@ -3606,6 +3530,7 @@ async fn invoices_payment_exact_remaining_marks_invoice_paid() {
 
     let (_status, Json(created)) = invoices_save_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(DraftInvoiceRequest {
             matter_id: "demo".to_string(),
             invoice_number: "INV-EXACT-PAID".to_string(),
@@ -3616,12 +3541,17 @@ async fn invoices_payment_exact_remaining_marks_invoice_paid() {
     .await
     .expect("save draft should succeed");
     let invoice_id = created.invoice.id.clone();
-    let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
-        .await
-        .expect("finalize should succeed");
+    let _ = invoices_finalize_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(invoice_id.clone()),
+    )
+    .await
+    .expect("finalize should succeed");
 
     let _ = invoices_payment_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path(invoice_id.clone()),
         Json(RecordInvoicePaymentRequest {
             amount: "29.99".to_string(),
@@ -3635,6 +3565,7 @@ async fn invoices_payment_exact_remaining_marks_invoice_paid() {
 
     let _ = invoices_payment_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path(invoice_id.clone()),
         Json(RecordInvoicePaymentRequest {
             amount: "0.01".to_string(),
@@ -3693,6 +3624,7 @@ async fn invoices_finalize_rejects_line_items_already_billed_elsewhere() {
 
     let (_, Json(first)) = invoices_save_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(DraftInvoiceRequest {
             matter_id: "demo".to_string(),
             invoice_number: "INV-SHARED-1".to_string(),
@@ -3704,6 +3636,7 @@ async fn invoices_finalize_rejects_line_items_already_billed_elsewhere() {
     .expect("save first draft");
     let (_, Json(second)) = invoices_save_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(DraftInvoiceRequest {
             matter_id: "demo".to_string(),
             invoice_number: "INV-SHARED-2".to_string(),
@@ -3716,13 +3649,21 @@ async fn invoices_finalize_rejects_line_items_already_billed_elsewhere() {
     assert_eq!(first.line_items.len(), 1);
     assert_eq!(second.line_items.len(), 1);
 
-    let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(first.invoice.id.clone()))
-        .await
-        .expect("first finalize should succeed");
+    let _ = invoices_finalize_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(first.invoice.id.clone()),
+    )
+    .await
+    .expect("first finalize should succeed");
 
-    let err = invoices_finalize_handler(State(Arc::clone(&state)), Path(second.invoice.id.clone()))
-        .await
-        .expect_err("second finalize should be blocked");
+    let err = invoices_finalize_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(second.invoice.id.clone()),
+    )
+    .await
+    .expect_err("second finalize should be blocked");
     assert_eq!(err.0, StatusCode::BAD_REQUEST);
     assert!(err.1.contains("already billed"));
 
@@ -3769,6 +3710,7 @@ async fn invoices_payment_concurrent_requests_allow_single_winner() {
 
     let (_, Json(created)) = invoices_save_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(DraftInvoiceRequest {
             matter_id: "demo".to_string(),
             invoice_number: "INV-CONCURRENT-1".to_string(),
@@ -3779,9 +3721,13 @@ async fn invoices_payment_concurrent_requests_allow_single_winner() {
     .await
     .expect("save draft");
     let invoice_id = created.invoice.id.clone();
-    let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
-        .await
-        .expect("finalize should succeed");
+    let _ = invoices_finalize_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(invoice_id.clone()),
+    )
+    .await
+    .expect("finalize should succeed");
 
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
     let barrier_a = Arc::clone(&barrier);
@@ -3791,6 +3737,7 @@ async fn invoices_payment_concurrent_requests_allow_single_winner() {
         barrier_a.wait().await;
         invoices_payment_handler(
             State(state_a),
+            owner_principal(),
             Path(invoice_a),
             Json(RecordInvoicePaymentRequest {
                 amount: "80.00".to_string(),
@@ -3809,6 +3756,7 @@ async fn invoices_payment_concurrent_requests_allow_single_winner() {
         barrier_b.wait().await;
         invoices_payment_handler(
             State(state_b),
+            owner_principal(),
             Path(invoice_b),
             Json(RecordInvoicePaymentRequest {
                 amount: "80.00".to_string(),
@@ -3877,6 +3825,7 @@ async fn invoices_payment_concurrent_trust_draw_creates_single_debit_entry() {
 
     let (_, Json(created)) = invoices_save_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(DraftInvoiceRequest {
             matter_id: "demo".to_string(),
             invoice_number: "INV-CONCURRENT-TRUST-1".to_string(),
@@ -3887,12 +3836,17 @@ async fn invoices_payment_concurrent_trust_draw_creates_single_debit_entry() {
     .await
     .expect("save draft");
     let invoice_id = created.invoice.id.clone();
-    let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
-        .await
-        .expect("finalize should succeed");
+    let _ = invoices_finalize_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(invoice_id.clone()),
+    )
+    .await
+    .expect("finalize should succeed");
 
     let _ = matter_trust_deposit_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Json(TrustDepositRequest {
             amount: "100.00".to_string(),
@@ -3911,6 +3865,7 @@ async fn invoices_payment_concurrent_trust_draw_creates_single_debit_entry() {
         barrier_a.wait().await;
         invoices_payment_handler(
             State(state_a),
+            owner_principal(),
             Path(invoice_a),
             Json(RecordInvoicePaymentRequest {
                 amount: "60.00".to_string(),
@@ -3929,6 +3884,7 @@ async fn invoices_payment_concurrent_trust_draw_creates_single_debit_entry() {
         barrier_b.wait().await;
         invoices_payment_handler(
             State(state_b),
+            owner_principal(),
             Path(invoice_b),
             Json(RecordInvoicePaymentRequest {
                 amount: "60.00".to_string(),
@@ -4010,6 +3966,7 @@ async fn invoices_void_rejects_paid_invoice_status() {
 
     let (_status, Json(created)) = invoices_save_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(DraftInvoiceRequest {
             matter_id: "demo".to_string(),
             invoice_number: "INV-PAID-100".to_string(),
@@ -4021,12 +3978,17 @@ async fn invoices_void_rejects_paid_invoice_status() {
     .expect("save draft should succeed");
 
     let invoice_id = created.invoice.id.clone();
-    let _ = invoices_finalize_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
-        .await
-        .expect("finalize should succeed");
+    let _ = invoices_finalize_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(invoice_id.clone()),
+    )
+    .await
+    .expect("finalize should succeed");
 
     let _ = invoices_payment_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path(invoice_id.clone()),
         Json(RecordInvoicePaymentRequest {
             amount: "100.00".to_string(),
@@ -4038,9 +4000,13 @@ async fn invoices_void_rejects_paid_invoice_status() {
     .await
     .expect("payment should succeed");
 
-    let err = invoices_void_handler(State(Arc::clone(&state)), Path(invoice_id.clone()))
-        .await
-        .expect_err("void on paid invoice should fail");
+    let err = invoices_void_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(invoice_id.clone()),
+    )
+    .await
+    .expect_err("void on paid invoice should fail");
     assert_eq!(err.0, StatusCode::CONFLICT);
     assert!(err.1.contains("status 'paid'"));
 
@@ -4143,6 +4109,7 @@ async fn matter_time_create_rejects_non_positive_hours() {
 
     let result = matter_time_create_handler(
         State(state),
+        owner_principal(),
         Path("demo".to_string()),
         Json(CreateTimeEntryRequest {
             timekeeper: "Paralegal".to_string(),
@@ -4174,6 +4141,7 @@ async fn matter_expense_create_rejects_non_positive_amount() {
 
     let result = matter_expenses_create_handler(
         State(state),
+        owner_principal(),
         Path("demo".to_string()),
         Json(CreateExpenseEntryRequest {
             submitted_by: "Associate".to_string(),
@@ -4257,6 +4225,7 @@ async fn matter_time_delete_rejects_billed_entry() {
 
     let billed_delete = matter_time_delete_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path(("demo".to_string(), billed_entry.id.to_string())),
     )
     .await;
@@ -4266,6 +4235,7 @@ async fn matter_time_delete_rejects_billed_entry() {
 
     let unbilled_delete = matter_time_delete_handler(
         State(state),
+        owner_principal(),
         Path(("demo".to_string(), unbilled_entry.id.to_string())),
     )
     .await
@@ -4357,9 +4327,10 @@ async fn matter_time_summary_aggregates_hours_and_expenses() {
         .await
         .expect("mark one expense entry billed");
 
-    let Json(summary) = matter_time_summary_handler(State(state), Path("demo".to_string()))
-        .await
-        .expect("summary handler should succeed");
+    let Json(summary) =
+        matter_time_summary_handler(State(state), owner_principal(), Path("demo".to_string()))
+            .await
+            .expect("summary handler should succeed");
 
     let total_hours = summary
         .total_hours
@@ -4408,6 +4379,7 @@ async fn matter_detail_work_and_finance_endpoints_return_expected_data() {
 
     let _ = matter_tasks_create_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Json(CreateMatterTaskRequest {
             title: "Draft chronology".to_string(),
@@ -4423,6 +4395,7 @@ async fn matter_detail_work_and_finance_endpoints_return_expected_data() {
 
     let _ = matter_notes_create_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Json(CreateMatterNoteRequest {
             author: "Lead".to_string(),
@@ -4435,6 +4408,7 @@ async fn matter_detail_work_and_finance_endpoints_return_expected_data() {
 
     let _ = matter_time_create_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Json(CreateTimeEntryRequest {
             timekeeper: "Lead".to_string(),
@@ -4450,6 +4424,7 @@ async fn matter_detail_work_and_finance_endpoints_return_expected_data() {
 
     let _ = matter_expenses_create_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Json(CreateExpenseEntryRequest {
             submitted_by: "Lead".to_string(),
@@ -4466,6 +4441,7 @@ async fn matter_detail_work_and_finance_endpoints_return_expected_data() {
 
     let _ = matter_trust_deposit_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Path("demo".to_string()),
         Json(TrustDepositRequest {
             amount: "500.00".to_string(),
@@ -4476,40 +4452,59 @@ async fn matter_detail_work_and_finance_endpoints_return_expected_data() {
     .await
     .expect("create trust deposit");
 
-    let Json(tasks) = matter_tasks_list_handler(State(Arc::clone(&state)), Path("demo".into()))
-        .await
-        .expect("list tasks");
+    let Json(tasks) = matter_tasks_list_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".into()),
+    )
+    .await
+    .expect("list tasks");
     assert_eq!(tasks.tasks.len(), 1);
 
-    let Json(notes) = matter_notes_list_handler(State(Arc::clone(&state)), Path("demo".into()))
-        .await
-        .expect("list notes");
+    let Json(notes) = matter_notes_list_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".into()),
+    )
+    .await
+    .expect("list notes");
     assert_eq!(notes.notes.len(), 1);
 
-    let Json(time_entries) =
-        matter_time_list_handler(State(Arc::clone(&state)), Path("demo".into()))
-            .await
-            .expect("list time entries");
+    let Json(time_entries) = matter_time_list_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".into()),
+    )
+    .await
+    .expect("list time entries");
     assert_eq!(time_entries.entries.len(), 1);
 
-    let Json(expense_entries) =
-        matter_expenses_list_handler(State(Arc::clone(&state)), Path("demo".into()))
-            .await
-            .expect("list expense entries");
+    let Json(expense_entries) = matter_expenses_list_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".into()),
+    )
+    .await
+    .expect("list expense entries");
     assert_eq!(expense_entries.entries.len(), 1);
 
-    let Json(summary) = matter_time_summary_handler(State(Arc::clone(&state)), Path("demo".into()))
-        .await
-        .expect("time summary");
+    let Json(summary) = matter_time_summary_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".into()),
+    )
+    .await
+    .expect("time summary");
     let total_hours = summary
         .total_hours
         .parse::<rust_decimal::Decimal>()
         .expect("hours decimal");
     assert_eq!(total_hours, rust_decimal::Decimal::new(125, 2));
 
-    let Json(ledger) = matter_trust_ledger_handler(State(state), Path("demo".into()))
-        .await
-        .expect("trust ledger");
+    let Json(ledger) =
+        matter_trust_ledger_handler(State(state), owner_principal(), Path("demo".into()))
+            .await
+            .expect("trust ledger");
     assert_eq!(ledger.matter_id, "demo");
     assert_eq!(ledger.entries.len(), 1);
 }

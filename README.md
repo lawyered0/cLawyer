@@ -12,6 +12,9 @@
 
 <p align="center">
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
+  <a href="https://github.com/lawyered0/cLawyer/actions/workflows/test.yml"><img src="https://github.com/lawyered0/cLawyer/actions/workflows/test.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/lawyered0/cLawyer/releases/latest"><img src="https://img.shields.io/github/v/release/lawyered0/cLawyer?label=release" alt="Latest Release" /></a>
+  <img src="https://img.shields.io/badge/rust-1.92%2B-orange.svg" alt="Rust 1.92+" />
 </p>
 
 <p align="center">
@@ -24,7 +27,8 @@
   <a href="#configuration">Configuration</a> •
   <a href="#security">Security</a> •
   <a href="#architecture">Architecture</a> •
-  <a href="#roadmap-next-36-months">Roadmap</a>
+  <a href="#roadmap-next-36-months">Roadmap</a> •
+  <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
 ---
@@ -37,14 +41,12 @@ Version 1 defaults to a U.S.-general legal profile with max-lockdown guardrails 
 
 ### Why cLawyer for lawyers
 
-- **No cross-matter leakage by design** - Legal conversations are matter-bound and blocked from cross-matter reuse.
-- **Citations and uncertainty are first-class** - Legal outputs are expected to include source references plus risk/uncertainty sections.
-- **Runs on your infrastructure** - Local-first architecture, firm-controlled secrets, and audit logging without SaaS telemetry.
-
-- **Matter-first by default** - Work is scoped to `matters/<matter_id>/...` with matter metadata and conflict-check hooks
-- **Citation discipline** - Legal outputs require source references and uncertainty/risk sections
-- **Max-lockdown hardening** - Deny-by-default network, approval-gated sensitive actions, and strict write boundaries
-- **Auditability built in** - Append-only legal audit log with hash-chain integrity and security counters
+- **No cross-matter leakage by design** — Legal conversations are matter-bound and blocked from cross-matter reuse.
+- **Citations and uncertainty are first-class** — Legal outputs are expected to include source references plus risk/uncertainty sections.
+- **Runs on your infrastructure** — Local-first architecture, firm-controlled secrets, and audit logging without SaaS telemetry.
+- **Matter-first by default** — Work is scoped to `matters/<matter_id>/...` with matter metadata and conflict-check hooks.
+- **Max-lockdown hardening** — Deny-by-default network, approval-gated sensitive actions, and strict write boundaries.
+- **Auditability built in** — Append-only legal audit log with hash-chain integrity and security counters.
 
 cLawyer is designed for confidential, defensible legal work product on a single-tenant local deployment.
 

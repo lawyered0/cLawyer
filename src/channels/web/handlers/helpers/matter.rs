@@ -12,7 +12,8 @@ use crate::channels::web::state::GatewayState;
 use crate::channels::web::types::*;
 use crate::db::{
     ClientType, CreateClientParams, CreateDocumentVersionParams, CreateMatterDeadlineParams,
-    MatterStatus, UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterParams,
+    MatterMemberRole, MatterStatus, UpsertDocumentTemplateParams, UpsertMatterDocumentParams,
+    UpsertMatterParams,
 };
 use crate::workspace::Workspace;
 
@@ -981,4 +982,47 @@ pub(crate) fn list_matters_root_entries(
         Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => Ok(Vec::new()),
         Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
     }
+}
+
+// ==================== RBAC Guard ====================
+
+/// Role hierarchy rank — higher value = more permissive.
+fn role_rank(role: &MatterMemberRole) -> u8 {
+    match role {
+        MatterMemberRole::Viewer => 1,
+        MatterMemberRole::Collaborator => 2,
+        MatterMemberRole::Owner => 3,
+    }
+}
+
+/// Verify that `requesting_user_id` holds at least `minimum_role` for the matter.
+///
+/// When no store is configured (workspace-only mode), access is always granted
+/// as Owner — there are no other users to gate against.
+///
+/// Returns the effective [`MatterMemberRole`] on success, or an appropriate
+/// HTTP status code (`FORBIDDEN` / `INTERNAL_SERVER_ERROR`) on failure.
+pub async fn require_matter_access(
+    store: &Option<Arc<dyn crate::db::Database>>,
+    matter_owner_user_id: &str,
+    matter_id: &str,
+    requesting_user_id: &str,
+    minimum_role: MatterMemberRole,
+) -> Result<MatterMemberRole, StatusCode> {
+    let Some(store) = store.as_ref() else {
+        // Single-user workspace mode — no other users exist.
+        return Ok(MatterMemberRole::Owner);
+    };
+    let role = store
+        .check_matter_access(matter_owner_user_id, matter_id, requesting_user_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("check_matter_access failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::FORBIDDEN)?;
+    if role_rank(&role) < role_rank(&minimum_role) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(role)
 }

@@ -660,6 +660,83 @@ impl RbacStore for LibSqlBackend {
         }
         Ok(out)
     }
+
+    async fn check_matter_access(
+        &self,
+        matter_owner_user_id: &str,
+        matter_id: &str,
+        requesting_user_id: &str,
+    ) -> Result<Option<MatterMemberRole>, DatabaseError> {
+        if requesting_user_id == matter_owner_user_id {
+            return Ok(Some(MatterMemberRole::Owner));
+        }
+        let conn = self.connect().await?;
+        let row = conn
+            .query(
+                "SELECT role FROM matter_memberships \
+                 WHERE matter_owner_user_id = ?1 AND matter_id = ?2 AND member_user_id = ?3 \
+                 LIMIT 1",
+                params![matter_owner_user_id, matter_id, requesting_user_id],
+            )
+            .await?
+            .next()
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let role_raw = get_text(&row, 0);
+        Ok(Some(parse_matter_member_role(&role_raw)?))
+    }
+
+    async fn remove_matter_membership(
+        &self,
+        matter_owner_user_id: &str,
+        matter_id: &str,
+        member_user_id: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        conn.execute(
+            "DELETE FROM matter_memberships \
+             WHERE matter_owner_user_id = ?1 AND matter_id = ?2 AND member_user_id = ?3",
+            params![matter_owner_user_id, matter_id, member_user_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn update_user_role(
+        &self,
+        user_id: &str,
+        new_role: UserRole,
+    ) -> Result<Option<UserRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        conn.execute(
+            "UPDATE users SET role = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![new_role.as_str(), user_id],
+        )
+        .await?;
+        // SELECT after UPDATE (libSQL has no RETURNING clause).
+        let row = conn
+            .query(
+                "SELECT id, display_name, role, is_active, created_at, updated_at \
+                 FROM users WHERE id = ?1 LIMIT 1",
+                params![user_id],
+            )
+            .await?
+            .next()
+            .await?;
+        row.map(|r| row_to_user_record(&r)).transpose()
+    }
+
+    async fn deactivate_user(&self, user_id: &str) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        conn.execute(
+            "UPDATE users SET is_active = 0, updated_at = datetime('now') WHERE id = ?1",
+            params![user_id],
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]

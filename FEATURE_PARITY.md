@@ -18,7 +18,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 |---------|----------|----------|-------|
 | Hub-and-spoke architecture | ✅ | ✅ | Web gateway as central hub |
 | WebSocket control plane | ✅ | ✅ | Gateway with WebSocket + SSE |
-| Single-user system | ✅ | ✅ | |
+| Single-user system | ✅ | ✅ | Gateway owner is single; matter endpoints support collaborator/viewer roles via RBAC |
 | Multi-agent routing | ✅ | ❌ | Workspace isolation per-agent |
 | Session-based messaging | ✅ | ✅ | Per-sender sessions; legal mode now hard-binds conversations to a single matter |
 | Loopback-first networking | ✅ | ✅ | HTTP binds to 0.0.0.0 but can be configured |
@@ -464,6 +464,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Session file permissions (0o600) | ✅ | ✅ | Session token file set to 0o600 in llm/session.rs |
 | Skill download path restriction | ✅ | ❌ | Prevent arbitrary write targets |
 | Webhook signature verification | ✅ | ✅ | |
+| Matter role-based access control (RBAC) | ❌ | ✅ | IronClaw innovation: Owner/Collaborator/Viewer roles on all matter surfaces (core, work, finance, documents) |
 | Media URL validation | ✅ | ❌ | |
 | Prompt injection defense | ✅ | ✅ | Pattern detection, sanitization |
 | Leak detection | ✅ | ✅ | Secret exfiltration |
