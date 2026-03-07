@@ -32,7 +32,7 @@
 4. cLawyer also injects curated matter memory files when present (`facts.md`, `parties.md`, `strategy.md`, `documents.md`) with strict sanitization/truncation.
 5. Sensitive tool calls are approval-gated in `max_lockdown`.
 6. Memory/file writes are scoped to `matters/<matter_id>/...` when matter context is required.
-7. Output is scanned for leakage and structured citation-format markers.
+7. Generated legal text is still scanned for leakage and citation-format markers, but filing readiness now depends on persisted citation verification results.
 8. Audit events are appended to JSONL with hash-chain links.
 
 ## Matter-Bound Conversations
@@ -108,12 +108,21 @@ For web-first firm workflows, matter detail now includes:
   - lists bundled rule metadata (citation, deadline type, offset, court-day behavior).
 - `POST /api/matters/{id}/filing-package`
   - writes a matter-local filing package index to `matters/<id>/exports/`.
+  - hard-blocks export when any DB-backed `pleading` or `filing` document for the matter is not `ready_to_file`.
 - `GET /api/matters/{id}/documents`
   - DB-backed matter document index linked to `memory_documents` (workspace backfill for legacy files).
 - `GET /api/matters/{id}/templates`
   - DB-backed template list (workspace templates are backfilled for compatibility).
 - `POST /api/documents/generate`
   - renders a DB template with matter/client context, writes a draft document, links it to the matter, and records a version row.
+  - generated matter documents start in `draft` readiness.
+- `POST /api/matters/{id}/citations/verify`
+  - extracts reporter-style citations from a matter document, verifies them through the provider abstraction, persists the verification run/results, and updates document readiness.
+  - CourtListener is the first provider in this phase; attorney waivers are persisted with actor, reason, and timestamp.
+- `GET /api/documents/{id}/citations`
+  - returns extracted citations, the latest verification run, stored results, and the current document readiness state.
+- `POST /api/documents/{id}/ready`
+  - marks a document `ready_to_file` only when the latest verification run matches the current document hash and every extracted citation is verified or waived.
 - `POST /api/matters/conflict-check`
   - runs intake-time conflict review against the DB-backed party graph and returns structured `ConflictHit` rows.
 - `POST /api/matters`
@@ -123,6 +132,36 @@ For web-first firm workflows, matter detail now includes:
   - request supports optional `conflict_decision` (`clear|waived|declined`) + `conflict_note` (required for `waived`/`declined`) to persist review decisions.
 - `POST /api/matters/conflicts/reindex`
   - rebuilds DB conflict graph from `matters/*/matter.yaml` plus workspace `conflicts.json`.
+- `GET /api/matters/{id}/parties`
+  - lists structured DB-backed matter parties, bootstrapping from `matter.yaml` when the matter has not been reviewed yet.
+- `POST /api/matters/{id}/parties`
+  - records manually reviewed parties with role, aliases, notes, and optional open/close timestamps.
+- `POST /api/matters/{id}/parties/relationships`
+  - records affiliate/principal/opposing-counsel style party relationships used during conflict traversal.
+- `GET /api/matters/{id}/conflicts/report`
+  - returns a structured conflict report with checked parties, relationship rows, detailed hits, and the latest clearance record.
+- `POST /api/matters/{id}/conflicts/clearance`
+  - records signed attorney review decisions with reviewer identity, report hash, note, and hit snapshot.
+- `GET /api/trust/account`
+  - returns the primary deployment trust account and current account-level book balance.
+- `PUT /api/trust/account`
+  - configures or updates the primary trust account (Phase 1 assumes one primary IOLTA/trust account per deployment).
+- `POST /api/trust/statements/import`
+  - imports canonical CSV bank statements with columns `date`, `description`, `debit`, `credit`, `balance`, and optional `reference`.
+- `POST /api/trust/reconciliations/compute`
+  - computes and persists three-way reconciliation between the imported statement balance, account book balance, and summed client/matter trust balances.
+- `POST /api/trust/reconciliations/{id}/signoff`
+  - signs off a computed reconciliation and produces examiner-readable report content.
+- `GET /api/matters/{id}/trust/ledger`
+  - returns the matter ledger, account summary, and latest reconciliation status for the primary trust account.
+- `GET /api/billing/rates`
+  - lists effective-dated billing rate schedules.
+- `POST /api/billing/rates`
+  - creates a billing rate schedule. Resolution precedence is matter override, then timekeeper default, then explicit per-entry manual rate.
+- `PATCH /api/billing/rates/{id}`
+  - updates an existing billing rate schedule without rewriting historical invoice line-item snapshots.
+- `GET /api/invoices/{id}/ledes?format=98b`
+  - exports the invoice as LEDES98B with UTBMS task/activity codes and snapshot billing-rate data.
 - `POST /api/matters/{id}/exports/retrieval-packet`
   - generates matter-local CSV + plain-English retrieval artifacts for AI workflows under `matters/<id>/exports/retrieval/<timestamp>/`.
 
@@ -150,6 +189,7 @@ CLI parity:
 - Chat conflict checks are DB-first. Fallback to workspace-global `conflicts.json` is controlled by `legal.conflict_file_fallback_enabled`.
 - Startup can auto-reindex DB conflict graph from workspace (`legal.conflict_reindex_on_startup = true`).
 - Existing `POST /api/matters/conflicts/check` remains for compatibility and now uses the same DB-first path plus fallback.
+- Structured matter conflict review now persists manual parties, aliases, relationships, and signed clearance records; workspace data is bootstrap input, not the authoritative review record.
 - Matching remains normalized/boundary-aware and heuristic; short aliases are intentionally ignored to reduce false positives.
 
 ## Deadline Reminder Notes
@@ -160,13 +200,20 @@ CLI parity:
 
 ## Citation Check Limits
 
-- Citation enforcement checks for structured citation formats in generated text.
-- This check does not verify the truth, existence, or legal validity of cited sources.
+- Generated text is still scanned for structured citation formats, but filing readiness is gated on stored citation verification results rather than regex markers alone.
+- Phase 1 ships a provider abstraction with CourtListener as the only concrete adapter.
+- Attorney waivers are supported and fully audited, but they do not make a document `ready_to_file` until the explicit ready transition is recorded.
+- Verification quality still depends on provider coverage and API availability; this phase does not integrate Westlaw or Lexis.
+
+## Trust Accounting Limits
+
+- Phase 1 assumes one primary trust account per deployment.
+- Statement import is canonical CSV only; OFX/QFX/PDF parsing is out of scope for this phase.
+- Matter/client trust ledgers are filtered views over the account ledger rather than separate ledgers with independent balances.
 
 ## Deferred Architecture Items
 
 - Self-repair stuck-job handling is still attempt-count based; time-threshold stuck detection is not implemented yet.
-- Conflict checks do not yet traverse `party_relationships` recursively for affiliate/corporate-family logic.
 - Per-matter encryption-at-rest for workspace files remains a follow-up phase.
 
 ## Bundled Legal Skills
@@ -200,7 +247,9 @@ Audit log events include:
 - explicit approval decision events (`approval_decision`)
 - matter lifecycle events (`matter_created`, `matter_closed`)
 - billing/trust events (`invoice_finalized`, `payment_recorded`, `trust_deposit`, `trust_withdrawal_rejected`)
+- trust reconciliation events (`trust_statement_imported`, `trust_reconciliation_computed`, `trust_reconciliation_signed_off`)
 - conflict system events (`conflict_detected`, `conflict_graph_reindexed`)
+- citation workflow events (`document_citations_verified`, `document_marked_ready`)
 
 Counters tracked in audit state:
 

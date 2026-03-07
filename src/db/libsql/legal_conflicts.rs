@@ -1,17 +1,20 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use libsql::params;
 use uuid::Uuid;
 
 use crate::db::{
-    ConflictClearanceInfo, ConflictClearanceRecord, ConflictDecision, ConflictHit,
-    LegalConflictStore, PartyRole, conflict_terms_from_text, normalize_party_name,
-    trigram_similarity,
+    ConflictClearanceInfo, ConflictClearanceRecord, ConflictClearanceStatus, ConflictDecision,
+    ConflictHit, CreatePartyRelationshipParams, LegalConflictStore, MatterPartyRecord,
+    PartyRelationshipRecord, PartyRole, UpsertMatterPartyParams, conflict_terms_from_text,
+    normalize_party_name, trigram_similarity,
 };
 use crate::error::DatabaseError;
 
-use super::{LibSqlBackend, get_i64, get_opt_text, get_text, opt_text, parse_timestamp};
+use super::{
+    LibSqlBackend, get_i64, get_opt_text, get_text, opt_text, opt_text_owned, parse_timestamp,
+};
 
 fn match_priority(matched_via: &str) -> u8 {
     if matched_via == "direct" {
@@ -59,27 +62,21 @@ fn parse_opened_at_text(raw: Option<&str>) -> Result<Option<String>, DatabaseErr
     )))
 }
 
-fn dedupe_hits(
-    rows: Vec<(String, String, String, String, String, f64)>,
-    limit: usize,
-) -> Vec<ConflictHit> {
-    let mut best: std::collections::HashMap<(String, String, String), (u8, f64, ConflictHit)> =
-        std::collections::HashMap::new();
+fn parse_uuid(raw: &str, field: &str) -> Result<Uuid, DatabaseError> {
+    Uuid::parse_str(raw)
+        .map_err(|e| DatabaseError::Serialization(format!("invalid {field} uuid: {e}")))
+}
 
-    for (party, role_raw, matter_id, matter_status, matched_via, score) in rows {
-        let Some(role) = PartyRole::from_db_value(&role_raw) else {
-            continue;
-        };
+fn dedupe_hits(rows: Vec<(ConflictHit, f64)>, limit: usize) -> Vec<ConflictHit> {
+    let mut best: HashMap<(String, String, String), (u8, f64, ConflictHit)> = HashMap::new();
 
-        let key = (party.clone(), role_raw, matter_id.clone());
-        let hit = ConflictHit {
-            party,
-            role,
-            matter_id,
-            matter_status,
-            matched_via: matched_via.clone(),
-        };
-        let priority = match_priority(&matched_via);
+    for (hit, score) in rows {
+        let key = (
+            hit.party.clone(),
+            hit.role.as_str().to_string(),
+            hit.matter_id.clone(),
+        );
+        let priority = match_priority(&hit.matched_via);
 
         match best.get(&key) {
             Some((existing_priority, existing_score, _))
@@ -102,6 +99,26 @@ fn dedupe_hits(
         hits.truncate(limit);
     }
     hits
+}
+
+fn build_hit(
+    party: String,
+    role: PartyRole,
+    matter_id: String,
+    matter_status: String,
+    matched_via: String,
+    relationship_path: Vec<String>,
+) -> ConflictHit {
+    ConflictHit {
+        party,
+        role,
+        matter_id,
+        matter_status,
+        matched_via,
+        relationship_path,
+        clearance_status: ConflictClearanceStatus::Unreviewed,
+        latest_clearance: None,
+    }
 }
 
 async fn upsert_party_libsql_with_conn(
@@ -186,6 +203,154 @@ async fn upsert_party_aliases_with_conn(
     Ok(())
 }
 
+async fn party_aliases_with_conn(
+    conn: &libsql::Connection,
+    party_id: &str,
+) -> Result<Vec<String>, DatabaseError> {
+    let mut rows = conn
+        .query(
+            "SELECT alias FROM party_aliases WHERE party_id = ?1 ORDER BY alias_normalized ASC",
+            params![party_id],
+        )
+        .await?;
+    let mut aliases = Vec::new();
+    while let Some(row) = rows.next().await? {
+        aliases.push(get_text(&row, 0));
+    }
+    Ok(aliases)
+}
+
+async fn relationship_paths_with_conn(
+    conn: &libsql::Connection,
+    start_party_id: &str,
+    start_party_name: &str,
+    max_depth: usize,
+) -> Result<Vec<(String, Vec<String>)>, DatabaseError> {
+    let mut queue: VecDeque<(String, Vec<String>, usize)> = VecDeque::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+
+    queue.push_back((
+        start_party_id.to_string(),
+        vec![start_party_name.to_string()],
+        0,
+    ));
+    visited.insert(start_party_id.to_string());
+
+    while let Some((current_id, path, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+
+        let mut rows = conn
+            .query(
+                "SELECT pr.child_id, child.name, pr.kind \
+                 FROM party_relationships pr \
+                 JOIN parties child ON child.id = pr.child_id \
+                 WHERE pr.parent_id = ?1 \
+                 UNION ALL \
+                 SELECT pr.parent_id, parent.name, ('reverse:' || pr.kind) \
+                 FROM party_relationships pr \
+                 JOIN parties parent ON parent.id = pr.parent_id \
+                 WHERE pr.child_id = ?1",
+                params![current_id.as_str()],
+            )
+            .await?;
+
+        while let Some(row) = rows.next().await? {
+            let neighbor_id = get_text(&row, 0);
+            if !visited.insert(neighbor_id.clone()) {
+                continue;
+            }
+            let neighbor_name = get_text(&row, 1);
+            let kind = get_text(&row, 2);
+            let mut next_path = path.clone();
+            next_path.push(kind);
+            next_path.push(neighbor_name.clone());
+            out.push((neighbor_id.clone(), next_path.clone()));
+            queue.push_back((neighbor_id, next_path, depth + 1));
+        }
+    }
+
+    Ok(out)
+}
+
+async fn matter_party_record_by_membership_id(
+    conn: &libsql::Connection,
+    membership_id: &str,
+) -> Result<MatterPartyRecord, DatabaseError> {
+    let row = conn
+        .query(
+            "SELECT mp.id, mp.matter_id, p.id, p.name, COALESCE(mp.role_detail, mp.role) AS role_name, \
+                    p.notes, mp.opened_at, mp.closed_at, mp.created_at, mp.updated_at \
+             FROM matter_parties mp \
+             JOIN parties p ON p.id = mp.party_id \
+             WHERE mp.id = ?1 \
+             LIMIT 1",
+            params![membership_id],
+        )
+        .await?
+        .next()
+        .await?
+        .ok_or_else(|| DatabaseError::Query("failed to load matter party".to_string()))?;
+    let role_name = get_text(&row, 4);
+    let role = PartyRole::from_db_value(&role_name)
+        .ok_or_else(|| DatabaseError::Serialization(format!("invalid party role '{role_name}'")))?;
+    let party_id = get_text(&row, 2);
+    Ok(MatterPartyRecord {
+        id: parse_uuid(&get_text(&row, 0), "matter_parties.id")?,
+        matter_id: get_text(&row, 1),
+        party_id: parse_uuid(&party_id, "matter_parties.party_id")?,
+        name: get_text(&row, 3),
+        role,
+        aliases: party_aliases_with_conn(conn, &party_id).await?,
+        notes: get_opt_text(&row, 5),
+        opened_at: get_opt_text(&row, 6)
+            .map(|value| parse_timestamp(&value))
+            .transpose()
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+        closed_at: get_opt_text(&row, 7)
+            .map(|value| parse_timestamp(&value))
+            .transpose()
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+        created_at: parse_timestamp(&get_text(&row, 8))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+        updated_at: parse_timestamp(&get_text(&row, 9))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+    })
+}
+
+async fn relationship_record_by_id(
+    conn: &libsql::Connection,
+    relationship_id: &str,
+) -> Result<PartyRelationshipRecord, DatabaseError> {
+    let row = conn
+        .query(
+            "SELECT pr.id, pr.parent_id, parent.name, pr.child_id, child.name, pr.kind, pr.created_at, pr.updated_at \
+             FROM party_relationships pr \
+             JOIN parties parent ON parent.id = pr.parent_id \
+             JOIN parties child ON child.id = pr.child_id \
+             WHERE pr.id = ?1 LIMIT 1",
+            params![relationship_id],
+        )
+        .await?
+        .next()
+        .await?
+        .ok_or_else(|| DatabaseError::Query("failed to load party relationship".to_string()))?;
+    Ok(PartyRelationshipRecord {
+        id: parse_uuid(&get_text(&row, 0), "party_relationships.id")?,
+        parent_party_id: parse_uuid(&get_text(&row, 1), "party_relationships.parent_id")?,
+        parent_name: get_text(&row, 2),
+        child_party_id: parse_uuid(&get_text(&row, 3), "party_relationships.child_id")?,
+        child_name: get_text(&row, 4),
+        kind: get_text(&row, 5),
+        created_at: parse_timestamp(&get_text(&row, 6))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+        updated_at: parse_timestamp(&get_text(&row, 7))
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+    })
+}
+
 #[async_trait::async_trait]
 impl LegalConflictStore for LibSqlBackend {
     async fn find_conflict_hits_for_names(
@@ -200,12 +365,13 @@ impl LegalConflictStore for LibSqlBackend {
 
         let limit = limit.min(200);
         let conn = self.connect().await?;
-        let mut rows: Vec<(String, String, String, String, String, f64)> = Vec::new();
+        let mut rows: Vec<(ConflictHit, f64)> = Vec::new();
+        let mut seed_parties: HashMap<String, String> = HashMap::new();
 
         for term in &terms {
             let mut direct_rows = conn
                 .query(
-                    "SELECT p.name, mp.role, mp.matter_id, \
+                    "SELECT p.id, p.name, COALESCE(mp.role_detail, mp.role), mp.matter_id, \
                             CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
                             'direct' AS matched_via \
                      FROM parties p \
@@ -216,19 +382,29 @@ impl LegalConflictStore for LibSqlBackend {
                 )
                 .await?;
             while let Some(row) = direct_rows.next().await? {
+                let party_id = get_text(&row, 0);
+                let party_name = get_text(&row, 1);
+                let role_name = get_text(&row, 2);
+                let Some(role) = PartyRole::from_db_value(&role_name) else {
+                    continue;
+                };
+                seed_parties.insert(party_id, party_name.clone());
                 rows.push((
-                    get_text(&row, 0),
-                    get_text(&row, 1),
-                    get_text(&row, 2),
-                    get_text(&row, 3),
-                    get_text(&row, 4),
+                    build_hit(
+                        party_name,
+                        role,
+                        get_text(&row, 3),
+                        get_text(&row, 4),
+                        get_text(&row, 5),
+                        Vec::new(),
+                    ),
                     1.0,
                 ));
             }
 
             let mut alias_rows = conn
                 .query(
-                    "SELECT p.name, mp.role, mp.matter_id, \
+                    "SELECT p.id, p.name, COALESCE(mp.role_detail, mp.role), mp.matter_id, \
                             CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
                             ('alias:' || pa.alias) AS matched_via \
                      FROM party_aliases pa \
@@ -240,12 +416,22 @@ impl LegalConflictStore for LibSqlBackend {
                 )
                 .await?;
             while let Some(row) = alias_rows.next().await? {
+                let party_id = get_text(&row, 0);
+                let party_name = get_text(&row, 1);
+                let role_name = get_text(&row, 2);
+                let Some(role) = PartyRole::from_db_value(&role_name) else {
+                    continue;
+                };
+                seed_parties.insert(party_id, party_name.clone());
                 rows.push((
-                    get_text(&row, 0),
-                    get_text(&row, 1),
-                    get_text(&row, 2),
-                    get_text(&row, 3),
-                    get_text(&row, 4),
+                    build_hit(
+                        party_name,
+                        role,
+                        get_text(&row, 3),
+                        get_text(&row, 4),
+                        get_text(&row, 5),
+                        Vec::new(),
+                    ),
                     0.9,
                 ));
             }
@@ -266,7 +452,7 @@ impl LegalConflictStore for LibSqlBackend {
                 let like_term = format!("%{}%", token);
                 let mut fuzzy_party_rows = conn
                     .query(
-                        "SELECT p.name, p.name_normalized, mp.role, mp.matter_id, \
+                        "SELECT p.id, p.name, p.name_normalized, COALESCE(mp.role_detail, mp.role), mp.matter_id, \
                                 CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status \
                          FROM parties p \
                          JOIN matter_parties mp ON mp.party_id = p.id \
@@ -276,15 +462,25 @@ impl LegalConflictStore for LibSqlBackend {
                     )
                     .await?;
                 while let Some(row) = fuzzy_party_rows.next().await? {
-                    let normalized = get_text(&row, 1);
+                    let normalized = get_text(&row, 2);
                     let score = trigram_similarity(&normalized, term);
                     if score >= 0.45 {
+                        let party_id = get_text(&row, 0);
+                        let party_name = get_text(&row, 1);
+                        let role_name = get_text(&row, 3);
+                        let Some(role) = PartyRole::from_db_value(&role_name) else {
+                            continue;
+                        };
+                        seed_parties.insert(party_id, party_name.clone());
                         rows.push((
-                            get_text(&row, 0),
-                            get_text(&row, 2),
-                            get_text(&row, 3),
-                            get_text(&row, 4),
-                            format!("fuzzy:{term}"),
+                            build_hit(
+                                party_name,
+                                role,
+                                get_text(&row, 4),
+                                get_text(&row, 5),
+                                format!("fuzzy:{term}"),
+                                Vec::new(),
+                            ),
                             score,
                         ));
                     }
@@ -292,7 +488,7 @@ impl LegalConflictStore for LibSqlBackend {
 
                 let mut fuzzy_alias_rows = conn
                     .query(
-                        "SELECT p.name, pa.alias_normalized, mp.role, mp.matter_id, \
+                        "SELECT p.id, p.name, pa.alias_normalized, COALESCE(mp.role_detail, mp.role), mp.matter_id, \
                                 CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status \
                          FROM party_aliases pa \
                          JOIN parties p ON p.id = pa.party_id \
@@ -303,18 +499,67 @@ impl LegalConflictStore for LibSqlBackend {
                     )
                     .await?;
                 while let Some(row) = fuzzy_alias_rows.next().await? {
-                    let normalized = get_text(&row, 1);
+                    let normalized = get_text(&row, 2);
                     let score = trigram_similarity(&normalized, term);
                     if score >= 0.45 {
+                        let party_id = get_text(&row, 0);
+                        let party_name = get_text(&row, 1);
+                        let role_name = get_text(&row, 3);
+                        let Some(role) = PartyRole::from_db_value(&role_name) else {
+                            continue;
+                        };
+                        seed_parties.insert(party_id, party_name.clone());
                         rows.push((
-                            get_text(&row, 0),
-                            get_text(&row, 2),
-                            get_text(&row, 3),
-                            get_text(&row, 4),
-                            format!("fuzzy:{term}"),
+                            build_hit(
+                                party_name,
+                                role,
+                                get_text(&row, 4),
+                                get_text(&row, 5),
+                                format!("fuzzy:{term}"),
+                                Vec::new(),
+                            ),
                             score,
                         ));
                     }
+                }
+            }
+        }
+
+        for (party_id, party_name) in seed_parties {
+            for (related_party_id, relationship_path) in
+                relationship_paths_with_conn(&conn, &party_id, &party_name, 3).await?
+            {
+                let mut relationship_rows = conn
+                    .query(
+                        "SELECT p.name, COALESCE(mp.role_detail, mp.role), mp.matter_id, \
+                                CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status \
+                         FROM matter_parties mp \
+                         JOIN parties p ON p.id = mp.party_id \
+                         WHERE mp.party_id = ?1 \
+                         LIMIT ?2",
+                        params![related_party_id.as_str(), limit as i64],
+                    )
+                    .await?;
+                while let Some(row) = relationship_rows.next().await? {
+                    let role_name = get_text(&row, 1);
+                    let Some(role) = PartyRole::from_db_value(&role_name) else {
+                        continue;
+                    };
+                    let matched_via = relationship_path
+                        .get(1)
+                        .map(|segment| format!("relationship:{segment}"))
+                        .unwrap_or_else(|| "relationship".to_string());
+                    rows.push((
+                        build_hit(
+                            get_text(&row, 0),
+                            role,
+                            get_text(&row, 2),
+                            get_text(&row, 3),
+                            matched_via,
+                            relationship_path.clone(),
+                        ),
+                        0.8,
+                    ));
                 }
             }
         }
@@ -514,8 +759,8 @@ impl LegalConflictStore for LibSqlBackend {
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
         conn.execute(
             "INSERT INTO conflict_clearances \
-             (id, matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))",
+             (id, matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count, reviewing_attorney, report_hash, signed_at, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))",
             params![
                 Uuid::new_v4().to_string(),
                 row.matter_id.as_str(),
@@ -525,6 +770,11 @@ impl LegalConflictStore for LibSqlBackend {
                 opt_text(row.note.as_deref()),
                 hits_json,
                 row.hit_count,
+                opt_text(row.reviewing_attorney.as_deref()),
+                opt_text(row.report_hash.as_deref()),
+                opt_text_owned(row.signed_at.as_ref().map(|value| {
+                    value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                })),
             ],
         )
         .await?;
@@ -538,7 +788,7 @@ impl LegalConflictStore for LibSqlBackend {
         let conn = self.connect().await?;
         let mut rows = conn
             .query(
-                "SELECT matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count, created_at \
+                "SELECT matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count, reviewing_attorney, report_hash, signed_at, created_at \
                  FROM conflict_clearances \
                  WHERE matter_id = ?1 \
                  ORDER BY created_at DESC, rowid DESC \
@@ -555,7 +805,7 @@ impl LegalConflictStore for LibSqlBackend {
             .ok_or_else(|| DatabaseError::Serialization("invalid conflict decision".to_string()))?;
         let hits_json: serde_json::Value = serde_json::from_str(&get_text(&row, 5))
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-        let created_at = parse_timestamp(&get_text(&row, 7))
+        let created_at = parse_timestamp(&get_text(&row, 10))
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
         Ok(Some(ConflictClearanceInfo {
@@ -566,8 +816,202 @@ impl LegalConflictStore for LibSqlBackend {
             note: get_opt_text(&row, 4),
             hits_json,
             hit_count: get_i64(&row, 6) as i32,
+            reviewing_attorney: get_opt_text(&row, 7),
+            report_hash: get_opt_text(&row, 8),
+            signed_at: get_opt_text(&row, 9)
+                .map(|value| parse_timestamp(&value))
+                .transpose()
+                .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
             created_at,
         }))
+    }
+
+    async fn list_matter_parties(
+        &self,
+        matter_id: &str,
+    ) -> Result<Vec<MatterPartyRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT mp.id \
+                 FROM matter_parties mp \
+                 JOIN parties p ON p.id = mp.party_id \
+                 WHERE mp.matter_id = ?1 \
+                 ORDER BY p.name_normalized ASC, mp.created_at ASC",
+                params![matter_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(matter_party_record_by_membership_id(&conn, &get_text(&row, 0)).await?);
+        }
+        Ok(out)
+    }
+
+    async fn upsert_matter_party(
+        &self,
+        matter_id: &str,
+        input: &UpsertMatterPartyParams,
+    ) -> Result<MatterPartyRecord, DatabaseError> {
+        let conn = self.connect().await?;
+        conn.execute("BEGIN", ()).await?;
+
+        let op_result: Result<String, DatabaseError> = async {
+            let Some(party_id) = upsert_party_libsql_with_conn(&conn, &input.name).await? else {
+                return Err(DatabaseError::Serialization(
+                    "matter party name cannot be empty".to_string(),
+                ));
+            };
+            if let Some(notes) = input.notes.as_deref() {
+                conn.execute(
+                    "UPDATE parties SET notes = ?2, updated_at = datetime('now') WHERE id = ?1",
+                    params![party_id.as_str(), notes],
+                )
+                .await?;
+            }
+            let membership_id = Uuid::new_v4().to_string();
+            let opened_at = input
+                .opened_at
+                .as_ref()
+                .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+            let closed_at = input
+                .closed_at
+                .as_ref()
+                .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+            conn.execute(
+                "INSERT INTO matter_parties \
+                 (id, matter_id, party_id, role, role_detail, opened_at, closed_at, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), datetime('now')) \
+                 ON CONFLICT(matter_id, party_id, role) DO UPDATE SET \
+                   role_detail = excluded.role_detail, \
+                   opened_at = COALESCE(excluded.opened_at, matter_parties.opened_at), \
+                   closed_at = excluded.closed_at, \
+                   updated_at = datetime('now')",
+                params![
+                    membership_id.as_str(),
+                    matter_id,
+                    party_id.as_str(),
+                    input.role.base_db_role(),
+                    opt_text(input.role.role_detail()),
+                    opt_text_owned(opened_at),
+                    opt_text_owned(closed_at),
+                ],
+            )
+            .await?;
+            upsert_party_aliases_with_conn(&conn, party_id.as_str(), &input.aliases).await?;
+            let row = conn
+                .query(
+                    "SELECT id FROM matter_parties WHERE matter_id = ?1 AND party_id = ?2 AND role = ?3 LIMIT 1",
+                    params![matter_id, party_id.as_str(), input.role.base_db_role()],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_else(|| DatabaseError::Query("failed to resolve matter party".to_string()))?;
+            Ok(get_text(&row, 0))
+        }
+        .await;
+
+        match op_result {
+            Ok(membership_id) => {
+                conn.execute("COMMIT", ()).await?;
+                matter_party_record_by_membership_id(&conn, &membership_id).await
+            }
+            Err(err) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn list_matter_party_relationships(
+        &self,
+        matter_id: &str,
+    ) -> Result<Vec<PartyRelationshipRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT DISTINCT pr.id \
+                 FROM party_relationships pr \
+                 JOIN matter_parties parent_mp ON parent_mp.party_id = pr.parent_id \
+                 LEFT JOIN matter_parties child_mp ON child_mp.party_id = pr.child_id \
+                 WHERE parent_mp.matter_id = ?1 OR child_mp.matter_id = ?1 \
+                 ORDER BY pr.kind ASC",
+                params![matter_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(relationship_record_by_id(&conn, &get_text(&row, 0)).await?);
+        }
+        Ok(out)
+    }
+
+    async fn upsert_party_relationship(
+        &self,
+        input: &CreatePartyRelationshipParams,
+    ) -> Result<PartyRelationshipRecord, DatabaseError> {
+        let conn = self.connect().await?;
+        conn.execute("BEGIN", ()).await?;
+        let op_result: Result<String, DatabaseError> = async {
+            let parent_id = match input.parent_party_id {
+                Some(id) => id.to_string(),
+                None => {
+                    let name = input.parent_name.as_deref().ok_or_else(|| {
+                        DatabaseError::Serialization("parent_name is required".to_string())
+                    })?;
+                    upsert_party_libsql_with_conn(&conn, name)
+                        .await?
+                        .ok_or_else(|| {
+                            DatabaseError::Serialization("parent_name cannot be empty".to_string())
+                        })?
+                }
+            };
+            let child_id = match input.child_party_id {
+                Some(id) => id.to_string(),
+                None => {
+                    let name = input.child_name.as_deref().ok_or_else(|| {
+                        DatabaseError::Serialization("child_name is required".to_string())
+                    })?;
+                    upsert_party_libsql_with_conn(&conn, name)
+                        .await?
+                        .ok_or_else(|| {
+                            DatabaseError::Serialization("child_name cannot be empty".to_string())
+                        })?
+                }
+            };
+            let relationship_id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO party_relationships \
+                 (id, parent_id, child_id, kind, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now')) \
+                 ON CONFLICT(parent_id, child_id, kind) DO UPDATE SET updated_at = datetime('now')",
+                params![relationship_id.as_str(), parent_id.as_str(), child_id.as_str(), input.kind.as_str()],
+            )
+            .await?;
+            let row = conn
+                .query(
+                    "SELECT id FROM party_relationships WHERE parent_id = ?1 AND child_id = ?2 AND kind = ?3 LIMIT 1",
+                    params![parent_id.as_str(), child_id.as_str(), input.kind.as_str()],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_else(|| DatabaseError::Query("failed to resolve party relationship".to_string()))?;
+            Ok(get_text(&row, 0))
+        }
+        .await;
+
+        match op_result {
+            Ok(relationship_id) => {
+                conn.execute("COMMIT", ()).await?;
+                relationship_record_by_id(&conn, &relationship_id).await
+            }
+            Err(err) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(err)
+            }
+        }
     }
 }
 
@@ -1016,6 +1460,9 @@ mod tests {
                 note: Some("initial waiver".to_string()),
                 hits_json: serde_json::json!([{ "party": "Acme" }]),
                 hit_count: 1,
+                reviewing_attorney: Some("reviewer-a".to_string()),
+                report_hash: Some("sha256:test-a".to_string()),
+                signed_at: Some(Utc::now()),
             })
             .await
             .expect("insert first clearance");
@@ -1030,6 +1477,9 @@ mod tests {
                 note: Some("superseding decline".to_string()),
                 hits_json: serde_json::json!([{ "party": "Acme" }]),
                 hit_count: 1,
+                reviewing_attorney: Some("reviewer-b".to_string()),
+                report_hash: Some("sha256:test-b".to_string()),
+                signed_at: None,
             })
             .await
             .expect("insert second clearance");

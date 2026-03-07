@@ -429,8 +429,14 @@ pub struct TimeEntryInfo {
     pub description: String,
     pub hours: String,
     pub hourly_rate: Option<String>,
+    pub task_code: Option<String>,
+    pub activity_code: Option<String>,
+    pub resolved_rate: Option<String>,
+    pub rate_source: Option<String>,
     pub entry_date: String,
     pub billable: bool,
+    pub block_billing_flag: bool,
+    pub block_billing_reason: Option<String>,
     pub billed_invoice_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -448,9 +454,17 @@ pub struct CreateTimeEntryRequest {
     pub hours: String,
     #[serde(default)]
     pub hourly_rate: Option<String>,
+    #[serde(default)]
+    pub task_code: Option<String>,
+    #[serde(default)]
+    pub activity_code: Option<String>,
     pub entry_date: String,
     #[serde(default)]
     pub billable: Option<bool>,
+    #[serde(default)]
+    pub block_billing_flag: Option<bool>,
+    #[serde(default)]
+    pub block_billing_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -464,9 +478,17 @@ pub struct UpdateTimeEntryRequest {
     #[serde(default)]
     pub hourly_rate: Option<Option<String>>,
     #[serde(default)]
+    pub task_code: Option<Option<String>>,
+    #[serde(default)]
+    pub activity_code: Option<Option<String>>,
+    #[serde(default)]
     pub entry_date: Option<String>,
     #[serde(default)]
     pub billable: Option<bool>,
+    #[serde(default)]
+    pub block_billing_flag: Option<bool>,
+    #[serde(default)]
+    pub block_billing_reason: Option<Option<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -539,6 +561,11 @@ pub struct InvoiceLineItemInfo {
     pub amount: String,
     pub time_entry_id: Option<String>,
     pub expense_entry_id: Option<String>,
+    pub task_code: Option<String>,
+    pub activity_code: Option<String>,
+    pub timekeeper: Option<String>,
+    pub resolved_rate: Option<String>,
+    pub rate_source: Option<String>,
     pub sort_order: i32,
 }
 
@@ -616,26 +643,176 @@ pub struct TrustDepositRequest {
     pub recorded_by: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub reference_number: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct TrustLedgerEntryInfo {
     pub id: String,
     pub matter_id: String,
+    pub trust_account_id: Option<String>,
     pub entry_type: String,
     pub amount: String,
+    pub delta: String,
     pub balance_after: String,
     pub description: String,
+    pub reference_number: Option<String>,
+    pub source: String,
     pub invoice_id: Option<String>,
     pub recorded_by: String,
     pub created_at: String,
 }
 
 #[derive(Debug, Serialize)]
+pub struct TrustAccountInfo {
+    pub id: String,
+    pub name: String,
+    pub bank_name: Option<String>,
+    pub account_number_last4: Option<String>,
+    pub is_primary: bool,
+    pub current_balance: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateTrustAccountRequest {
+    pub name: String,
+    #[serde(default)]
+    pub bank_name: Option<String>,
+    #[serde(default)]
+    pub account_number_last4: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrustStatementImportInfo {
+    pub id: String,
+    pub trust_account_id: String,
+    pub statement_date: String,
+    pub starting_balance: String,
+    pub ending_balance: String,
+    pub imported_by: String,
+    pub row_count: i32,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrustStatementLineInfo {
+    pub id: String,
+    pub entry_date: String,
+    pub description: String,
+    pub debit: String,
+    pub credit: String,
+    pub running_balance: String,
+    pub reference_number: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportTrustStatementRequest {
+    pub imported_by: String,
+    #[serde(default)]
+    pub statement_date: Option<String>,
+    pub csv: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportTrustStatementResponse {
+    pub statement: TrustStatementImportInfo,
+    pub lines: Vec<TrustStatementLineInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrustReconciliationInfo {
+    pub id: String,
+    pub trust_account_id: String,
+    pub statement_import_id: String,
+    pub statement_ending_balance: String,
+    pub book_balance: String,
+    pub client_balance_total: String,
+    pub difference: String,
+    pub exceptions_json: serde_json::Value,
+    pub status: String,
+    pub signed_off_by: Option<String>,
+    pub signed_off_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub report_markdown: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ComputeTrustReconciliationRequest {
+    pub statement_import_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SignoffTrustReconciliationRequest {
+    pub signed_off_by: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct TrustLedgerResponse {
     pub matter_id: String,
     pub balance: String,
+    pub account: Option<TrustAccountInfo>,
+    pub account_balance: Option<String>,
+    pub latest_reconciliation: Option<TrustReconciliationInfo>,
     pub entries: Vec<TrustLedgerEntryInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BillingRateScheduleInfo {
+    pub id: String,
+    pub matter_id: Option<String>,
+    pub timekeeper: String,
+    pub rate: String,
+    pub effective_start: String,
+    pub effective_end: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BillingRateSchedulesResponse {
+    pub schedules: Vec<BillingRateScheduleInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateBillingRateScheduleRequest {
+    #[serde(default)]
+    pub matter_id: Option<String>,
+    pub timekeeper: String,
+    pub rate: String,
+    pub effective_start: String,
+    #[serde(default)]
+    pub effective_end: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateBillingRateScheduleRequest {
+    #[serde(default)]
+    pub matter_id: Option<Option<String>>,
+    #[serde(default)]
+    pub timekeeper: Option<String>,
+    #[serde(default)]
+    pub rate: Option<String>,
+    #[serde(default)]
+    pub effective_start: Option<String>,
+    #[serde(default)]
+    pub effective_end: Option<Option<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InvoiceLedesQuery {
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvoiceLedesResponse {
+    pub invoice_id: String,
+    pub format: String,
+    pub content: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -730,6 +907,112 @@ pub struct MatterConflictCheckResponse {
     pub conflict: Option<String>,
     pub matter_id: Option<String>,
     pub hits: Vec<crate::db::ConflictHit>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConflictClearanceInfoResponse {
+    pub matter_id: String,
+    pub checked_by: String,
+    pub cleared_by: Option<String>,
+    pub decision: String,
+    pub note: Option<String>,
+    pub hit_count: i32,
+    pub reviewing_attorney: Option<String>,
+    pub report_hash: Option<String>,
+    pub signed_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterPartyInfo {
+    pub id: String,
+    pub matter_id: String,
+    pub party_id: String,
+    pub name: String,
+    pub role: String,
+    pub aliases: Vec<String>,
+    pub notes: Option<String>,
+    pub opened_at: Option<String>,
+    pub closed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterPartiesResponse {
+    pub matter_id: String,
+    pub parties: Vec<MatterPartyInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpsertMatterPartyRequest {
+    pub name: String,
+    pub role: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub opened_at: Option<String>,
+    #[serde(default)]
+    pub closed_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PartyRelationshipInfo {
+    pub id: String,
+    pub parent_party_id: String,
+    pub parent_name: String,
+    pub child_party_id: String,
+    pub child_name: String,
+    pub kind: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterPartyRelationshipResponse {
+    pub relationship: PartyRelationshipInfo,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreatePartyRelationshipRequest {
+    #[serde(default)]
+    pub parent_party_id: Option<String>,
+    #[serde(default)]
+    pub parent_name: Option<String>,
+    #[serde(default)]
+    pub child_party_id: Option<String>,
+    #[serde(default)]
+    pub child_name: Option<String>,
+    pub kind: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterConflictReportResponse {
+    pub matter_id: String,
+    pub checked_parties: Vec<String>,
+    pub parties: Vec<MatterPartyInfo>,
+    pub relationships: Vec<PartyRelationshipInfo>,
+    pub hits: Vec<crate::db::ConflictHit>,
+    pub latest_clearance: Option<ConflictClearanceInfoResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MatterConflictClearanceRequest {
+    pub decision: crate::db::ConflictDecision,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub reviewing_attorney: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterConflictClearanceResponse {
+    pub matter_id: String,
+    pub decision: String,
+    pub hit_count: usize,
+    pub latest_clearance: ConflictClearanceInfoResponse,
 }
 
 /// Request body for `POST /api/matters/conflict-check`.
@@ -914,6 +1197,7 @@ pub struct MatterDocumentInfo {
     pub path: String,
     pub is_dir: bool,
     pub category: Option<String>,
+    pub readiness_state: Option<String>,
     pub updated_at: Option<String>,
 }
 
@@ -986,8 +1270,81 @@ pub struct GenerateDocumentResponse {
     pub path: String,
     pub display_name: String,
     pub category: String,
+    pub readiness_state: String,
     pub version_number: i32,
     pub label: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CitationWaiverRequest {
+    pub citation_text: String,
+    pub waived_by: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyMatterCitationsRequest {
+    pub matter_document_id: String,
+    #[serde(default)]
+    pub waivers: Vec<CitationWaiverRequest>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CitationVerificationRunInfo {
+    pub id: String,
+    pub matter_id: String,
+    pub matter_document_id: String,
+    pub provider: String,
+    pub document_hash: String,
+    pub created_by: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CitationVerificationResultInfo {
+    pub id: String,
+    pub citation_text: String,
+    pub normalized_citation: String,
+    pub status: String,
+    pub provider_reference: Option<String>,
+    pub provider_title: Option<String>,
+    pub detail: Option<String>,
+    pub waived_by: Option<String>,
+    pub waiver_reason: Option<String>,
+    pub waived_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocumentCitationsResponse {
+    pub document_id: String,
+    pub matter_id: String,
+    pub readiness_state: String,
+    pub extracted_citations: Vec<String>,
+    pub run: Option<CitationVerificationRunInfo>,
+    pub results: Vec<CitationVerificationResultInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyMatterCitationsResponse {
+    pub matter_id: String,
+    pub document_id: String,
+    pub readiness_state: String,
+    pub extracted_citations: Vec<String>,
+    pub run: CitationVerificationRunInfo,
+    pub results: Vec<CitationVerificationResultInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MarkDocumentReadyRequest {
+    #[serde(default)]
+    pub attorney: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MarkDocumentReadyResponse {
+    pub document: MatterDocumentInfo,
 }
 
 #[derive(Debug, Serialize)]

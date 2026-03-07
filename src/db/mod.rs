@@ -97,6 +97,9 @@ pub enum PartyRole {
     Adverse,
     Related,
     Witness,
+    Affiliate,
+    Principal,
+    OpposingCounsel,
 }
 
 impl PartyRole {
@@ -106,7 +109,31 @@ impl PartyRole {
             Self::Adverse => "adverse",
             Self::Related => "related",
             Self::Witness => "witness",
+            Self::Affiliate => "affiliate",
+            Self::Principal => "principal",
+            Self::OpposingCounsel => "opposing_counsel",
         }
+    }
+
+    pub fn base_db_role(self) -> &'static str {
+        match self {
+            Self::Affiliate | Self::Principal => Self::Related.as_str(),
+            Self::OpposingCounsel => Self::Adverse.as_str(),
+            _ => self.as_str(),
+        }
+    }
+
+    pub fn role_detail(self) -> Option<&'static str> {
+        match self {
+            Self::Affiliate | Self::Principal | Self::OpposingCounsel => Some(self.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn from_db_role_columns(role: &str, role_detail: Option<&str>) -> Option<Self> {
+        role_detail
+            .and_then(Self::from_db_value)
+            .or_else(|| Self::from_db_value(role))
     }
 
     pub fn from_db_value(value: &str) -> Option<Self> {
@@ -115,9 +142,55 @@ impl PartyRole {
             "adverse" => Some(Self::Adverse),
             "related" => Some(Self::Related),
             "witness" => Some(Self::Witness),
+            "affiliate" => Some(Self::Affiliate),
+            "principal" => Some(Self::Principal),
+            "opposing_counsel" => Some(Self::OpposingCounsel),
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictClearanceStatus {
+    #[default]
+    Unreviewed,
+    Clear,
+    Waived,
+    Declined,
+}
+
+impl ConflictClearanceStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unreviewed => "unreviewed",
+            Self::Clear => "clear",
+            Self::Waived => "waived",
+            Self::Declined => "declined",
+        }
+    }
+}
+
+impl From<ConflictDecision> for ConflictClearanceStatus {
+    fn from(value: ConflictDecision) -> Self {
+        match value {
+            ConflictDecision::Clear => Self::Clear,
+            ConflictDecision::Waived => Self::Waived,
+            ConflictDecision::Declined => Self::Declined,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictClearanceSummary {
+    pub decision: ConflictDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewing_attorney: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Structured conflict match for legal intake and attorney review.
@@ -128,6 +201,12 @@ pub struct ConflictHit {
     pub matter_id: String,
     pub matter_status: String,
     pub matched_via: String,
+    #[serde(default)]
+    pub relationship_path: Vec<String>,
+    #[serde(default)]
+    pub clearance_status: ConflictClearanceStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_clearance: Option<ConflictClearanceSummary>,
 }
 
 /// Attorney decision after reviewing potential conflict hits.
@@ -168,6 +247,9 @@ pub struct ConflictClearanceRecord {
     pub note: Option<String>,
     pub hits_json: serde_json::Value,
     pub hit_count: i32,
+    pub reviewing_attorney: Option<String>,
+    pub report_hash: Option<String>,
+    pub signed_at: Option<DateTime<Utc>>,
 }
 
 /// Latest persisted conflict-clearance decision metadata for a matter.
@@ -180,7 +262,56 @@ pub struct ConflictClearanceInfo {
     pub note: Option<String>,
     pub hits_json: serde_json::Value,
     pub hit_count: i32,
+    pub reviewing_attorney: Option<String>,
+    pub report_hash: Option<String>,
+    pub signed_at: Option<DateTime<Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatterPartyRecord {
+    pub id: Uuid,
+    pub matter_id: String,
+    pub party_id: Uuid,
+    pub name: String,
+    pub role: PartyRole,
+    pub aliases: Vec<String>,
+    pub notes: Option<String>,
+    pub opened_at: Option<DateTime<Utc>>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertMatterPartyParams {
+    pub name: String,
+    pub role: PartyRole,
+    pub aliases: Vec<String>,
+    pub notes: Option<String>,
+    pub opened_at: Option<DateTime<Utc>>,
+    pub closed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartyRelationshipRecord {
+    pub id: Uuid,
+    pub parent_party_id: Uuid,
+    pub parent_name: String,
+    pub child_party_id: Uuid,
+    pub child_name: String,
+    pub kind: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreatePartyRelationshipParams {
+    pub parent_party_id: Option<Uuid>,
+    pub parent_name: Option<String>,
+    pub child_party_id: Option<Uuid>,
+    pub child_name: Option<String>,
+    pub kind: String,
 }
 
 /// Role assigned to a gateway user identity.
@@ -621,6 +752,40 @@ impl MatterDocumentCategory {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentReadinessState {
+    #[default]
+    Draft,
+    CitationsPending,
+    Verified,
+    Waived,
+    ReadyToFile,
+}
+
+impl DocumentReadinessState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::CitationsPending => "citations_pending",
+            Self::Verified => "verified",
+            Self::Waived => "waived",
+            Self::ReadyToFile => "ready_to_file",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "draft" => Some(Self::Draft),
+            "citations_pending" => Some(Self::CitationsPending),
+            "verified" => Some(Self::Verified),
+            "waived" => Some(Self::Waived),
+            "ready_to_file" => Some(Self::ReadyToFile),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatterDocumentRecord {
     pub id: Uuid,
@@ -630,6 +795,8 @@ pub struct MatterDocumentRecord {
     pub path: String,
     pub display_name: String,
     pub category: MatterDocumentCategory,
+    #[serde(default)]
+    pub readiness_state: DocumentReadinessState,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -640,12 +807,95 @@ pub struct UpsertMatterDocumentParams {
     pub path: String,
     pub display_name: String,
     pub category: MatterDocumentCategory,
+    pub readiness_state: Option<DocumentReadinessState>,
 }
 
 #[derive(Debug, Clone)]
 pub struct UpdateMatterDocumentParams {
     pub display_name: Option<String>,
     pub category: Option<MatterDocumentCategory>,
+    pub readiness_state: Option<DocumentReadinessState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CitationVerificationStatus {
+    Verified,
+    Unverified,
+    Ambiguous,
+    Waived,
+}
+
+impl CitationVerificationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Unverified => "unverified",
+            Self::Ambiguous => "ambiguous",
+            Self::Waived => "waived",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "verified" => Some(Self::Verified),
+            "unverified" => Some(Self::Unverified),
+            "ambiguous" => Some(Self::Ambiguous),
+            "waived" => Some(Self::Waived),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CitationVerificationRunRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: String,
+    pub matter_document_id: Uuid,
+    pub provider: String,
+    pub document_hash: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateCitationVerificationRunParams {
+    pub matter_id: String,
+    pub matter_document_id: Uuid,
+    pub provider: String,
+    pub document_hash: String,
+    pub created_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CitationVerificationResultRecord {
+    pub id: Uuid,
+    pub run_id: Uuid,
+    pub citation_text: String,
+    pub normalized_citation: String,
+    pub status: CitationVerificationStatus,
+    pub provider_reference: Option<String>,
+    pub provider_title: Option<String>,
+    pub detail: Option<String>,
+    pub waived_by: Option<String>,
+    pub waiver_reason: Option<String>,
+    pub waived_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateCitationVerificationResultParams {
+    pub citation_text: String,
+    pub normalized_citation: String,
+    pub status: CitationVerificationStatus,
+    pub provider_reference: Option<String>,
+    pub provider_title: Option<String>,
+    pub detail: Option<String>,
+    pub waived_by: Option<String>,
+    pub waiver_reason: Option<String>,
+    pub waived_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -743,8 +993,14 @@ pub struct TimeEntryRecord {
     pub description: String,
     pub hours: Decimal,
     pub hourly_rate: Option<Decimal>,
+    pub task_code: Option<String>,
+    pub activity_code: Option<String>,
+    pub resolved_rate: Option<Decimal>,
+    pub rate_source: Option<BillingRateSource>,
     pub entry_date: NaiveDate,
     pub billable: bool,
+    pub block_billing_flag: bool,
+    pub block_billing_reason: Option<String>,
     pub billed_invoice_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -756,8 +1012,14 @@ pub struct CreateTimeEntryParams {
     pub description: String,
     pub hours: Decimal,
     pub hourly_rate: Option<Decimal>,
+    pub task_code: Option<String>,
+    pub activity_code: Option<String>,
+    pub resolved_rate: Option<Decimal>,
+    pub rate_source: Option<BillingRateSource>,
     pub entry_date: NaiveDate,
     pub billable: bool,
+    pub block_billing_flag: bool,
+    pub block_billing_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -766,8 +1028,72 @@ pub struct UpdateTimeEntryParams {
     pub description: Option<String>,
     pub hours: Option<Decimal>,
     pub hourly_rate: Option<Option<Decimal>>,
+    pub task_code: Option<Option<String>>,
+    pub activity_code: Option<Option<String>>,
+    pub resolved_rate: Option<Option<Decimal>>,
+    pub rate_source: Option<Option<BillingRateSource>>,
     pub entry_date: Option<NaiveDate>,
     pub billable: Option<bool>,
+    pub block_billing_flag: Option<bool>,
+    pub block_billing_reason: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingRateSource {
+    MatterOverride,
+    TimekeeperDefault,
+    ManualOverride,
+}
+
+impl BillingRateSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MatterOverride => "matter_override",
+            Self::TimekeeperDefault => "timekeeper_default",
+            Self::ManualOverride => "manual_override",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "matter_override" => Some(Self::MatterOverride),
+            "timekeeper_default" => Some(Self::TimekeeperDefault),
+            "manual_override" => Some(Self::ManualOverride),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BillingRateScheduleRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub matter_id: Option<String>,
+    pub timekeeper: String,
+    pub rate: Decimal,
+    pub effective_start: NaiveDate,
+    pub effective_end: Option<NaiveDate>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateBillingRateScheduleParams {
+    pub matter_id: Option<String>,
+    pub timekeeper: String,
+    pub rate: Decimal,
+    pub effective_start: NaiveDate,
+    pub effective_end: Option<NaiveDate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateBillingRateScheduleParams {
+    pub matter_id: Option<Option<String>>,
+    pub timekeeper: Option<String>,
+    pub rate: Option<Decimal>,
+    pub effective_start: Option<NaiveDate>,
+    pub effective_end: Option<Option<NaiveDate>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -895,6 +1221,11 @@ pub struct InvoiceLineItemRecord {
     pub amount: Decimal,
     pub time_entry_id: Option<Uuid>,
     pub expense_entry_id: Option<Uuid>,
+    pub task_code: Option<String>,
+    pub activity_code: Option<String>,
+    pub timekeeper: Option<String>,
+    pub resolved_rate: Option<Decimal>,
+    pub rate_source: Option<BillingRateSource>,
     pub sort_order: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -908,6 +1239,11 @@ pub struct CreateInvoiceLineItemParams {
     pub amount: Decimal,
     pub time_entry_id: Option<Uuid>,
     pub expense_entry_id: Option<Uuid>,
+    pub task_code: Option<String>,
+    pub activity_code: Option<String>,
+    pub timekeeper: Option<String>,
+    pub resolved_rate: Option<Decimal>,
+    pub rate_source: Option<BillingRateSource>,
     pub sort_order: i32,
 }
 
@@ -918,6 +1254,8 @@ pub enum TrustLedgerEntryType {
     Withdrawal,
     InvoicePayment,
     Refund,
+    BankFee,
+    FirmFunds,
 }
 
 impl TrustLedgerEntryType {
@@ -927,7 +1265,30 @@ impl TrustLedgerEntryType {
             Self::Withdrawal => "withdrawal",
             Self::InvoicePayment => "invoice_payment",
             Self::Refund => "refund",
+            Self::BankFee => "bank_fee",
+            Self::FirmFunds => "firm_funds",
         }
+    }
+
+    pub fn base_db_value(self) -> &'static str {
+        match self {
+            Self::BankFee => Self::Withdrawal.as_str(),
+            Self::FirmFunds => Self::Deposit.as_str(),
+            _ => self.as_str(),
+        }
+    }
+
+    pub fn entry_detail(self) -> Option<&'static str> {
+        match self {
+            Self::BankFee | Self::FirmFunds => Some(self.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn from_db_columns(entry_type: &str, entry_detail: Option<&str>) -> Option<Self> {
+        entry_detail
+            .and_then(Self::from_db_value)
+            .or_else(|| Self::from_db_value(entry_type))
     }
 
     pub fn from_db_value(value: &str) -> Option<Self> {
@@ -936,6 +1297,36 @@ impl TrustLedgerEntryType {
             "withdrawal" => Some(Self::Withdrawal),
             "invoice_payment" => Some(Self::InvoicePayment),
             "refund" => Some(Self::Refund),
+            "bank_fee" => Some(Self::BankFee),
+            "firm_funds" => Some(Self::FirmFunds),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustLedgerSource {
+    #[default]
+    Manual,
+    StatementImport,
+    InvoicePayment,
+}
+
+impl TrustLedgerSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::StatementImport => "statement_import",
+            Self::InvoicePayment => "invoice_payment",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "manual" => Some(Self::Manual),
+            "statement_import" => Some(Self::StatementImport),
+            "invoice_payment" => Some(Self::InvoicePayment),
             _ => None,
         }
     }
@@ -946,10 +1337,16 @@ pub struct TrustLedgerEntryRecord {
     pub id: Uuid,
     pub user_id: String,
     pub matter_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_account_id: Option<Uuid>,
     pub entry_type: TrustLedgerEntryType,
     pub amount: Decimal,
+    pub delta: Decimal,
     pub balance_after: Decimal,
     pub description: String,
+    pub reference_number: Option<String>,
+    #[serde(default)]
+    pub source: TrustLedgerSource,
     pub invoice_id: Option<Uuid>,
     pub recorded_by: String,
     pub created_at: DateTime<Utc>,
@@ -957,14 +1354,130 @@ pub struct TrustLedgerEntryRecord {
 
 #[derive(Debug, Clone)]
 pub struct CreateTrustLedgerEntryParams {
+    pub trust_account_id: Option<Uuid>,
     pub entry_type: TrustLedgerEntryType,
     pub amount: Decimal,
     /// Signed balance delta applied atomically by the backend.
     /// Positive values credit trust; negative values debit trust.
     pub delta: Decimal,
     pub description: String,
+    pub reference_number: Option<String>,
+    pub source: TrustLedgerSource,
     pub invoice_id: Option<Uuid>,
     pub recorded_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustAccountRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub name: String,
+    pub bank_name: Option<String>,
+    pub account_number_last4: Option<String>,
+    pub is_primary: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertTrustAccountParams {
+    pub name: String,
+    pub bank_name: Option<String>,
+    pub account_number_last4: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustStatementImportRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub trust_account_id: Uuid,
+    pub statement_date: NaiveDate,
+    pub starting_balance: Decimal,
+    pub ending_balance: Decimal,
+    pub imported_by: String,
+    pub row_count: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateTrustStatementImportParams {
+    pub trust_account_id: Uuid,
+    pub statement_date: NaiveDate,
+    pub starting_balance: Decimal,
+    pub ending_balance: Decimal,
+    pub imported_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustStatementLineRecord {
+    pub id: Uuid,
+    pub statement_import_id: Uuid,
+    pub entry_date: NaiveDate,
+    pub description: String,
+    pub debit: Decimal,
+    pub credit: Decimal,
+    pub running_balance: Decimal,
+    pub reference_number: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateTrustStatementLineParams {
+    pub entry_date: NaiveDate,
+    pub description: String,
+    pub debit: Decimal,
+    pub credit: Decimal,
+    pub running_balance: Decimal,
+    pub reference_number: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustReconciliationStatus {
+    #[default]
+    Draft,
+    SignedOff,
+}
+
+impl TrustReconciliationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::SignedOff => "signed_off",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "draft" => Some(Self::Draft),
+            "signed_off" => Some(Self::SignedOff),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustReconciliationRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub trust_account_id: Uuid,
+    pub statement_import_id: Uuid,
+    pub statement_ending_balance: Decimal,
+    pub book_balance: Decimal,
+    pub client_balance_total: Decimal,
+    pub difference: Decimal,
+    pub exceptions_json: serde_json::Value,
+    pub status: TrustReconciliationStatus,
+    pub signed_off_by: Option<String>,
+    pub signed_off_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComputeTrustReconciliationParams {
+    pub trust_account_id: Uuid,
+    pub statement_import_id: Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -1393,6 +1906,23 @@ pub trait LegalConflictStore: Send + Sync {
         &self,
         matter_id: &str,
     ) -> Result<Option<ConflictClearanceInfo>, DatabaseError>;
+    async fn list_matter_parties(
+        &self,
+        matter_id: &str,
+    ) -> Result<Vec<MatterPartyRecord>, DatabaseError>;
+    async fn upsert_matter_party(
+        &self,
+        matter_id: &str,
+        input: &UpsertMatterPartyParams,
+    ) -> Result<MatterPartyRecord, DatabaseError>;
+    async fn list_matter_party_relationships(
+        &self,
+        matter_id: &str,
+    ) -> Result<Vec<PartyRelationshipRecord>, DatabaseError>;
+    async fn upsert_party_relationship(
+        &self,
+        input: &CreatePartyRelationshipParams,
+    ) -> Result<PartyRelationshipRecord, DatabaseError>;
 }
 
 #[async_trait]
@@ -1607,6 +2137,11 @@ pub trait MatterDocumentStore: Send + Sync {
         matter_id: &str,
         matter_document_id: Uuid,
     ) -> Result<Option<MatterDocumentRecord>, DatabaseError>;
+    async fn get_matter_document_by_id(
+        &self,
+        user_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError>;
     async fn upsert_matter_document(
         &self,
         user_id: &str,
@@ -1626,6 +2161,39 @@ pub trait MatterDocumentStore: Send + Sync {
         matter_id: &str,
         matter_document_id: Uuid,
     ) -> Result<bool, DatabaseError>;
+}
+
+#[async_trait]
+pub trait CitationVerificationStore: Send + Sync {
+    async fn create_citation_verification_run(
+        &self,
+        user_id: &str,
+        input: &CreateCitationVerificationRunParams,
+        results: &[CreateCitationVerificationResultParams],
+    ) -> Result<
+        (
+            CitationVerificationRunRecord,
+            Vec<CitationVerificationResultRecord>,
+        ),
+        DatabaseError,
+    >;
+    async fn latest_citation_verification_run(
+        &self,
+        user_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Option<CitationVerificationRunRecord>, DatabaseError>;
+    async fn list_citation_verification_results(
+        &self,
+        user_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Vec<CitationVerificationResultRecord>, DatabaseError>;
+    async fn set_matter_document_readiness(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        matter_document_id: Uuid,
+        state: DocumentReadinessState,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError>;
 }
 
 #[async_trait]
@@ -1762,6 +2330,27 @@ pub trait TimeExpenseStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait BillingRateStore: Send + Sync {
+    async fn list_billing_rate_schedules(
+        &self,
+        user_id: &str,
+        matter_id: Option<&str>,
+        timekeeper: Option<&str>,
+    ) -> Result<Vec<BillingRateScheduleRecord>, DatabaseError>;
+    async fn create_billing_rate_schedule(
+        &self,
+        user_id: &str,
+        input: &CreateBillingRateScheduleParams,
+    ) -> Result<BillingRateScheduleRecord, DatabaseError>;
+    async fn update_billing_rate_schedule(
+        &self,
+        user_id: &str,
+        schedule_id: Uuid,
+        input: &UpdateBillingRateScheduleParams,
+    ) -> Result<Option<BillingRateScheduleRecord>, DatabaseError>;
+}
+
+#[async_trait]
 pub trait BillingStore: Send + Sync {
     async fn save_invoice_draft(
         &self,
@@ -1824,6 +2413,66 @@ pub trait BillingStore: Send + Sync {
         user_id: &str,
         matter_id: &str,
     ) -> Result<Decimal, DatabaseError>;
+}
+
+#[async_trait]
+pub trait TrustAccountingStore: Send + Sync {
+    async fn get_primary_trust_account(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<TrustAccountRecord>, DatabaseError>;
+    async fn upsert_primary_trust_account(
+        &self,
+        user_id: &str,
+        input: &UpsertTrustAccountParams,
+    ) -> Result<TrustAccountRecord, DatabaseError>;
+    async fn list_trust_ledger_entries_for_account(
+        &self,
+        user_id: &str,
+        trust_account_id: Uuid,
+    ) -> Result<Vec<TrustLedgerEntryRecord>, DatabaseError>;
+    async fn current_trust_account_balance(
+        &self,
+        user_id: &str,
+        trust_account_id: Uuid,
+    ) -> Result<Decimal, DatabaseError>;
+    async fn import_trust_statement(
+        &self,
+        user_id: &str,
+        input: &CreateTrustStatementImportParams,
+        lines: &[CreateTrustStatementLineParams],
+    ) -> Result<(TrustStatementImportRecord, Vec<TrustStatementLineRecord>), DatabaseError>;
+    async fn get_trust_statement_import(
+        &self,
+        user_id: &str,
+        statement_import_id: Uuid,
+    ) -> Result<Option<TrustStatementImportRecord>, DatabaseError>;
+    async fn list_trust_statement_lines(
+        &self,
+        user_id: &str,
+        statement_import_id: Uuid,
+    ) -> Result<Vec<TrustStatementLineRecord>, DatabaseError>;
+    async fn compute_trust_reconciliation(
+        &self,
+        user_id: &str,
+        input: &ComputeTrustReconciliationParams,
+    ) -> Result<TrustReconciliationRecord, DatabaseError>;
+    async fn get_trust_reconciliation(
+        &self,
+        user_id: &str,
+        reconciliation_id: Uuid,
+    ) -> Result<Option<TrustReconciliationRecord>, DatabaseError>;
+    async fn latest_trust_reconciliation_for_account(
+        &self,
+        user_id: &str,
+        trust_account_id: Uuid,
+    ) -> Result<Option<TrustReconciliationRecord>, DatabaseError>;
+    async fn signoff_trust_reconciliation(
+        &self,
+        user_id: &str,
+        reconciliation_id: Uuid,
+        signed_off_by: &str,
+    ) -> Result<Option<TrustReconciliationRecord>, DatabaseError>;
 }
 
 #[async_trait]
@@ -1998,10 +2647,13 @@ pub trait Database:
     + MatterNoteStore
     + MatterDeadlineStore
     + MatterDocumentStore
+    + CitationVerificationStore
     + DocumentVersionStore
     + DocumentTemplateStore
     + TimeExpenseStore
+    + BillingRateStore
     + BillingStore
+    + TrustAccountingStore
     + AuditEventStore
     + LegalRestoreStore
     + SettingsStore

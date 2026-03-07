@@ -3,6 +3,8 @@
 //! Delegates to the existing `Store` (history) and `Repository` (workspace)
 //! implementations, avoiding SQL duplication.
 
+mod legal_hardening;
+
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
@@ -30,13 +32,13 @@ use crate::db::{
     MatterMembershipRecord, MatterNoteRecord, MatterNoteStore, MatterRecord, MatterStatus,
     MatterStore, MatterTaskRecord, MatterTaskStatus, MatterTaskStore, MatterTimeSummary, PartyRole,
     RbacStore, RecordInvoicePaymentParams, RecordInvoicePaymentResult, RoutineStore, SandboxStore,
-    SettingsStore, TimeEntryRecord, TimeExpenseStore, ToolFailureStore, TrustLedgerEntryRecord,
-    TrustLedgerEntryType, UpdateClientParams, UpdateDocumentTemplateParams,
+    SettingsStore, TimeEntryRecord, TimeExpenseStore, ToolFailureStore, TrustAccountingStore,
+    TrustLedgerEntryRecord, TrustLedgerEntryType, UpdateClientParams, UpdateDocumentTemplateParams,
     UpdateExpenseEntryParams, UpdateMatterDeadlineParams, UpdateMatterDocumentParams,
     UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
     UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterMembershipParams,
-    UpsertMatterParams, UserRecord, UserRole, WorkspaceStore, conflict_terms_from_text,
-    normalize_party_name,
+    UpsertMatterParams, UpsertTrustAccountParams, UserRecord, UserRole, WorkspaceStore,
+    conflict_terms_from_text, normalize_party_name,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -152,26 +154,154 @@ where
     Ok(Some(row.get::<_, Uuid>(0)))
 }
 
-fn dedupe_hits(
-    rows: Vec<(String, String, String, String, String, f64)>,
-    limit: usize,
-) -> Vec<ConflictHit> {
+async fn party_aliases_pg<C>(conn: &C, party_id: Uuid) -> Result<Vec<String>, DatabaseError>
+where
+    C: GenericClient + Sync,
+{
+    let rows = conn
+        .query(
+            "SELECT alias FROM party_aliases WHERE party_id = $1 ORDER BY alias_normalized ASC",
+            &[&party_id],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect())
+}
+
+async fn relationship_paths_pg<C>(
+    conn: &C,
+    start_party_id: Uuid,
+    start_party_name: &str,
+    max_depth: usize,
+) -> Result<Vec<(Uuid, Vec<String>)>, DatabaseError>
+where
+    C: GenericClient + Sync,
+{
+    let mut queue: std::collections::VecDeque<(Uuid, Vec<String>, usize)> =
+        std::collections::VecDeque::new();
+    let mut visited = HashSet::new();
+    let mut out = Vec::new();
+
+    queue.push_back((start_party_id, vec![start_party_name.to_string()], 0));
+    visited.insert(start_party_id);
+
+    while let Some((current_id, path, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+
+        let rows = conn
+            .query(
+                "SELECT pr.child_id, child.name, pr.kind \
+                 FROM party_relationships pr \
+                 JOIN parties child ON child.id = pr.child_id \
+                 WHERE pr.parent_id = $1 \
+                 UNION ALL \
+                 SELECT pr.parent_id, parent.name, ('reverse:' || pr.kind) \
+                 FROM party_relationships pr \
+                 JOIN parties parent ON parent.id = pr.parent_id \
+                 WHERE pr.child_id = $1",
+                &[&current_id],
+            )
+            .await?;
+
+        for row in rows {
+            let neighbor_id: Uuid = row.get(0);
+            if !visited.insert(neighbor_id) {
+                continue;
+            }
+            let neighbor_name: String = row.get(1);
+            let kind: String = row.get(2);
+            let mut next_path = path.clone();
+            next_path.push(kind);
+            next_path.push(neighbor_name.clone());
+            out.push((neighbor_id, next_path.clone()));
+            queue.push_back((neighbor_id, next_path, depth + 1));
+        }
+    }
+
+    Ok(out)
+}
+
+async fn matter_party_record_pg<C>(
+    conn: &C,
+    membership_id: Uuid,
+) -> Result<crate::db::MatterPartyRecord, DatabaseError>
+where
+    C: GenericClient + Sync,
+{
+    let row = conn
+        .query_one(
+            "SELECT mp.id, mp.matter_id, p.id, p.name, COALESCE(mp.role_detail, mp.role) AS role_name, \
+                    p.notes, mp.opened_at, mp.closed_at, mp.created_at, mp.updated_at \
+             FROM matter_parties mp \
+             JOIN parties p ON p.id = mp.party_id \
+             WHERE mp.id = $1",
+            &[&membership_id],
+        )
+        .await?;
+    let role_name: String = row.get(4);
+    let role = PartyRole::from_db_value(&role_name).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid matter party role '{}'", role_name))
+    })?;
+    let party_id: Uuid = row.get(2);
+    Ok(crate::db::MatterPartyRecord {
+        id: row.get(0),
+        matter_id: row.get(1),
+        party_id,
+        name: row.get(3),
+        role,
+        aliases: party_aliases_pg(conn, party_id).await?,
+        notes: row.get(5),
+        opened_at: row.get(6),
+        closed_at: row.get(7),
+        created_at: row.get(8),
+        updated_at: row.get(9),
+    })
+}
+
+async fn party_relationship_record_pg<C>(
+    conn: &C,
+    relationship_id: Uuid,
+) -> Result<crate::db::PartyRelationshipRecord, DatabaseError>
+where
+    C: GenericClient + Sync,
+{
+    let row = conn
+        .query_one(
+            "SELECT pr.id, pr.parent_id, parent.name, pr.child_id, child.name, pr.kind, pr.created_at, pr.updated_at \
+             FROM party_relationships pr \
+             JOIN parties parent ON parent.id = pr.parent_id \
+             JOIN parties child ON child.id = pr.child_id \
+             WHERE pr.id = $1",
+            &[&relationship_id],
+        )
+        .await?;
+    Ok(crate::db::PartyRelationshipRecord {
+        id: row.get(0),
+        parent_party_id: row.get(1),
+        parent_name: row.get(2),
+        child_party_id: row.get(3),
+        child_name: row.get(4),
+        kind: row.get(5),
+        created_at: row.get(6),
+        updated_at: row.get(7),
+    })
+}
+
+fn dedupe_hits(rows: Vec<(ConflictHit, f64)>, limit: usize) -> Vec<ConflictHit> {
     let mut best: std::collections::HashMap<(String, String, String), (u8, f64, ConflictHit)> =
         std::collections::HashMap::new();
 
-    for (party, role_raw, matter_id, matter_status, matched_via, score) in rows {
-        let Some(role) = PartyRole::from_db_value(&role_raw) else {
-            continue;
-        };
-        let key = (party.clone(), role_raw, matter_id.clone());
-        let hit = ConflictHit {
-            party,
-            role,
-            matter_id,
-            matter_status,
-            matched_via: matched_via.clone(),
-        };
-        let priority = match_priority(&matched_via);
+    for (hit, score) in rows {
+        let key = (
+            hit.party.clone(),
+            hit.role.as_str().to_string(),
+            hit.matter_id.clone(),
+        );
+        let priority = match_priority(&hit.matched_via);
 
         match best.get(&key) {
             Some((existing_priority, existing_score, _))
@@ -194,6 +324,26 @@ fn dedupe_hits(
         hits.truncate(limit);
     }
     hits
+}
+
+fn build_conflict_hit(
+    party: String,
+    role: PartyRole,
+    matter_id: String,
+    matter_status: String,
+    matched_via: String,
+    relationship_path: Vec<String>,
+) -> ConflictHit {
+    ConflictHit {
+        party,
+        role,
+        matter_id,
+        matter_status,
+        matched_via,
+        relationship_path,
+        clearance_status: crate::db::ConflictClearanceStatus::Unreviewed,
+        latest_clearance: None,
+    }
 }
 
 fn parse_json_string_array(value: &serde_json::Value) -> Vec<String> {
@@ -384,6 +534,11 @@ fn row_to_matter_document_record(
         path: row.get("path"),
         display_name: row.get("display_name"),
         category,
+        readiness_state: row
+            .try_get::<_, String>("readiness_state")
+            .ok()
+            .and_then(|value| crate::db::DocumentReadinessState::from_db_value(&value))
+            .unwrap_or_default(),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
@@ -429,8 +584,18 @@ fn row_to_time_entry_record(row: &tokio_postgres::Row) -> Result<TimeEntryRecord
         description: row.get("description"),
         hours: row.get("hours"),
         hourly_rate: row.get("hourly_rate"),
+        task_code: row.try_get("task_code").ok(),
+        activity_code: row.try_get("activity_code").ok(),
+        resolved_rate: row.try_get("resolved_rate").ok(),
+        rate_source: row
+            .try_get::<_, Option<String>>("rate_source")
+            .ok()
+            .flatten()
+            .and_then(|value| crate::db::BillingRateSource::from_db_value(&value)),
         entry_date: row.get("entry_date"),
         billable: row.get("billable"),
+        block_billing_flag: row.try_get("block_billing_flag").unwrap_or(false),
+        block_billing_reason: row.try_get("block_billing_reason").ok(),
         billed_invoice_id: row.get("billed_invoice_id"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -498,6 +663,15 @@ fn row_to_invoice_line_item_record(
         amount: row.get("amount"),
         time_entry_id: row.get("time_entry_id"),
         expense_entry_id: row.get("expense_entry_id"),
+        task_code: row.try_get("task_code").ok(),
+        activity_code: row.try_get("activity_code").ok(),
+        timekeeper: row.try_get("timekeeper").ok(),
+        resolved_rate: row.try_get("resolved_rate").ok(),
+        rate_source: row
+            .try_get::<_, Option<String>>("rate_source")
+            .ok()
+            .flatten()
+            .and_then(|value| crate::db::BillingRateSource::from_db_value(&value)),
         sort_order: row.get("sort_order"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -508,20 +682,45 @@ fn row_to_trust_ledger_entry_record(
     row: &tokio_postgres::Row,
 ) -> Result<TrustLedgerEntryRecord, DatabaseError> {
     let entry_type_raw: String = row.get("entry_type");
-    let entry_type = TrustLedgerEntryType::from_db_value(&entry_type_raw).ok_or_else(|| {
-        DatabaseError::Serialization(format!(
-            "invalid trust ledger entry type '{}'",
-            entry_type_raw
-        ))
-    })?;
+    let entry_detail: Option<String> = row.try_get("entry_detail").ok().flatten();
+    let entry_type =
+        TrustLedgerEntryType::from_db_columns(&entry_type_raw, entry_detail.as_deref())
+            .ok_or_else(|| {
+                DatabaseError::Serialization(format!(
+                    "invalid trust ledger entry type '{}' / detail {:?}",
+                    entry_type_raw, entry_detail
+                ))
+            })?;
     Ok(TrustLedgerEntryRecord {
         id: row.get("id"),
         user_id: row.get("user_id"),
         matter_id: row.get("matter_id"),
+        trust_account_id: row.try_get("trust_account_id").ok(),
         entry_type,
         amount: row.get("amount"),
+        delta: row.try_get("delta").unwrap_or_else(|_| {
+            let amount: Decimal = row.get("amount");
+            if matches!(
+                entry_type,
+                TrustLedgerEntryType::Withdrawal
+                    | TrustLedgerEntryType::InvoicePayment
+                    | TrustLedgerEntryType::Refund
+            ) {
+                -amount
+            } else {
+                amount
+            }
+        }),
         balance_after: row.get("balance_after"),
         description: row.get("description"),
+        reference_number: row.try_get("reference_number").ok(),
+        source: row
+            .try_get::<_, Option<String>>("source")
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(crate::db::TrustLedgerSource::from_db_value)
+            .unwrap_or_default(),
         invoice_id: row.get("invoice_id"),
         recorded_by: row.get("recorded_by"),
         created_at: row.get("created_at"),
@@ -1015,11 +1214,12 @@ impl LegalConflictStore for PgBackend {
 
         let limit = limit.min(200);
         let conn = self.store.conn().await?;
-        let mut rows: Vec<(String, String, String, String, String, f64)> = Vec::new();
+        let mut rows: Vec<(ConflictHit, f64)> = Vec::new();
+        let mut seed_parties: HashMap<Uuid, String> = HashMap::new();
 
         let direct_clause = sql_or_eq("p.name_normalized", 1, terms.len());
         let direct_query = format!(
-            "SELECT p.name, mp.role, mp.matter_id, \
+            "SELECT p.id, p.name, COALESCE(mp.role_detail, mp.role), mp.matter_id, \
                     CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
                     'direct' AS matched_via, \
                     1.0::double precision AS score \
@@ -1036,19 +1236,29 @@ impl LegalConflictStore for PgBackend {
             .collect();
         direct_params.push(&direct_limit);
         for row in conn.query(&direct_query, &direct_params).await? {
+            let party_id: Uuid = row.get(0);
+            let party_name: String = row.get(1);
+            let role_name: String = row.get(2);
+            let Some(role) = PartyRole::from_db_value(&role_name) else {
+                continue;
+            };
+            seed_parties.insert(party_id, party_name.clone());
             rows.push((
-                row.get(0),
-                row.get(1),
-                row.get(2),
-                row.get(3),
-                row.get(4),
-                row.get(5),
+                build_conflict_hit(
+                    party_name,
+                    role,
+                    row.get(3),
+                    row.get(4),
+                    row.get(5),
+                    Vec::new(),
+                ),
+                row.get(6),
             ));
         }
 
         let alias_clause = sql_or_eq("pa.alias_normalized", 1, terms.len());
         let alias_query = format!(
-            "SELECT p.name, mp.role, mp.matter_id, \
+            "SELECT p.id, p.name, COALESCE(mp.role_detail, mp.role), mp.matter_id, \
                     CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
                     ('alias:' || pa.alias) AS matched_via, \
                     0.9::double precision AS score \
@@ -1066,13 +1276,23 @@ impl LegalConflictStore for PgBackend {
             .collect();
         alias_params.push(&alias_limit);
         for row in conn.query(&alias_query, &alias_params).await? {
+            let party_id: Uuid = row.get(0);
+            let party_name: String = row.get(1);
+            let role_name: String = row.get(2);
+            let Some(role) = PartyRole::from_db_value(&role_name) else {
+                continue;
+            };
+            seed_parties.insert(party_id, party_name.clone());
             rows.push((
-                row.get(0),
-                row.get(1),
-                row.get(2),
-                row.get(3),
-                row.get(4),
-                row.get(5),
+                build_conflict_hit(
+                    party_name,
+                    role,
+                    row.get(3),
+                    row.get(4),
+                    row.get(5),
+                    Vec::new(),
+                ),
+                row.get(6),
             ));
         }
 
@@ -1080,7 +1300,7 @@ impl LegalConflictStore for PgBackend {
         let values = sql_values_terms(1, terms.len());
         let fuzzy_names_query = format!(
             "WITH input_terms(term) AS (VALUES {values}) \
-             SELECT p.name, mp.role, mp.matter_id, \
+             SELECT p.id, p.name, COALESCE(mp.role_detail, mp.role), mp.matter_id, \
                     CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
                     ('fuzzy:' || input_terms.term) AS matched_via, \
                     similarity(p.name_normalized, input_terms.term) AS score \
@@ -1098,19 +1318,29 @@ impl LegalConflictStore for PgBackend {
             .collect();
         fuzzy_name_params.push(&fuzzy_names_limit);
         for row in conn.query(&fuzzy_names_query, &fuzzy_name_params).await? {
+            let party_id: Uuid = row.get(0);
+            let party_name: String = row.get(1);
+            let role_name: String = row.get(2);
+            let Some(role) = PartyRole::from_db_value(&role_name) else {
+                continue;
+            };
+            seed_parties.insert(party_id, party_name.clone());
             rows.push((
-                row.get(0),
-                row.get(1),
-                row.get(2),
-                row.get(3),
-                row.get(4),
-                row.get(5),
+                build_conflict_hit(
+                    party_name,
+                    role,
+                    row.get(3),
+                    row.get(4),
+                    row.get(5),
+                    Vec::new(),
+                ),
+                row.get(6),
             ));
         }
 
         let fuzzy_alias_query = format!(
             "WITH input_terms(term) AS (VALUES {values}) \
-             SELECT p.name, mp.role, mp.matter_id, \
+             SELECT p.id, p.name, COALESCE(mp.role_detail, mp.role), mp.matter_id, \
                     CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status, \
                     ('fuzzy:' || input_terms.term) AS matched_via, \
                     similarity(pa.alias_normalized, input_terms.term) AS score \
@@ -1129,14 +1359,63 @@ impl LegalConflictStore for PgBackend {
             .collect();
         fuzzy_alias_params.push(&fuzzy_alias_limit);
         for row in conn.query(&fuzzy_alias_query, &fuzzy_alias_params).await? {
+            let party_id: Uuid = row.get(0);
+            let party_name: String = row.get(1);
+            let role_name: String = row.get(2);
+            let Some(role) = PartyRole::from_db_value(&role_name) else {
+                continue;
+            };
+            seed_parties.insert(party_id, party_name.clone());
             rows.push((
-                row.get(0),
-                row.get(1),
-                row.get(2),
-                row.get(3),
-                row.get(4),
-                row.get(5),
+                build_conflict_hit(
+                    party_name,
+                    role,
+                    row.get(3),
+                    row.get(4),
+                    row.get(5),
+                    Vec::new(),
+                ),
+                row.get(6),
             ));
+        }
+
+        for (party_id, party_name) in seed_parties {
+            for (related_party_id, relationship_path) in
+                relationship_paths_pg(&conn, party_id, &party_name, 3).await?
+            {
+                let relationship_rows = conn
+                    .query(
+                        "SELECT p.name, COALESCE(mp.role_detail, mp.role), mp.matter_id, \
+                                CASE WHEN mp.closed_at IS NULL THEN 'Open' ELSE 'Closed' END AS matter_status \
+                         FROM matter_parties mp \
+                         JOIN parties p ON p.id = mp.party_id \
+                         WHERE mp.party_id = $1 \
+                         LIMIT $2",
+                        &[&related_party_id, &(limit as i64)],
+                    )
+                    .await?;
+                for row in relationship_rows {
+                    let role_name: String = row.get(1);
+                    let Some(role) = PartyRole::from_db_value(&role_name) else {
+                        continue;
+                    };
+                    let matched_via = relationship_path
+                        .get(1)
+                        .map(|segment| format!("relationship:{segment}"))
+                        .unwrap_or_else(|| "relationship".to_string());
+                    rows.push((
+                        build_conflict_hit(
+                            row.get(0),
+                            role,
+                            row.get(2),
+                            row.get(3),
+                            matched_via,
+                            relationship_path.clone(),
+                        ),
+                        0.8,
+                    ));
+                }
+            }
         }
 
         Ok(dedupe_hits(rows, limit))
@@ -1173,8 +1452,8 @@ impl LegalConflictStore for PgBackend {
 
         if let Some(client_party_id) = upsert_party_pg(&tx, client).await? {
             tx.execute(
-                "INSERT INTO matter_parties (id, matter_id, party_id, role, opened_at, closed_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
+                "INSERT INTO matter_parties (id, matter_id, party_id, role, role_detail, opened_at, closed_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
                  ON CONFLICT (matter_id, party_id, role) DO UPDATE \
                  SET opened_at = COALESCE(matter_parties.opened_at, EXCLUDED.opened_at), \
                      updated_at = NOW()",
@@ -1182,7 +1461,8 @@ impl LegalConflictStore for PgBackend {
                     &Uuid::new_v4(),
                     &matter_id,
                     &client_party_id,
-                    &PartyRole::Client.as_str(),
+                    &PartyRole::Client.base_db_role(),
+                    &PartyRole::Client.role_detail(),
                     &opened_at,
                     &Option::<DateTime<Utc>>::None,
                 ],
@@ -1195,8 +1475,8 @@ impl LegalConflictStore for PgBackend {
                 continue;
             };
             tx.execute(
-                "INSERT INTO matter_parties (id, matter_id, party_id, role, opened_at, closed_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
+                "INSERT INTO matter_parties (id, matter_id, party_id, role, role_detail, opened_at, closed_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
                  ON CONFLICT (matter_id, party_id, role) DO UPDATE \
                  SET opened_at = COALESCE(matter_parties.opened_at, EXCLUDED.opened_at), \
                      updated_at = NOW()",
@@ -1204,7 +1484,8 @@ impl LegalConflictStore for PgBackend {
                     &Uuid::new_v4(),
                     &matter_id,
                     &adverse_party_id,
-                    &PartyRole::Adverse.as_str(),
+                    &PartyRole::Adverse.base_db_role(),
+                    &PartyRole::Adverse.role_detail(),
                     &opened_at,
                     &Option::<DateTime<Utc>>::None,
                 ],
@@ -1240,8 +1521,8 @@ impl LegalConflictStore for PgBackend {
         };
 
         tx.execute(
-            "INSERT INTO matter_parties (id, matter_id, party_id, role, opened_at, closed_at) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+            "INSERT INTO matter_parties (id, matter_id, party_id, role, role_detail, opened_at, closed_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (matter_id, party_id, role) DO UPDATE \
              SET opened_at = COALESCE(matter_parties.opened_at, EXCLUDED.opened_at), \
                  updated_at = NOW()",
@@ -1249,7 +1530,8 @@ impl LegalConflictStore for PgBackend {
                 &Uuid::new_v4(),
                 &matter_id,
                 &party_id,
-                &PartyRole::Adverse.as_str(),
+                &PartyRole::Adverse.base_db_role(),
+                &PartyRole::Adverse.role_detail(),
                 &opened_at,
                 &Option::<DateTime<Utc>>::None,
             ],
@@ -1345,8 +1627,8 @@ impl LegalConflictStore for PgBackend {
         let conn = self.store.conn().await?;
         conn.execute(
             "INSERT INTO conflict_clearances \
-             (id, matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             (id, matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count, reviewing_attorney, report_hash, signed_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &[
                 &Uuid::new_v4(),
                 &row.matter_id,
@@ -1356,6 +1638,9 @@ impl LegalConflictStore for PgBackend {
                 &row.note,
                 &row.hits_json,
                 &row.hit_count,
+                &row.reviewing_attorney,
+                &row.report_hash,
+                &row.signed_at,
             ],
         )
         .await?;
@@ -1369,7 +1654,7 @@ impl LegalConflictStore for PgBackend {
         let conn = self.store.conn().await?;
         let row = conn
             .query_opt(
-                "SELECT matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count, created_at \
+                "SELECT matter_id, checked_by, cleared_by, decision, note, hits_json, hit_count, reviewing_attorney, report_hash, signed_at, created_at \
                  FROM conflict_clearances \
                  WHERE matter_id = $1 \
                  ORDER BY created_at DESC \
@@ -1393,8 +1678,180 @@ impl LegalConflictStore for PgBackend {
             note: row.get(4),
             hits_json: row.get(5),
             hit_count: row.get(6),
-            created_at: row.get(7),
+            reviewing_attorney: row.get(7),
+            report_hash: row.get(8),
+            signed_at: row.get(9),
+            created_at: row.get(10),
         }))
+    }
+
+    async fn list_matter_parties(
+        &self,
+        matter_id: &str,
+    ) -> Result<Vec<crate::db::MatterPartyRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT mp.id \
+                 FROM matter_parties mp \
+                 JOIN parties p ON p.id = mp.party_id \
+                 WHERE mp.matter_id = $1 \
+                 ORDER BY p.name_normalized ASC, mp.created_at ASC",
+                &[&matter_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(matter_party_record_pg(&conn, row.get(0)).await?);
+        }
+        Ok(out)
+    }
+
+    async fn upsert_matter_party(
+        &self,
+        matter_id: &str,
+        input: &crate::db::UpsertMatterPartyParams,
+    ) -> Result<crate::db::MatterPartyRecord, DatabaseError> {
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+        let party_id = upsert_party_pg(&tx, &input.name).await?.ok_or_else(|| {
+            DatabaseError::Serialization("matter party name cannot be empty".to_string())
+        })?;
+        if let Some(notes) = input.notes.as_deref() {
+            tx.execute(
+                "UPDATE parties SET notes = $2, updated_at = NOW() WHERE id = $1",
+                &[&party_id, &notes],
+            )
+            .await?;
+        }
+        let membership_id = Uuid::new_v4();
+        tx.execute(
+            "INSERT INTO matter_parties \
+             (id, matter_id, party_id, role, role_detail, opened_at, closed_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (matter_id, party_id, role) DO UPDATE SET \
+                role_detail = EXCLUDED.role_detail, \
+                opened_at = COALESCE(EXCLUDED.opened_at, matter_parties.opened_at), \
+                closed_at = EXCLUDED.closed_at, \
+                updated_at = NOW()",
+            &[
+                &membership_id,
+                &matter_id,
+                &party_id,
+                &input.role.base_db_role(),
+                &input.role.role_detail(),
+                &input.opened_at,
+                &input.closed_at,
+            ],
+        )
+        .await?;
+
+        let mut seen = HashSet::new();
+        for alias in &input.aliases {
+            let display_alias = alias.trim();
+            if display_alias.is_empty() {
+                continue;
+            }
+            let normalized_alias = normalize_party_name(display_alias);
+            if normalized_alias.is_empty() || !seen.insert(normalized_alias.clone()) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO party_aliases (id, party_id, alias, alias_normalized) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (party_id, alias_normalized) DO UPDATE \
+                 SET alias = EXCLUDED.alias, updated_at = NOW()",
+                &[
+                    &Uuid::new_v4(),
+                    &party_id,
+                    &display_alias,
+                    &normalized_alias,
+                ],
+            )
+            .await?;
+        }
+        let row = tx
+            .query_one(
+                "SELECT id FROM matter_parties WHERE matter_id = $1 AND party_id = $2 AND role = $3 LIMIT 1",
+                &[&matter_id, &party_id, &input.role.base_db_role()],
+            )
+            .await?;
+        let membership_id: Uuid = row.get(0);
+        tx.commit().await?;
+        matter_party_record_pg(&conn, membership_id).await
+    }
+
+    async fn list_matter_party_relationships(
+        &self,
+        matter_id: &str,
+    ) -> Result<Vec<crate::db::PartyRelationshipRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT DISTINCT pr.id \
+                 FROM party_relationships pr \
+                 JOIN matter_parties parent_mp ON parent_mp.party_id = pr.parent_id \
+                 LEFT JOIN matter_parties child_mp ON child_mp.party_id = pr.child_id \
+                 WHERE parent_mp.matter_id = $1 OR child_mp.matter_id = $1 \
+                 ORDER BY pr.kind ASC",
+                &[&matter_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(party_relationship_record_pg(&conn, row.get(0)).await?);
+        }
+        Ok(out)
+    }
+
+    async fn upsert_party_relationship(
+        &self,
+        input: &crate::db::CreatePartyRelationshipParams,
+    ) -> Result<crate::db::PartyRelationshipRecord, DatabaseError> {
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+        let parent_id = match input.parent_party_id {
+            Some(id) => id,
+            None => upsert_party_pg(
+                &tx,
+                input.parent_name.as_deref().ok_or_else(|| {
+                    DatabaseError::Serialization("parent_name is required".to_string())
+                })?,
+            )
+            .await?
+            .ok_or_else(|| {
+                DatabaseError::Serialization("parent_name cannot be empty".to_string())
+            })?,
+        };
+        let child_id = match input.child_party_id {
+            Some(id) => id,
+            None => upsert_party_pg(
+                &tx,
+                input.child_name.as_deref().ok_or_else(|| {
+                    DatabaseError::Serialization("child_name is required".to_string())
+                })?,
+            )
+            .await?
+            .ok_or_else(|| {
+                DatabaseError::Serialization("child_name cannot be empty".to_string())
+            })?,
+        };
+        tx.execute(
+            "INSERT INTO party_relationships (id, parent_id, child_id, kind) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (parent_id, child_id, kind) DO UPDATE SET updated_at = NOW()",
+            &[&Uuid::new_v4(), &parent_id, &child_id, &input.kind],
+        )
+        .await?;
+        let row = tx
+            .query_one(
+                "SELECT id FROM party_relationships WHERE parent_id = $1 AND child_id = $2 AND kind = $3 LIMIT 1",
+                &[&parent_id, &child_id, &input.kind],
+            )
+            .await?;
+        let relationship_id: Uuid = row.get(0);
+        tx.commit().await?;
+        party_relationship_record_pg(&conn, relationship_id).await
     }
 }
 
@@ -2350,7 +2807,7 @@ impl MatterDocumentStore for PgBackend {
         let conn = self.store.conn().await?;
         let rows = conn
             .query(
-                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at \
+                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.readiness_state, md.created_at, md.updated_at \
                  FROM matter_documents md \
                  JOIN memory_documents d ON d.id = md.memory_document_id \
                  WHERE md.user_id = $1 AND md.matter_id = $2 \
@@ -2372,11 +2829,30 @@ impl MatterDocumentStore for PgBackend {
         let conn = self.store.conn().await?;
         let row = conn
             .query_opt(
-                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at \
+                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.readiness_state, md.created_at, md.updated_at \
                  FROM matter_documents md \
                  JOIN memory_documents d ON d.id = md.memory_document_id \
                  WHERE md.user_id = $1 AND md.matter_id = $2 AND md.id = $3",
                 &[&user_id, &matter_id, &matter_document_id],
+            )
+            .await?;
+        row.map(|row| row_to_matter_document_record(&row))
+            .transpose()
+    }
+
+    async fn get_matter_document_by_id(
+        &self,
+        user_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.readiness_state, md.created_at, md.updated_at \
+                 FROM matter_documents md \
+                 JOIN memory_documents d ON d.id = md.memory_document_id \
+                 WHERE md.user_id = $1 AND md.id = $2",
+                &[&user_id, &matter_document_id],
             )
             .await?;
         row.map(|row| row_to_matter_document_record(&row))
@@ -2390,14 +2866,16 @@ impl MatterDocumentStore for PgBackend {
         input: &UpsertMatterDocumentParams,
     ) -> Result<MatterDocumentRecord, DatabaseError> {
         let conn = self.store.conn().await?;
+        let insert_readiness_state = input.readiness_state.unwrap_or_default();
         let row = conn
             .query_one(
                 "INSERT INTO matter_documents \
-                 (id, user_id, matter_id, memory_document_id, display_name, category) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 (id, user_id, matter_id, memory_document_id, display_name, category, readiness_state) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
                  ON CONFLICT (user_id, matter_id, memory_document_id) DO UPDATE SET \
                     display_name = EXCLUDED.display_name, \
                     category = EXCLUDED.category, \
+                    readiness_state = COALESCE($8, matter_documents.readiness_state), \
                     updated_at = NOW() \
                  RETURNING id",
                 &[
@@ -2407,6 +2885,8 @@ impl MatterDocumentStore for PgBackend {
                     &input.memory_document_id,
                     &input.display_name,
                     &input.category.as_str(),
+                    &insert_readiness_state.as_str(),
+                    &input.readiness_state.map(|state| state.as_str()),
                 ],
             )
             .await?;
@@ -2437,11 +2917,13 @@ impl MatterDocumentStore for PgBackend {
             .clone()
             .unwrap_or(existing.display_name.clone());
         let merged_category = input.category.unwrap_or(existing.category);
+        let merged_readiness_state = input.readiness_state.unwrap_or(existing.readiness_state);
         let conn = self.store.conn().await?;
         conn.execute(
             "UPDATE matter_documents SET \
                 display_name = $4, \
                 category = $5, \
+                readiness_state = $6, \
                 updated_at = NOW() \
              WHERE user_id = $1 AND matter_id = $2 AND id = $3",
             &[
@@ -2450,6 +2932,7 @@ impl MatterDocumentStore for PgBackend {
                 &matter_document_id,
                 &merged_display_name,
                 &merged_category.as_str(),
+                &merged_readiness_state.as_str(),
             ],
         )
         .await?;
@@ -2760,7 +3243,8 @@ impl TimeExpenseStore for PgBackend {
         let conn = self.store.conn().await?;
         let rows = conn
             .query(
-                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at \
+                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at, \
+                        task_code, activity_code, resolved_rate, rate_source, block_billing_flag, block_billing_reason \
                  FROM time_entries \
                  WHERE user_id = $1 AND matter_id = $2 \
                  ORDER BY entry_date DESC, created_at DESC",
@@ -2781,7 +3265,8 @@ impl TimeExpenseStore for PgBackend {
         let conn = self.store.conn().await?;
         let row = conn
             .query_opt(
-                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at \
+                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at, \
+                        task_code, activity_code, resolved_rate, rate_source, block_billing_flag, block_billing_reason \
                  FROM time_entries \
                  WHERE user_id = $1 AND matter_id = $2 AND id = $3",
                 &[&user_id, &matter_id, &entry_id],
@@ -2800,9 +3285,10 @@ impl TimeExpenseStore for PgBackend {
         let row = conn
             .query_one(
                 "INSERT INTO time_entries \
-                 (id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-                 RETURNING id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at",
+                 (id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, task_code, activity_code, resolved_rate, rate_source, block_billing_flag, block_billing_reason) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+                 RETURNING id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at, \
+                           task_code, activity_code, resolved_rate, rate_source, block_billing_flag, block_billing_reason",
                 &[
                     &Uuid::new_v4(),
                     &user_id,
@@ -2813,6 +3299,12 @@ impl TimeExpenseStore for PgBackend {
                     &input.hourly_rate,
                     &input.entry_date,
                     &input.billable,
+                    &input.task_code,
+                    &input.activity_code,
+                    &input.resolved_rate,
+                    &input.rate_source.map(|value| value.as_str().to_string()),
+                    &input.block_billing_flag,
+                    &input.block_billing_reason,
                 ],
             )
             .await?;
@@ -2836,6 +3328,20 @@ impl TimeExpenseStore for PgBackend {
         let merged_hourly_rate = input.hourly_rate.unwrap_or(existing.hourly_rate);
         let merged_entry_date = input.entry_date.unwrap_or(existing.entry_date);
         let merged_billable = input.billable.unwrap_or(existing.billable);
+        let merged_task_code = input.task_code.clone().unwrap_or(existing.task_code);
+        let merged_activity_code = input
+            .activity_code
+            .clone()
+            .unwrap_or(existing.activity_code);
+        let merged_resolved_rate = input.resolved_rate.unwrap_or(existing.resolved_rate);
+        let merged_rate_source = input.rate_source.unwrap_or(existing.rate_source);
+        let merged_block_billing_flag = input
+            .block_billing_flag
+            .unwrap_or(existing.block_billing_flag);
+        let merged_block_billing_reason = input
+            .block_billing_reason
+            .clone()
+            .unwrap_or(existing.block_billing_reason);
 
         let conn = self.store.conn().await?;
         let row = conn
@@ -2847,9 +3353,16 @@ impl TimeExpenseStore for PgBackend {
                     hourly_rate = $7, \
                     entry_date = $8, \
                     billable = $9, \
+                    task_code = $10, \
+                    activity_code = $11, \
+                    resolved_rate = $12, \
+                    rate_source = $13, \
+                    block_billing_flag = $14, \
+                    block_billing_reason = $15, \
                     updated_at = NOW() \
                  WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
-                 RETURNING id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at",
+                 RETURNING id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at, \
+                           task_code, activity_code, resolved_rate, rate_source, block_billing_flag, block_billing_reason",
                 &[
                     &user_id,
                     &matter_id,
@@ -2860,6 +3373,12 @@ impl TimeExpenseStore for PgBackend {
                     &merged_hourly_rate,
                     &merged_entry_date,
                     &merged_billable,
+                    &merged_task_code,
+                    &merged_activity_code,
+                    &merged_resolved_rate,
+                    &merged_rate_source.map(|value| value.as_str().to_string()),
+                    &merged_block_billing_flag,
+                    &merged_block_billing_reason,
                 ],
             )
             .await?;
@@ -3138,9 +3657,10 @@ impl BillingStore for PgBackend {
         for item in line_items {
             let row = tx
                 .query_one(
-                    "INSERT INTO invoice_line_items (id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-                     RETURNING id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at",
+                    "INSERT INTO invoice_line_items (id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, task_code, activity_code, timekeeper, resolved_rate, rate_source) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+                     RETURNING id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at, \
+                               task_code, activity_code, timekeeper, resolved_rate, rate_source",
                     &[
                         &Uuid::new_v4(),
                         &user_id,
@@ -3152,6 +3672,11 @@ impl BillingStore for PgBackend {
                         &item.time_entry_id,
                         &item.expense_entry_id,
                         &item.sort_order,
+                        &item.task_code,
+                        &item.activity_code,
+                        &item.timekeeper,
+                        &item.resolved_rate,
+                        &item.rate_source.map(|value| value.as_str().to_string()),
                     ],
                 )
                 .await?;
@@ -3217,7 +3742,8 @@ impl BillingStore for PgBackend {
         let conn = self.store.conn().await?;
         let rows = conn
             .query(
-                "SELECT id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at \
+                "SELECT id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at, \
+                        task_code, activity_code, timekeeper, resolved_rate, rate_source \
                  FROM invoice_line_items \
                  WHERE user_id = $1 AND invoice_id = $2 \
                  ORDER BY sort_order ASC, created_at ASC",
@@ -3467,20 +3993,35 @@ impl BillingStore for PgBackend {
 
         let mut trust_entry = None;
         if input.draw_from_trust {
+            let trust_account_id = match self.get_primary_trust_account(user_id).await? {
+                Some(account) => account.id,
+                None => {
+                    self.upsert_primary_trust_account(
+                        user_id,
+                        &UpsertTrustAccountParams {
+                            name: "Primary IOLTA".to_string(),
+                            bank_name: None,
+                            account_number_last4: None,
+                        },
+                    )
+                    .await?
+                    .id
+                }
+            };
             tx.query(
                 "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
-                &[&user_id, &invoice.matter_id],
+                &[&user_id, &trust_account_id.to_string()],
             )
             .await?;
             let current_row = tx
                 .query_opt(
                     "SELECT balance_after \
                      FROM trust_ledger \
-                     WHERE user_id = $1 AND matter_id = $2 \
+                     WHERE user_id = $1 AND trust_account_id = $2 \
                      ORDER BY created_at DESC, id DESC \
                      LIMIT 1 \
                      FOR UPDATE",
-                    &[&user_id, &invoice.matter_id],
+                    &[&user_id, &trust_account_id],
                 )
                 .await?;
             let current_balance = current_row
@@ -3503,18 +4044,26 @@ impl BillingStore for PgBackend {
                 .to_string();
             let row = tx
                 .query_one(
-                    "INSERT INTO trust_ledger (id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-                     RETURNING id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at",
+                    "INSERT INTO trust_ledger (id, user_id, matter_id, trust_account_id, entry_type, entry_detail, amount, delta, balance_after, description, invoice_id, reference_number, source, recorded_by) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                     RETURNING id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at, \
+                               trust_account_id, entry_detail, delta, reference_number, source",
                     &[
                         &Uuid::new_v4(),
                         &user_id,
                         &invoice.matter_id,
-                        &TrustLedgerEntryType::InvoicePayment.as_str(),
+                        &trust_account_id,
+                        &TrustLedgerEntryType::InvoicePayment.base_db_value(),
+                        &TrustLedgerEntryType::InvoicePayment
+                            .entry_detail()
+                            .map(str::to_string),
                         &input.amount,
+                        &(-input.amount).round_dp(2),
                         &balance_after,
                         &description,
                         &Some(invoice_id),
+                        &Option::<String>::None,
+                        &Some(crate::db::TrustLedgerSource::InvoicePayment.as_str().to_string()),
                         &input.recorded_by,
                     ],
                 )
@@ -3547,22 +4096,40 @@ impl BillingStore for PgBackend {
         matter_id: &str,
         input: &CreateTrustLedgerEntryParams,
     ) -> Result<TrustLedgerEntryRecord, DatabaseError> {
+        let trust_account_id = match input.trust_account_id {
+            Some(id) => id,
+            None => match self.get_primary_trust_account(user_id).await? {
+                Some(account) => account.id,
+                None => {
+                    self.upsert_primary_trust_account(
+                        user_id,
+                        &UpsertTrustAccountParams {
+                            name: "Primary IOLTA".to_string(),
+                            bank_name: None,
+                            account_number_last4: None,
+                        },
+                    )
+                    .await?
+                    .id
+                }
+            },
+        };
         let mut conn = self.store.conn().await?;
         let tx = conn.transaction().await?;
         tx.query(
             "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
-            &[&user_id, &matter_id],
+            &[&user_id, &trust_account_id.to_string()],
         )
         .await?;
         let current_row = tx
             .query_opt(
                 "SELECT balance_after \
                  FROM trust_ledger \
-                 WHERE user_id = $1 AND matter_id = $2 \
+                 WHERE user_id = $1 AND trust_account_id = $2 \
                  ORDER BY created_at DESC, id DESC \
                  LIMIT 1 \
                  FOR UPDATE",
-                &[&user_id, &matter_id],
+                &[&user_id, &trust_account_id],
             )
             .await?;
         let current_balance = current_row
@@ -3577,18 +4144,24 @@ impl BillingStore for PgBackend {
         }
         let row = tx
             .query_one(
-                "INSERT INTO trust_ledger (id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-                 RETURNING id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at",
+                "INSERT INTO trust_ledger (id, user_id, matter_id, trust_account_id, entry_type, entry_detail, amount, delta, balance_after, description, invoice_id, reference_number, source, recorded_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                 RETURNING id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at, \
+                           trust_account_id, entry_detail, delta, reference_number, source",
                 &[
                     &Uuid::new_v4(),
                     &user_id,
                     &matter_id,
-                    &input.entry_type.as_str(),
+                    &trust_account_id,
+                    &input.entry_type.base_db_value(),
+                    &input.entry_type.entry_detail().map(str::to_string),
                     &input.amount,
+                    &input.delta,
                     &balance_after,
                     &input.description,
                     &input.invoice_id,
+                    &input.reference_number,
+                    &Some(input.source.as_str().to_string()),
                     &input.recorded_by,
                 ],
             )
@@ -3605,7 +4178,8 @@ impl BillingStore for PgBackend {
         let conn = self.store.conn().await?;
         let rows = conn
             .query(
-                "SELECT id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at \
+                "SELECT id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at, \
+                        trust_account_id, entry_detail, delta, reference_number, source \
                  FROM trust_ledger \
                  WHERE user_id = $1 AND matter_id = $2 \
                  ORDER BY created_at DESC, id DESC",
@@ -3625,7 +4199,8 @@ impl BillingStore for PgBackend {
         let conn = self.store.conn().await?;
         let row = conn
             .query_one(
-                "SELECT COALESCE((SELECT balance_after FROM trust_ledger WHERE user_id = $1 AND matter_id = $2 ORDER BY created_at DESC, id DESC LIMIT 1), 0)::numeric AS balance",
+                "SELECT COALESCE(SUM(delta), 0)::numeric AS balance \
+                 FROM trust_ledger WHERE user_id = $1 AND matter_id = $2",
                 &[&user_id, &matter_id],
             )
             .await?;
@@ -3865,14 +4440,15 @@ impl crate::db::LegalRestoreStore for PgBackend {
         let conn = self.store.conn().await?;
         conn.execute(
             "INSERT INTO matter_documents \
-             (id, user_id, matter_id, memory_document_id, display_name, category, created_at, updated_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+             (id, user_id, matter_id, memory_document_id, display_name, category, readiness_state, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
              ON CONFLICT (id) DO UPDATE SET \
                 user_id = EXCLUDED.user_id, \
                 matter_id = EXCLUDED.matter_id, \
                 memory_document_id = EXCLUDED.memory_document_id, \
                 display_name = EXCLUDED.display_name, \
                 category = EXCLUDED.category, \
+                readiness_state = EXCLUDED.readiness_state, \
                 created_at = EXCLUDED.created_at, \
                 updated_at = EXCLUDED.updated_at",
             &[
@@ -3882,6 +4458,7 @@ impl crate::db::LegalRestoreStore for PgBackend {
                 &row.memory_document_id,
                 &row.display_name,
                 &row.category.as_str(),
+                &row.readiness_state.as_str(),
                 &row.created_at,
                 &row.updated_at,
             ],
@@ -3926,8 +4503,8 @@ impl crate::db::LegalRestoreStore for PgBackend {
         let conn = self.store.conn().await?;
         conn.execute(
             "INSERT INTO time_entries \
-             (id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
+             (id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, task_code, activity_code, resolved_rate, rate_source, block_billing_flag, block_billing_reason, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) \
              ON CONFLICT (id) DO UPDATE SET \
                 user_id = EXCLUDED.user_id, \
                 matter_id = EXCLUDED.matter_id, \
@@ -3938,6 +4515,12 @@ impl crate::db::LegalRestoreStore for PgBackend {
                 entry_date = EXCLUDED.entry_date, \
                 billable = EXCLUDED.billable, \
                 billed_invoice_id = EXCLUDED.billed_invoice_id, \
+                task_code = EXCLUDED.task_code, \
+                activity_code = EXCLUDED.activity_code, \
+                resolved_rate = EXCLUDED.resolved_rate, \
+                rate_source = EXCLUDED.rate_source, \
+                block_billing_flag = EXCLUDED.block_billing_flag, \
+                block_billing_reason = EXCLUDED.block_billing_reason, \
                 created_at = EXCLUDED.created_at, \
                 updated_at = EXCLUDED.updated_at",
             &[
@@ -3951,6 +4534,12 @@ impl crate::db::LegalRestoreStore for PgBackend {
                 &row.entry_date,
                 &row.billable,
                 &row.billed_invoice_id,
+                &row.task_code,
+                &row.activity_code,
+                &row.resolved_rate,
+                &row.rate_source.map(|value| value.as_str().to_string()),
+                &row.block_billing_flag,
+                &row.block_billing_reason,
                 &row.created_at,
                 &row.updated_at,
             ],
@@ -4059,8 +4648,8 @@ impl crate::db::LegalRestoreStore for PgBackend {
         let conn = self.store.conn().await?;
         conn.execute(
             "INSERT INTO invoice_line_items \
-             (id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
+             (id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, task_code, activity_code, timekeeper, resolved_rate, rate_source, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
              ON CONFLICT (id) DO UPDATE SET \
                 user_id = EXCLUDED.user_id, \
                 invoice_id = EXCLUDED.invoice_id, \
@@ -4071,6 +4660,11 @@ impl crate::db::LegalRestoreStore for PgBackend {
                 time_entry_id = EXCLUDED.time_entry_id, \
                 expense_entry_id = EXCLUDED.expense_entry_id, \
                 sort_order = EXCLUDED.sort_order, \
+                task_code = EXCLUDED.task_code, \
+                activity_code = EXCLUDED.activity_code, \
+                timekeeper = EXCLUDED.timekeeper, \
+                resolved_rate = EXCLUDED.resolved_rate, \
+                rate_source = EXCLUDED.rate_source, \
                 created_at = EXCLUDED.created_at, \
                 updated_at = EXCLUDED.updated_at",
             &[
@@ -4084,6 +4678,11 @@ impl crate::db::LegalRestoreStore for PgBackend {
                 &row.time_entry_id,
                 &row.expense_entry_id,
                 &row.sort_order,
+                &row.task_code,
+                &row.activity_code,
+                &row.timekeeper,
+                &row.resolved_rate,
+                &row.rate_source.map(|value| value.as_str().to_string()),
                 &row.created_at,
                 &row.updated_at,
             ],
@@ -4099,27 +4698,37 @@ impl crate::db::LegalRestoreStore for PgBackend {
         let conn = self.store.conn().await?;
         conn.execute(
             "INSERT INTO trust_ledger \
-             (id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+             (id, user_id, matter_id, trust_account_id, entry_type, entry_detail, amount, delta, balance_after, description, invoice_id, reference_number, source, recorded_by, created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
              ON CONFLICT (id) DO UPDATE SET \
                 user_id = EXCLUDED.user_id, \
                 matter_id = EXCLUDED.matter_id, \
+                trust_account_id = EXCLUDED.trust_account_id, \
                 entry_type = EXCLUDED.entry_type, \
+                entry_detail = EXCLUDED.entry_detail, \
                 amount = EXCLUDED.amount, \
+                delta = EXCLUDED.delta, \
                 balance_after = EXCLUDED.balance_after, \
                 description = EXCLUDED.description, \
                 invoice_id = EXCLUDED.invoice_id, \
+                reference_number = EXCLUDED.reference_number, \
+                source = EXCLUDED.source, \
                 recorded_by = EXCLUDED.recorded_by, \
                 created_at = EXCLUDED.created_at",
             &[
                 &row.id,
                 &row.user_id,
                 &row.matter_id,
-                &row.entry_type.as_str(),
+                &row.trust_account_id,
+                &row.entry_type.base_db_value(),
+                &row.entry_type.entry_detail().map(str::to_string),
                 &row.amount,
+                &row.delta,
                 &row.balance_after,
                 &row.description,
                 &row.invoice_id,
+                &row.reference_number,
+                &Some(row.source.as_str().to_string()),
                 &row.recorded_by,
                 &row.created_at,
             ],

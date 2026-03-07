@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::channels::web::auth::RequestPrincipal;
 use crate::channels::web::handlers::helpers::matter::require_matter_access;
@@ -200,11 +201,12 @@ fn clearance_signature_matches_hits(
     conflict_signature_for_hits(&stored_hits) == conflict_signature_for_hits(hits)
 }
 
-async fn persist_conflict_clearance_decision(
+pub(crate) async fn persist_conflict_clearance_decision(
     state: &Arc<GatewayState>,
     matter_id: &str,
     decision: ConflictDecision,
     note: Option<String>,
+    reviewing_attorney: Option<String>,
     hits: &[ConflictHit],
     source: &str,
 ) -> Result<(), (StatusCode, String)> {
@@ -219,6 +221,10 @@ async fn persist_conflict_clearance_decision(
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
+    let serialized_hits = serde_json::to_vec(hits).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(&serialized_hits);
+    let report_hash = format!("sha256:{:x}", hasher.finalize());
     let clearance = ConflictClearanceRecord {
         matter_id: matter_id.to_string(),
         checked_by: state.user_id.clone(),
@@ -238,6 +244,13 @@ async fn persist_conflict_clearance_decision(
             serde_json::json!([])
         }),
         hit_count: hits.len() as i32,
+        reviewing_attorney: reviewing_attorney.or_else(|| Some(state.user_id.clone())),
+        report_hash: Some(report_hash.clone()),
+        signed_at: if decision_allows_matter_activation(decision) {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        },
     };
     store
         .record_conflict_clearance(&clearance)
@@ -256,6 +269,7 @@ async fn persist_conflict_clearance_decision(
             "checked_by": state.user_id.clone(),
             "cleared_by_present": clearance.cleared_by.is_some(),
             "hit_count": clearance.hit_count,
+            "report_hash": report_hash,
             "source": source,
         }),
     )
@@ -381,6 +395,7 @@ pub(crate) async fn matters_create_handler(
             &sanitized,
             decision,
             conflict_note.clone(),
+            None,
             &conflict_hits,
             "create_flow",
         )
@@ -1121,6 +1136,7 @@ pub(crate) async fn matters_active_set_handler(
                             &sanitized,
                             decision,
                             requested_note,
+                            None,
                             &hits,
                             "active_set_flow",
                         )

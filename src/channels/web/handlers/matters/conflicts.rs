@@ -2,14 +2,24 @@
 
 use std::sync::Arc;
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{get, post},
+};
 
+use crate::channels::web::auth::RequestPrincipal;
+use crate::channels::web::handlers::helpers::matter::require_matter_access;
 use crate::channels::web::state::GatewayState;
 use crate::channels::web::types::{
-    MatterConflictCheckRequest, MatterConflictCheckResponse, MatterConflictGraphReindexResponse,
-    MatterIntakeConflictCheckRequest, MatterIntakeConflictCheckResponse,
+    CreatePartyRelationshipRequest, MatterConflictCheckRequest, MatterConflictCheckResponse,
+    MatterConflictClearanceRequest, MatterConflictClearanceResponse,
+    MatterConflictGraphReindexResponse, MatterConflictReportResponse,
+    MatterIntakeConflictCheckRequest, MatterIntakeConflictCheckResponse, MatterPartiesResponse,
+    MatterPartyRelationshipResponse, UpsertMatterPartyRequest,
 };
-use crate::db::AuditSeverity;
+use crate::db::{AuditSeverity, MatterMemberRole, PartyRole, UpsertMatterPartyParams};
 
 const MAX_CONFLICT_TEXT_PREVIEW_CHARS: usize = 100;
 
@@ -26,6 +36,22 @@ pub fn routes() -> Router<Arc<GatewayState>> {
         .route(
             "/api/matters/conflicts/reindex",
             post(matters_conflicts_reindex_handler),
+        )
+        .route(
+            "/api/matters/{id}/parties",
+            get(matter_parties_list_handler).post(matter_parties_upsert_handler),
+        )
+        .route(
+            "/api/matters/{id}/parties/relationships",
+            post(matter_parties_relationships_handler),
+        )
+        .route(
+            "/api/matters/{id}/conflicts/report",
+            get(matter_conflicts_report_handler),
+        )
+        .route(
+            "/api/matters/{id}/conflicts/clearance",
+            post(matter_conflicts_clearance_handler),
         )
 }
 
@@ -319,5 +345,329 @@ pub(crate) async fn matters_conflicts_reindex_handler(
     Ok(Json(MatterConflictGraphReindexResponse {
         status: "ok",
         report,
+    }))
+}
+
+fn parse_party_role(raw: &str) -> Result<PartyRole, (StatusCode, String)> {
+    PartyRole::from_db_value(&raw.trim().to_ascii_lowercase()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "role must be one of client, adverse, related, witness, affiliate, principal, or opposing_counsel".to_string(),
+    ))
+}
+
+async fn ensure_structured_matter_parties(
+    state: &GatewayState,
+    matter_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(());
+    };
+    if !store
+        .list_matter_parties(matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .is_empty()
+    {
+        return Ok(());
+    }
+    let Some(workspace) = state.workspace.as_ref() else {
+        return Ok(());
+    };
+    let matter_root = crate::channels::web::server::matter_root_for_gateway(state);
+    let metadata = match crate::legal::matter::read_matter_metadata_for_root(
+        workspace.as_ref(),
+        &matter_root,
+        matter_id,
+    )
+    .await
+    {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(()),
+    };
+    store
+        .upsert_matter_party(
+            matter_id,
+            &UpsertMatterPartyParams {
+                name: metadata.client,
+                role: PartyRole::Client,
+                aliases: Vec::new(),
+                notes: None,
+                opened_at: None,
+                closed_at: None,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    for adversary in metadata.adversaries {
+        store
+            .upsert_matter_party(
+                matter_id,
+                &UpsertMatterPartyParams {
+                    name: adversary,
+                    role: PartyRole::Adverse,
+                    aliases: Vec::new(),
+                    notes: None,
+                    opened_at: None,
+                    closed_at: None,
+                },
+            )
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn build_matter_conflict_report(
+    state: &GatewayState,
+    matter_id: &str,
+) -> Result<MatterConflictReportResponse, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    ensure_structured_matter_parties(state, matter_id).await?;
+    let parties = store
+        .list_matter_parties(matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let relationships = store
+        .list_matter_party_relationships(matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    // Include aliases alongside canonical names so alias-only matches are not missed.
+    let checked_parties = parties
+        .iter()
+        .flat_map(|party| std::iter::once(party.name.clone()).chain(party.aliases.iter().cloned()))
+        .collect::<Vec<_>>();
+    let mut hits = store
+        .find_conflict_hits_for_names(&checked_parties, 100)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    hits.retain(|hit| hit.matter_id != matter_id);
+    let latest_clearance = store
+        .latest_conflict_clearance(matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .map(crate::channels::web::server::conflict_clearance_info_to_response);
+    Ok(MatterConflictReportResponse {
+        matter_id: matter_id.to_string(),
+        checked_parties,
+        parties: parties
+            .into_iter()
+            .map(crate::channels::web::server::matter_party_record_to_info)
+            .collect(),
+        relationships: relationships
+            .into_iter()
+            .map(crate::channels::web::server::party_relationship_record_to_info)
+            .collect(),
+        hits,
+        latest_clearance,
+    })
+}
+
+pub(crate) async fn matter_parties_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path(id): Path<String>,
+) -> Result<Json<MatterPartiesResponse>, (StatusCode, String)> {
+    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
+    crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    ensure_structured_matter_parties(state.as_ref(), &matter_id).await?;
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let parties = store
+        .list_matter_parties(&matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(MatterPartiesResponse {
+        matter_id,
+        parties: parties
+            .into_iter()
+            .map(crate::channels::web::server::matter_party_record_to_info)
+            .collect(),
+    }))
+}
+
+pub(crate) async fn matter_parties_upsert_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path(id): Path<String>,
+    Json(req): Json<UpsertMatterPartyRequest>,
+) -> Result<
+    (
+        StatusCode,
+        Json<crate::channels::web::types::MatterPartyInfo>,
+    ),
+    (StatusCode, String),
+> {
+    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
+    crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let name = crate::channels::web::server::parse_required_matter_field("name", &req.name)?;
+    let role = parse_party_role(&req.role)?;
+    let aliases = req
+        .aliases
+        .into_iter()
+        .filter_map(|alias| crate::channels::web::server::parse_optional_matter_field(Some(alias)))
+        .collect::<Vec<_>>();
+    let notes = crate::channels::web::server::parse_optional_matter_field(req.notes);
+    let opened_at =
+        crate::channels::web::server::parse_optional_datetime("opened_at", req.opened_at)?;
+    let closed_at =
+        crate::channels::web::server::parse_optional_datetime("closed_at", req.closed_at)?;
+    let party = store
+        .upsert_matter_party(
+            &matter_id,
+            &UpsertMatterPartyParams {
+                name,
+                role,
+                aliases,
+                notes,
+                opened_at,
+                closed_at,
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(crate::channels::web::server::matter_party_record_to_info(
+            party,
+        )),
+    ))
+}
+
+pub(crate) async fn matter_parties_relationships_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path(id): Path<String>,
+    Json(req): Json<CreatePartyRelationshipRequest>,
+) -> Result<Json<MatterPartyRelationshipResponse>, (StatusCode, String)> {
+    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
+    crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let relationship = store
+        .upsert_party_relationship(&crate::db::CreatePartyRelationshipParams {
+            parent_party_id: req
+                .parent_party_id
+                .as_deref()
+                .map(|value| crate::channels::web::server::parse_uuid(value, "parent_party_id"))
+                .transpose()?,
+            parent_name: crate::channels::web::server::parse_optional_matter_field(req.parent_name),
+            child_party_id: req
+                .child_party_id
+                .as_deref()
+                .map(|value| crate::channels::web::server::parse_uuid(value, "child_party_id"))
+                .transpose()?,
+            child_name: crate::channels::web::server::parse_optional_matter_field(req.child_name),
+            kind: crate::channels::web::server::parse_required_matter_field("kind", &req.kind)?,
+        })
+        .await
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok(Json(MatterPartyRelationshipResponse {
+        relationship: crate::channels::web::server::party_relationship_record_to_info(relationship),
+    }))
+}
+
+pub(crate) async fn matter_conflicts_report_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path(id): Path<String>,
+) -> Result<Json<MatterConflictReportResponse>, (StatusCode, String)> {
+    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
+    crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    Ok(Json(
+        build_matter_conflict_report(state.as_ref(), &matter_id).await?,
+    ))
+}
+
+pub(crate) async fn matter_conflicts_clearance_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path(id): Path<String>,
+    Json(req): Json<MatterConflictClearanceRequest>,
+) -> Result<Json<MatterConflictClearanceResponse>, (StatusCode, String)> {
+    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
+    let report = build_matter_conflict_report(state.as_ref(), &matter_id).await?;
+    crate::channels::web::handlers::matters::core::persist_conflict_clearance_decision(
+        &state,
+        &matter_id,
+        req.decision,
+        crate::channels::web::server::parse_optional_matter_field(req.note),
+        req.reviewing_attorney,
+        &report.hits,
+        "manual_conflict_report",
+    )
+    .await?;
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let latest = store
+        .latest_conflict_clearance(&matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Conflict clearance was not recorded".to_string(),
+        ))?;
+    Ok(Json(MatterConflictClearanceResponse {
+        matter_id,
+        decision: req.decision.as_str().to_string(),
+        hit_count: report.hits.len(),
+        latest_clearance: crate::channels::web::server::conflict_clearance_info_to_response(latest),
     }))
 }

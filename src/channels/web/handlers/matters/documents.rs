@@ -16,9 +16,10 @@ use crate::channels::web::server::MatterDocumentsQuery;
 use crate::channels::web::state::GatewayState;
 use crate::channels::web::types::*;
 use crate::db::{
-    CreateDocumentVersionParams, MatterDocumentCategory, MatterMemberRole,
+    CreateDocumentVersionParams, DocumentReadinessState, MatterDocumentCategory, MatterMemberRole,
     UpsertMatterDocumentParams,
 };
+use crate::legal::citations::CitationVerificationProvider;
 
 pub fn routes() -> Router<Arc<GatewayState>> {
     Router::new()
@@ -34,6 +35,15 @@ pub fn routes() -> Router<Arc<GatewayState>> {
             post(matter_retrieval_export_handler),
         )
         .route("/api/documents/generate", post(documents_generate_handler))
+        .route(
+            "/api/matters/{id}/citations/verify",
+            post(matter_citations_verify_handler),
+        )
+        .route(
+            "/api/documents/{id}/citations",
+            get(document_citations_handler),
+        )
+        .route("/api/documents/{id}/ready", post(document_ready_handler))
         .route(
             "/api/matters/{id}/filing-package",
             post(matter_filing_package_handler),
@@ -118,6 +128,7 @@ pub(crate) async fn matter_documents_handler(
                         path: template.path,
                         is_dir: false,
                         category: Some("template".to_string()),
+                        readiness_state: None,
                         updated_at: template.updated_at,
                     }),
             );
@@ -248,6 +259,37 @@ pub(crate) async fn matter_dashboard_handler(
         upcoming_deadlines_14d,
         next_deadline: next_deadline.map(|(_, item)| item),
     }))
+}
+
+async fn ensure_ready_filing_documents(
+    state: &GatewayState,
+    matter_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(());
+    };
+    crate::channels::web::server::ensure_matter_db_row_from_workspace(state, matter_id).await?;
+    crate::channels::web::server::backfill_matter_documents_from_workspace(state, matter_id)
+        .await?;
+    let documents = store
+        .list_matter_documents_db(&state.user_id, matter_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if let Some(blocking) = documents.into_iter().find(|document| {
+        matches!(
+            document.category,
+            MatterDocumentCategory::Pleading | MatterDocumentCategory::Filing
+        ) && document.readiness_state != DocumentReadinessState::ReadyToFile
+    }) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Document '{}' is not ready to file; verify citations and mark it ready before exporting a filing package",
+                blocking.display_name
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) async fn matter_templates_handler(
@@ -399,6 +441,7 @@ pub(crate) async fn matter_template_apply_handler(
                     path: written.path.clone(),
                     display_name: template_name.clone(),
                     category: MatterDocumentCategory::Internal,
+                    readiness_state: Some(crate::db::DocumentReadinessState::Draft),
                 },
             )
             .await;
@@ -637,6 +680,7 @@ pub(crate) async fn documents_generate_handler(
                 path: written.path.clone(),
                 display_name: display_name.clone(),
                 category,
+                readiness_state: Some(crate::db::DocumentReadinessState::Draft),
             },
         )
         .await
@@ -677,10 +721,306 @@ pub(crate) async fn documents_generate_handler(
             path: linked.path,
             display_name: linked.display_name,
             category: linked.category.as_str().to_string(),
+            readiness_state: linked.readiness_state.as_str().to_string(),
             version_number: version.version_number,
             label: version.label,
         }),
     ))
+}
+
+async fn load_document_for_citation_workflow(
+    state: &GatewayState,
+    matter_document_id: uuid::Uuid,
+) -> Result<(crate::db::MatterDocumentRecord, String), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let document = store
+        .get_matter_document_by_id(&state.user_id, matter_document_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Document not found".to_string()))?;
+    let content = workspace
+        .read(&document.path)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .content;
+    Ok((document, content))
+}
+
+async fn build_document_citations_response(
+    state: &GatewayState,
+    document: crate::db::MatterDocumentRecord,
+    content: &str,
+) -> Result<DocumentCitationsResponse, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let extracted_citations = crate::legal::citations::extract_citations(content)
+        .into_iter()
+        .map(|citation| citation.citation_text)
+        .collect::<Vec<_>>();
+    let latest_run = store
+        .latest_citation_verification_run(&state.user_id, document.id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let results = store
+        .list_citation_verification_results(&state.user_id, document.id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(DocumentCitationsResponse {
+        document_id: document.id.to_string(),
+        matter_id: document.matter_id,
+        readiness_state: document.readiness_state.as_str().to_string(),
+        extracted_citations,
+        run: latest_run.map(crate::channels::web::server::citation_verification_run_record_to_info),
+        results: results
+            .into_iter()
+            .map(crate::channels::web::server::citation_verification_result_record_to_info)
+            .collect(),
+    })
+}
+
+pub(crate) async fn matter_citations_verify_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path(id): Path<String>,
+    Json(req): Json<VerifyMatterCitationsRequest>,
+) -> Result<Json<VerifyMatterCitationsResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
+    crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
+    let matter_document_id =
+        crate::channels::web::server::parse_uuid(&req.matter_document_id, "matter_document_id")?;
+    let (document, content) =
+        load_document_for_citation_workflow(state.as_ref(), matter_document_id).await?;
+    if document.matter_id != matter_id {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Document not found for matter".to_string(),
+        ));
+    }
+    let legal = crate::channels::web::server::legal_config_for_gateway_or_500(state.as_ref())?;
+    let provider = crate::legal::citations::CourtListenerCitationProvider::from_env(
+        crate::legal::policy::is_network_domain_allowed(&legal, "courtlistener.com"),
+    );
+    let waivers = req
+        .waivers
+        .into_iter()
+        .map(|waiver| {
+            Ok(crate::legal::citations::CitationWaiver {
+                citation_text: crate::channels::web::server::parse_required_matter_field(
+                    "citation_text",
+                    &waiver.citation_text,
+                )?,
+                waived_by: crate::channels::web::server::parse_required_matter_field(
+                    "waived_by",
+                    &waiver.waived_by,
+                )?,
+                reason: crate::channels::web::server::parse_required_matter_field(
+                    "reason",
+                    &waiver.reason,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, (StatusCode, String)>>()?;
+    let extracted_citations = crate::legal::citations::extract_citations(&content)
+        .into_iter()
+        .map(|citation| citation.citation_text)
+        .collect::<Vec<_>>();
+    let result_params =
+        crate::legal::citations::verify_document_with_provider(&provider, &content, &waivers).await;
+    let (run, results) = store
+        .create_citation_verification_run(
+            &state.user_id,
+            &crate::db::CreateCitationVerificationRunParams {
+                matter_id: matter_id.clone(),
+                matter_document_id: document.id,
+                provider: provider.provider_name().to_string(),
+                document_hash: crate::legal::citations::document_hash(&content),
+                created_by: state.user_id.clone(),
+            },
+            &result_params,
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let updated_document = store
+        .get_matter_document(&state.user_id, &matter_id, document.id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Document not found".to_string()))?;
+    crate::channels::web::server::record_legal_audit_event(
+        state.as_ref(),
+        "document_citations_verified",
+        state.user_id.as_str(),
+        Some(matter_id.as_str()),
+        if results.iter().all(|result| {
+            matches!(
+                result.status,
+                crate::db::CitationVerificationStatus::Verified
+                    | crate::db::CitationVerificationStatus::Waived
+            )
+        }) {
+            crate::db::AuditSeverity::Info
+        } else {
+            crate::db::AuditSeverity::Warn
+        },
+        serde_json::json!({
+            "matter_document_id": document.id.to_string(),
+            "provider": run.provider,
+            "citation_count": results.len(),
+            "readiness_state": updated_document.readiness_state.as_str(),
+        }),
+    )
+    .await;
+    Ok(Json(VerifyMatterCitationsResponse {
+        matter_id,
+        document_id: updated_document.id.to_string(),
+        readiness_state: updated_document.readiness_state.as_str().to_string(),
+        extracted_citations,
+        run: crate::channels::web::server::citation_verification_run_record_to_info(run),
+        results: results
+            .into_iter()
+            .map(crate::channels::web::server::citation_verification_result_record_to_info)
+            .collect(),
+    }))
+}
+
+pub(crate) async fn document_citations_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path(id): Path<String>,
+) -> Result<Json<DocumentCitationsResponse>, (StatusCode, String)> {
+    let matter_document_id = crate::channels::web::server::parse_uuid(&id, "matter_document_id")?;
+    let (document, content) =
+        load_document_for_citation_workflow(state.as_ref(), matter_document_id).await?;
+    // Normalize RBAC failure to 404: callers must not be able to use a 403 response
+    // to confirm that a document UUID exists across matters they cannot access.
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &document.matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|_| (StatusCode::NOT_FOUND, "Document not found".to_string()))?;
+    Ok(Json(
+        build_document_citations_response(state.as_ref(), document, &content).await?,
+    ))
+}
+
+pub(crate) async fn document_ready_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path(id): Path<String>,
+    Json(req): Json<MarkDocumentReadyRequest>,
+) -> Result<Json<MarkDocumentReadyResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let matter_document_id = crate::channels::web::server::parse_uuid(&id, "matter_document_id")?;
+    let (document, content) =
+        load_document_for_citation_workflow(state.as_ref(), matter_document_id).await?;
+    // Normalize RBAC failure to 404: callers must not be able to use a 403 response
+    // to confirm that a document UUID exists across matters they cannot access.
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &document.matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|_| (StatusCode::NOT_FOUND, "Document not found".to_string()))?;
+    let extracted = crate::legal::citations::extract_citations(&content);
+    if !extracted.is_empty() {
+        let latest_run = store
+            .latest_citation_verification_run(&state.user_id, document.id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+            .ok_or((
+                StatusCode::CONFLICT,
+                "Document citations must be verified before marking ready to file".to_string(),
+            ))?;
+        let current_hash = crate::legal::citations::document_hash(&content);
+        if latest_run.document_hash != current_hash {
+            return Err((
+                StatusCode::CONFLICT,
+                "Document changed after the latest citation verification; re-run verification"
+                    .to_string(),
+            ));
+        }
+        let results = store
+            .list_citation_verification_results(&state.user_id, document.id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        let statuses = results
+            .iter()
+            .map(|result| (result.normalized_citation.clone(), result.status))
+            .collect::<std::collections::HashMap<_, _>>();
+        for citation in extracted {
+            let status = statuses.get(&citation.normalized_citation);
+            if !matches!(
+                status,
+                Some(crate::db::CitationVerificationStatus::Verified)
+                    | Some(crate::db::CitationVerificationStatus::Waived)
+            ) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Citation '{}' is unresolved; verify or waive all citations before export",
+                        citation.citation_text
+                    ),
+                ));
+            }
+        }
+    }
+
+    let updated_document = store
+        .set_matter_document_readiness(
+            &state.user_id,
+            &document.matter_id,
+            document.id,
+            DocumentReadinessState::ReadyToFile,
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Document not found".to_string()))?;
+    crate::channels::web::server::record_legal_audit_event(
+        state.as_ref(),
+        "document_marked_ready",
+        req.attorney.as_deref().unwrap_or(state.user_id.as_str()),
+        Some(updated_document.matter_id.as_str()),
+        crate::db::AuditSeverity::Info,
+        serde_json::json!({
+            "matter_document_id": updated_document.id.to_string(),
+            "readiness_state": updated_document.readiness_state.as_str(),
+        }),
+    )
+    .await;
+    Ok(Json(MarkDocumentReadyResponse {
+        document: crate::channels::web::server::matter_document_record_to_info(updated_document),
+    }))
 }
 
 pub(crate) async fn matter_filing_package_handler(
@@ -709,6 +1049,7 @@ pub(crate) async fn matter_filing_package_handler(
         &id,
     )
     .await?;
+    ensure_ready_filing_documents(state.as_ref(), &matter_id).await?;
     let matter_prefix = format!("{matter_root}/{matter_id}");
     let generated_at = Utc::now();
     let timestamp = generated_at.format("%Y%m%d-%H%M%S").to_string();

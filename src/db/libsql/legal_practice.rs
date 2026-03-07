@@ -7,22 +7,23 @@ use uuid::Uuid;
 
 use crate::db::{
     AppendAuditEventParams, AuditEventQuery, AuditEventRecord, AuditEventStore, AuditSeverity,
-    BillingStore, ClientRecord, ClientStore, ClientType, CreateClientParams,
+    BillingRateSource, BillingStore, ClientRecord, ClientStore, ClientType, CreateClientParams,
     CreateDocumentVersionParams, CreateExpenseEntryParams, CreateInvoiceLineItemParams,
     CreateInvoiceParams, CreateMatterDeadlineParams, CreateMatterNoteParams,
     CreateMatterTaskParams, CreateTimeEntryParams, CreateTrustLedgerEntryParams,
-    DocumentTemplateRecord, DocumentTemplateStore, DocumentVersionRecord, DocumentVersionStore,
-    ExpenseCategory, ExpenseEntryRecord, InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus,
-    LegalRestoreStore, MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType,
-    MatterDocumentCategory, MatterDocumentRecord, MatterDocumentStore, MatterMemberRole,
-    MatterMembershipRecord, MatterNoteRecord, MatterNoteStore, MatterRecord, MatterStatus,
-    MatterStore, MatterTaskRecord, MatterTaskStatus, MatterTaskStore, MatterTimeSummary, RbacStore,
-    RecordInvoicePaymentParams, RecordInvoicePaymentResult, TimeEntryRecord, TimeExpenseStore,
-    TrustLedgerEntryRecord, TrustLedgerEntryType, UpdateClientParams, UpdateDocumentTemplateParams,
+    DocumentReadinessState, DocumentTemplateRecord, DocumentTemplateStore, DocumentVersionRecord,
+    DocumentVersionStore, ExpenseCategory, ExpenseEntryRecord, InvoiceLineItemRecord,
+    InvoiceRecord, InvoiceStatus, LegalRestoreStore, MatterDeadlineRecord, MatterDeadlineStore,
+    MatterDeadlineType, MatterDocumentCategory, MatterDocumentRecord, MatterDocumentStore,
+    MatterMemberRole, MatterMembershipRecord, MatterNoteRecord, MatterNoteStore, MatterRecord,
+    MatterStatus, MatterStore, MatterTaskRecord, MatterTaskStatus, MatterTaskStore,
+    MatterTimeSummary, RbacStore, RecordInvoicePaymentParams, RecordInvoicePaymentResult,
+    TimeEntryRecord, TimeExpenseStore, TrustAccountingStore, TrustLedgerEntryRecord,
+    TrustLedgerEntryType, TrustLedgerSource, UpdateClientParams, UpdateDocumentTemplateParams,
     UpdateExpenseEntryParams, UpdateMatterDeadlineParams, UpdateMatterDocumentParams,
     UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
     UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterMembershipParams,
-    UpsertMatterParams, UserRecord, UserRole, normalize_party_name,
+    UpsertMatterParams, UpsertTrustAccountParams, UserRecord, UserRole, normalize_party_name,
 };
 use crate::error::DatabaseError;
 
@@ -86,6 +87,18 @@ fn parse_invoice_status(raw: &str) -> Result<InvoiceStatus, DatabaseError> {
         .ok_or_else(|| DatabaseError::Serialization(format!("invalid invoice status '{}'", raw)))
 }
 
+fn parse_document_readiness_state(raw: &str) -> Result<DocumentReadinessState, DatabaseError> {
+    DocumentReadinessState::from_db_value(raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid document readiness state '{}'", raw))
+    })
+}
+
+fn parse_billing_rate_source(raw: &str) -> Result<BillingRateSource, DatabaseError> {
+    BillingRateSource::from_db_value(raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid billing rate source '{}'", raw))
+    })
+}
+
 fn parse_user_role(raw: &str) -> Result<UserRole, DatabaseError> {
     UserRole::from_db_value(raw)
         .ok_or_else(|| DatabaseError::Serialization(format!("invalid user role '{}'", raw)))
@@ -100,6 +113,12 @@ fn parse_matter_member_role(raw: &str) -> Result<MatterMemberRole, DatabaseError
 fn parse_trust_ledger_entry_type(raw: &str) -> Result<TrustLedgerEntryType, DatabaseError> {
     TrustLedgerEntryType::from_db_value(raw).ok_or_else(|| {
         DatabaseError::Serialization(format!("invalid trust ledger entry type '{}'", raw))
+    })
+}
+
+fn parse_trust_ledger_source(raw: &str) -> Result<TrustLedgerSource, DatabaseError> {
+    TrustLedgerSource::from_db_value(raw).ok_or_else(|| {
+        DatabaseError::Serialization(format!("invalid trust ledger source '{}'", raw))
     })
 }
 
@@ -276,6 +295,10 @@ fn parse_matter_document_category(raw: &str) -> Result<MatterDocumentCategory, D
 
 fn row_to_matter_document_record(row: &libsql::Row) -> Result<MatterDocumentRecord, DatabaseError> {
     let category_raw = get_text(row, 6);
+    let readiness_state = get_opt_text(row, 9)
+        .map(|value| parse_document_readiness_state(&value))
+        .transpose()?
+        .unwrap_or_default();
     Ok(MatterDocumentRecord {
         id: parse_uuid(&get_text(row, 0), "matter_documents.id")?,
         user_id: get_text(row, 1),
@@ -284,6 +307,7 @@ fn row_to_matter_document_record(row: &libsql::Row) -> Result<MatterDocumentReco
         path: get_text(row, 4),
         display_name: get_text(row, 5),
         category: parse_matter_document_category(&category_raw)?,
+        readiness_state,
         created_at: parse_timestamp(&get_text(row, 7))
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
         updated_at: parse_timestamp(&get_text(row, 8))
@@ -337,8 +361,16 @@ fn row_to_time_entry_record(row: &libsql::Row) -> Result<TimeEntryRecord, Databa
         description: get_text(row, 4),
         hours: get_decimal(row, 5),
         hourly_rate: get_opt_decimal(row, 6),
+        task_code: get_opt_text(row, 12),
+        activity_code: get_opt_text(row, 13),
+        resolved_rate: get_opt_decimal(row, 14),
+        rate_source: get_opt_text(row, 15)
+            .map(|value| parse_billing_rate_source(&value))
+            .transpose()?,
         entry_date: parse_naive_date(&entry_date_raw, "entry_date")?,
         billable: get_i64(row, 8) != 0,
+        block_billing_flag: get_i64(row, 16) != 0,
+        block_billing_reason: get_opt_text(row, 17),
         billed_invoice_id: get_opt_text(row, 9),
         created_at: parse_timestamp(&get_text(row, 10))
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
@@ -414,6 +446,13 @@ fn row_to_invoice_line_item_record(
         expense_entry_id: get_opt_text(row, 8)
             .map(|value| parse_uuid(&value, "invoice_line_items.expense_entry_id"))
             .transpose()?,
+        task_code: get_opt_text(row, 12),
+        activity_code: get_opt_text(row, 13),
+        timekeeper: get_opt_text(row, 14),
+        resolved_rate: get_opt_decimal(row, 15),
+        rate_source: get_opt_text(row, 16)
+            .map(|value| parse_billing_rate_source(&value))
+            .transpose()?,
         sort_order: i32::try_from(get_i64(row, 9))
             .map_err(|_| DatabaseError::Serialization("invalid sort_order".to_string()))?,
         created_at: parse_timestamp(&get_text(row, 10))
@@ -427,14 +466,41 @@ fn row_to_trust_ledger_entry_record(
     row: &libsql::Row,
 ) -> Result<TrustLedgerEntryRecord, DatabaseError> {
     let entry_type_raw = get_text(row, 3);
+    let entry_detail = get_opt_text(row, 11);
     Ok(TrustLedgerEntryRecord {
         id: parse_uuid(&get_text(row, 0), "trust_ledger.id")?,
         user_id: get_text(row, 1),
         matter_id: get_text(row, 2),
-        entry_type: parse_trust_ledger_entry_type(&entry_type_raw)?,
+        trust_account_id: get_opt_text(row, 10)
+            .map(|value| parse_uuid(&value, "trust_ledger.trust_account_id"))
+            .transpose()?,
+        entry_type: TrustLedgerEntryType::from_db_columns(&entry_type_raw, entry_detail.as_deref())
+            .ok_or_else(|| {
+                DatabaseError::Serialization(format!(
+                    "invalid trust ledger entry type '{}' / detail {:?}",
+                    entry_type_raw, entry_detail
+                ))
+            })?,
         amount: get_decimal(row, 4),
+        delta: get_opt_decimal(row, 12).unwrap_or_else(|| {
+            if matches!(
+                parse_trust_ledger_entry_type(&entry_type_raw),
+                Ok(TrustLedgerEntryType::Withdrawal
+                    | TrustLedgerEntryType::InvoicePayment
+                    | TrustLedgerEntryType::Refund)
+            ) {
+                -get_decimal(row, 4)
+            } else {
+                get_decimal(row, 4)
+            }
+        }),
         balance_after: get_decimal(row, 5),
         description: get_text(row, 6),
+        reference_number: get_opt_text(row, 13),
+        source: get_opt_text(row, 14)
+            .map(|value| parse_trust_ledger_source(&value))
+            .transpose()?
+            .unwrap_or_default(),
         invoice_id: get_opt_text(row, 7)
             .map(|value| parse_uuid(&value, "trust_ledger.invoice_id"))
             .transpose()?,
@@ -1568,6 +1634,7 @@ impl MatterDocumentStore for LibSqlBackend {
         let mut rows = conn
             .query(
                 "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at \
+                 , md.readiness_state \
                  FROM matter_documents md \
                  JOIN memory_documents d ON d.id = md.memory_document_id \
                  WHERE md.user_id = ?1 AND md.matter_id = ?2 \
@@ -1592,11 +1659,33 @@ impl MatterDocumentStore for LibSqlBackend {
         let conn = self.connect().await?;
         let row = conn
             .query(
-                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at \
+                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at, md.readiness_state \
                  FROM matter_documents md \
                  JOIN memory_documents d ON d.id = md.memory_document_id \
                  WHERE md.user_id = ?1 AND md.matter_id = ?2 AND md.id = ?3 LIMIT 1",
                 params![user_id, matter_id, matter_document_id.to_string()],
+            )
+            .await?
+            .next()
+            .await?;
+
+        row.map(|row| row_to_matter_document_record(&row))
+            .transpose()
+    }
+
+    async fn get_matter_document_by_id(
+        &self,
+        user_id: &str,
+        matter_document_id: Uuid,
+    ) -> Result<Option<MatterDocumentRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let row = conn
+            .query(
+                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at, md.readiness_state \
+                 FROM matter_documents md \
+                 JOIN memory_documents d ON d.id = md.memory_document_id \
+                 WHERE md.user_id = ?1 AND md.id = ?2 LIMIT 1",
+                params![user_id, matter_document_id.to_string()],
             )
             .await?
             .next()
@@ -1614,13 +1703,15 @@ impl MatterDocumentStore for LibSqlBackend {
     ) -> Result<MatterDocumentRecord, DatabaseError> {
         let conn = self.connect().await?;
         let id = Uuid::new_v4().to_string();
+        let insert_readiness_state = input.readiness_state.unwrap_or_default();
         conn.execute(
             "INSERT INTO matter_documents \
-             (id, user_id, matter_id, memory_document_id, display_name, category, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now')) \
+             (id, user_id, matter_id, memory_document_id, display_name, category, readiness_state, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), datetime('now')) \
              ON CONFLICT (user_id, matter_id, memory_document_id) DO UPDATE SET \
                 display_name = excluded.display_name, \
                 category = excluded.category, \
+                readiness_state = COALESCE(?8, matter_documents.readiness_state), \
                 updated_at = datetime('now')",
             params![
                 id.as_str(),
@@ -1629,6 +1720,8 @@ impl MatterDocumentStore for LibSqlBackend {
                 input.memory_document_id.to_string(),
                 input.display_name.as_str(),
                 input.category.as_str(),
+                insert_readiness_state.as_str(),
+                input.readiness_state.map(|state| state.as_str()),
             ],
         )
         .await?;
@@ -1636,7 +1729,7 @@ impl MatterDocumentStore for LibSqlBackend {
         // Prefer fetching by unique memory_document binding to cover both insert/update paths.
         let row = conn
             .query(
-                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at \
+                "SELECT md.id, md.user_id, md.matter_id, md.memory_document_id, d.path, md.display_name, md.category, md.created_at, md.updated_at, md.readiness_state \
                  FROM matter_documents md \
                  JOIN memory_documents d ON d.id = md.memory_document_id \
                  WHERE md.user_id = ?1 AND md.matter_id = ?2 AND md.memory_document_id = ?3 LIMIT 1",
@@ -1668,12 +1761,14 @@ impl MatterDocumentStore for LibSqlBackend {
 
         let merged_display_name = input.display_name.clone().unwrap_or(existing.display_name);
         let merged_category = input.category.unwrap_or(existing.category);
+        let merged_readiness_state = input.readiness_state.unwrap_or(existing.readiness_state);
 
         let conn = self.connect().await?;
         conn.execute(
             "UPDATE matter_documents SET \
                 display_name = ?4, \
                 category = ?5, \
+                readiness_state = ?6, \
                 updated_at = datetime('now') \
              WHERE user_id = ?1 AND matter_id = ?2 AND id = ?3",
             params![
@@ -1682,6 +1777,7 @@ impl MatterDocumentStore for LibSqlBackend {
                 matter_document_id.to_string(),
                 merged_display_name,
                 merged_category.as_str(),
+                merged_readiness_state.as_str(),
             ],
         )
         .await?;
@@ -2084,7 +2180,8 @@ impl TimeExpenseStore for LibSqlBackend {
         let conn = self.connect().await?;
         let mut rows = conn
             .query(
-                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at \
+                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at, \
+                        task_code, activity_code, resolved_rate, rate_source, block_billing_flag, block_billing_reason \
                  FROM time_entries \
                  WHERE user_id = ?1 AND matter_id = ?2 \
                  ORDER BY entry_date DESC, created_at DESC",
@@ -2108,7 +2205,8 @@ impl TimeExpenseStore for LibSqlBackend {
         let conn = self.connect().await?;
         let row = conn
             .query(
-                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at \
+                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at, \
+                        task_code, activity_code, resolved_rate, rate_source, block_billing_flag, block_billing_reason \
                  FROM time_entries \
                  WHERE user_id = ?1 AND matter_id = ?2 AND id = ?3 LIMIT 1",
                 params![user_id, matter_id, entry_id.to_string()],
@@ -2129,8 +2227,8 @@ impl TimeExpenseStore for LibSqlBackend {
         let id = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO time_entries \
-             (id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now'))",
+             (id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, task_code, activity_code, resolved_rate, rate_source, block_billing_flag, block_billing_reason, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, datetime('now'), datetime('now'))",
             params![
                 id.as_str(),
                 user_id,
@@ -2141,13 +2239,20 @@ impl TimeExpenseStore for LibSqlBackend {
                 opt_text_owned(input.hourly_rate.map(|rate| rate.to_string())),
                 input.entry_date.format("%Y-%m-%d").to_string(),
                 if input.billable { 1 } else { 0 },
+                opt_text(input.task_code.as_deref()),
+                opt_text(input.activity_code.as_deref()),
+                opt_text_owned(input.resolved_rate.map(|rate| rate.to_string())),
+                opt_text_owned(input.rate_source.map(|source| source.as_str().to_string())),
+                if input.block_billing_flag { 1 } else { 0 },
+                opt_text(input.block_billing_reason.as_deref()),
             ],
         )
         .await?;
 
         let row = conn
             .query(
-                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at \
+                "SELECT id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at, \
+                        task_code, activity_code, resolved_rate, rate_source, block_billing_flag, block_billing_reason \
                  FROM time_entries WHERE id = ?1 LIMIT 1",
                 params![id.as_str()],
             )
@@ -2176,6 +2281,20 @@ impl TimeExpenseStore for LibSqlBackend {
         let merged_hourly_rate = input.hourly_rate.unwrap_or(existing.hourly_rate);
         let merged_entry_date = input.entry_date.unwrap_or(existing.entry_date);
         let merged_billable = input.billable.unwrap_or(existing.billable);
+        let merged_task_code = input.task_code.clone().unwrap_or(existing.task_code);
+        let merged_activity_code = input
+            .activity_code
+            .clone()
+            .unwrap_or(existing.activity_code);
+        let merged_resolved_rate = input.resolved_rate.unwrap_or(existing.resolved_rate);
+        let merged_rate_source = input.rate_source.unwrap_or(existing.rate_source);
+        let merged_block_billing_flag = input
+            .block_billing_flag
+            .unwrap_or(existing.block_billing_flag);
+        let merged_block_billing_reason = input
+            .block_billing_reason
+            .clone()
+            .unwrap_or(existing.block_billing_reason);
 
         let conn = self.connect().await?;
         conn.execute(
@@ -2186,6 +2305,12 @@ impl TimeExpenseStore for LibSqlBackend {
                 hourly_rate = ?7, \
                 entry_date = ?8, \
                 billable = ?9, \
+                task_code = ?10, \
+                activity_code = ?11, \
+                resolved_rate = ?12, \
+                rate_source = ?13, \
+                block_billing_flag = ?14, \
+                block_billing_reason = ?15, \
                 updated_at = datetime('now') \
              WHERE user_id = ?1 AND matter_id = ?2 AND id = ?3",
             params![
@@ -2198,6 +2323,12 @@ impl TimeExpenseStore for LibSqlBackend {
                 opt_text_owned(merged_hourly_rate.map(|rate| rate.to_string())),
                 merged_entry_date.format("%Y-%m-%d").to_string(),
                 if merged_billable { 1 } else { 0 },
+                opt_text(merged_task_code.as_deref()),
+                opt_text(merged_activity_code.as_deref()),
+                opt_text_owned(merged_resolved_rate.map(|rate| rate.to_string())),
+                opt_text_owned(merged_rate_source.map(|source| source.as_str().to_string())),
+                if merged_block_billing_flag { 1 } else { 0 },
+                opt_text(merged_block_billing_reason.as_deref()),
             ],
         )
         .await?;
@@ -2560,8 +2691,8 @@ impl BillingStore for LibSqlBackend {
             for item in line_items {
                 let line_item_id = Uuid::new_v4().to_string();
                 conn.execute(
-                    "INSERT INTO invoice_line_items (id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), datetime('now'))",
+                    "INSERT INTO invoice_line_items (id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, task_code, activity_code, timekeeper, resolved_rate, rate_source, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, datetime('now'), datetime('now'))",
                     params![
                         line_item_id.as_str(),
                         user_id,
@@ -2573,12 +2704,18 @@ impl BillingStore for LibSqlBackend {
                         opt_text_owned(item.time_entry_id.map(|value| value.to_string())),
                         opt_text_owned(item.expense_entry_id.map(|value| value.to_string())),
                         item.sort_order,
+                        opt_text(item.task_code.as_deref()),
+                        opt_text(item.activity_code.as_deref()),
+                        opt_text(item.timekeeper.as_deref()),
+                        opt_text_owned(item.resolved_rate.map(|value| value.to_string())),
+                        opt_text_owned(item.rate_source.map(|value| value.as_str().to_string())),
                     ],
                 )
                 .await?;
                 let row = conn
                     .query(
-                        "SELECT id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at \
+                        "SELECT id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at, \
+                                task_code, activity_code, timekeeper, resolved_rate, rate_source \
                          FROM invoice_line_items WHERE id = ?1 LIMIT 1",
                         params![line_item_id.as_str()],
                     )
@@ -2669,7 +2806,8 @@ impl BillingStore for LibSqlBackend {
         let conn = self.connect().await?;
         let mut rows = conn
             .query(
-                "SELECT id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at \
+                "SELECT id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at, \
+                        task_code, activity_code, timekeeper, resolved_rate, rate_source \
                  FROM invoice_line_items \
                  WHERE user_id = ?1 AND invoice_id = ?2 \
                  ORDER BY sort_order ASC, created_at ASC",
@@ -3008,10 +3146,25 @@ impl BillingStore for LibSqlBackend {
 
             let mut trust_entry = None;
             if input.draw_from_trust {
+                let trust_account_id = match self.get_primary_trust_account(user_id).await? {
+                    Some(account) => account.id,
+                    None => {
+                        self.upsert_primary_trust_account(
+                            user_id,
+                            &UpsertTrustAccountParams {
+                                name: "Primary IOLTA".to_string(),
+                                bank_name: None,
+                                account_number_last4: None,
+                            },
+                        )
+                        .await?
+                        .id
+                    }
+                };
                 let balance_row = conn
                     .query(
-                        "SELECT COALESCE((SELECT balance_after FROM trust_ledger WHERE user_id = ?1 AND matter_id = ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1), '0') AS balance",
-                        params![user_id, invoice.matter_id.as_str()],
+                        "SELECT COALESCE((SELECT balance_after FROM trust_ledger WHERE user_id = ?1 AND trust_account_id = ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1), '0') AS balance",
+                        params![user_id, trust_account_id.to_string()],
                     )
                     .await?
                     .next()
@@ -3039,24 +3192,34 @@ impl BillingStore for LibSqlBackend {
                     .to_string();
                 let entry_id = Uuid::new_v4().to_string();
                 conn.execute(
-                    "INSERT INTO trust_ledger (id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                    "INSERT INTO trust_ledger (id, user_id, matter_id, trust_account_id, entry_type, entry_detail, amount, delta, balance_after, description, invoice_id, reference_number, source, recorded_by, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
                     params![
                         entry_id.as_str(),
                         user_id,
                         invoice.matter_id.as_str(),
-                        TrustLedgerEntryType::InvoicePayment.as_str(),
+                        trust_account_id.to_string(),
+                        TrustLedgerEntryType::InvoicePayment.base_db_value(),
+                        opt_text_owned(
+                            TrustLedgerEntryType::InvoicePayment
+                                .entry_detail()
+                                .map(str::to_string),
+                        ),
                         input.amount.to_string(),
+                        (-input.amount).round_dp(2).to_string(),
                         balance_after.to_string(),
                         description.as_str(),
                         invoice_id.to_string(),
+                        libsql::Value::Null,
+                        TrustLedgerSource::InvoicePayment.as_str(),
                         input.recorded_by.as_str(),
                     ],
                 )
                 .await?;
                 let row = conn
                     .query(
-                        "SELECT id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at \
+                        "SELECT id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at, \
+                                trust_account_id, entry_detail, delta, reference_number, source \
                          FROM trust_ledger WHERE id = ?1 LIMIT 1",
                         params![entry_id.as_str()],
                     )
@@ -3122,13 +3285,31 @@ impl BillingStore for LibSqlBackend {
         matter_id: &str,
         input: &CreateTrustLedgerEntryParams,
     ) -> Result<TrustLedgerEntryRecord, DatabaseError> {
+        let trust_account_id = match input.trust_account_id {
+            Some(id) => id,
+            None => match self.get_primary_trust_account(user_id).await? {
+                Some(account) => account.id,
+                None => {
+                    self.upsert_primary_trust_account(
+                        user_id,
+                        &UpsertTrustAccountParams {
+                            name: "Primary IOLTA".to_string(),
+                            bank_name: None,
+                            account_number_last4: None,
+                        },
+                    )
+                    .await?
+                    .id
+                }
+            },
+        };
         let conn = self.connect().await?;
         conn.execute("BEGIN IMMEDIATE", ()).await?;
         let result = async {
             let balance_row = conn
                 .query(
-                    "SELECT COALESCE((SELECT balance_after FROM trust_ledger WHERE user_id = ?1 AND matter_id = ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1), '0') AS balance",
-                    params![user_id, matter_id],
+                    "SELECT COALESCE((SELECT balance_after FROM trust_ledger WHERE user_id = ?1 AND trust_account_id = ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1), '0') AS balance",
+                    params![user_id, trust_account_id.to_string()],
                 )
                 .await?
                 .next()
@@ -3150,24 +3331,30 @@ impl BillingStore for LibSqlBackend {
 
             let entry_id = Uuid::new_v4().to_string();
             conn.execute(
-                "INSERT INTO trust_ledger (id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                "INSERT INTO trust_ledger (id, user_id, matter_id, trust_account_id, entry_type, entry_detail, amount, delta, balance_after, description, invoice_id, reference_number, source, recorded_by, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
                 params![
                     entry_id.as_str(),
                     user_id,
                     matter_id,
-                    input.entry_type.as_str(),
+                    trust_account_id.to_string(),
+                    input.entry_type.base_db_value(),
+                    opt_text_owned(input.entry_type.entry_detail().map(str::to_string)),
                     input.amount.to_string(),
+                    input.delta.to_string(),
                     balance_after.to_string(),
                     input.description.as_str(),
                     opt_text_owned(input.invoice_id.map(|value| value.to_string())),
+                    opt_text(input.reference_number.as_deref()),
+                    input.source.as_str(),
                     input.recorded_by.as_str(),
                 ],
             )
             .await?;
             let row = conn
                 .query(
-                    "SELECT id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at \
+                    "SELECT id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at, \
+                            trust_account_id, entry_detail, delta, reference_number, source \
                      FROM trust_ledger WHERE id = ?1 LIMIT 1",
                     params![entry_id.as_str()],
                 )
@@ -3201,7 +3388,8 @@ impl BillingStore for LibSqlBackend {
         let conn = self.connect().await?;
         let mut rows = conn
             .query(
-                "SELECT id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at \
+                "SELECT id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at, \
+                        trust_account_id, entry_detail, delta, reference_number, source \
                  FROM trust_ledger WHERE user_id = ?1 AND matter_id = ?2 ORDER BY created_at DESC, rowid DESC",
                 params![user_id, matter_id],
             )
@@ -3221,7 +3409,8 @@ impl BillingStore for LibSqlBackend {
         let conn = self.connect().await?;
         let row = conn
             .query(
-                "SELECT COALESCE((SELECT balance_after FROM trust_ledger WHERE user_id = ?1 AND matter_id = ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1), '0') AS balance",
+                "SELECT printf('%.2f', COALESCE(SUM(CAST(delta AS REAL)), 0.0)) AS balance \
+                 FROM trust_ledger WHERE user_id = ?1 AND matter_id = ?2",
                 params![user_id, matter_id],
             )
             .await?
@@ -3455,11 +3644,11 @@ impl LegalRestoreStore for LibSqlBackend {
         let conn = self.connect().await?;
         conn.execute(
             "INSERT INTO matter_documents \
-             (id, user_id, matter_id, memory_document_id, display_name, category, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             (id, user_id, matter_id, memory_document_id, display_name, category, readiness_state, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
              ON CONFLICT(id) DO UPDATE SET \
                user_id=excluded.user_id, matter_id=excluded.matter_id, memory_document_id=excluded.memory_document_id, \
-               display_name=excluded.display_name, category=excluded.category, \
+               display_name=excluded.display_name, category=excluded.category, readiness_state=excluded.readiness_state, \
                created_at=excluded.created_at, updated_at=excluded.updated_at",
             params![
                 row.id.to_string(),
@@ -3468,6 +3657,7 @@ impl LegalRestoreStore for LibSqlBackend {
                 row.memory_document_id.to_string(),
                 row.display_name.as_str(),
                 row.category.as_str(),
+                row.readiness_state.as_str(),
                 fmt_ts(&row.created_at),
                 fmt_ts(&row.updated_at),
             ],
@@ -3509,12 +3699,15 @@ impl LegalRestoreStore for LibSqlBackend {
         let conn = self.connect().await?;
         conn.execute(
             "INSERT INTO time_entries \
-             (id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+             (id, user_id, matter_id, timekeeper, description, hours, hourly_rate, entry_date, billable, billed_invoice_id, task_code, activity_code, resolved_rate, rate_source, block_billing_flag, block_billing_reason, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) \
              ON CONFLICT(id) DO UPDATE SET \
                user_id=excluded.user_id, matter_id=excluded.matter_id, timekeeper=excluded.timekeeper, \
                description=excluded.description, hours=excluded.hours, hourly_rate=excluded.hourly_rate, \
                entry_date=excluded.entry_date, billable=excluded.billable, billed_invoice_id=excluded.billed_invoice_id, \
+               task_code=excluded.task_code, activity_code=excluded.activity_code, resolved_rate=excluded.resolved_rate, \
+               rate_source=excluded.rate_source, block_billing_flag=excluded.block_billing_flag, \
+               block_billing_reason=excluded.block_billing_reason, \
                created_at=excluded.created_at, updated_at=excluded.updated_at",
             params![
                 row.id.to_string(),
@@ -3527,6 +3720,12 @@ impl LegalRestoreStore for LibSqlBackend {
                 row.entry_date.to_string(),
                 row.billable,
                 opt_text(row.billed_invoice_id.as_deref()),
+                opt_text(row.task_code.as_deref()),
+                opt_text(row.activity_code.as_deref()),
+                opt_text_owned(row.resolved_rate.map(|v| v.to_string())),
+                opt_text_owned(row.rate_source.map(|v| v.as_str().to_string())),
+                row.block_billing_flag,
+                opt_text(row.block_billing_reason.as_deref()),
                 fmt_ts(&row.created_at),
                 fmt_ts(&row.updated_at),
             ],
@@ -3620,13 +3819,15 @@ impl LegalRestoreStore for LibSqlBackend {
         let conn = self.connect().await?;
         conn.execute(
             "INSERT INTO invoice_line_items \
-             (id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+             (id, user_id, invoice_id, description, quantity, unit_price, amount, time_entry_id, expense_entry_id, sort_order, task_code, activity_code, timekeeper, resolved_rate, rate_source, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
              ON CONFLICT(id) DO UPDATE SET \
                user_id=excluded.user_id, invoice_id=excluded.invoice_id, description=excluded.description, \
                quantity=excluded.quantity, unit_price=excluded.unit_price, amount=excluded.amount, \
                time_entry_id=excluded.time_entry_id, expense_entry_id=excluded.expense_entry_id, \
-               sort_order=excluded.sort_order, created_at=excluded.created_at, updated_at=excluded.updated_at",
+               sort_order=excluded.sort_order, task_code=excluded.task_code, activity_code=excluded.activity_code, \
+               timekeeper=excluded.timekeeper, resolved_rate=excluded.resolved_rate, rate_source=excluded.rate_source, \
+               created_at=excluded.created_at, updated_at=excluded.updated_at",
             params![
                 row.id.to_string(),
                 row.user_id.as_str(),
@@ -3638,6 +3839,11 @@ impl LegalRestoreStore for LibSqlBackend {
                 opt_text_owned(row.time_entry_id.as_ref().map(Uuid::to_string)),
                 opt_text_owned(row.expense_entry_id.as_ref().map(Uuid::to_string)),
                 i64::from(row.sort_order),
+                opt_text(row.task_code.as_deref()),
+                opt_text(row.activity_code.as_deref()),
+                opt_text(row.timekeeper.as_deref()),
+                opt_text_owned(row.resolved_rate.map(|v| v.to_string())),
+                opt_text_owned(row.rate_source.map(|v| v.as_str().to_string())),
                 fmt_ts(&row.created_at),
                 fmt_ts(&row.updated_at),
             ],
@@ -3653,21 +3859,28 @@ impl LegalRestoreStore for LibSqlBackend {
         let conn = self.connect().await?;
         conn.execute(
             "INSERT INTO trust_ledger \
-             (id, user_id, matter_id, entry_type, amount, balance_after, description, invoice_id, recorded_by, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             (id, user_id, matter_id, trust_account_id, entry_type, entry_detail, amount, delta, balance_after, description, invoice_id, reference_number, source, recorded_by, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
              ON CONFLICT(id) DO UPDATE SET \
-               user_id=excluded.user_id, matter_id=excluded.matter_id, entry_type=excluded.entry_type, \
-               amount=excluded.amount, balance_after=excluded.balance_after, description=excluded.description, \
-               invoice_id=excluded.invoice_id, recorded_by=excluded.recorded_by, created_at=excluded.created_at",
+               user_id=excluded.user_id, matter_id=excluded.matter_id, trust_account_id=excluded.trust_account_id, \
+               entry_type=excluded.entry_type, entry_detail=excluded.entry_detail, amount=excluded.amount, delta=excluded.delta, \
+               balance_after=excluded.balance_after, description=excluded.description, invoice_id=excluded.invoice_id, \
+               reference_number=excluded.reference_number, source=excluded.source, recorded_by=excluded.recorded_by, \
+               created_at=excluded.created_at",
             params![
                 row.id.to_string(),
                 row.user_id.as_str(),
                 row.matter_id.as_str(),
-                row.entry_type.as_str(),
+                opt_text_owned(row.trust_account_id.as_ref().map(Uuid::to_string)),
+                row.entry_type.base_db_value(),
+                opt_text_owned(row.entry_type.entry_detail().map(str::to_string)),
                 row.amount.to_string(),
+                row.delta.to_string(),
                 row.balance_after.to_string(),
                 row.description.as_str(),
                 opt_text_owned(row.invoice_id.as_ref().map(Uuid::to_string)),
+                opt_text(row.reference_number.as_deref()),
+                row.source.as_str(),
                 row.recorded_by.as_str(),
                 fmt_ts(&row.created_at),
             ],
