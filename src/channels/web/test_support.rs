@@ -137,7 +137,9 @@ pub(crate) fn test_gateway_state_with_store_workspace_and_legal(
         prompt_queue: None,
         user_id: "test-user".to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
-        ws_tracker: Some(Arc::new(crate::channels::web::ws::WsConnectionTracker::new())),
+        ws_tracker: Some(Arc::new(
+            crate::channels::web::ws::WsConnectionTracker::new(),
+        )),
         llm_provider: None,
         skill_registry: None,
         skill_catalog: None,
@@ -181,7 +183,9 @@ pub(crate) fn test_gateway_state_with_store_workspace_and_chat(
         prompt_queue: None,
         user_id: "test-user".to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
-        ws_tracker: Some(Arc::new(crate::channels::web::ws::WsConnectionTracker::new())),
+        ws_tracker: Some(Arc::new(
+            crate::channels::web::ws::WsConnectionTracker::new(),
+        )),
         llm_provider: None,
         skill_registry: None,
         skill_catalog: None,
@@ -216,7 +220,9 @@ pub(crate) fn test_gateway_state_for_user(
         prompt_queue: None,
         user_id: user_id.to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
-        ws_tracker: Some(Arc::new(crate::channels::web::ws::WsConnectionTracker::new())),
+        ws_tracker: Some(Arc::new(
+            crate::channels::web::ws::WsConnectionTracker::new(),
+        )),
         llm_provider: None,
         skill_registry: None,
         skill_catalog: None,

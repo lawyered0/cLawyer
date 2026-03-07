@@ -46,7 +46,10 @@ async fn update_user_role_handler(
         return Err(StatusCode::FORBIDDEN);
     }
     let new_role = UserRole::from_db_value(&body.role).ok_or(StatusCode::BAD_REQUEST)?;
-    let store = state.store.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let store = state
+        .store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let record = store
         .update_user_role(&user_id, new_role)
         .await
@@ -75,13 +78,13 @@ async fn deactivate_user_handler(
     if principal.role != UserRole::Admin {
         return Err(StatusCode::FORBIDDEN);
     }
-    let store = state.store.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    store
-        .deactivate_user(&user_id)
-        .await
-        .map_err(|e| {
-            tracing::error!("deactivate_user failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let store = state
+        .store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    store.deactivate_user(&user_id).await.map_err(|e| {
+        tracing::error!("deactivate_user failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }

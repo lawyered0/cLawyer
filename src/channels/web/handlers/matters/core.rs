@@ -58,8 +58,7 @@ pub fn routes() -> Router<Arc<GatewayState>> {
         )
         .route(
             "/api/matters/{id}/members/{member_user_id}",
-            axum::routing::put(matter_member_upsert_handler)
-                .delete(matter_member_remove_handler),
+            axum::routing::put(matter_member_upsert_handler).delete(matter_member_remove_handler),
         )
         .route(
             "/api/matters/{id}/deadlines",
@@ -1558,7 +1557,10 @@ async fn matter_members_list_handler(
         MatterMemberRole::Owner,
     )
     .await?;
-    let store = state.store.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let store = state
+        .store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let rows = store
         .list_matter_memberships(&state.user_id, &matter_id)
         .await
@@ -1600,7 +1602,10 @@ async fn matter_member_upsert_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
     let role = MatterMemberRole::from_db_value(&body.role).ok_or(StatusCode::BAD_REQUEST)?;
-    let store = state.store.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let store = state
+        .store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let record = store
         .upsert_matter_membership(&UpsertMatterMembershipParams {
             matter_owner_user_id: state.user_id.clone(),
@@ -1637,7 +1642,10 @@ async fn matter_member_remove_handler(
         MatterMemberRole::Owner,
     )
     .await?;
-    let store = state.store.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let store = state
+        .store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     store
         .remove_matter_membership(&state.user_id, &matter_id, &member_user_id)
         .await
