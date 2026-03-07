@@ -30,6 +30,7 @@ body {
   background: var(--bg);
   color: var(--text);
   height: 100vh;
+  height: 100dvh; /* mobile: shrinks when browser chrome collapses */
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -41,6 +42,7 @@ body {
   align-items: center;
   justify-content: center;
   height: 100vh;
+  height: 100dvh;
 }
 
 .auth-card-login {
@@ -153,6 +155,7 @@ body {
   display: none;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
 }
 
 /* Tab Bar */
@@ -1030,6 +1033,8 @@ body {
 .chat-input {
   display: flex;
   padding: 12px 16px;
+  /* safe area for iPhone home indicator / notch */
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
   gap: 8px;
   background: var(--bg-secondary);
   border-top: 1px solid var(--border);
@@ -1042,7 +1047,7 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   color: var(--text);
-  font-size: 14px;
+  font-size: 16px; /* ≥16px prevents iOS Safari auto-zoom on focus */
   font-family: inherit;
   resize: none;
   min-height: 40px;
@@ -3501,6 +3506,71 @@ mark {
 
   .ext-install-form input {
     width: 100%;
+  }
+
+  /* ---- iOS: prevent auto-zoom on input focus (requires font-size ≥ 16px) ---- */
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  textarea,
+  select {
+    font-size: 16px;
+  }
+
+  /* ---- Tables: horizontal scroll on narrow screens ---- */
+  .jobs-table,
+  .routines-table,
+  .tools-table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    width: 100%;
+  }
+
+  /* ---- Logs toolbar: wrap controls onto multiple rows ---- */
+  .logs-toolbar {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+
+  .logs-toolbar input {
+    max-width: none;
+    flex: 1 1 120px;
+  }
+
+  /* ---- Momentum scroll on all inner scrollable containers ---- */
+  .jobs-container,
+  .routines-container,
+  .extensions-container,
+  .chat-messages,
+  .memory-viewer,
+  .memory-content,
+  .logs-output,
+  .matter-detail-panel {
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* ---- Matter detail panel: cap height on stacked mobile layout ---- */
+  .matter-detail-panel {
+    max-height: 60vh;
+  }
+
+  /* ---- Touch targets: ≥ 44 px for small interactive elements ---- */
+  .thread-toggle-btn {
+    min-width: 44px;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .btn-ext {
+    min-height: 36px;
+    padding: 6px 12px;
+  }
+
+  .copy-btn {
+    min-width: 44px;
+    min-height: 32px;
   }
 }
 
