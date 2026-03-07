@@ -1512,6 +1512,76 @@ impl RbacStore for PgBackend {
             .await?;
         rows.iter().map(row_to_matter_membership_record).collect()
     }
+
+    async fn check_matter_access(
+        &self,
+        matter_owner_user_id: &str,
+        matter_id: &str,
+        requesting_user_id: &str,
+    ) -> Result<Option<MatterMemberRole>, DatabaseError> {
+        if requesting_user_id == matter_owner_user_id {
+            return Ok(Some(MatterMemberRole::Owner));
+        }
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT role FROM matter_memberships \
+                 WHERE matter_owner_user_id = $1 AND matter_id = $2 AND member_user_id = $3",
+                &[&matter_owner_user_id, &matter_id, &requesting_user_id],
+            )
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let role_raw: String = row.get("role");
+        let role = MatterMemberRole::from_db_value(&role_raw).ok_or_else(|| {
+            DatabaseError::Serialization(format!("invalid matter member role '{}'", role_raw))
+        })?;
+        Ok(Some(role))
+    }
+
+    async fn remove_matter_membership(
+        &self,
+        matter_owner_user_id: &str,
+        matter_id: &str,
+        member_user_id: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "DELETE FROM matter_memberships \
+             WHERE matter_owner_user_id = $1 AND matter_id = $2 AND member_user_id = $3",
+            &[&matter_owner_user_id, &matter_id, &member_user_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn update_user_role(
+        &self,
+        user_id: &str,
+        new_role: UserRole,
+    ) -> Result<Option<UserRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "UPDATE users SET role = $1, updated_at = NOW() \
+                 WHERE id = $2 \
+                 RETURNING id, display_name, role, is_active, created_at, updated_at",
+                &[&new_role.as_str(), &user_id],
+            )
+            .await?;
+        row.map(|r| row_to_user_record(&r)).transpose()
+    }
+
+    async fn deactivate_user(&self, user_id: &str) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "UPDATE users SET is_active = FALSE, updated_at = NOW() WHERE id = $1",
+            &[&user_id],
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 // ==================== ClientStore ====================

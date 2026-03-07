@@ -1614,6 +1614,44 @@ pub struct SkepticalModeResolvedResponse {
     pub enabled: bool,
 }
 
+// --- RBAC / Membership ---
+
+#[derive(Debug, Serialize)]
+pub struct MatterMemberResponse {
+    pub user_id: String,
+    /// "owner" | "collaborator" | "viewer"
+    pub role: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatterMembersListResponse {
+    pub matter_id: String,
+    pub members: Vec<MatterMemberResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpsertMatterMemberRequest {
+    /// "collaborator" | "viewer"
+    pub role: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateUserRoleRequest {
+    /// "admin" | "attorney" | "staff" | "viewer"
+    pub role: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserResponse {
+    pub user_id: String,
+    pub display_name: String,
+    pub role: String,
+    pub is_active: bool,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SettingsExportResponse {
     pub settings: std::collections::HashMap<String, serde_json::Value>,

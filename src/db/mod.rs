@@ -1423,6 +1423,32 @@ pub trait RbacStore: Send + Sync {
         matter_owner_user_id: &str,
         matter_id: &str,
     ) -> Result<Vec<MatterMembershipRecord>, DatabaseError>;
+    /// Check whether `requesting_user_id` has access to a matter.
+    ///
+    /// Returns `Some(MatterMemberRole::Owner)` immediately when the requester is
+    /// the matter owner (no DB query). Otherwise queries `matter_memberships` and
+    /// returns the stored role, or `None` if no membership row exists.
+    async fn check_matter_access(
+        &self,
+        matter_owner_user_id: &str,
+        matter_id: &str,
+        requesting_user_id: &str,
+    ) -> Result<Option<MatterMemberRole>, DatabaseError>;
+    /// Delete a specific membership row. No-op if the row does not exist.
+    async fn remove_matter_membership(
+        &self,
+        matter_owner_user_id: &str,
+        matter_id: &str,
+        member_user_id: &str,
+    ) -> Result<(), DatabaseError>;
+    /// Change a user's system role. Returns `None` if the user does not exist.
+    async fn update_user_role(
+        &self,
+        user_id: &str,
+        new_role: UserRole,
+    ) -> Result<Option<UserRecord>, DatabaseError>;
+    /// Set `is_active = false` for a user. No-op if the user does not exist.
+    async fn deactivate_user(&self, user_id: &str) -> Result<(), DatabaseError>;
 }
 
 #[async_trait]

@@ -35,4 +35,5 @@ pub fn protected_feature_routes() -> Router<Arc<GatewayState>> {
         .merge(super::backups::routes())
         .merge(super::gateway::routes())
         .merge(super::skills::routes())
+        .merge(super::users::routes())
 }

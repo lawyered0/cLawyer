@@ -9,11 +9,13 @@ use axum::{
     routing::get,
 };
 
+use crate::channels::web::auth::RequestPrincipal;
+use crate::channels::web::handlers::helpers::matter::require_matter_access;
 use crate::channels::web::state::GatewayState;
 use crate::channels::web::types::*;
 use crate::db::{
-    CreateMatterNoteParams, CreateMatterTaskParams, MatterTaskStatus, UpdateMatterNoteParams,
-    UpdateMatterTaskParams,
+    CreateMatterNoteParams, CreateMatterTaskParams, MatterMemberRole, MatterTaskStatus,
+    UpdateMatterNoteParams, UpdateMatterTaskParams,
 };
 
 pub fn routes() -> Router<Arc<GatewayState>> {
@@ -38,6 +40,7 @@ pub fn routes() -> Router<Arc<GatewayState>> {
 
 pub(crate) async fn matter_tasks_list_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<MatterTasksListResponse>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -45,6 +48,15 @@ pub(crate) async fn matter_tasks_list_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let tasks = store
         .list_matter_tasks(&state.user_id, &matter_id)
@@ -58,6 +70,7 @@ pub(crate) async fn matter_tasks_list_handler(
 
 pub(crate) async fn matter_tasks_create_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Json(req): Json<CreateMatterTaskRequest>,
 ) -> Result<(StatusCode, Json<MatterTaskInfo>), (StatusCode, String)> {
@@ -66,6 +79,15 @@ pub(crate) async fn matter_tasks_create_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let title = crate::channels::web::server::parse_required_matter_field("title", &req.title)?;
     let status = req
@@ -104,6 +126,7 @@ pub(crate) async fn matter_tasks_create_handler(
 
 pub(crate) async fn matter_tasks_patch_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path((id, task_id)): Path<(String, String)>,
     Json(req): Json<UpdateMatterTaskRequest>,
 ) -> Result<Json<MatterTaskInfo>, (StatusCode, String)> {
@@ -112,6 +135,15 @@ pub(crate) async fn matter_tasks_patch_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let task_id = crate::channels::web::server::parse_uuid(&task_id, "task_id")?;
     let status = req
@@ -157,6 +189,7 @@ pub(crate) async fn matter_tasks_patch_handler(
 
 pub(crate) async fn matter_tasks_delete_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path((id, task_id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -164,6 +197,15 @@ pub(crate) async fn matter_tasks_delete_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let task_id = crate::channels::web::server::parse_uuid(&task_id, "task_id")?;
     let deleted = store
@@ -178,6 +220,7 @@ pub(crate) async fn matter_tasks_delete_handler(
 
 pub(crate) async fn matter_notes_list_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<MatterNotesListResponse>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -185,6 +228,15 @@ pub(crate) async fn matter_notes_list_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let notes = store
         .list_matter_notes(&state.user_id, &matter_id)
@@ -198,6 +250,7 @@ pub(crate) async fn matter_notes_list_handler(
 
 pub(crate) async fn matter_notes_create_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Json(req): Json<CreateMatterNoteRequest>,
 ) -> Result<(StatusCode, Json<MatterNoteInfo>), (StatusCode, String)> {
@@ -206,6 +259,15 @@ pub(crate) async fn matter_notes_create_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let author = crate::channels::web::server::parse_required_matter_field("author", &req.author)?;
     let body = crate::channels::web::server::parse_required_matter_field("body", &req.body)?;
@@ -231,6 +293,7 @@ pub(crate) async fn matter_notes_create_handler(
 
 pub(crate) async fn matter_notes_patch_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path((id, note_id)): Path<(String, String)>,
     Json(req): Json<UpdateMatterNoteRequest>,
 ) -> Result<Json<MatterNoteInfo>, (StatusCode, String)> {
@@ -239,6 +302,15 @@ pub(crate) async fn matter_notes_patch_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let note_id = crate::channels::web::server::parse_uuid(&note_id, "note_id")?;
     let note = store
@@ -262,6 +334,7 @@ pub(crate) async fn matter_notes_patch_handler(
 
 pub(crate) async fn matter_notes_delete_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path((id, note_id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -269,6 +342,15 @@ pub(crate) async fn matter_notes_delete_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     crate::channels::web::server::ensure_existing_matter_db(state.as_ref(), &matter_id).await?;
     let note_id = crate::channels::web::server::parse_uuid(&note_id, "note_id")?;
     let deleted = store

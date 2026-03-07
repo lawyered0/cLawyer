@@ -10,12 +10,15 @@ use axum::{
 };
 use serde::Deserialize;
 
+use crate::channels::web::auth::RequestPrincipal;
+use crate::channels::web::handlers::helpers::matter::require_matter_access;
 use crate::channels::web::state::GatewayState;
 use crate::channels::web::types::*;
 use crate::db::{
     AuditSeverity, ClientType, ConflictClearanceRecord, ConflictDecision, ConflictHit,
-    CreateClientParams, CreateMatterDeadlineParams, MatterStatus, UpdateClientParams,
-    UpdateMatterDeadlineParams, UpdateMatterParams, UpsertMatterParams,
+    CreateClientParams, CreateMatterDeadlineParams, MatterMemberRole, MatterStatus,
+    UpdateClientParams, UpdateMatterDeadlineParams, UpdateMatterParams,
+    UpsertMatterMembershipParams, UpsertMatterParams,
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -48,6 +51,15 @@ pub fn routes() -> Router<Arc<GatewayState>> {
         .route(
             "/api/matters/active",
             get(matters_active_get_handler).post(matters_active_set_handler),
+        )
+        .route(
+            "/api/matters/{id}/members",
+            get(matter_members_list_handler),
+        )
+        .route(
+            "/api/matters/{id}/members/{member_user_id}",
+            axum::routing::put(matter_member_upsert_handler)
+                .delete(matter_member_remove_handler),
         )
         .route(
             "/api/matters/{id}/deadlines",
@@ -255,8 +267,16 @@ async fn persist_conflict_clearance_decision(
 
 pub(crate) async fn matters_create_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Json(req): Json<CreateMatterRequest>,
 ) -> Result<(StatusCode, Json<CreateMatterResponse>), (StatusCode, String)> {
+    // Only the matter owner can create matters.
+    if state.store.is_some() && principal.user_id != state.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Insufficient permissions".to_string(),
+        ));
+    }
     let workspace = state.workspace.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
@@ -554,7 +574,15 @@ pub(crate) async fn matters_create_handler(
 
 pub(crate) async fn matters_list_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
 ) -> Result<Json<MattersListResponse>, (StatusCode, String)> {
+    // Only the matter owner can list all matters.
+    if state.store.is_some() && principal.user_id != state.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Insufficient permissions".to_string(),
+        ));
+    }
     let matter_root = crate::channels::web::server::matter_root_for_gateway(state.as_ref());
     if let Some(store) = state.store.as_ref() {
         let matter_rows = store
@@ -750,6 +778,7 @@ pub(crate) async fn clients_delete_handler(
 
 pub(crate) async fn matter_get_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<MatterInfo>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -757,6 +786,15 @@ pub(crate) async fn matter_get_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let matter = store
         .get_matter_db(&state.user_id, &matter_id)
         .await
@@ -769,6 +807,7 @@ pub(crate) async fn matter_get_handler(
 
 pub(crate) async fn matter_patch_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Json(req): Json<UpdateMatterRequest>,
 ) -> Result<Json<MatterInfo>, (StatusCode, String)> {
@@ -777,6 +816,15 @@ pub(crate) async fn matter_patch_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let client_id = req
         .client_id
         .as_deref()
@@ -904,6 +952,7 @@ pub(crate) async fn matter_patch_handler(
 
 pub(crate) async fn matter_delete_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -911,6 +960,15 @@ pub(crate) async fn matter_delete_handler(
         "Database not available".to_string(),
     ))?;
     let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Owner,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let deleted = store
         .delete_matter(&state.user_id, &matter_id)
         .await
@@ -1119,8 +1177,19 @@ pub(crate) async fn matters_active_set_handler(
 
 pub(crate) async fn matter_deadlines_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<MatterDeadlinesResponse>, (StatusCode, String)> {
+    let sanitized_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &sanitized_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let workspace = state.workspace.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
@@ -1159,9 +1228,20 @@ fn court_rule_to_info(rule: &crate::legal::calendar::CourtRule) -> CourtRuleInfo
 
 pub(crate) async fn matter_deadlines_create_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Json(req): Json<CreateMatterDeadlineRequest>,
 ) -> Result<(StatusCode, Json<MatterDeadlineRecordInfo>), (StatusCode, String)> {
+    let sanitized_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &sanitized_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
@@ -1232,9 +1312,20 @@ pub(crate) async fn matter_deadlines_create_handler(
 
 pub(crate) async fn matter_deadlines_patch_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path((id, deadline_id)): Path<(String, String)>,
     Json(req): Json<UpdateMatterDeadlineRequest>,
 ) -> Result<Json<MatterDeadlineRecordInfo>, (StatusCode, String)> {
+    let sanitized_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &sanitized_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
@@ -1328,8 +1419,19 @@ pub(crate) async fn matter_deadlines_patch_handler(
 
 pub(crate) async fn matter_deadlines_delete_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path((id, deadline_id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let sanitized_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &sanitized_id,
+        &principal.user_id,
+        MatterMemberRole::Owner,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
@@ -1375,9 +1477,20 @@ pub(crate) async fn matter_deadlines_delete_handler(
 
 pub(crate) async fn matter_deadlines_compute_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Json(req): Json<MatterDeadlineComputeRequest>,
 ) -> Result<Json<MatterDeadlineComputeResponse>, (StatusCode, String)> {
+    let sanitized_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &sanitized_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let workspace = state.workspace.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
@@ -1425,4 +1538,112 @@ pub(crate) async fn matter_deadlines_compute_handler(
         rule: court_rule_to_info(&rule),
         deadline: crate::channels::web::server::deadline_compute_preview_from_params(&computed),
     }))
+}
+
+// ==================== Membership Handlers ====================
+
+/// `GET /api/matters/{id}/members` — list members (Owner only).
+async fn matter_members_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path(id): Path<String>,
+) -> Result<Json<MatterMembersListResponse>, StatusCode> {
+    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Owner,
+    )
+    .await?;
+    let store = state.store.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let rows = store
+        .list_matter_memberships(&state.user_id, &matter_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("list_matter_memberships failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let members = rows
+        .into_iter()
+        .map(|r| MatterMemberResponse {
+            user_id: r.member_user_id,
+            role: r.role.as_str().to_string(),
+            created_at: r.created_at.to_rfc3339(),
+            updated_at: r.updated_at.to_rfc3339(),
+        })
+        .collect();
+    Ok(Json(MatterMembersListResponse { matter_id, members }))
+}
+
+/// `PUT /api/matters/{id}/members/{member_user_id}` — add or update a member (Owner only).
+async fn matter_member_upsert_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path((id, member_user_id)): Path<(String, String)>,
+    Json(body): Json<UpsertMatterMemberRequest>,
+) -> Result<Json<MatterMemberResponse>, StatusCode> {
+    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Owner,
+    )
+    .await?;
+    // Owner cannot be assigned via this endpoint — ownership is implicit.
+    if body.role.trim().eq_ignore_ascii_case("owner") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let role = MatterMemberRole::from_db_value(&body.role).ok_or(StatusCode::BAD_REQUEST)?;
+    let store = state.store.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let record = store
+        .upsert_matter_membership(&UpsertMatterMembershipParams {
+            matter_owner_user_id: state.user_id.clone(),
+            matter_id,
+            member_user_id,
+            role,
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("upsert_matter_membership failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(MatterMemberResponse {
+        user_id: record.member_user_id,
+        role: record.role.as_str().to_string(),
+        created_at: record.created_at.to_rfc3339(),
+        updated_at: record.updated_at.to_rfc3339(),
+    }))
+}
+
+/// `DELETE /api/matters/{id}/members/{member_user_id}` — remove a member (Owner only).
+async fn matter_member_remove_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path((id, member_user_id)): Path<(String, String)>,
+) -> Result<StatusCode, StatusCode> {
+    let matter_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id,
+        &principal.user_id,
+        MatterMemberRole::Owner,
+    )
+    .await?;
+    let store = state.store.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    store
+        .remove_matter_membership(&state.user_id, &matter_id, &member_user_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("remove_matter_membership failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }

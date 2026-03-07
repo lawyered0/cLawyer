@@ -10,10 +10,15 @@ use axum::{
 };
 use chrono::{NaiveDate, Utc};
 
+use crate::channels::web::auth::RequestPrincipal;
+use crate::channels::web::handlers::helpers::matter::require_matter_access;
 use crate::channels::web::server::MatterDocumentsQuery;
 use crate::channels::web::state::GatewayState;
 use crate::channels::web::types::*;
-use crate::db::{CreateDocumentVersionParams, MatterDocumentCategory, UpsertMatterDocumentParams};
+use crate::db::{
+    CreateDocumentVersionParams, MatterDocumentCategory, MatterMemberRole,
+    UpsertMatterDocumentParams,
+};
 
 pub fn routes() -> Router<Arc<GatewayState>> {
     Router::new()
@@ -37,9 +42,20 @@ pub fn routes() -> Router<Arc<GatewayState>> {
 
 pub(crate) async fn matter_documents_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Query(query): Query<MatterDocumentsQuery>,
 ) -> Result<Json<MatterDocumentsResponse>, (StatusCode, String)> {
+    let matter_id_guard = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id_guard,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let workspace = state.workspace.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
@@ -126,8 +142,19 @@ pub(crate) async fn matter_documents_handler(
 
 pub(crate) async fn matter_dashboard_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<MatterDashboardResponse>, (StatusCode, String)> {
+    let matter_id_guard = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id_guard,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let workspace = state.workspace.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
@@ -225,8 +252,19 @@ pub(crate) async fn matter_dashboard_handler(
 
 pub(crate) async fn matter_templates_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<MatterTemplatesResponse>, (StatusCode, String)> {
+    let matter_id_guard = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id_guard,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let workspace = state.workspace.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
@@ -275,9 +313,20 @@ pub(crate) async fn matter_templates_handler(
 
 pub(crate) async fn matter_template_apply_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Json(req): Json<MatterTemplateApplyRequest>,
 ) -> Result<(StatusCode, Json<MatterTemplateApplyResponse>), (StatusCode, String)> {
+    let matter_id_guard = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id_guard,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let workspace = state.workspace.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
@@ -390,9 +439,20 @@ pub(crate) async fn matter_template_apply_handler(
 
 pub(crate) async fn matter_retrieval_export_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     body: Option<Json<MatterRetrievalExportRequest>>,
 ) -> Result<(StatusCode, Json<MatterRetrievalExportResponse>), (StatusCode, String)> {
+    let matter_id_guard = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id_guard,
+        &principal.user_id,
+        MatterMemberRole::Owner,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
@@ -461,8 +521,16 @@ pub(crate) async fn matter_retrieval_export_handler(
 
 pub(crate) async fn documents_generate_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Json(req): Json<GenerateDocumentRequest>,
 ) -> Result<(StatusCode, Json<GenerateDocumentResponse>), (StatusCode, String)> {
+    // matter_id comes from request body, not path — fall back to owner-only guard.
+    if state.store.is_some() && principal.user_id != state.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Insufficient permissions".to_string(),
+        ));
+    }
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
@@ -611,8 +679,19 @@ pub(crate) async fn documents_generate_handler(
 
 pub(crate) async fn matter_filing_package_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<MatterFilingPackageResponse>), (StatusCode, String)> {
+    let matter_id_guard = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &matter_id_guard,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
     let workspace = state.workspace.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Workspace not available".to_string(),
