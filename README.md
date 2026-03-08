@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="clawyer.png?v=2" alt="cLawyer" width="200"/>
+  <img src="clawyer-20260308.png" alt="cLawyer" width="200"/>
 </p>
 
 <h1 align="center">cLawyer</h1>
