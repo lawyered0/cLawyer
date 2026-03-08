@@ -18,7 +18,7 @@ use crate::channels::web::types::*;
 use crate::db::{
     AuditSeverity, ClientType, ConflictClearanceRecord, ConflictDecision, ConflictHit,
     CreateClientParams, CreateMatterDeadlineParams, MatterMemberRole, MatterStatus,
-    UpdateClientParams, UpdateMatterDeadlineParams, UpdateMatterParams,
+    OverrideDeadlineParams, UpdateClientParams, UpdateMatterDeadlineParams, UpdateMatterParams,
     UpsertMatterMembershipParams, UpsertMatterParams,
 };
 
@@ -73,6 +73,14 @@ pub fn routes() -> Router<Arc<GatewayState>> {
         .route(
             "/api/matters/{id}/deadlines/compute",
             post(matter_deadlines_compute_handler),
+        )
+        .route(
+            "/api/matters/{id}/deadlines/{deadline_id}/override",
+            post(matter_deadline_override_handler),
+        )
+        .route(
+            "/api/matters/{id}/deadlines/{deadline_id}/audit",
+            get(matter_deadline_audit_handler),
         )
 }
 
@@ -1238,6 +1246,8 @@ fn court_rule_to_info(rule: &crate::legal::calendar::CourtRule) -> CourtRuleInfo
         deadline_type: rule.deadline_type.as_str().to_string(),
         offset_days: rule.offset_days,
         court_days: rule.court_days,
+        version: rule.version.clone(),
+        jurisdiction: rule.jurisdiction.clone(),
     }
 }
 
@@ -1293,6 +1303,41 @@ pub(crate) async fn matter_deadlines_create_handler(
     )?;
     let task_id = crate::channels::web::server::parse_optional_uuid_field(req.task_id, "task_id")?;
 
+    // If rule_ref is a known rule ID and computed_from is set, auto-compute the
+    // explanation trace from the trigger deadline so it is stored with the record.
+    let (explanation, rule_version) = if let (Some(rule_id), Some(trigger_deadline_id)) =
+        (&rule_ref, computed_from)
+    {
+        match crate::legal::calendar::get_court_rule(rule_id) {
+            Ok(Some(ref rule)) => {
+                // Fetch the trigger deadline's due_at to use as the trigger date.
+                match store
+                    .get_matter_deadline(&state.user_id, &matter_id, trigger_deadline_id)
+                    .await
+                {
+                    Ok(Some(trigger)) => {
+                        let (_, trace) = crate::legal::calendar::deadline_from_rule_with_trace(
+                            title,
+                            rule,
+                            trigger.due_at,
+                            reminder_days.clone(),
+                            computed_from,
+                            task_id,
+                        );
+                        let exp = serde_json::to_value(&trace).unwrap_or(serde_json::Value::Null);
+                        (Some(exp), Some(rule.version.clone()))
+                    }
+                    _ => (None, None),
+                }
+            }
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    let is_unsupported = req.is_unsupported.unwrap_or(false);
+
     let created = store
         .create_matter_deadline(
             &state.user_id,
@@ -1306,6 +1351,9 @@ pub(crate) async fn matter_deadlines_create_handler(
                 rule_ref,
                 computed_from,
                 task_id,
+                explanation,
+                rule_version,
+                is_unsupported,
             },
         )
         .await
@@ -1401,6 +1449,8 @@ pub(crate) async fn matter_deadlines_patch_handler(
     let task_id =
         crate::channels::web::server::parse_optional_uuid_patch_field(req.task_id, "task_id")?;
 
+    let is_unsupported = req.is_unsupported;
+
     let updated = store
         .update_matter_deadline(
             &state.user_id,
@@ -1415,6 +1465,9 @@ pub(crate) async fn matter_deadlines_patch_handler(
                 rule_ref,
                 computed_from,
                 task_id,
+                explanation: None,
+                rule_version: None,
+                is_unsupported,
             },
         )
         .await
@@ -1426,6 +1479,58 @@ pub(crate) async fn matter_deadlines_patch_handler(
         &updated,
     )
     .await?;
+
+    // Cascade recompute: if due_at changed, update any deadlines computed from this one.
+    if let Some(new_trigger_date) = due_at {
+        let dependents = store
+            .list_deadlines_by_trigger(&state.user_id, &matter_id, deadline_id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+        for dep in dependents {
+            if let Some(ref rule_id) = dep.rule_ref
+                && let Ok(Some(ref rule)) = crate::legal::calendar::get_court_rule(rule_id)
+            {
+                let (new_params, _trace) =
+                    crate::legal::calendar::deadline_from_rule_with_trace(
+                        &dep.title,
+                        rule,
+                        new_trigger_date,
+                        dep.reminder_days.clone(),
+                        dep.computed_from,
+                        dep.task_id,
+                    );
+                let new_exp = serde_json::to_value(&_trace).unwrap_or(serde_json::Value::Null);
+                if let Err(err) = store
+                    .update_matter_deadline(
+                        &state.user_id,
+                        &matter_id,
+                        dep.id,
+                        &UpdateMatterDeadlineParams {
+                            title: None,
+                            deadline_type: None,
+                            due_at: Some(new_params.due_at),
+                            completed_at: None,
+                            reminder_days: None,
+                            rule_ref: None,
+                            computed_from: None,
+                            task_id: None,
+                            explanation: Some(Some(new_exp)),
+                            rule_version: Some(Some(rule.version.clone())),
+                            is_unsupported: None,
+                        },
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "cascade recompute failed for dependent deadline {}: {}",
+                        dep.id,
+                        err
+                    );
+                }
+            }
+        }
+    }
 
     Ok(Json(crate::channels::web::server::deadline_record_to_info(
         updated,
@@ -1497,12 +1602,18 @@ pub(crate) async fn matter_deadlines_compute_handler(
     Json(req): Json<MatterDeadlineComputeRequest>,
 ) -> Result<Json<MatterDeadlineComputeResponse>, (StatusCode, String)> {
     let sanitized_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    // Saving a deadline requires Collaborator access; read-only compute only needs Viewer.
+    let minimum_role = if req.save {
+        MatterMemberRole::Collaborator
+    } else {
+        MatterMemberRole::Viewer
+    };
     require_matter_access(
         &state.store,
         &state.user_id,
         &sanitized_id,
         &principal.user_id,
-        MatterMemberRole::Viewer,
+        minimum_role,
     )
     .await
     .map_err(|s| (s, String::new()))?;
@@ -1526,7 +1637,7 @@ pub(crate) async fn matter_deadlines_compute_handler(
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?
         .ok_or((
             StatusCode::BAD_REQUEST,
-            format!("Unknown rule_id '{}'", rule_id),
+            format!("Unknown rule_id '{rule_id}'"),
         ))?;
     let trigger =
         crate::channels::web::server::parse_datetime_value("trigger_date", &req.trigger_date)?;
@@ -1539,7 +1650,7 @@ pub(crate) async fn matter_deadlines_compute_handler(
     let title = crate::channels::web::server::parse_optional_matter_field(req.title)
         .unwrap_or_else(|| format!("{} deadline", rule.citation));
 
-    let computed = crate::legal::calendar::deadline_from_rule(
+    let (computed, trace) = crate::legal::calendar::deadline_from_rule_with_trace(
         &title,
         &rule,
         trigger,
@@ -1547,11 +1658,176 @@ pub(crate) async fn matter_deadlines_compute_handler(
         computed_from,
         task_id,
     );
+    let explanation = serde_json::to_value(&trace).unwrap_or(serde_json::Value::Null);
+
+    // Optionally persist the computed deadline to the database.
+    let saved = if req.save {
+        let store = state.store.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Database not available".to_string(),
+        ))?;
+        crate::channels::web::server::ensure_matter_db_row_from_workspace(
+            state.as_ref(),
+            &matter_id,
+        )
+        .await?;
+        let record = store
+            .create_matter_deadline(&state.user_id, &matter_id, &computed)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        crate::channels::web::server::sync_deadline_reminder_routines_for_record(
+            state.as_ref(),
+            &record,
+        )
+        .await?;
+        Some(crate::channels::web::server::deadline_record_to_info(
+            record,
+        ))
+    } else {
+        None
+    };
 
     Ok(Json(MatterDeadlineComputeResponse {
         matter_id,
         rule: court_rule_to_info(&rule),
-        deadline: crate::channels::web::server::deadline_compute_preview_from_params(&computed),
+        deadline: crate::channels::web::server::deadline_compute_preview_from_params(
+            &computed,
+            explanation,
+        ),
+        saved,
+    }))
+}
+
+// ==================== Deadline Override / Audit Handlers ====================
+
+/// `POST /api/matters/{id}/deadlines/{deadline_id}/override` — apply a manual override (Collaborator+).
+///
+/// Writes an immutable row to `deadline_override_audit` and updates the deadline's `due_at`,
+/// `is_manual_override`, `override_reason`, `override_by`, and `overridden_at`.
+async fn matter_deadline_override_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path((id, deadline_id)): Path<(String, String)>,
+    Json(req): Json<DeadlineOverrideRequest>,
+) -> Result<Json<MatterDeadlineRecordInfo>, (StatusCode, String)> {
+    let sanitized_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &sanitized_id,
+        &principal.user_id,
+        MatterMemberRole::Collaborator,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
+
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_root = crate::channels::web::server::matter_root_for_gateway(state.as_ref());
+    let matter_id = crate::channels::web::server::ensure_existing_matter_for_route(
+        workspace.as_ref(),
+        &matter_root,
+        &id,
+    )
+    .await?;
+    crate::channels::web::server::ensure_matter_db_row_from_workspace(state.as_ref(), &matter_id)
+        .await?;
+
+    let deadline_id = crate::channels::web::server::parse_uuid(deadline_id.trim(), "deadline_id")?;
+    let new_due_at = crate::channels::web::server::parse_datetime_value("due_at", &req.due_at)?;
+
+    let reason = req.reason.trim().to_string();
+    if reason.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "'reason' is required".to_string()));
+    }
+
+    let updated = store
+        .apply_deadline_override(
+            &state.user_id,
+            &matter_id,
+            deadline_id,
+            &OverrideDeadlineParams {
+                new_due_at,
+                reason,
+                overriding_user_id: principal.user_id.clone(),
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    crate::channels::web::server::sync_deadline_reminder_routines_for_record(
+        state.as_ref(),
+        &updated,
+    )
+    .await?;
+
+    Ok(Json(crate::channels::web::server::deadline_record_to_info(
+        updated,
+    )))
+}
+
+/// `GET /api/matters/{id}/deadlines/{deadline_id}/audit` — list override audit trail (Viewer+).
+async fn matter_deadline_audit_handler(
+    State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
+    Path((id, deadline_id)): Path<(String, String)>,
+) -> Result<Json<DeadlineOverrideAuditResponse>, (StatusCode, String)> {
+    let sanitized_id = crate::channels::web::server::sanitize_matter_id_for_route(&id)?;
+    require_matter_access(
+        &state.store,
+        &state.user_id,
+        &sanitized_id,
+        &principal.user_id,
+        MatterMemberRole::Viewer,
+    )
+    .await
+    .map_err(|s| (s, String::new()))?;
+
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let workspace = state.workspace.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Workspace not available".to_string(),
+    ))?;
+    let matter_root = crate::channels::web::server::matter_root_for_gateway(state.as_ref());
+    let matter_id = crate::channels::web::server::ensure_existing_matter_for_route(
+        workspace.as_ref(),
+        &matter_root,
+        &id,
+    )
+    .await?;
+
+    let deadline_id = crate::channels::web::server::parse_uuid(deadline_id.trim(), "deadline_id")?;
+
+    let entries = store
+        .list_deadline_override_audit(&state.user_id, &matter_id, deadline_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    let audit_infos = entries
+        .into_iter()
+        .map(|e| DeadlineOverrideAuditInfo {
+            id: e.id.to_string(),
+            deadline_id: e.deadline_id.to_string(),
+            user_id: e.user_id,
+            previous_due_at: e.previous_due_at.to_rfc3339(),
+            new_due_at: e.new_due_at.to_rfc3339(),
+            reason: e.reason,
+            created_at: e.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    Ok(Json(DeadlineOverrideAuditResponse {
+        deadline_id: deadline_id.to_string(),
+        entries: audit_infos,
     }))
 }
 

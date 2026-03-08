@@ -2817,6 +2817,7 @@ async fn matter_deadlines_db_entries_prefer_over_workspace_calendar() {
             rule_ref: Some("FRCP 56(c)(1)".to_string()),
             computed_from: None,
             task_id: None,
+            is_unsupported: None,
         }),
     )
     .await
@@ -2857,6 +2858,7 @@ async fn legal_court_rules_and_compute_deadline() {
             reminder_days: vec![7, 3],
             computed_from: None,
             task_id: None,
+            save: false,
         }),
     )
     .await
@@ -2893,6 +2895,7 @@ async fn matter_deadline_delete_disables_reminder_routines() {
             rule_ref: None,
             computed_from: None,
             task_id: None,
+            is_unsupported: None,
         }),
     )
     .await

@@ -790,6 +790,13 @@ pub(crate) fn deadline_record_to_info(
         rule_ref: record.rule_ref,
         computed_from: record.computed_from.map(|value| value.to_string()),
         task_id: record.task_id.map(|value| value.to_string()),
+        explanation: record.explanation,
+        rule_version: record.rule_version,
+        is_manual_override: record.is_manual_override,
+        override_reason: record.override_reason,
+        override_by: record.override_by,
+        overridden_at: record.overridden_at.map(|value| value.to_rfc3339()),
+        is_unsupported: record.is_unsupported,
         is_overdue: record.completed_at.is_none() && due_date < today,
         days_until_due: due_date.signed_duration_since(today).num_days(),
         created_at: record.created_at.to_rfc3339(),
@@ -817,6 +824,7 @@ fn deadline_record_to_legacy_info(record: &crate::db::MatterDeadlineRecord) -> M
 
 pub(crate) fn deadline_compute_preview_from_params(
     params: &CreateMatterDeadlineParams,
+    explanation: serde_json::Value,
 ) -> MatterDeadlineComputePreview {
     let today = Utc::now().date_naive();
     let due_date = params.due_at.date_naive();
@@ -830,6 +838,7 @@ pub(crate) fn deadline_compute_preview_from_params(
         task_id: params.task_id.map(|value| value.to_string()),
         is_overdue: due_date < today,
         days_until_due: due_date.signed_duration_since(today).num_days(),
+        explanation,
     }
 }
 

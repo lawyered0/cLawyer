@@ -687,6 +687,21 @@ pub struct MatterDeadlineRecord {
     pub rule_ref: Option<String>,
     pub computed_from: Option<Uuid>,
     pub task_id: Option<Uuid>,
+    /// JSON computation trace produced by the deadline engine.
+    pub explanation: Option<serde_json::Value>,
+    /// Rule version string at computation time (e.g. `"1"`).
+    pub rule_version: Option<String>,
+    /// True when an attorney has manually overridden the computed date.
+    pub is_manual_override: bool,
+    /// Free-text reason for the override.
+    pub override_reason: Option<String>,
+    /// user_id of the attorney who set the override.
+    pub override_by: Option<String>,
+    /// When the override was recorded.
+    pub overridden_at: Option<DateTime<Utc>>,
+    /// True when this deadline was created outside a supported jurisdiction
+    /// and must be verified manually before filing.
+    pub is_unsupported: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -701,6 +716,13 @@ pub struct CreateMatterDeadlineParams {
     pub rule_ref: Option<String>,
     pub computed_from: Option<Uuid>,
     pub task_id: Option<Uuid>,
+    /// JSON computation trace (set by the deadline engine; `None` for
+    /// manually-entered deadlines without a rule).
+    pub explanation: Option<serde_json::Value>,
+    /// Rule version at creation time.
+    pub rule_version: Option<String>,
+    /// Mark this deadline as outside a supported jurisdiction.
+    pub is_unsupported: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -713,6 +735,32 @@ pub struct UpdateMatterDeadlineParams {
     pub rule_ref: Option<Option<String>>,
     pub computed_from: Option<Option<Uuid>>,
     pub task_id: Option<Option<Uuid>>,
+    /// Replace the explanation trace (e.g. after cascade recompute).
+    pub explanation: Option<Option<serde_json::Value>>,
+    /// Replace the rule version.
+    pub rule_version: Option<Option<String>>,
+    /// Mark/unmark as unsupported jurisdiction.
+    pub is_unsupported: Option<bool>,
+}
+
+/// Params for applying a manual override to a computed deadline.
+#[derive(Debug, Clone)]
+pub struct OverrideDeadlineParams {
+    pub new_due_at: DateTime<Utc>,
+    pub reason: String,
+    pub overriding_user_id: String,
+}
+
+/// One entry in the immutable deadline override audit trail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadlineOverrideAuditRecord {
+    pub id: Uuid,
+    pub deadline_id: Uuid,
+    pub user_id: String,
+    pub previous_due_at: DateTime<Utc>,
+    pub new_due_at: DateTime<Utc>,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Matter document category for attorney workflows.
@@ -2122,6 +2170,30 @@ pub trait MatterDeadlineStore: Send + Sync {
         matter_id: &str,
         deadline_id: Uuid,
     ) -> Result<bool, DatabaseError>;
+    /// Find all deadlines whose `computed_from` equals `trigger_deadline_id`.
+    /// Used for cascade recomputation when a trigger deadline's `due_at` changes.
+    async fn list_deadlines_by_trigger(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        trigger_deadline_id: Uuid,
+    ) -> Result<Vec<MatterDeadlineRecord>, DatabaseError>;
+    /// Apply a manual override: update `due_at`, set override flags, and write
+    /// an immutable row to `deadline_override_audit`.
+    async fn apply_deadline_override(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+        params: &OverrideDeadlineParams,
+    ) -> Result<MatterDeadlineRecord, DatabaseError>;
+    /// List the complete override audit trail for a deadline, newest first.
+    async fn list_deadline_override_audit(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+    ) -> Result<Vec<DeadlineOverrideAuditRecord>, DatabaseError>;
 }
 
 #[async_trait]
