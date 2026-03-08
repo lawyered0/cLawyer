@@ -1,5 +1,6 @@
 //! Matter and client core handlers.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::{
@@ -1251,6 +1252,122 @@ fn court_rule_to_info(rule: &crate::legal::calendar::CourtRule) -> CourtRuleInfo
     }
 }
 
+fn resolve_deadline_rule(
+    deadline: &crate::db::MatterDeadlineRecord,
+) -> Result<Option<crate::legal::calendar::CourtRule>, String> {
+    if let Some(rule_id) = deadline
+        .explanation
+        .as_ref()
+        .and_then(|value| value.get("rule_id"))
+        .and_then(|value| value.as_str())
+        && let Some(rule) = crate::legal::calendar::get_court_rule(rule_id)?
+    {
+        return Ok(Some(rule));
+    }
+
+    match deadline.rule_ref.as_deref() {
+        Some(rule_ref) => crate::legal::calendar::find_court_rule_by_ref(rule_ref),
+        None => Ok(None),
+    }
+}
+
+async fn cascade_recompute_deadline_dependents(
+    state: &GatewayState,
+    matter_id: &str,
+    trigger_deadline_id: uuid::Uuid,
+    new_trigger_date: chrono::DateTime<chrono::Utc>,
+) -> Result<(), (StatusCode, String)> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(());
+    };
+
+    let mut visited = HashSet::new();
+    let mut pending = vec![(trigger_deadline_id, new_trigger_date)];
+
+    while let Some((current_deadline_id, current_trigger_date)) = pending.pop() {
+        if !visited.insert(current_deadline_id) {
+            continue;
+        }
+
+        let dependents = store
+            .list_deadlines_by_trigger(&state.user_id, matter_id, current_deadline_id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+        for dep in dependents {
+            let Some(rule) = resolve_deadline_rule(&dep)
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+            else {
+                tracing::warn!(
+                    "skipping cascade recompute for dependent deadline {} without a resolvable rule",
+                    dep.id
+                );
+                continue;
+            };
+
+            let (new_params, trace) = crate::legal::calendar::deadline_from_rule_with_trace(
+                &dep.title,
+                &rule,
+                current_trigger_date,
+                dep.reminder_days.clone(),
+                dep.computed_from,
+                dep.task_id,
+            );
+            let new_exp = serde_json::to_value(&trace).unwrap_or(serde_json::Value::Null);
+
+            let updated = match store
+                .update_matter_deadline(
+                    &state.user_id,
+                    matter_id,
+                    dep.id,
+                    &UpdateMatterDeadlineParams {
+                        title: None,
+                        deadline_type: None,
+                        due_at: Some(new_params.due_at),
+                        completed_at: None,
+                        reminder_days: None,
+                        rule_ref: None,
+                        computed_from: None,
+                        task_id: None,
+                        explanation: Some(Some(new_exp)),
+                        rule_version: Some(Some(rule.version.clone())),
+                        is_unsupported: None,
+                    },
+                )
+                .await
+            {
+                Ok(Some(updated)) => updated,
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        "cascade recompute failed for dependent deadline {}: {}",
+                        dep.id,
+                        err
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(err) =
+                crate::channels::web::server::sync_deadline_reminder_routines_for_record(
+                    state, &updated,
+                )
+                .await
+            {
+                tracing::warn!(
+                    "failed to sync reminder routines after cascade recompute for deadline {}: {:?}",
+                    updated.id,
+                    err
+                );
+            }
+
+            pending.push((updated.id, updated.due_at));
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn matter_deadlines_create_handler(
     State(state): State<Arc<GatewayState>>,
     RequestPrincipal(principal): RequestPrincipal,
@@ -1308,7 +1425,7 @@ pub(crate) async fn matter_deadlines_create_handler(
     let (explanation, rule_version) = if let (Some(rule_id), Some(trigger_deadline_id)) =
         (&rule_ref, computed_from)
     {
-        match crate::legal::calendar::get_court_rule(rule_id) {
+        match crate::legal::calendar::find_court_rule_by_ref(rule_id) {
             Ok(Some(ref rule)) => {
                 // Fetch the trigger deadline's due_at to use as the trigger date.
                 match store
@@ -1482,53 +1599,13 @@ pub(crate) async fn matter_deadlines_patch_handler(
 
     // Cascade recompute: if due_at changed, update any deadlines computed from this one.
     if let Some(new_trigger_date) = due_at {
-        let dependents = store
-            .list_deadlines_by_trigger(&state.user_id, &matter_id, deadline_id)
-            .await
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-        for dep in dependents {
-            if let Some(ref rule_id) = dep.rule_ref
-                && let Ok(Some(ref rule)) = crate::legal::calendar::get_court_rule(rule_id)
-            {
-                let (new_params, _trace) = crate::legal::calendar::deadline_from_rule_with_trace(
-                    &dep.title,
-                    rule,
-                    new_trigger_date,
-                    dep.reminder_days.clone(),
-                    dep.computed_from,
-                    dep.task_id,
-                );
-                let new_exp = serde_json::to_value(&_trace).unwrap_or(serde_json::Value::Null);
-                if let Err(err) = store
-                    .update_matter_deadline(
-                        &state.user_id,
-                        &matter_id,
-                        dep.id,
-                        &UpdateMatterDeadlineParams {
-                            title: None,
-                            deadline_type: None,
-                            due_at: Some(new_params.due_at),
-                            completed_at: None,
-                            reminder_days: None,
-                            rule_ref: None,
-                            computed_from: None,
-                            task_id: None,
-                            explanation: Some(Some(new_exp)),
-                            rule_version: Some(Some(rule.version.clone())),
-                            is_unsupported: None,
-                        },
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "cascade recompute failed for dependent deadline {}: {}",
-                        dep.id,
-                        err
-                    );
-                }
-            }
-        }
+        cascade_recompute_deadline_dependents(
+            state.as_ref(),
+            &matter_id,
+            deadline_id,
+            new_trigger_date,
+        )
+        .await?;
     }
 
     Ok(Json(crate::channels::web::server::deadline_record_to_info(
@@ -1703,7 +1780,7 @@ pub(crate) async fn matter_deadlines_compute_handler(
 ///
 /// Writes an immutable row to `deadline_override_audit` and updates the deadline's `due_at`,
 /// `is_manual_override`, `override_reason`, `override_by`, and `overridden_at`.
-async fn matter_deadline_override_handler(
+pub(crate) async fn matter_deadline_override_handler(
     State(state): State<Arc<GatewayState>>,
     RequestPrincipal(principal): RequestPrincipal,
     Path((id, deadline_id)): Path<(String, String)>,
@@ -1766,13 +1843,16 @@ async fn matter_deadline_override_handler(
     )
     .await?;
 
+    cascade_recompute_deadline_dependents(state.as_ref(), &matter_id, deadline_id, updated.due_at)
+        .await?;
+
     Ok(Json(crate::channels::web::server::deadline_record_to_info(
         updated,
     )))
 }
 
 /// `GET /api/matters/{id}/deadlines/{deadline_id}/audit` — list override audit trail (Viewer+).
-async fn matter_deadline_audit_handler(
+pub(crate) async fn matter_deadline_audit_handler(
     State(state): State<Arc<GatewayState>>,
     RequestPrincipal(principal): RequestPrincipal,
     Path((id, deadline_id)): Path<(String, String)>,

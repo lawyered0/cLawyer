@@ -154,6 +154,19 @@ pub fn get_court_rule(rule_id: &str) -> Result<Option<CourtRule>, String> {
     Ok(rules.iter().find(|rule| rule.id == rule_id).cloned())
 }
 
+pub fn find_court_rule_by_ref(rule_ref: &str) -> Result<Option<CourtRule>, String> {
+    let normalized = rule_ref.trim();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+
+    let rules = all_court_rules()?;
+    Ok(rules
+        .iter()
+        .find(|rule| rule.id == normalized || rule.citation.eq_ignore_ascii_case(normalized))
+        .cloned())
+}
+
 // ---------------------------------------------------------------------------
 // US federal holiday calendar (FRCP 6(a)(1)(C))
 // ---------------------------------------------------------------------------
@@ -170,8 +183,8 @@ pub fn us_federal_holidays(year: i32) -> Vec<NaiveDate> {
     let mut holidays = Vec::with_capacity(11);
 
     // Observed date for a fixed holiday (Sat→Fri, Sun→Mon).
-    let observe = |m: u32, d: u32| -> NaiveDate {
-        let date = NaiveDate::from_ymd_opt(year, m, d).unwrap_or_default();
+    let observe = |holiday_year: i32, m: u32, d: u32| -> NaiveDate {
+        let date = NaiveDate::from_ymd_opt(holiday_year, m, d).unwrap_or_default();
         match date.weekday() {
             Weekday::Sat => date.pred_opt().unwrap_or(date),
             Weekday::Sun => date.succ_opt().unwrap_or(date),
@@ -202,19 +215,29 @@ pub fn us_federal_holidays(year: i32) -> Vec<NaiveDate> {
         last - Duration::days(offset as i64)
     };
 
-    holidays.push(observe(1, 1)); // New Year's Day
+    holidays.push(observe(year, 1, 1)); // New Year's Day
     holidays.push(nth_weekday(1, Weekday::Mon, 3)); // MLK Jr. Day
     holidays.push(nth_weekday(2, Weekday::Mon, 3)); // Presidents Day
     holidays.push(last_weekday(5, Weekday::Mon)); // Memorial Day
-    holidays.push(observe(6, 19)); // Juneteenth (effective 2021)
-    holidays.push(observe(7, 4)); // Independence Day
+    holidays.push(observe(year, 6, 19)); // Juneteenth (effective 2021)
+    holidays.push(observe(year, 7, 4)); // Independence Day
     holidays.push(nth_weekday(9, Weekday::Mon, 1)); // Labor Day
     holidays.push(nth_weekday(10, Weekday::Mon, 2)); // Columbus Day
-    holidays.push(observe(11, 11)); // Veterans Day
+    holidays.push(observe(year, 11, 11)); // Veterans Day
     holidays.push(nth_weekday(11, Weekday::Thu, 4)); // Thanksgiving
-    holidays.push(observe(12, 25)); // Christmas
+    holidays.push(observe(year, 12, 25)); // Christmas
+
+    // When January 1 of the following year falls on Saturday, the federal
+    // holiday is observed on December 31 of the current year.
+    if let Some(next_year) = year.checked_add(1) {
+        let observed_next_new_year = observe(next_year, 1, 1);
+        if observed_next_new_year.year() == year {
+            holidays.push(observed_next_new_year);
+        }
+    }
 
     holidays.sort_unstable();
+    holidays.dedup();
     holidays
 }
 
@@ -500,7 +523,7 @@ mod tests {
 
     use super::{
         CourtRule, DeadlineProvider, FirstPartyProvider, all_court_rules, apply_rule,
-        apply_rule_with_trace, get_court_rule, us_federal_holidays,
+        apply_rule_with_trace, find_court_rule_by_ref, get_court_rule, us_federal_holidays,
     };
 
     // ---- bundled rule coverage ----
@@ -646,6 +669,16 @@ mod tests {
     }
 
     #[test]
+    fn federal_holidays_include_observed_next_new_year_on_december_31() {
+        let holidays = us_federal_holidays(2021);
+        let dec_31 = chrono::NaiveDate::from_ymd_opt(2021, 12, 31).unwrap();
+        assert!(
+            holidays.contains(&dec_31),
+            "expected Dec 31, 2021 as observed New Year's Day for 2022"
+        );
+    }
+
+    #[test]
     fn independence_day_2026_observed_correctly() {
         // July 4 2026 is a Saturday → observed Friday July 3
         let holidays = us_federal_holidays(2026);
@@ -662,6 +695,31 @@ mod tests {
         let holidays = us_federal_holidays(2026);
         let dec_25 = chrono::NaiveDate::from_ymd_opt(2026, 12, 25).unwrap();
         assert!(holidays.contains(&dec_25));
+    }
+
+    #[test]
+    fn find_court_rule_by_ref_accepts_citation() {
+        let rule = find_court_rule_by_ref("FRCP 12(a)(1)").expect("rule lookup should not error");
+        assert_eq!(rule.expect("citation should resolve").id, "frcp_12_a_1");
+    }
+
+    #[test]
+    fn calendar_day_deadline_skips_observed_new_years_eve() {
+        let rule = CourtRule {
+            id: "test_rule".to_string(),
+            citation: "Test Rule".to_string(),
+            deadline_type: MatterDeadlineType::Internal,
+            offset_days: 1,
+            court_days: false,
+            version: "1".to_string(),
+            jurisdiction: "FRCP".to_string(),
+        };
+        let trigger = chrono::Utc
+            .with_ymd_and_hms(2021, 12, 30, 12, 0, 0)
+            .single()
+            .expect("valid trigger");
+        let due = apply_rule(&rule, trigger);
+        assert_eq!(due.date_naive().to_string(), "2022-01-03");
     }
 
     // ---- DeadlineProvider trait ----
