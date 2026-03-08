@@ -482,7 +482,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Three-way trust reconciliation | ➖ | ✅ | Canonical CSV statement import, persisted reconciliation records, signoff flow, and examiner-readable report output |
 | Citation verification + readiness gating | ➖ | ✅ | Reporter-style extraction, CourtListener provider abstraction, waiver audit trail, and `ready_to_file` gate on filing-package export |
 | Structured conflict report + signed clearance | ➖ | ✅ | DB-backed matter parties, relationships, hit reports, and persisted reviewer signoff with hit snapshot/report hash |
-| Billing rate schedules + UTBMS + LEDES98B | ➖ | ✅ | Effective-dated rates, matter override precedence, UTBMS task/activity codes, block-billing flags, and invoice-level LEDES98B export |
+| Billing rate schedules + UTBMS + LEDES98B | ➖ | ✅ | Admin-managed effective-dated rates with overlap validation, matter override precedence, draft-time schedule/fallback review, UTBMS task/activity codes, block-billing flags, and structured LEDES98B export validation |
 
 ### Owner: _Unassigned_
 

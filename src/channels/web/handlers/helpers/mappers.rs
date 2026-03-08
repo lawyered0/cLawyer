@@ -147,23 +147,54 @@ pub(crate) fn invoice_line_item_record_to_info(item: InvoiceLineItemRecord) -> I
     }
 }
 
-pub(crate) fn invoice_line_item_params_to_info(
-    item: &crate::db::CreateInvoiceLineItemParams,
-) -> InvoiceLineItemInfo {
-    InvoiceLineItemInfo {
+pub(crate) fn invoice_draft_line_item_to_info(
+    item: &crate::legal::billing::DraftInvoiceLineItem,
+) -> InvoiceDraftLineItemInfo {
+    let params = &item.params;
+    InvoiceDraftLineItemInfo {
         id: "draft".to_string(),
-        description: item.description.clone(),
-        quantity: item.quantity.to_string(),
-        unit_price: item.unit_price.to_string(),
-        amount: item.amount.to_string(),
-        time_entry_id: item.time_entry_id.map(|value| value.to_string()),
-        expense_entry_id: item.expense_entry_id.map(|value| value.to_string()),
-        task_code: item.task_code.clone(),
-        activity_code: item.activity_code.clone(),
-        timekeeper: item.timekeeper.clone(),
-        resolved_rate: item.resolved_rate.map(|value| value.to_string()),
-        rate_source: item.rate_source.map(|value| value.as_str().to_string()),
-        sort_order: item.sort_order,
+        description: params.description.clone(),
+        quantity: params.quantity.to_string(),
+        unit_price: params.unit_price.to_string(),
+        amount: params.amount.to_string(),
+        time_entry_id: params.time_entry_id.map(|value| value.to_string()),
+        expense_entry_id: params.expense_entry_id.map(|value| value.to_string()),
+        task_code: params.task_code.clone(),
+        activity_code: params.activity_code.clone(),
+        timekeeper: params.timekeeper.clone(),
+        resolved_rate: params.resolved_rate.map(|value| value.to_string()),
+        rate_source: params.rate_source.map(|value| value.as_str().to_string()),
+        sort_order: params.sort_order,
+        rate_resolution: item
+            .rate_resolution
+            .as_ref()
+            .map(invoice_draft_rate_resolution_to_info),
+    }
+}
+
+fn invoice_draft_rate_resolution_to_info(
+    resolution: &crate::legal::billing::ResolvedTimeEntryRate,
+) -> InvoiceDraftRateResolutionInfo {
+    InvoiceDraftRateResolutionInfo {
+        matched_schedule: resolution
+            .matched_schedule
+            .as_ref()
+            .map(invoice_draft_rate_schedule_to_info),
+        fallback_applied: resolution.fallback.is_some(),
+        fallback_reason: resolution.fallback.map(|value| value.as_str().to_string()),
+    }
+}
+
+fn invoice_draft_rate_schedule_to_info(
+    schedule: &crate::db::BillingRateScheduleRecord,
+) -> InvoiceDraftRateScheduleInfo {
+    InvoiceDraftRateScheduleInfo {
+        id: schedule.id.to_string(),
+        matter_id: schedule.matter_id.clone(),
+        timekeeper: schedule.timekeeper.clone(),
+        rate: schedule.rate.to_string(),
+        effective_start: schedule.effective_start.to_string(),
+        effective_end: schedule.effective_end.map(|value| value.to_string()),
     }
 }
 
