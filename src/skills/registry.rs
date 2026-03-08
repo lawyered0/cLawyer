@@ -1143,4 +1143,26 @@ mod tests {
         let skill = registry.find_by_name("my-skill").unwrap();
         assert_eq!(skill.trust, SkillTrust::Trusted);
     }
+
+    #[tokio::test]
+    async fn test_workspace_discovers_new_canadian_skills() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let workspace_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("skills");
+        let previous_api_key = std::env::var("CANLII_API_KEY").ok();
+        unsafe { std::env::set_var("CANLII_API_KEY", "test-canlii-key") };
+
+        let mut registry =
+            SkillRegistry::new(user_dir.path().to_path_buf()).with_workspace_dir(workspace_dir);
+        let loaded = registry.discover_all().await;
+
+        if let Some(value) = previous_api_key {
+            unsafe { std::env::set_var("CANLII_API_KEY", value) };
+        } else {
+            unsafe { std::env::remove_var("CANLII_API_KEY") };
+        }
+
+        assert!(loaded.iter().any(|name| name == "ontario-litigation"));
+        assert!(loaded.iter().any(|name| name == "canadian-corporate"));
+        assert!(loaded.iter().any(|name| name == "canlii-research"));
+    }
 }

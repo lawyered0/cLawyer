@@ -6,6 +6,7 @@ pub mod billing;
 pub mod calendar;
 pub mod citations;
 pub mod docgen;
+pub mod jurisdictions;
 pub mod ledes;
 pub mod matter;
 pub mod policy;

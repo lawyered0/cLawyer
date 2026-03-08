@@ -1,11 +1,12 @@
 # cLawyer Legal Profile
 
-`cLawyer` ships with legal-mode enabled by default for U.S.-general workflows.
+`cLawyer` ships with legal-mode enabled by default for U.S.-general workflows, with Ontario (`ca-on`) available as an additive Canadian profile.
 
 ## Defaults
 
 - `legal.enabled = true`
 - `legal.jurisdiction = "us-general"`
+- supported profiles: `us-general`, `ca-on`
 - `legal.hardening = "max_lockdown"`
 - `legal.require_matter_context = true`
 - `legal.citation_required = true`
@@ -13,6 +14,7 @@
 - `legal.conflict_file_fallback_enabled = true`
 - `legal.conflict_reindex_on_startup = true`
 - `legal.network.deny_by_default = true`
+- `legal.network.allowed_domains = ["api.canlii.org", "www.canlii.org"]`
 - `legal.audit.enabled = true`
 - `legal.audit.path = "logs/legal_audit.jsonl"`
 - `legal.audit.hash_chain = true`
@@ -21,6 +23,7 @@
 
 - `--matter <matter_id>`
 - `--jurisdiction <code>`
+  - supported codes: `us-general`, `ca-on`
 - `--legal-profile <max-lockdown|standard>`
 - `--allow-domain <domain>` (repeatable)
 
@@ -101,6 +104,7 @@ For web-first firm workflows, matter detail now includes:
 - `POST /api/matters/{id}/deadlines/compute`
   - computes deadline previews from bundled court rules without persisting.
 - `GET /api/legal/court-rules`
+  - returns bundled rule metadata for both existing U.S. rules and additive Ontario rules.
 - `GET /api/legal/audit`
   - returns DB-backed, user-scoped legal audit events with filters:
     - `event_type`, `matter_id`, `severity`, `since`, `until`, `limit`, `offset`
@@ -206,6 +210,21 @@ CLI parity:
 - Phase 1 ships a provider abstraction with CourtListener as the only concrete adapter.
 - Attorney waivers are supported and fully audited, but they do not make a document `ready_to_file` until the explicit ready transition is recorded.
 - Verification quality still depends on provider coverage and API availability; this phase does not integrate Westlaw or Lexis.
+- Canadian citation parsing is available for research and drafting helpers, but CanLII is not yet a filing-readiness verification provider.
+
+## Canadian Legal Tools
+
+- Ontario is the first supported Canadian legal profile (`ca-on`).
+- Bundled Ontario support includes:
+  - Ontario court holidays and Ontario rules in the deadline engine
+  - Canadian citation parsing helpers in `legal::citations`
+  - `canlii_search`
+  - `court_deadline_calculator`
+  - `ontario_limitation_calculator`
+  - `ontario_court_form`
+  - `corporate_compliance_checker`
+  - `trust_compliance_checker`
+- `us-general` remains the platform default jurisdiction.
 
 ## Trust Accounting Limits
 

@@ -88,7 +88,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub matter: Option<String>,
 
-    /// Legal jurisdiction profile (default: us-general).
+    /// Legal jurisdiction profile (default: us-general; supported: us-general, ca-on).
     #[arg(long, global = true)]
     pub jurisdiction: Option<String>,
 

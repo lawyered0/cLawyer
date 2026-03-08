@@ -339,6 +339,7 @@ impl AppBuilder {
             Arc::new(ToolRegistry::new().with_legal_policy(self.config.legal.clone()))
         };
         tools.register_builtin_tools();
+        tools.register_legal_tools(self.db.clone());
 
         // Create embeddings provider using the unified method
         let embeddings = self

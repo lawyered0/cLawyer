@@ -1931,6 +1931,7 @@ mod tests {
 
         let registry = ToolRegistry::new().with_legal_policy(legal.clone());
         registry.register_builtin_tools();
+        registry.register_legal_tools(None);
         registry.register_dev_tools();
 
         let agent = make_test_agent_with_components(
@@ -2178,6 +2179,7 @@ mod tests {
 
         let registry = ToolRegistry::new().with_legal_policy(legal.clone());
         registry.register_builtin_tools();
+        registry.register_legal_tools(None);
         registry.register_dev_tools();
 
         let agent = make_test_agent_with_components(

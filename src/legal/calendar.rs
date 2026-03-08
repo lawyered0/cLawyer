@@ -1,8 +1,8 @@
 //! Court deadline computation engine.
 //!
-//! Provides rule-based deadline calculation compliant with FRCP 6(a)(1):
+//! Provides rule-based deadline calculation compliant with the bundled rule set:
 //! - Calendar-day periods: adds the offset and pushes the last day past
-//!   any weekend or US federal holiday to the next business day.
+//!   any weekend or jurisdiction-specific court holiday to the next business day.
 //! - Court-day periods: counts only business days (Mon–Fri, non-holiday).
 //!
 //! All computation produces a human-readable [`ComputationTrace`] that can
@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::db::{CreateMatterDeadlineParams, MatterDeadlineType};
+use crate::legal::jurisdictions::ontario_court_holidays;
 
 // ---------------------------------------------------------------------------
 // Engine version
@@ -154,6 +155,14 @@ pub fn get_court_rule(rule_id: &str) -> Result<Option<CourtRule>, String> {
     Ok(rules.iter().find(|rule| rule.id == rule_id).cloned())
 }
 
+pub fn rules_for_jurisdiction(jurisdiction: &str) -> Result<Vec<&'static CourtRule>, String> {
+    let rules = all_court_rules()?;
+    Ok(rules
+        .iter()
+        .filter(|rule| rule.jurisdiction.eq_ignore_ascii_case(jurisdiction))
+        .collect())
+}
+
 pub fn find_court_rule_by_ref(rule_ref: &str) -> Result<Option<CourtRule>, String> {
     let normalized = rule_ref.trim();
     if normalized.is_empty() {
@@ -246,8 +255,24 @@ fn is_federal_holiday(date: NaiveDate) -> bool {
     holidays.binary_search(&date).is_ok()
 }
 
-fn is_non_business_day(date: NaiveDate) -> bool {
-    matches!(date.weekday(), Weekday::Sat | Weekday::Sun) || is_federal_holiday(date)
+fn is_court_holiday(date: NaiveDate, jurisdiction: &str) -> bool {
+    match jurisdiction.to_ascii_uppercase().as_str() {
+        "ON" => ontario_court_holidays(date.year())
+            .binary_search(&date)
+            .is_ok(),
+        _ => is_federal_holiday(date),
+    }
+}
+
+fn holiday_label(jurisdiction: &str) -> &'static str {
+    match jurisdiction.to_ascii_uppercase().as_str() {
+        "ON" => "Ontario court holiday",
+        _ => "U.S. federal holiday",
+    }
+}
+
+fn is_non_business_day(date: NaiveDate, jurisdiction: &str) -> bool {
+    matches!(date.weekday(), Weekday::Sat | Weekday::Sun) || is_court_holiday(date, jurisdiction)
 }
 
 fn weekday_name(wd: Weekday) -> &'static str {
@@ -312,16 +337,16 @@ pub fn apply_rule_with_trace(
             raw.format("%A, %B %e, %Y")
         ));
 
-        // Push past weekends/holidays (FRCP 6(a)(1)(C))
+        // Push past weekends/holidays based on the rule's jurisdiction.
         let mut cursor = raw;
-        while is_non_business_day(cursor) {
+        while is_non_business_day(cursor, &rule.jurisdiction) {
             let why = if matches!(cursor.weekday(), Weekday::Sat | Weekday::Sun) {
                 weekday_name(cursor.weekday()).to_string()
             } else {
-                "US federal holiday".to_string()
+                holiday_label(&rule.jurisdiction).to_string()
             };
             push!(format!(
-                "{} is a {} — advance to next business day (FRCP 6(a)(1)(C))",
+                "{} is a {} — advance to next business day",
                 cursor, why
             ));
             cursor = cursor.succ_opt().unwrap_or(cursor);
@@ -343,7 +368,7 @@ pub fn apply_rule_with_trace(
     } else {
         // --- Court-day period ---
         push!(format!(
-            "Count {} court {} per {} (court_days = true; weekends and federal holidays excluded)",
+            "Count {} court {} per {} (court_days = true; weekends and jurisdictional court holidays excluded)",
             rule.offset_days,
             if rule.offset_days == 1 { "day" } else { "days" },
             rule.citation
@@ -355,11 +380,11 @@ pub fn apply_rule_with_trace(
 
         while remaining > 0 {
             cursor += Duration::days(step_dir);
-            if is_non_business_day(cursor) {
+            if is_non_business_day(cursor, &rule.jurisdiction) {
                 let why = if matches!(cursor.weekday(), Weekday::Sat | Weekday::Sun) {
                     weekday_name(cursor.weekday()).to_string()
                 } else {
-                    "federal holiday".to_string()
+                    holiday_label(&rule.jurisdiction).to_string()
                 };
                 push!(format!("Skip {} ({})", cursor, why));
             } else {
@@ -523,7 +548,8 @@ mod tests {
 
     use super::{
         CourtRule, DeadlineProvider, FirstPartyProvider, all_court_rules, apply_rule,
-        apply_rule_with_trace, find_court_rule_by_ref, get_court_rule, us_federal_holidays,
+        apply_rule_with_trace, find_court_rule_by_ref, get_court_rule, rules_for_jurisdiction,
+        us_federal_holidays,
     };
 
     // ---- bundled rule coverage ----
@@ -562,6 +588,20 @@ mod tests {
                 rule.id
             );
         }
+    }
+
+    #[test]
+    fn rules_for_jurisdiction_returns_only_ontario_rules() {
+        let rules = rules_for_jurisdiction("ON").expect("rules should parse");
+        assert!(
+            !rules.is_empty(),
+            "expected at least one Ontario rule in bundled rules"
+        );
+        assert!(
+            rules
+                .iter()
+                .all(|rule| rule.jurisdiction.eq_ignore_ascii_case("ON"))
+        );
     }
 
     // ---- calendar-day computation ----
@@ -616,6 +656,22 @@ mod tests {
         // Actually: Jul 4 2026 is a Saturday, observed holiday = Fri Jul 3.
         // raw = Jun 13 + 21 = Jul 4 (Sat) → push to Jul 5 (Sun) → push to Jul 6 (Mon, not a holiday)
         assert_eq!(due.date_naive().to_string(), "2026-07-06");
+    }
+
+    #[test]
+    fn apply_rule_uses_ontario_court_holidays_for_ontario_rules() {
+        let rule = get_court_rule("on_rcp_37_07_5")
+            .expect("rules should parse")
+            .expect("rule should exist");
+        let trigger = chrono::Utc
+            .with_ymd_and_hms(2026, 4, 3, 10, 0, 0)
+            .single()
+            .expect("valid trigger");
+        let due = apply_rule(&rule, trigger);
+        assert_eq!(
+            due.date_naive(),
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 7).expect("valid due date")
+        );
     }
 
     // ---- court-day computation ----
