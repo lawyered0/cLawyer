@@ -18,8 +18,9 @@ use crate::channels::web::handlers::{
             matters_conflicts_check_handler, matters_conflicts_reindex_handler,
         },
         core::{
-            matter_deadlines_compute_handler, matter_deadlines_create_handler,
-            matter_deadlines_delete_handler, matter_deadlines_handler, matters_active_get_handler,
+            matter_deadline_override_handler, matter_deadlines_compute_handler,
+            matter_deadlines_create_handler, matter_deadlines_delete_handler,
+            matter_deadlines_handler, matter_deadlines_patch_handler, matters_active_get_handler,
             matters_active_set_handler, matters_create_handler, matters_list_handler,
         },
         documents::{
@@ -2817,6 +2818,7 @@ async fn matter_deadlines_db_entries_prefer_over_workspace_calendar() {
             rule_ref: Some("FRCP 56(c)(1)".to_string()),
             computed_from: None,
             task_id: None,
+            is_unsupported: None,
         }),
     )
     .await
@@ -2857,6 +2859,7 @@ async fn legal_court_rules_and_compute_deadline() {
             reminder_days: vec![7, 3],
             computed_from: None,
             task_id: None,
+            save: false,
         }),
     )
     .await
@@ -2868,6 +2871,230 @@ async fn legal_court_rules_and_compute_deadline() {
         computed.deadline.due_at
     );
     assert_eq!(computed.deadline.reminder_days, vec![3, 7]);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn matter_deadlines_patch_cascades_saved_compute_deadline_using_trace_rule_id() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync matter row");
+    let store = state.store.as_ref().expect("store should exist");
+
+    let rule = crate::legal::calendar::get_court_rule("frcp_12_a_1")
+        .expect("rules should parse")
+        .expect("rule should exist");
+    let mut trigger_due_at = Utc::now() + chrono::TimeDelta::days(90);
+    while crate::legal::calendar::apply_rule(&rule, trigger_due_at).date_naive()
+        == crate::legal::calendar::apply_rule(&rule, trigger_due_at + chrono::TimeDelta::days(1))
+            .date_naive()
+    {
+        trigger_due_at += chrono::TimeDelta::days(1);
+    }
+    let (_status, Json(trigger)) = matter_deadlines_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(CreateMatterDeadlineRequest {
+            title: "Service date".to_string(),
+            deadline_type: "court_date".to_string(),
+            due_at: trigger_due_at.to_rfc3339(),
+            completed_at: None,
+            reminder_days: vec![],
+            rule_ref: None,
+            computed_from: None,
+            task_id: None,
+            is_unsupported: None,
+        }),
+    )
+    .await
+    .expect("create trigger deadline");
+    let trigger_id = trigger.id.clone();
+
+    let Json(computed) = matter_deadlines_compute_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(MatterDeadlineComputeRequest {
+            rule_id: "frcp_12_a_1".to_string(),
+            trigger_date: trigger_due_at.to_rfc3339(),
+            title: Some("Response due".to_string()),
+            reminder_days: vec![5],
+            computed_from: Some(trigger_id.clone()),
+            task_id: None,
+            save: true,
+        }),
+    )
+    .await
+    .expect("compute+save should succeed");
+    let saved = computed.saved.expect("saved deadline should be returned");
+    assert_eq!(saved.rule_ref.as_deref(), Some("FRCP 12(a)(1)"));
+
+    let dependent_id = Uuid::parse_str(&saved.id).expect("dependent uuid");
+    let before = store
+        .get_matter_deadline(&state.user_id, "demo", dependent_id)
+        .await
+        .expect("load dependent deadline before patch")
+        .expect("dependent deadline exists");
+
+    let new_trigger_due_at = trigger_due_at + chrono::TimeDelta::days(1);
+    let expected_after_due_at = crate::legal::calendar::apply_rule(&rule, new_trigger_due_at);
+    let Json(_updated_trigger) = matter_deadlines_patch_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(("demo".to_string(), trigger_id)),
+        Json(UpdateMatterDeadlineRequest {
+            title: None,
+            deadline_type: None,
+            due_at: Some(new_trigger_due_at.to_rfc3339()),
+            completed_at: None,
+            reminder_days: None,
+            rule_ref: None,
+            computed_from: None,
+            task_id: None,
+            is_unsupported: None,
+        }),
+    )
+    .await
+    .expect("patch should succeed");
+
+    let after = store
+        .get_matter_deadline(&state.user_id, "demo", dependent_id)
+        .await
+        .expect("load dependent deadline after patch")
+        .expect("dependent deadline exists");
+    assert_ne!(before.due_at, expected_after_due_at);
+    assert_eq!(after.due_at, expected_after_due_at);
+    assert_eq!(
+        after
+            .explanation
+            .as_ref()
+            .and_then(|value| value.get("rule_id"))
+            .and_then(|value| value.as_str()),
+        Some("frcp_12_a_1")
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn matter_deadline_override_cascades_dependents_and_resyncs_reminders() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync matter row");
+    let store = state.store.as_ref().expect("store should exist");
+
+    let rule = crate::legal::calendar::get_court_rule("frcp_12_a_1")
+        .expect("rules should parse")
+        .expect("rule should exist");
+    let mut trigger_due_at = Utc::now() + chrono::TimeDelta::days(120);
+    while crate::legal::calendar::apply_rule(&rule, trigger_due_at).date_naive()
+        == crate::legal::calendar::apply_rule(&rule, trigger_due_at + chrono::TimeDelta::days(1))
+            .date_naive()
+    {
+        trigger_due_at += chrono::TimeDelta::days(1);
+    }
+    let (_status, Json(trigger)) = matter_deadlines_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(CreateMatterDeadlineRequest {
+            title: "Service date".to_string(),
+            deadline_type: "court_date".to_string(),
+            due_at: trigger_due_at.to_rfc3339(),
+            completed_at: None,
+            reminder_days: vec![],
+            rule_ref: None,
+            computed_from: None,
+            task_id: None,
+            is_unsupported: None,
+        }),
+    )
+    .await
+    .expect("create trigger deadline");
+    let trigger_id = trigger.id.clone();
+
+    let Json(computed) = matter_deadlines_compute_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(MatterDeadlineComputeRequest {
+            rule_id: "frcp_12_a_1".to_string(),
+            trigger_date: trigger_due_at.to_rfc3339(),
+            title: Some("Response due".to_string()),
+            reminder_days: vec![7],
+            computed_from: Some(trigger_id.clone()),
+            task_id: None,
+            save: true,
+        }),
+    )
+    .await
+    .expect("compute+save should succeed");
+
+    let dependent = computed.saved.expect("saved deadline should be returned");
+    let dependent_id = Uuid::parse_str(&dependent.id).expect("dependent uuid");
+    let dependent_before = store
+        .get_matter_deadline(&state.user_id, "demo", dependent_id)
+        .await
+        .expect("load dependent deadline before override")
+        .expect("dependent deadline exists");
+
+    let prefix = deadline_reminder_prefix("demo", dependent_id);
+    let routines_before = db.list_routines("test-user").await.expect("list routines");
+    let routine_before = routines_before
+        .into_iter()
+        .find(|routine| routine.name.starts_with(&prefix) && routine.enabled)
+        .expect("dependent reminder routine should exist");
+    let next_fire_before = routine_before
+        .next_fire_at
+        .expect("dependent reminder should have next fire");
+
+    let new_trigger_due_at = trigger_due_at + chrono::TimeDelta::days(1);
+    let expected_after_due_at = crate::legal::calendar::apply_rule(&rule, new_trigger_due_at);
+    let Json(_updated_trigger) = matter_deadline_override_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(("demo".to_string(), trigger_id)),
+        Json(DeadlineOverrideRequest {
+            due_at: new_trigger_due_at.to_rfc3339(),
+            reason: "Stipulated extension".to_string(),
+        }),
+    )
+    .await
+    .expect("override should succeed");
+
+    let dependent_after = store
+        .get_matter_deadline(&state.user_id, "demo", dependent_id)
+        .await
+        .expect("load dependent deadline after override")
+        .expect("dependent deadline exists");
+    assert_ne!(dependent_before.due_at, expected_after_due_at);
+    assert_eq!(dependent_after.due_at, expected_after_due_at);
+
+    let routines_after = db
+        .list_routines("test-user")
+        .await
+        .expect("list routines after override");
+    let routine_after = routines_after
+        .into_iter()
+        .find(|routine| routine.name.starts_with(&prefix) && routine.enabled)
+        .expect("dependent reminder routine should still exist");
+    let next_fire_after = routine_after
+        .next_fire_at
+        .expect("dependent reminder should have next fire after override");
+    assert!(
+        next_fire_after > next_fire_before,
+        "expected rescheduled reminder after override"
+    );
 }
 
 #[cfg(feature = "libsql")]
@@ -2893,6 +3120,7 @@ async fn matter_deadline_delete_disables_reminder_routines() {
             rule_ref: None,
             computed_from: None,
             task_id: None,
+            is_unsupported: None,
         }),
     )
     .await

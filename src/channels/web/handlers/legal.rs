@@ -30,6 +30,8 @@ fn court_rule_to_info(rule: &crate::legal::calendar::CourtRule) -> CourtRuleInfo
         deadline_type: rule.deadline_type.as_str().to_string(),
         offset_days: rule.offset_days,
         court_days: rule.court_days,
+        version: rule.version.clone(),
+        jurisdiction: rule.jurisdiction.clone(),
     }
 }
 

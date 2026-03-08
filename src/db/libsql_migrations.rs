@@ -669,6 +669,15 @@ CREATE TABLE IF NOT EXISTS matter_deadlines (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
     matter_id TEXT NOT NULL,
+    -- Phase 3 deadline engine columns (present on fresh installs; backfilled
+    -- via ALTER TABLE in run_migrations for existing databases)
+    explanation TEXT,
+    rule_version TEXT,
+    is_manual_override INTEGER NOT NULL DEFAULT 0 CHECK (is_manual_override IN (0, 1)),
+    override_reason TEXT,
+    override_by TEXT,
+    overridden_at TEXT,
+    is_unsupported INTEGER NOT NULL DEFAULT 0 CHECK (is_unsupported IN (0, 1)),
     title TEXT NOT NULL,
     deadline_type TEXT NOT NULL CHECK (deadline_type IN (
         'court_date',
@@ -695,6 +704,20 @@ CREATE INDEX IF NOT EXISTS idx_matter_deadlines_user_matter_completed
     ON matter_deadlines(user_id, matter_id, completed_at);
 CREATE INDEX IF NOT EXISTS idx_matter_deadlines_rule_ref
     ON matter_deadlines(rule_ref);
+
+-- Immutable override audit log (Phase 3).
+CREATE TABLE IF NOT EXISTS deadline_override_audit (
+    id TEXT PRIMARY KEY,
+    deadline_id TEXT NOT NULL REFERENCES matter_deadlines(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL,
+    previous_due_at TEXT NOT NULL,
+    new_due_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_deadline_override_audit_deadline
+    ON deadline_override_audit(deadline_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS matter_documents (
     id TEXT PRIMARY KEY,

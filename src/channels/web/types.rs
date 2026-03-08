@@ -1437,6 +1437,23 @@ pub struct MatterDeadlineRecordInfo {
     pub rule_ref: Option<String>,
     pub computed_from: Option<String>,
     pub task_id: Option<String>,
+    /// JSON computation trace from the deadline engine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<serde_json::Value>,
+    /// Rule version used to compute this deadline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_version: Option<String>,
+    /// True when an attorney has manually overridden the computed date.
+    pub is_manual_override: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub override_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub override_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overridden_at: Option<String>,
+    /// True when the jurisdiction is not officially supported and the date
+    /// requires manual verification before filing.
+    pub is_unsupported: bool,
     pub is_overdue: bool,
     pub days_until_due: i64,
     pub created_at: String,
@@ -1458,6 +1475,9 @@ pub struct CreateMatterDeadlineRequest {
     pub computed_from: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
+    /// Mark this deadline as outside a supported jurisdiction.
+    #[serde(default)]
+    pub is_unsupported: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1478,6 +1498,8 @@ pub struct UpdateMatterDeadlineRequest {
     pub computed_from: Option<Option<String>>,
     #[serde(default)]
     pub task_id: Option<Option<String>>,
+    #[serde(default)]
+    pub is_unsupported: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1492,6 +1514,9 @@ pub struct MatterDeadlineComputeRequest {
     pub computed_from: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
+    /// If true, persist the computed deadline to the database.
+    #[serde(default)]
+    pub save: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1499,6 +1524,9 @@ pub struct MatterDeadlineComputeResponse {
     pub matter_id: String,
     pub rule: CourtRuleInfo,
     pub deadline: MatterDeadlineComputePreview,
+    /// Populated when `save = true` in the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved: Option<MatterDeadlineRecordInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1512,6 +1540,36 @@ pub struct MatterDeadlineComputePreview {
     pub task_id: Option<String>,
     pub is_overdue: bool,
     pub days_until_due: i64,
+    /// Human-readable computation trace from the deadline engine.
+    pub explanation: serde_json::Value,
+}
+
+/// Request body for `POST /api/matters/{id}/deadlines/{deadline_id}/override`.
+#[derive(Debug, Deserialize)]
+pub struct DeadlineOverrideRequest {
+    /// New deadline date (RFC-3339 or `YYYY-MM-DD` format).
+    pub due_at: String,
+    /// Mandatory reason for the override (e.g. "Stipulated extension by counsel").
+    pub reason: String,
+}
+
+/// One entry in the deadline override audit trail.
+#[derive(Debug, Serialize)]
+pub struct DeadlineOverrideAuditInfo {
+    pub id: String,
+    pub deadline_id: String,
+    pub user_id: String,
+    pub previous_due_at: String,
+    pub new_due_at: String,
+    pub reason: String,
+    pub created_at: String,
+}
+
+/// Response for `GET /api/matters/{id}/deadlines/{deadline_id}/audit`.
+#[derive(Debug, Serialize)]
+pub struct DeadlineOverrideAuditResponse {
+    pub deadline_id: String,
+    pub entries: Vec<DeadlineOverrideAuditInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1521,6 +1579,8 @@ pub struct CourtRuleInfo {
     pub deadline_type: String,
     pub offset_days: i64,
     pub court_days: bool,
+    pub version: String,
+    pub jurisdiction: String,
 }
 
 #[derive(Debug, Serialize)]

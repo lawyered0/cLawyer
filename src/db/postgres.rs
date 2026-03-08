@@ -25,12 +25,13 @@ use crate::db::{
     CreateDocumentVersionParams, CreateExpenseEntryParams, CreateInvoiceLineItemParams,
     CreateInvoiceParams, CreateMatterDeadlineParams, CreateMatterNoteParams,
     CreateMatterTaskParams, CreateTimeEntryParams, CreateTrustLedgerEntryParams, Database,
-    DocumentTemplateRecord, DocumentTemplateStore, DocumentVersionRecord, DocumentVersionStore,
-    ExpenseCategory, ExpenseEntryRecord, InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus,
-    JobStore, LegalConflictStore, MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType,
-    MatterDocumentCategory, MatterDocumentRecord, MatterDocumentStore, MatterMemberRole,
-    MatterMembershipRecord, MatterNoteRecord, MatterNoteStore, MatterRecord, MatterStatus,
-    MatterStore, MatterTaskRecord, MatterTaskStatus, MatterTaskStore, MatterTimeSummary, PartyRole,
+    DeadlineOverrideAuditRecord, DocumentTemplateRecord, DocumentTemplateStore,
+    DocumentVersionRecord, DocumentVersionStore, ExpenseCategory, ExpenseEntryRecord,
+    InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus, JobStore, LegalConflictStore,
+    MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType, MatterDocumentCategory,
+    MatterDocumentRecord, MatterDocumentStore, MatterMemberRole, MatterMembershipRecord,
+    MatterNoteRecord, MatterNoteStore, MatterRecord, MatterStatus, MatterStore, MatterTaskRecord,
+    MatterTaskStatus, MatterTaskStore, MatterTimeSummary, OverrideDeadlineParams, PartyRole,
     RbacStore, RecordInvoicePaymentParams, RecordInvoicePaymentResult, RoutineStore, SandboxStore,
     SettingsStore, TimeEntryRecord, TimeExpenseStore, ToolFailureStore, TrustAccountingStore,
     TrustLedgerEntryRecord, TrustLedgerEntryType, UpdateClientParams, UpdateDocumentTemplateParams,
@@ -511,9 +512,28 @@ fn row_to_matter_deadline_record(
         rule_ref: row.get("rule_ref"),
         computed_from: row.get("computed_from"),
         task_id: row.get("task_id"),
+        explanation: row.get("explanation"),
+        rule_version: row.get("rule_version"),
+        is_manual_override: row.get("is_manual_override"),
+        override_reason: row.get("override_reason"),
+        override_by: row.get("override_by"),
+        overridden_at: row.get("overridden_at"),
+        is_unsupported: row.get("is_unsupported"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
+}
+
+fn row_to_deadline_override_audit(row: &tokio_postgres::Row) -> DeadlineOverrideAuditRecord {
+    DeadlineOverrideAuditRecord {
+        id: row.get("id"),
+        deadline_id: row.get("deadline_id"),
+        user_id: row.get("user_id"),
+        previous_due_at: row.get("previous_due_at"),
+        new_due_at: row.get("new_due_at"),
+        reason: row.get("reason"),
+        created_at: row.get("created_at"),
+    }
 }
 
 fn row_to_matter_document_record(
@@ -2643,6 +2663,12 @@ impl MatterNoteStore for PgBackend {
 
 // ==================== MatterDeadlineStore ====================
 
+const DEADLINE_SELECT_COLS: &str = "id, user_id, matter_id, title, deadline_type, due_at, completed_at, \
+     reminder_days, rule_ref, computed_from, task_id, \
+     explanation, rule_version, is_manual_override, \
+     override_reason, override_by, overridden_at, is_unsupported, \
+     created_at, updated_at";
+
 #[async_trait]
 impl MatterDeadlineStore for PgBackend {
     async fn list_matter_deadlines(
@@ -2653,10 +2679,11 @@ impl MatterDeadlineStore for PgBackend {
         let conn = self.store.conn().await?;
         let rows = conn
             .query(
-                "SELECT id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at \
-                 FROM matter_deadlines \
-                 WHERE user_id = $1 AND matter_id = $2 \
-                 ORDER BY due_at ASC, created_at ASC",
+                &format!(
+                    "SELECT {DEADLINE_SELECT_COLS} FROM matter_deadlines \
+                     WHERE user_id = $1 AND matter_id = $2 \
+                     ORDER BY due_at ASC, created_at ASC"
+                ),
                 &[&user_id, &matter_id],
             )
             .await?;
@@ -2674,9 +2701,10 @@ impl MatterDeadlineStore for PgBackend {
         let conn = self.store.conn().await?;
         let row = conn
             .query_opt(
-                "SELECT id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at \
-                 FROM matter_deadlines \
-                 WHERE user_id = $1 AND matter_id = $2 AND id = $3",
+                &format!(
+                    "SELECT {DEADLINE_SELECT_COLS} FROM matter_deadlines \
+                     WHERE user_id = $1 AND matter_id = $2 AND id = $3"
+                ),
                 &[&user_id, &matter_id, &deadline_id],
             )
             .await?;
@@ -2695,10 +2723,14 @@ impl MatterDeadlineStore for PgBackend {
         let conn = self.store.conn().await?;
         let row = conn
             .query_one(
-                "INSERT INTO matter_deadlines \
-                 (id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-                 RETURNING id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at",
+                &format!(
+                    "INSERT INTO matter_deadlines \
+                     (id, user_id, matter_id, title, deadline_type, due_at, completed_at, \
+                      reminder_days, rule_ref, computed_from, task_id, \
+                      explanation, rule_version, is_unsupported) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                     RETURNING {DEADLINE_SELECT_COLS}"
+                ),
                 &[
                     &Uuid::new_v4(),
                     &user_id,
@@ -2711,6 +2743,9 @@ impl MatterDeadlineStore for PgBackend {
                     &input.rule_ref,
                     &input.computed_from,
                     &input.task_id,
+                    &input.explanation,
+                    &input.rule_version,
+                    &input.is_unsupported,
                 ],
             )
             .await?;
@@ -2742,24 +2777,24 @@ impl MatterDeadlineStore for PgBackend {
         let merged_rule_ref = input.rule_ref.clone().unwrap_or(existing.rule_ref);
         let merged_computed_from = input.computed_from.unwrap_or(existing.computed_from);
         let merged_task_id = input.task_id.unwrap_or(existing.task_id);
+        let merged_explanation = input.explanation.clone().unwrap_or(existing.explanation);
+        let merged_rule_version = input.rule_version.clone().unwrap_or(existing.rule_version);
+        let merged_is_unsupported = input.is_unsupported.unwrap_or(existing.is_unsupported);
         let reminder_days = serde_json::to_value(&merged_reminder_days)
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
         let conn = self.store.conn().await?;
         let row = conn
             .query_one(
-                "UPDATE matter_deadlines SET \
-                    title = $4, \
-                    deadline_type = $5, \
-                    due_at = $6, \
-                    completed_at = $7, \
-                    reminder_days = $8, \
-                    rule_ref = $9, \
-                    computed_from = $10, \
-                    task_id = $11, \
-                    updated_at = NOW() \
-                 WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
-                 RETURNING id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at",
+                &format!(
+                    "UPDATE matter_deadlines SET \
+                        title = $4, deadline_type = $5, due_at = $6, completed_at = $7, \
+                        reminder_days = $8, rule_ref = $9, computed_from = $10, task_id = $11, \
+                        explanation = $12, rule_version = $13, is_unsupported = $14, \
+                        updated_at = NOW() \
+                     WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
+                     RETURNING {DEADLINE_SELECT_COLS}"
+                ),
                 &[
                     &user_id,
                     &matter_id,
@@ -2772,6 +2807,9 @@ impl MatterDeadlineStore for PgBackend {
                     &merged_rule_ref,
                     &merged_computed_from,
                     &merged_task_id,
+                    &merged_explanation,
+                    &merged_rule_version,
+                    &merged_is_unsupported,
                 ],
             )
             .await?;
@@ -2792,6 +2830,114 @@ impl MatterDeadlineStore for PgBackend {
             )
             .await?;
         Ok(deleted > 0)
+    }
+
+    async fn list_deadlines_by_trigger(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        trigger_deadline_id: Uuid,
+    ) -> Result<Vec<MatterDeadlineRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                &format!(
+                    "SELECT {DEADLINE_SELECT_COLS} FROM matter_deadlines \
+                     WHERE user_id = $1 AND matter_id = $2 AND computed_from = $3 \
+                     ORDER BY due_at ASC, created_at ASC"
+                ),
+                &[&user_id, &matter_id, &trigger_deadline_id],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| row_to_matter_deadline_record(&row))
+            .collect()
+    }
+
+    async fn apply_deadline_override(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+        params: &OverrideDeadlineParams,
+    ) -> Result<MatterDeadlineRecord, DatabaseError> {
+        let existing = self
+            .get_matter_deadline(user_id, matter_id, deadline_id)
+            .await?
+            .ok_or_else(|| DatabaseError::Query("deadline not found".to_string()))?;
+
+        let conn = self.store.conn().await?;
+
+        // Write immutable audit row first.
+        conn.execute(
+            "INSERT INTO deadline_override_audit \
+             (deadline_id, user_id, previous_due_at, new_due_at, reason) \
+             VALUES ($1, $2, $3, $4, $5)",
+            &[
+                &deadline_id,
+                &params.overriding_user_id,
+                &existing.due_at,
+                &params.new_due_at,
+                &params.reason,
+            ],
+        )
+        .await?;
+
+        // Update the deadline with override flags.
+        let row = conn
+            .query_one(
+                &format!(
+                    "UPDATE matter_deadlines SET \
+                        due_at = $4, \
+                        is_manual_override = TRUE, \
+                        override_reason = $5, \
+                        override_by = $6, \
+                        overridden_at = NOW(), \
+                        updated_at = NOW() \
+                     WHERE user_id = $1 AND matter_id = $2 AND id = $3 \
+                     RETURNING {DEADLINE_SELECT_COLS}"
+                ),
+                &[
+                    &user_id,
+                    &matter_id,
+                    &deadline_id,
+                    &params.new_due_at,
+                    &params.reason,
+                    &params.overriding_user_id,
+                ],
+            )
+            .await?;
+        row_to_matter_deadline_record(&row)
+    }
+
+    async fn list_deadline_override_audit(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+    ) -> Result<Vec<DeadlineOverrideAuditRecord>, DatabaseError> {
+        // Verify ownership before returning audit rows.
+        if self
+            .get_matter_deadline(user_id, matter_id, deadline_id)
+            .await?
+            .is_none()
+        {
+            return Ok(Vec::new());
+        }
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, deadline_id, user_id, previous_due_at, new_due_at, reason, created_at \
+                 FROM deadline_override_audit \
+                 WHERE deadline_id = $1 \
+                 ORDER BY created_at DESC",
+                &[&deadline_id],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| row_to_deadline_override_audit(&r))
+            .collect())
     }
 }
 

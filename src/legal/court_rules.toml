@@ -1,16 +1,79 @@
+# First-party court deadline rules.
+#
+# Fields:
+#   id            – machine-readable identifier used in API calls
+#   citation      – human-readable citation shown in UI and traces
+#   deadline_type – one of: court_date | filing | statute_of_limitations |
+#                   response_due | discovery_cutoff | internal
+#   offset_days   – number of days to add to the trigger date
+#   court_days    – if true, weekends and federal holidays are excluded from
+#                   the count (FRCP 6(a)(1)); if false, calendar days are used
+#                   but the last day is pushed to the next business day per
+#                   FRCP 6(a)(1)(C)
+#   version       – rule version string; bump when the underlying rule changes
+#   jurisdiction  – "FRCP" or two-letter state code (e.g. "CA")
+
+# ---------------------------------------------------------------------------
+# FRCP responses (Rule 12)
+# ---------------------------------------------------------------------------
+
 [[rules]]
 id = "frcp_12_a_1"
 citation = "FRCP 12(a)(1)"
 deadline_type = "response_due"
 offset_days = 21
 court_days = false
+version = "1"
+jurisdiction = "FRCP"
 
+# Response by the United States, a US agency, or a US officer sued in official
+# capacity: 60 days from service.
 [[rules]]
-id = "frcp_26_a_1"
-citation = "FRCP 26(a)(1)"
-deadline_type = "discovery_cutoff"
-offset_days = 14
+id = "frcp_12_a_3"
+citation = "FRCP 12(a)(3)"
+deadline_type = "response_due"
+offset_days = 60
 court_days = false
+version = "1"
+jurisdiction = "FRCP"
+
+# ---------------------------------------------------------------------------
+# FRCP discovery responses (Rules 33, 34, 36)
+# ---------------------------------------------------------------------------
+
+# Rule 33 – interrogatories: 30 days after being served.
+[[rules]]
+id = "frcp_33"
+citation = "FRCP 33(b)(2)"
+deadline_type = "response_due"
+offset_days = 30
+court_days = false
+version = "1"
+jurisdiction = "FRCP"
+
+# Rule 34 – document production: 30 days after being served.
+[[rules]]
+id = "frcp_34"
+citation = "FRCP 34(b)(2)(A)"
+deadline_type = "response_due"
+offset_days = 30
+court_days = false
+version = "1"
+jurisdiction = "FRCP"
+
+# Rule 36 – requests for admission: 30 days after being served.
+[[rules]]
+id = "frcp_36"
+citation = "FRCP 36(a)(3)"
+deadline_type = "response_due"
+offset_days = 30
+court_days = false
+version = "1"
+jurisdiction = "FRCP"
+
+# ---------------------------------------------------------------------------
+# FRCP summary judgment (Rule 56)
+# ---------------------------------------------------------------------------
 
 [[rules]]
 id = "frcp_56_c_1"
@@ -18,6 +81,51 @@ citation = "FRCP 56(c)(1)"
 deadline_type = "filing"
 offset_days = 30
 court_days = false
+version = "1"
+jurisdiction = "FRCP"
+
+# ---------------------------------------------------------------------------
+# FRCP initial disclosures (Rule 26)
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "frcp_26_a_1"
+citation = "FRCP 26(a)(1)"
+deadline_type = "discovery_cutoff"
+offset_days = 14
+court_days = false
+version = "1"
+jurisdiction = "FRCP"
+
+# ---------------------------------------------------------------------------
+# FRCP post-trial motions
+# ---------------------------------------------------------------------------
+
+# Rule 59(b) – motion for new trial: 28 days after entry of judgment.
+[[rules]]
+id = "frcp_59_b"
+citation = "FRCP 59(b)"
+deadline_type = "filing"
+offset_days = 28
+court_days = false
+version = "1"
+jurisdiction = "FRCP"
+
+# Rule 60(c)(1) – motion for relief from judgment on grounds of mistake,
+# newly-discovered evidence, fraud, or void/satisfied judgment:
+# no more than 1 year (365 days) after entry.
+[[rules]]
+id = "frcp_60_c_1"
+citation = "FRCP 60(c)(1)"
+deadline_type = "filing"
+offset_days = 365
+court_days = false
+version = "1"
+jurisdiction = "FRCP"
+
+# ---------------------------------------------------------------------------
+# California state rules
+# ---------------------------------------------------------------------------
 
 [[rules]]
 id = "ca_ccp_412_20"
@@ -25,3 +133,5 @@ citation = "CA CCP 412.20"
 deadline_type = "response_due"
 offset_days = 30
 court_days = false
+version = "1"
+jurisdiction = "CA"

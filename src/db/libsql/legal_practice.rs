@@ -11,17 +11,18 @@ use crate::db::{
     CreateDocumentVersionParams, CreateExpenseEntryParams, CreateInvoiceLineItemParams,
     CreateInvoiceParams, CreateMatterDeadlineParams, CreateMatterNoteParams,
     CreateMatterTaskParams, CreateTimeEntryParams, CreateTrustLedgerEntryParams,
-    DocumentReadinessState, DocumentTemplateRecord, DocumentTemplateStore, DocumentVersionRecord,
-    DocumentVersionStore, ExpenseCategory, ExpenseEntryRecord, InvoiceLineItemRecord,
-    InvoiceRecord, InvoiceStatus, LegalRestoreStore, MatterDeadlineRecord, MatterDeadlineStore,
-    MatterDeadlineType, MatterDocumentCategory, MatterDocumentRecord, MatterDocumentStore,
-    MatterMemberRole, MatterMembershipRecord, MatterNoteRecord, MatterNoteStore, MatterRecord,
-    MatterStatus, MatterStore, MatterTaskRecord, MatterTaskStatus, MatterTaskStore,
-    MatterTimeSummary, RbacStore, RecordInvoicePaymentParams, RecordInvoicePaymentResult,
-    TimeEntryRecord, TimeExpenseStore, TrustAccountingStore, TrustLedgerEntryRecord,
-    TrustLedgerEntryType, TrustLedgerSource, UpdateClientParams, UpdateDocumentTemplateParams,
-    UpdateExpenseEntryParams, UpdateMatterDeadlineParams, UpdateMatterDocumentParams,
-    UpdateMatterNoteParams, UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
+    DeadlineOverrideAuditRecord, DocumentReadinessState, DocumentTemplateRecord,
+    DocumentTemplateStore, DocumentVersionRecord, DocumentVersionStore, ExpenseCategory,
+    ExpenseEntryRecord, InvoiceLineItemRecord, InvoiceRecord, InvoiceStatus, LegalRestoreStore,
+    MatterDeadlineRecord, MatterDeadlineStore, MatterDeadlineType, MatterDocumentCategory,
+    MatterDocumentRecord, MatterDocumentStore, MatterMemberRole, MatterMembershipRecord,
+    MatterNoteRecord, MatterNoteStore, MatterRecord, MatterStatus, MatterStore, MatterTaskRecord,
+    MatterTaskStatus, MatterTaskStore, MatterTimeSummary, OverrideDeadlineParams, RbacStore,
+    RecordInvoicePaymentParams, RecordInvoicePaymentResult, TimeEntryRecord, TimeExpenseStore,
+    TrustAccountingStore, TrustLedgerEntryRecord, TrustLedgerEntryType, TrustLedgerSource,
+    UpdateClientParams, UpdateDocumentTemplateParams, UpdateExpenseEntryParams,
+    UpdateMatterDeadlineParams, UpdateMatterDocumentParams, UpdateMatterNoteParams,
+    UpdateMatterParams, UpdateMatterTaskParams, UpdateTimeEntryParams,
     UpsertDocumentTemplateParams, UpsertMatterDocumentParams, UpsertMatterMembershipParams,
     UpsertMatterParams, UpsertTrustAccountParams, UserRecord, UserRole, normalize_party_name,
 };
@@ -259,11 +260,24 @@ fn row_to_matter_note_record(row: &libsql::Row) -> Result<MatterNoteRecord, Data
     })
 }
 
+/// Column order: id(0) user_id(1) matter_id(2) title(3) deadline_type(4)
+///   due_at(5) completed_at(6) reminder_days(7) rule_ref(8) computed_from(9)
+///   task_id(10) created_at(11) updated_at(12) explanation(13) rule_version(14)
+///   is_manual_override(15) override_reason(16) override_by(17) overridden_at(18)
+///   is_unsupported(19)
+const DEADLINE_COLS: &str = "id, user_id, matter_id, title, deadline_type, due_at, completed_at, \
+     reminder_days, rule_ref, computed_from, task_id, created_at, updated_at, \
+     explanation, rule_version, is_manual_override, override_reason, override_by, \
+     overridden_at, is_unsupported";
+
 fn row_to_matter_deadline_record(row: &libsql::Row) -> Result<MatterDeadlineRecord, DatabaseError> {
     let deadline_type_raw = get_text(row, 4);
     let due_at = parse_timestamp(&get_text(row, 5))
         .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
     let completed_at = parse_dt_opt(get_opt_text(row, 6))?;
+    let explanation: Option<serde_json::Value> =
+        get_opt_text(row, 13).and_then(|s| serde_json::from_str(&s).ok());
+    let overridden_at = parse_dt_opt(get_opt_text(row, 18))?;
     Ok(MatterDeadlineRecord {
         id: parse_uuid(&get_text(row, 0), "matter_deadlines.id")?,
         user_id: get_text(row, 1),
@@ -284,6 +298,33 @@ fn row_to_matter_deadline_record(row: &libsql::Row) -> Result<MatterDeadlineReco
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
         updated_at: parse_timestamp(&get_text(row, 12))
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+        explanation,
+        rule_version: get_opt_text(row, 14),
+        is_manual_override: row.get::<i64>(15).unwrap_or(0) != 0,
+        override_reason: get_opt_text(row, 16),
+        override_by: get_opt_text(row, 17),
+        overridden_at,
+        is_unsupported: row.get::<i64>(19).unwrap_or(0) != 0,
+    })
+}
+
+fn row_to_deadline_override_audit(
+    row: &libsql::Row,
+) -> Result<crate::db::DeadlineOverrideAuditRecord, DatabaseError> {
+    let previous_due_at = parse_timestamp(&get_text(row, 3))
+        .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+    let new_due_at = parse_timestamp(&get_text(row, 4))
+        .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+    let created_at = parse_timestamp(&get_text(row, 6))
+        .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+    Ok(crate::db::DeadlineOverrideAuditRecord {
+        id: parse_uuid(&get_text(row, 0), "deadline_override_audit.id")?,
+        deadline_id: parse_uuid(&get_text(row, 1), "deadline_override_audit.deadline_id")?,
+        user_id: get_text(row, 2),
+        previous_due_at,
+        new_due_at,
+        reason: get_text(row, 5),
+        created_at,
     })
 }
 
@@ -1471,14 +1512,11 @@ impl MatterDeadlineStore for LibSqlBackend {
         matter_id: &str,
     ) -> Result<Vec<MatterDeadlineRecord>, DatabaseError> {
         let conn = self.connect().await?;
-        let mut rows = conn
-            .query(
-                "SELECT id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at \
-                 FROM matter_deadlines WHERE user_id = ?1 AND matter_id = ?2 \
-                 ORDER BY due_at ASC, created_at ASC",
-                params![user_id, matter_id],
-            )
-            .await?;
+        let query = format!(
+            "SELECT {DEADLINE_COLS} FROM matter_deadlines \
+             WHERE user_id = ?1 AND matter_id = ?2 ORDER BY due_at ASC, created_at ASC"
+        );
+        let mut rows = conn.query(&query, params![user_id, matter_id]).await?;
 
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -1494,12 +1532,12 @@ impl MatterDeadlineStore for LibSqlBackend {
         deadline_id: Uuid,
     ) -> Result<Option<MatterDeadlineRecord>, DatabaseError> {
         let conn = self.connect().await?;
+        let query = format!(
+            "SELECT {DEADLINE_COLS} FROM matter_deadlines \
+             WHERE user_id = ?1 AND matter_id = ?2 AND id = ?3 LIMIT 1"
+        );
         let row = conn
-            .query(
-                "SELECT id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at \
-                 FROM matter_deadlines WHERE user_id = ?1 AND matter_id = ?2 AND id = ?3 LIMIT 1",
-                params![user_id, matter_id, deadline_id.to_string()],
-            )
+            .query(&query, params![user_id, matter_id, deadline_id.to_string()])
             .await?
             .next()
             .await?;
@@ -1517,11 +1555,19 @@ impl MatterDeadlineStore for LibSqlBackend {
         let deadline_id = Uuid::new_v4();
         let reminder_days = serde_json::to_string(&input.reminder_days)
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let explanation_str = input
+            .explanation
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
 
         conn.execute(
             "INSERT INTO matter_deadlines \
-             (id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'), datetime('now'))",
+             (id, user_id, matter_id, title, deadline_type, due_at, completed_at, \
+              reminder_days, rule_ref, computed_from, task_id, \
+              explanation, rule_version, is_unsupported, \
+              created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                     datetime('now'), datetime('now'))",
             params![
                 deadline_id.to_string(),
                 user_id,
@@ -1534,6 +1580,9 @@ impl MatterDeadlineStore for LibSqlBackend {
                 opt_text(input.rule_ref.as_deref()),
                 opt_text_owned(input.computed_from.as_ref().map(Uuid::to_string)),
                 opt_text_owned(input.task_id.as_ref().map(Uuid::to_string)),
+                opt_text(explanation_str.as_deref()),
+                opt_text(input.rule_version.as_deref()),
+                if input.is_unsupported { 1i64 } else { 0i64 },
             ],
         )
         .await?;
@@ -1570,8 +1619,14 @@ impl MatterDeadlineStore for LibSqlBackend {
         let merged_rule_ref = input.rule_ref.clone().unwrap_or(existing.rule_ref);
         let merged_computed_from = input.computed_from.unwrap_or(existing.computed_from);
         let merged_task_id = input.task_id.unwrap_or(existing.task_id);
+        let merged_explanation = input.explanation.clone().unwrap_or(existing.explanation);
+        let merged_rule_version = input.rule_version.clone().unwrap_or(existing.rule_version);
+        let merged_is_unsupported = input.is_unsupported.unwrap_or(existing.is_unsupported);
         let reminder_days = serde_json::to_string(&merged_reminder_days)
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let explanation_str = merged_explanation
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
 
         let conn = self.connect().await?;
         conn.execute(
@@ -1584,6 +1639,9 @@ impl MatterDeadlineStore for LibSqlBackend {
                 rule_ref = ?9, \
                 computed_from = ?10, \
                 task_id = ?11, \
+                explanation = ?12, \
+                rule_version = ?13, \
+                is_unsupported = ?14, \
                 updated_at = datetime('now') \
              WHERE user_id = ?1 AND matter_id = ?2 AND id = ?3",
             params![
@@ -1598,6 +1656,9 @@ impl MatterDeadlineStore for LibSqlBackend {
                 opt_text(merged_rule_ref.as_deref()),
                 opt_text_owned(merged_computed_from.as_ref().map(Uuid::to_string)),
                 opt_text_owned(merged_task_id.as_ref().map(Uuid::to_string)),
+                opt_text(explanation_str.as_deref()),
+                opt_text(merged_rule_version.as_deref()),
+                if merged_is_unsupported { 1i64 } else { 0i64 },
             ],
         )
         .await?;
@@ -1620,6 +1681,119 @@ impl MatterDeadlineStore for LibSqlBackend {
             )
             .await?;
         Ok(deleted > 0)
+    }
+
+    async fn list_deadlines_by_trigger(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        trigger_deadline_id: Uuid,
+    ) -> Result<Vec<MatterDeadlineRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let query = format!(
+            "SELECT {DEADLINE_COLS} FROM matter_deadlines \
+             WHERE user_id = ?1 AND matter_id = ?2 AND computed_from = ?3 \
+             ORDER BY due_at ASC, created_at ASC"
+        );
+        let mut rows = conn
+            .query(
+                &query,
+                params![user_id, matter_id, trigger_deadline_id.to_string()],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row_to_matter_deadline_record(&row)?);
+        }
+        Ok(out)
+    }
+
+    async fn apply_deadline_override(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+        params: &OverrideDeadlineParams,
+    ) -> Result<MatterDeadlineRecord, DatabaseError> {
+        let existing = self
+            .get_matter_deadline(user_id, matter_id, deadline_id)
+            .await?
+            .ok_or_else(|| DatabaseError::Query("deadline not found".to_string()))?;
+
+        let conn = self.connect().await?;
+
+        // Write immutable audit row first.
+        let audit_id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO deadline_override_audit \
+             (id, deadline_id, user_id, previous_due_at, new_due_at, reason) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            libsql::params![
+                audit_id.to_string(),
+                deadline_id.to_string(),
+                params.overriding_user_id.as_str(),
+                fmt_ts(&existing.due_at),
+                fmt_ts(&params.new_due_at),
+                params.reason.as_str(),
+            ],
+        )
+        .await?;
+
+        // Update the deadline with override flags.
+        conn.execute(
+            "UPDATE matter_deadlines SET \
+                due_at = ?4, \
+                is_manual_override = 1, \
+                override_reason = ?5, \
+                override_by = ?6, \
+                overridden_at = datetime('now'), \
+                updated_at = datetime('now') \
+             WHERE user_id = ?1 AND matter_id = ?2 AND id = ?3",
+            libsql::params![
+                user_id,
+                matter_id,
+                deadline_id.to_string(),
+                fmt_ts(&params.new_due_at),
+                params.reason.as_str(),
+                params.overriding_user_id.as_str(),
+            ],
+        )
+        .await?;
+
+        self.get_matter_deadline(user_id, matter_id, deadline_id)
+            .await?
+            .ok_or_else(|| DatabaseError::Query("failed to reload overridden deadline".to_string()))
+    }
+
+    async fn list_deadline_override_audit(
+        &self,
+        user_id: &str,
+        matter_id: &str,
+        deadline_id: Uuid,
+    ) -> Result<Vec<DeadlineOverrideAuditRecord>, DatabaseError> {
+        // Verify the deadline belongs to this matter/user before returning audit rows.
+        if self
+            .get_matter_deadline(user_id, matter_id, deadline_id)
+            .await?
+            .is_none()
+        {
+            return Ok(Vec::new());
+        }
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id, deadline_id, user_id, previous_due_at, new_due_at, reason, created_at \
+                 FROM deadline_override_audit \
+                 WHERE deadline_id = ?1 \
+                 ORDER BY created_at DESC",
+                libsql::params![deadline_id.to_string()],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row_to_deadline_override_audit(&row)?);
+        }
+        Ok(out)
     }
 }
 
@@ -3608,15 +3782,30 @@ impl LegalRestoreStore for LibSqlBackend {
         let conn = self.connect().await?;
         let reminder_days = serde_json::to_string(&row.reminder_days)
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let explanation_str = row
+            .explanation
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
         conn.execute(
             "INSERT INTO matter_deadlines \
-             (id, user_id, matter_id, title, deadline_type, due_at, completed_at, reminder_days, rule_ref, computed_from, task_id, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             (id, user_id, matter_id, title, deadline_type, due_at, completed_at, \
+              reminder_days, rule_ref, computed_from, task_id, \
+              explanation, rule_version, is_manual_override, \
+              override_reason, override_by, overridden_at, is_unsupported, \
+              created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                     ?15, ?16, ?17, ?18, ?19, ?20) \
              ON CONFLICT(id) DO UPDATE SET \
                user_id=excluded.user_id, matter_id=excluded.matter_id, title=excluded.title, \
-               deadline_type=excluded.deadline_type, due_at=excluded.due_at, completed_at=excluded.completed_at, \
-               reminder_days=excluded.reminder_days, rule_ref=excluded.rule_ref, computed_from=excluded.computed_from, \
-               task_id=excluded.task_id, created_at=excluded.created_at, updated_at=excluded.updated_at",
+               deadline_type=excluded.deadline_type, due_at=excluded.due_at, \
+               completed_at=excluded.completed_at, reminder_days=excluded.reminder_days, \
+               rule_ref=excluded.rule_ref, computed_from=excluded.computed_from, \
+               task_id=excluded.task_id, explanation=excluded.explanation, \
+               rule_version=excluded.rule_version, \
+               is_manual_override=excluded.is_manual_override, \
+               override_reason=excluded.override_reason, override_by=excluded.override_by, \
+               overridden_at=excluded.overridden_at, is_unsupported=excluded.is_unsupported, \
+               created_at=excluded.created_at, updated_at=excluded.updated_at",
             params![
                 row.id.to_string(),
                 row.user_id.as_str(),
@@ -3629,6 +3818,13 @@ impl LegalRestoreStore for LibSqlBackend {
                 opt_text(row.rule_ref.as_deref()),
                 opt_text_owned(row.computed_from.as_ref().map(Uuid::to_string)),
                 opt_text_owned(row.task_id.as_ref().map(Uuid::to_string)),
+                opt_text(explanation_str.as_deref()),
+                opt_text(row.rule_version.as_deref()),
+                if row.is_manual_override { 1i64 } else { 0i64 },
+                opt_text(row.override_reason.as_deref()),
+                opt_text(row.override_by.as_deref()),
+                opt_text_owned(row.overridden_at.as_ref().map(fmt_ts)),
+                if row.is_unsupported { 1i64 } else { 0i64 },
                 fmt_ts(&row.created_at),
                 fmt_ts(&row.updated_at),
             ],

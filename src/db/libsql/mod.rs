@@ -576,6 +576,66 @@ CREATE INDEX IF NOT EXISTS idx_trust_reconciliations_account
                 e
             ))
         })?;
+
+        // Phase 3: Deadline engine hardening — backfill for existing databases.
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE matter_deadlines ADD COLUMN explanation TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE matter_deadlines ADD COLUMN rule_version TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE matter_deadlines ADD COLUMN is_manual_override INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE matter_deadlines ADD COLUMN override_reason TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE matter_deadlines ADD COLUMN override_by TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE matter_deadlines ADD COLUMN overridden_at TEXT",
+        )
+        .await?;
+        ensure_libsql_column(
+            &conn,
+            "ALTER TABLE matter_deadlines ADD COLUMN is_unsupported INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+
+        // Deadline override audit log (idempotent; already in SCHEMA for fresh installs).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS deadline_override_audit (
+                id TEXT PRIMARY KEY,
+                deadline_id TEXT NOT NULL REFERENCES matter_deadlines(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL,
+                previous_due_at TEXT NOT NULL,
+                new_due_at TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_deadline_override_audit_deadline
+                ON deadline_override_audit(deadline_id, created_at DESC);",
+        )
+        .await
+        .map_err(|e| {
+            DatabaseError::Migration(format!(
+                "failed to ensure deadline_override_audit table: {}",
+                e
+            ))
+        })?;
+
         Ok(())
     }
 }
