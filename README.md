@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="clawyer-bw.png" alt="cLawyer" width="200"/>
+  <img src="cLawyer2.png" alt="cLawyer" width="200"/>
 </p>
 
 <h1 align="center">cLawyer</h1>
