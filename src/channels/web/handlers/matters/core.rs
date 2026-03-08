@@ -1491,15 +1491,14 @@ pub(crate) async fn matter_deadlines_patch_handler(
             if let Some(ref rule_id) = dep.rule_ref
                 && let Ok(Some(ref rule)) = crate::legal::calendar::get_court_rule(rule_id)
             {
-                let (new_params, _trace) =
-                    crate::legal::calendar::deadline_from_rule_with_trace(
-                        &dep.title,
-                        rule,
-                        new_trigger_date,
-                        dep.reminder_days.clone(),
-                        dep.computed_from,
-                        dep.task_id,
-                    );
+                let (new_params, _trace) = crate::legal::calendar::deadline_from_rule_with_trace(
+                    &dep.title,
+                    rule,
+                    new_trigger_date,
+                    dep.reminder_days.clone(),
+                    dep.computed_from,
+                    dep.task_id,
+                );
                 let new_exp = serde_json::to_value(&_trace).unwrap_or(serde_json::Value::Null);
                 if let Err(err) = store
                     .update_matter_deadline(
