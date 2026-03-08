@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::{collections::HashMap, sync::LazyLock};
 
 use chrono::NaiveDate;
 use regex::Regex;
@@ -143,17 +143,13 @@ fn matching_schedule_for_snapshot(
     entry_date: NaiveDate,
     resolved_rate: Option<Decimal>,
 ) -> Option<BillingRateScheduleRecord> {
-    let same_rate = schedules
+    let resolved_rate = resolved_rate?;
+    schedules
         .iter()
         .filter(|schedule| schedule_applies(schedule, entry_date))
-        .filter(|schedule| resolved_rate.is_none_or(|rate| schedule.rate == rate))
+        .filter(|schedule| schedule.rate == resolved_rate)
         .max_by_key(|schedule| schedule.effective_start)
-        .cloned();
-    if same_rate.is_some() {
-        same_rate
-    } else {
-        best_schedule(schedules.iter(), entry_date).cloned()
-    }
+        .cloned()
 }
 
 pub fn normalize_task_code(raw: Option<String>) -> Result<Option<String>, String> {
@@ -288,57 +284,13 @@ pub async fn review_time_entry_rate(
     timekeeper: &str,
     snapshot: PersistedTimeEntryRateSnapshot,
 ) -> Result<ResolvedTimeEntryRate, DatabaseError> {
-    match snapshot.persisted_source {
-        Some(BillingRateSource::MatterOverride) => {
-            let schedules = load_scoped_schedules(db, user_id, Some(matter_id), timekeeper).await?;
-            Ok(ResolvedTimeEntryRate {
-                rate: snapshot.persisted_rate,
-                source: Some(BillingRateSource::MatterOverride),
-                matched_schedule: matching_schedule_for_snapshot(
-                    &schedules,
-                    snapshot.entry_date,
-                    snapshot.persisted_rate,
-                ),
-                fallback: None,
-            })
-        }
-        Some(BillingRateSource::TimekeeperDefault) => {
-            let schedules = load_scoped_schedules(db, user_id, None, timekeeper).await?;
-            Ok(ResolvedTimeEntryRate {
-                rate: snapshot.persisted_rate,
-                source: Some(BillingRateSource::TimekeeperDefault),
-                matched_schedule: matching_schedule_for_snapshot(
-                    &schedules,
-                    snapshot.entry_date,
-                    snapshot.persisted_rate,
-                ),
-                fallback: None,
-            })
-        }
-        Some(BillingRateSource::ManualOverride) => Ok(ResolvedTimeEntryRate {
-            rate: snapshot.persisted_rate.or(snapshot.manual_hourly_rate),
-            source: Some(BillingRateSource::ManualOverride),
-            matched_schedule: None,
-            fallback: Some(BillingRateFallbackReason::ManualOverride),
-        }),
-        None if snapshot.persisted_rate.is_some() => Ok(ResolvedTimeEntryRate {
-            rate: snapshot.persisted_rate,
-            source: None,
-            matched_schedule: None,
-            fallback: None,
-        }),
-        None => {
-            resolve_time_entry_rate_details(
-                db,
-                user_id,
-                matter_id,
-                timekeeper,
-                snapshot.entry_date,
-                snapshot.manual_hourly_rate,
-            )
-            .await
-        }
-    }
+    let matter_schedules = load_scoped_schedules(db, user_id, Some(matter_id), timekeeper).await?;
+    let default_schedules = load_scoped_schedules(db, user_id, None, timekeeper).await?;
+    Ok(review_time_entry_rate_from_schedules(
+        &matter_schedules,
+        &default_schedules,
+        snapshot,
+    ))
 }
 
 pub async fn resolve_time_entry_rate(
@@ -373,24 +325,73 @@ pub async fn draft_invoice(
     let expense_entries = db.list_expense_entries(user_id, matter_id).await?;
 
     let mut line_items = Vec::new();
+    let mut matter_schedule_cache: HashMap<String, Vec<BillingRateScheduleRecord>> = HashMap::new();
+    let mut default_schedule_cache: HashMap<String, Vec<BillingRateScheduleRecord>> =
+        HashMap::new();
 
     for entry in time_entries {
         if entry.billed_invoice_id.is_some() || !entry.billable {
             continue;
         }
-        let rate_resolution = review_time_entry_rate(
-            db,
-            user_id,
-            matter_id,
-            &entry.timekeeper,
-            PersistedTimeEntryRateSnapshot {
-                entry_date: entry.entry_date,
-                manual_hourly_rate: entry.hourly_rate,
-                persisted_rate: entry.resolved_rate,
-                persisted_source: entry.rate_source,
-            },
-        )
-        .await?;
+        let snapshot = PersistedTimeEntryRateSnapshot {
+            entry_date: entry.entry_date,
+            manual_hourly_rate: entry.hourly_rate,
+            persisted_rate: entry.resolved_rate,
+            persisted_source: entry.rate_source,
+        };
+        let rate_resolution = match snapshot.persisted_source {
+            Some(BillingRateSource::MatterOverride) => {
+                let matter_schedules = cached_scoped_schedules(
+                    &mut matter_schedule_cache,
+                    db,
+                    user_id,
+                    Some(matter_id),
+                    &entry.timekeeper,
+                )
+                .await?;
+                review_time_entry_rate_from_schedules(&matter_schedules, &[], snapshot)
+            }
+            Some(BillingRateSource::TimekeeperDefault) => {
+                let default_schedules = cached_scoped_schedules(
+                    &mut default_schedule_cache,
+                    db,
+                    user_id,
+                    None,
+                    &entry.timekeeper,
+                )
+                .await?;
+                review_time_entry_rate_from_schedules(&[], &default_schedules, snapshot)
+            }
+            Some(BillingRateSource::ManualOverride) => {
+                review_time_entry_rate_from_schedules(&[], &[], snapshot)
+            }
+            None if snapshot.persisted_rate.is_some() => {
+                review_time_entry_rate_from_schedules(&[], &[], snapshot)
+            }
+            None => {
+                let matter_schedules = cached_scoped_schedules(
+                    &mut matter_schedule_cache,
+                    db,
+                    user_id,
+                    Some(matter_id),
+                    &entry.timekeeper,
+                )
+                .await?;
+                let default_schedules = cached_scoped_schedules(
+                    &mut default_schedule_cache,
+                    db,
+                    user_id,
+                    None,
+                    &entry.timekeeper,
+                )
+                .await?;
+                review_time_entry_rate_from_schedules(
+                    &matter_schedules,
+                    &default_schedules,
+                    snapshot,
+                )
+            }
+        };
         let (resolved_rate, rate_source) = match (entry.resolved_rate, entry.rate_source) {
             (Some(rate), source) => (Some(rate), source),
             _ => (rate_resolution.rate, rate_resolution.source),
@@ -470,6 +471,96 @@ pub async fn draft_invoice(
         },
         line_items,
     })
+}
+
+async fn cached_scoped_schedules(
+    cache: &mut HashMap<String, Vec<BillingRateScheduleRecord>>,
+    db: &dyn Database,
+    user_id: &str,
+    matter_id: Option<&str>,
+    timekeeper: &str,
+) -> Result<Vec<BillingRateScheduleRecord>, DatabaseError> {
+    if let Some(schedules) = cache.get(timekeeper) {
+        return Ok(schedules.clone());
+    }
+    let schedules = load_scoped_schedules(db, user_id, matter_id, timekeeper).await?;
+    cache.insert(timekeeper.to_string(), schedules.clone());
+    Ok(schedules)
+}
+
+fn review_time_entry_rate_from_schedules(
+    matter_schedules: &[BillingRateScheduleRecord],
+    default_schedules: &[BillingRateScheduleRecord],
+    snapshot: PersistedTimeEntryRateSnapshot,
+) -> ResolvedTimeEntryRate {
+    match snapshot.persisted_source {
+        Some(BillingRateSource::MatterOverride) => ResolvedTimeEntryRate {
+            rate: snapshot.persisted_rate,
+            source: Some(BillingRateSource::MatterOverride),
+            matched_schedule: matching_schedule_for_snapshot(
+                matter_schedules,
+                snapshot.entry_date,
+                snapshot.persisted_rate,
+            ),
+            fallback: None,
+        },
+        Some(BillingRateSource::TimekeeperDefault) => ResolvedTimeEntryRate {
+            rate: snapshot.persisted_rate,
+            source: Some(BillingRateSource::TimekeeperDefault),
+            matched_schedule: matching_schedule_for_snapshot(
+                default_schedules,
+                snapshot.entry_date,
+                snapshot.persisted_rate,
+            ),
+            fallback: None,
+        },
+        Some(BillingRateSource::ManualOverride) => ResolvedTimeEntryRate {
+            rate: snapshot.persisted_rate.or(snapshot.manual_hourly_rate),
+            source: Some(BillingRateSource::ManualOverride),
+            matched_schedule: None,
+            fallback: Some(BillingRateFallbackReason::ManualOverride),
+        },
+        None if snapshot.persisted_rate.is_some() => ResolvedTimeEntryRate {
+            rate: snapshot.persisted_rate,
+            source: None,
+            matched_schedule: None,
+            fallback: None,
+        },
+        None => {
+            if let Some(schedule) =
+                best_schedule(matter_schedules.iter(), snapshot.entry_date).cloned()
+            {
+                ResolvedTimeEntryRate {
+                    rate: Some(schedule.rate),
+                    source: Some(BillingRateSource::MatterOverride),
+                    matched_schedule: Some(schedule),
+                    fallback: None,
+                }
+            } else if let Some(schedule) =
+                best_schedule(default_schedules.iter(), snapshot.entry_date).cloned()
+            {
+                ResolvedTimeEntryRate {
+                    rate: Some(schedule.rate),
+                    source: Some(BillingRateSource::TimekeeperDefault),
+                    matched_schedule: Some(schedule),
+                    fallback: None,
+                }
+            } else {
+                ResolvedTimeEntryRate {
+                    rate: snapshot.manual_hourly_rate,
+                    source: snapshot
+                        .manual_hourly_rate
+                        .map(|_| BillingRateSource::ManualOverride),
+                    matched_schedule: None,
+                    fallback: Some(if snapshot.manual_hourly_rate.is_some() {
+                        BillingRateFallbackReason::ManualOverride
+                    } else {
+                        BillingRateFallbackReason::NoRateFound
+                    }),
+                }
+            }
+        }
+    }
 }
 
 pub async fn save_draft(
@@ -720,5 +811,30 @@ mod tests {
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].missing_fields, vec![LedesRequiredField::TaskCode]);
+    }
+
+    #[test]
+    fn snapshot_matching_does_not_report_schedule_with_different_rate() {
+        let now = chrono::DateTime::<chrono::Utc>::from_timestamp(1_762_476_800, 0).unwrap();
+        let schedules = vec![BillingRateScheduleRecord {
+            id: Uuid::new_v4(),
+            user_id: "test-user".to_string(),
+            matter_id: None,
+            timekeeper: "Lead".to_string(),
+            rate: dec!(500.00),
+            effective_start: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            effective_end: None,
+            created_at: now,
+            updated_at: now,
+        }];
+
+        assert!(
+            matching_schedule_for_snapshot(
+                &schedules,
+                NaiveDate::from_ymd_opt(2026, 4, 10).unwrap(),
+                Some(dec!(425.00))
+            )
+            .is_none()
+        );
     }
 }
