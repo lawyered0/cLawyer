@@ -185,7 +185,6 @@ impl Tool for CanLiiSearchTool {
                 .cmp(&left.year)
                 .then_with(|| left.id.cmp(&right.id))
         });
-        databases.truncate(3);
 
         if databases.is_empty() {
             return Ok(ToolOutput::text(
@@ -538,5 +537,68 @@ mod tests {
                 .expect("text result")
                 .contains("No CanLII databases were returned")
         );
+    }
+
+    #[tokio::test]
+    async fn searches_older_databases_when_newer_ones_are_empty() {
+        async fn browse(
+            Path((_lang, _jurisdiction)): Path<(String, String)>,
+        ) -> Json<serde_json::Value> {
+            Json(json!({
+                "caseDatabases": [
+                    { "databaseId": "onca2024" },
+                    { "databaseId": "onca2023" },
+                    { "databaseId": "onca2022" },
+                    { "databaseId": "onca2021" }
+                ]
+            }))
+        }
+
+        async fn search(
+            Path((_lang, database_id)): Path<(String, String)>,
+        ) -> Json<serde_json::Value> {
+            let results = if database_id == "onca2021" {
+                vec![json!({
+                    "caseId": "onca2021-1",
+                    "title": "older result",
+                    "citation": "2021 ONCA 321",
+                    "date": "2021-06-01",
+                    "url": "https://www.canlii.org/en/on/onca/doc/2021/2021onca321/2021onca321.html"
+                })]
+            } else {
+                Vec::new()
+            };
+            Json(json!({ "results": results }))
+        }
+
+        let app = Router::new()
+            .route("/v1/caseBrowse/{lang}/{jurisdiction}/", get(browse))
+            .route("/v1/caseSearch/{lang}/{database_id}/", get(search));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let tool = CanLiiSearchTool::new()
+            .with_base_url(format!("http://{addr}/v1"))
+            .with_api_key("test-key");
+        let output = tool
+            .execute(
+                json!({
+                    "query": "contract",
+                    "jurisdiction": "onca",
+                    "max_results": 1
+                }),
+                &JobContext::default(),
+            )
+            .await
+            .expect("search should succeed");
+
+        let results = output.result["results"].as_array().expect("results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["database_id"], "onca2021");
     }
 }

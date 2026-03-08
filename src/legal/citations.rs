@@ -407,13 +407,7 @@ fn parse_canadian_match(regex: &Regex, text: &str) -> Option<ParsedCitation> {
     if std::ptr::eq(regex, &*ONTARIO_REGULATION_RE) {
         let year = captures.get(2).and_then(|value| {
             let raw = value.as_str();
-            raw.parse::<u32>().ok().map(|parsed| {
-                if raw.len() == 2 {
-                    2000 + parsed
-                } else {
-                    parsed
-                }
-            })
+            parse_ontario_regulation_year(raw)
         });
         return Some(ParsedCitation {
             raw: text.to_string(),
@@ -429,6 +423,15 @@ fn parse_canadian_match(regex: &Regex, text: &str) -> Option<ParsedCitation> {
     }
 
     None
+}
+
+fn parse_ontario_regulation_year(raw: &str) -> Option<u32> {
+    let parsed = raw.parse::<u32>().ok()?;
+    Some(match raw.len() {
+        2 if parsed >= 50 => 1900 + parsed,
+        2 => 2000 + parsed,
+        _ => parsed,
+    })
 }
 
 pub async fn verify_document_with_provider<P: CitationVerificationProvider>(
@@ -571,6 +574,15 @@ mod tests {
             parse_canadian_citation("O Reg 123/24 applies here.").expect("citation should parse");
         assert_eq!(citation.kind, CitationKind::Regulation);
         assert_eq!(citation.year, Some(2024));
+        assert_eq!(citation.jurisdiction.as_deref(), Some("ON"));
+    }
+
+    #[test]
+    fn parses_ontario_regulation_pre_2000_year() {
+        let citation =
+            parse_canadian_citation("O Reg 123/99 applies here.").expect("citation should parse");
+        assert_eq!(citation.kind, CitationKind::Regulation);
+        assert_eq!(citation.year, Some(1999));
         assert_eq!(citation.jurisdiction.as_deref(), Some("ON"));
     }
 
