@@ -114,6 +114,10 @@ pub(crate) fn owner_principal() -> RequestPrincipal {
     RequestPrincipal(AuthPrincipal::new("test-user", UserRole::Admin))
 }
 
+pub(crate) fn principal_with_role(user_id: impl Into<String>, role: UserRole) -> RequestPrincipal {
+    RequestPrincipal(AuthPrincipal::new(user_id.into(), role))
+}
+
 /// Build a [`GatewayState`] backed by a real database store, workspace, and
 /// explicit legal config. Feature-gated to `libsql` because the test DB
 /// helper (`crate::testing::test_db`) only exists with that feature.

@@ -605,7 +605,7 @@ pub struct DraftInvoiceRequest {
 #[derive(Debug, Serialize)]
 pub struct InvoiceDraftResponse {
     pub invoice: InvoiceDraftInfo,
-    pub line_items: Vec<InvoiceLineItemInfo>,
+    pub line_items: Vec<InvoiceDraftLineItemInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -618,6 +618,44 @@ pub struct InvoiceDraftInfo {
     pub tax: String,
     pub total: String,
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvoiceDraftLineItemInfo {
+    pub id: String,
+    pub description: String,
+    pub quantity: String,
+    pub unit_price: String,
+    pub amount: String,
+    pub time_entry_id: Option<String>,
+    pub expense_entry_id: Option<String>,
+    pub task_code: Option<String>,
+    pub activity_code: Option<String>,
+    pub timekeeper: Option<String>,
+    pub resolved_rate: Option<String>,
+    pub rate_source: Option<String>,
+    pub sort_order: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_resolution: Option<InvoiceDraftRateResolutionInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvoiceDraftRateResolutionInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_schedule: Option<InvoiceDraftRateScheduleInfo>,
+    pub fallback_applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvoiceDraftRateScheduleInfo {
+    pub id: String,
+    pub matter_id: Option<String>,
+    pub timekeeper: String,
+    pub rate: String,
+    pub effective_start: String,
+    pub effective_end: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -812,7 +850,19 @@ pub struct InvoiceLedesQuery {
 pub struct InvoiceLedesResponse {
     pub invoice_id: String,
     pub format: String,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<InvoiceLedesValidationErrorInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvoiceLedesValidationErrorInfo {
+    pub line_item_id: String,
+    pub time_entry_id: Option<String>,
+    pub description: String,
+    pub sort_order: i32,
+    pub missing_fields: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

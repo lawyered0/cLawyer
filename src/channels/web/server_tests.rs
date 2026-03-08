@@ -28,9 +28,10 @@ use crate::channels::web::handlers::{
             matter_filing_package_handler, matter_template_apply_handler, matter_templates_handler,
         },
         finance::{
-            billing_rates_create_handler, invoice_ledes_handler, invoices_finalize_handler,
-            invoices_payment_handler, invoices_save_handler, invoices_void_handler,
-            matter_expenses_create_handler, matter_expenses_list_handler,
+            billing_rates_create_handler, billing_rates_list_handler, billing_rates_patch_handler,
+            invoice_ledes_handler, invoices_draft_handler, invoices_finalize_handler,
+            invoices_get_handler, invoices_payment_handler, invoices_save_handler,
+            invoices_void_handler, matter_expenses_create_handler, matter_expenses_list_handler,
             matter_invoices_list_handler, matter_time_create_handler, matter_time_delete_handler,
             matter_time_list_handler, matter_time_summary_handler, matter_trust_deposit_handler,
             matter_trust_ledger_handler, trust_account_put_handler,
@@ -4723,6 +4724,7 @@ async fn billing_rates_apply_matter_override_and_export_ledes() {
 
     let (_status, Json(default_rate)) = billing_rates_create_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(CreateBillingRateScheduleRequest {
             matter_id: None,
             timekeeper: "Lead".to_string(),
@@ -4737,6 +4739,7 @@ async fn billing_rates_apply_matter_override_and_export_ledes() {
 
     let (_status, Json(matter_rate)) = billing_rates_create_handler(
         State(Arc::clone(&state)),
+        owner_principal(),
         Json(CreateBillingRateScheduleRequest {
             matter_id: Some("demo".to_string()),
             timekeeper: "Lead".to_string(),
@@ -4799,7 +4802,7 @@ async fn billing_rates_apply_matter_override_and_export_ledes() {
     .await
     .expect("finalize invoice should succeed");
 
-    let Json(ledes) = invoice_ledes_handler(
+    let (status, Json(ledes)) = invoice_ledes_handler(
         State(Arc::clone(&state)),
         owner_principal(),
         Path(invoice.invoice.id.clone()),
@@ -4809,10 +4812,564 @@ async fn billing_rates_apply_matter_override_and_export_ledes() {
     )
     .await
     .expect("LEDES export should succeed");
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(ledes.format, "98b");
-    assert!(ledes.content.starts_with("LEDES1998B[]\n"));
-    assert!(ledes.content.contains("|B110||A101|"));
-    assert!(ledes.content.contains("|375.00|Lead|OT|"));
+    let content = ledes.content.expect("LEDES content should exist");
+    assert!(content.starts_with("LEDES1998B[]\n"));
+    assert!(content.contains("|B110||A101|"));
+    assert!(content.contains("|375.00|Lead|OT|"));
+    assert!(ledes.errors.is_empty());
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn billing_rates_enforce_rbac_and_overlap_validation() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    seed_valid_matter(workspace.as_ref(), "other").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync demo matter row");
+    ensure_matter_db_row_from_workspace(state.as_ref(), "other")
+        .await
+        .expect("sync other matter row");
+
+    let staff_principal = principal_with_role("staff-user", UserRole::Staff);
+    let Json(list) = billing_rates_list_handler(State(Arc::clone(&state)), staff_principal.clone())
+        .await
+        .expect("authenticated staff should list rates");
+    assert!(list.schedules.is_empty());
+
+    let create_forbidden = billing_rates_create_handler(
+        State(Arc::clone(&state)),
+        staff_principal.clone(),
+        Json(CreateBillingRateScheduleRequest {
+            matter_id: None,
+            timekeeper: "Lead".to_string(),
+            rate: "425.00".to_string(),
+            effective_start: "2026-01-01".to_string(),
+            effective_end: Some("2026-01-31".to_string()),
+        }),
+    )
+    .await
+    .expect_err("non-admin create should be forbidden");
+    assert_eq!(create_forbidden.0, StatusCode::FORBIDDEN);
+
+    let (_status, Json(january_rate)) = billing_rates_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Json(CreateBillingRateScheduleRequest {
+            matter_id: None,
+            timekeeper: "Lead".to_string(),
+            rate: "425.00".to_string(),
+            effective_start: "2026-01-01".to_string(),
+            effective_end: Some("2026-01-31".to_string()),
+        }),
+    )
+    .await
+    .expect("admin should create initial schedule");
+
+    let invalid_range = billing_rates_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Json(CreateBillingRateScheduleRequest {
+            matter_id: None,
+            timekeeper: "Lead".to_string(),
+            rate: "425.00".to_string(),
+            effective_start: "2026-03-01".to_string(),
+            effective_end: Some("2026-02-28".to_string()),
+        }),
+    )
+    .await
+    .expect_err("invalid date range should be rejected");
+    assert_eq!(invalid_range.0, StatusCode::BAD_REQUEST);
+
+    let overlap = billing_rates_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Json(CreateBillingRateScheduleRequest {
+            matter_id: None,
+            timekeeper: "Lead".to_string(),
+            rate: "430.00".to_string(),
+            effective_start: "2026-01-31".to_string(),
+            effective_end: Some("2026-02-15".to_string()),
+        }),
+    )
+    .await
+    .expect_err("inclusive date overlap should be rejected");
+    assert_eq!(overlap.0, StatusCode::CONFLICT);
+
+    let (_status, Json(february_rate)) = billing_rates_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Json(CreateBillingRateScheduleRequest {
+            matter_id: None,
+            timekeeper: "Lead".to_string(),
+            rate: "430.00".to_string(),
+            effective_start: "2026-02-01".to_string(),
+            effective_end: None,
+        }),
+    )
+    .await
+    .expect("adjacent non-overlapping range should succeed");
+
+    let (_status, Json(other_matter_rate)) = billing_rates_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Json(CreateBillingRateScheduleRequest {
+            matter_id: Some("other".to_string()),
+            timekeeper: "Lead".to_string(),
+            rate: "390.00".to_string(),
+            effective_start: "2026-01-15".to_string(),
+            effective_end: None,
+        }),
+    )
+    .await
+    .expect("same timekeeper on different matter scope should succeed");
+    assert_eq!(other_matter_rate.matter_id.as_deref(), Some("other"));
+
+    let (_status, Json(other_timekeeper_rate)) = billing_rates_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Json(CreateBillingRateScheduleRequest {
+            matter_id: None,
+            timekeeper: "Associate".to_string(),
+            rate: "275.00".to_string(),
+            effective_start: "2026-01-15".to_string(),
+            effective_end: None,
+        }),
+    )
+    .await
+    .expect("different timekeeper should not conflict");
+    assert_eq!(other_timekeeper_rate.timekeeper, "Associate");
+
+    let patch_forbidden = billing_rates_patch_handler(
+        State(Arc::clone(&state)),
+        staff_principal,
+        Path(february_rate.id.clone()),
+        Json(UpdateBillingRateScheduleRequest {
+            matter_id: None,
+            timekeeper: None,
+            rate: Some("440.00".to_string()),
+            effective_start: None,
+            effective_end: None,
+        }),
+    )
+    .await
+    .expect_err("non-admin patch should be forbidden");
+    assert_eq!(patch_forbidden.0, StatusCode::FORBIDDEN);
+
+    let patch_overlap = billing_rates_patch_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(february_rate.id.clone()),
+        Json(UpdateBillingRateScheduleRequest {
+            matter_id: None,
+            timekeeper: None,
+            rate: None,
+            effective_start: Some("2026-01-15".to_string()),
+            effective_end: None,
+        }),
+    )
+    .await
+    .expect_err("patch creating overlap should be rejected");
+    assert_eq!(patch_overlap.0, StatusCode::CONFLICT);
+
+    let Json(updated) = billing_rates_patch_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(january_rate.id.clone()),
+        Json(UpdateBillingRateScheduleRequest {
+            matter_id: None,
+            timekeeper: None,
+            rate: Some("410.00".to_string()),
+            effective_start: None,
+            effective_end: None,
+        }),
+    )
+    .await
+    .expect("admin patch should succeed");
+    assert_eq!(updated.rate, "410.00");
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn invoice_draft_reports_rate_resolution_and_fallbacks() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync matter row");
+
+    let (_status, Json(_default_rate)) = billing_rates_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Json(CreateBillingRateScheduleRequest {
+            matter_id: None,
+            timekeeper: "Lead".to_string(),
+            rate: "425.00".to_string(),
+            effective_start: "2026-01-01".to_string(),
+            effective_end: None,
+        }),
+    )
+    .await
+    .expect("create default rate");
+    let (_status, Json(matter_rate)) = billing_rates_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Json(CreateBillingRateScheduleRequest {
+            matter_id: Some("demo".to_string()),
+            timekeeper: "Lead".to_string(),
+            rate: "375.00".to_string(),
+            effective_start: "2026-01-01".to_string(),
+            effective_end: None,
+        }),
+    )
+    .await
+    .expect("create matter override rate");
+
+    let _ = matter_time_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(CreateTimeEntryRequest {
+            timekeeper: "Lead".to_string(),
+            description: "Draft complaint".to_string(),
+            hours: "1.00".to_string(),
+            hourly_rate: None,
+            task_code: Some("b110".to_string()),
+            activity_code: Some("a101".to_string()),
+            entry_date: "2026-04-10".to_string(),
+            billable: Some(true),
+            block_billing_flag: None,
+            block_billing_reason: None,
+        }),
+    )
+    .await
+    .expect("create matter-override time entry");
+    let _ = matter_time_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(CreateTimeEntryRequest {
+            timekeeper: "Associate".to_string(),
+            description: "Review production".to_string(),
+            hours: "2.00".to_string(),
+            hourly_rate: Some("250.00".to_string()),
+            task_code: Some("b120".to_string()),
+            activity_code: Some("a102".to_string()),
+            entry_date: "2026-04-10".to_string(),
+            billable: Some(true),
+            block_billing_flag: None,
+            block_billing_reason: None,
+        }),
+    )
+    .await
+    .expect("create manual-rate time entry");
+    let _ = matter_time_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(CreateTimeEntryRequest {
+            timekeeper: "Paralegal".to_string(),
+            description: "Prepare binders".to_string(),
+            hours: "0.50".to_string(),
+            hourly_rate: None,
+            task_code: Some("b130".to_string()),
+            activity_code: Some("a103".to_string()),
+            entry_date: "2026-04-10".to_string(),
+            billable: Some(true),
+            block_billing_flag: None,
+            block_billing_reason: None,
+        }),
+    )
+    .await
+    .expect("create no-rate time entry");
+
+    let Json(draft) = invoices_draft_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Json(DraftInvoiceRequest {
+            matter_id: "demo".to_string(),
+            invoice_number: "INV-DRAFT-200".to_string(),
+            due_date: Some("2026-05-10".to_string()),
+            notes: None,
+        }),
+    )
+    .await
+    .expect("draft invoice should succeed");
+
+    let matter_item = draft
+        .line_items
+        .iter()
+        .find(|item| item.timekeeper.as_deref() == Some("Lead"))
+        .expect("matter override line item");
+    let matter_resolution = matter_item
+        .rate_resolution
+        .as_ref()
+        .expect("matter override should include rate resolution");
+    assert_eq!(matter_item.rate_source.as_deref(), Some("matter_override"));
+    assert!(!matter_resolution.fallback_applied);
+    assert_eq!(matter_resolution.fallback_reason, None);
+    assert_eq!(
+        matter_resolution
+            .matched_schedule
+            .as_ref()
+            .expect("matched schedule should exist")
+            .id,
+        matter_rate.id
+    );
+    assert_eq!(
+        matter_resolution
+            .matched_schedule
+            .as_ref()
+            .and_then(|schedule| schedule.matter_id.as_deref()),
+        Some("demo")
+    );
+
+    let manual_item = draft
+        .line_items
+        .iter()
+        .find(|item| item.timekeeper.as_deref() == Some("Associate"))
+        .expect("manual fallback line item");
+    let manual_resolution = manual_item
+        .rate_resolution
+        .as_ref()
+        .expect("manual fallback should include rate resolution");
+    assert_eq!(manual_item.rate_source.as_deref(), Some("manual_override"));
+    assert_eq!(manual_item.resolved_rate.as_deref(), Some("250.00"));
+    assert!(manual_resolution.fallback_applied);
+    assert_eq!(
+        manual_resolution.fallback_reason.as_deref(),
+        Some("manual_override")
+    );
+    assert!(manual_resolution.matched_schedule.is_none());
+
+    let no_rate_item = draft
+        .line_items
+        .iter()
+        .find(|item| item.timekeeper.as_deref() == Some("Paralegal"))
+        .expect("no-rate line item");
+    let no_rate_resolution = no_rate_item
+        .rate_resolution
+        .as_ref()
+        .expect("no-rate review should exist");
+    assert_eq!(no_rate_item.rate_source, None);
+    assert_eq!(no_rate_item.resolved_rate, None);
+    assert_eq!(no_rate_item.unit_price, "0");
+    assert_eq!(
+        no_rate_resolution.fallback_reason.as_deref(),
+        Some("no_rate_found")
+    );
+    assert!(no_rate_resolution.fallback_applied);
+    assert!(no_rate_resolution.matched_schedule.is_none());
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn invoice_ledes_returns_structured_validation_errors_and_ignores_expenses() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync matter row");
+
+    let (_status, Json(time_entry)) = matter_time_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(CreateTimeEntryRequest {
+            timekeeper: "Lead".to_string(),
+            description: "Research issues".to_string(),
+            hours: "1.00".to_string(),
+            hourly_rate: Some("300.00".to_string()),
+            task_code: None,
+            activity_code: None,
+            entry_date: "2026-04-12".to_string(),
+            billable: Some(true),
+            block_billing_flag: None,
+            block_billing_reason: None,
+        }),
+    )
+    .await
+    .expect("create time entry");
+    let _ = matter_expenses_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(CreateExpenseEntryRequest {
+            submitted_by: "Lead".to_string(),
+            description: "Filing fee".to_string(),
+            amount: "45.00".to_string(),
+            category: "filing_fee".to_string(),
+            entry_date: "2026-04-12".to_string(),
+            receipt_path: None,
+            billable: Some(true),
+        }),
+    )
+    .await
+    .expect("create expense entry");
+
+    let (_status, Json(invoice)) = invoices_save_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Json(DraftInvoiceRequest {
+            matter_id: "demo".to_string(),
+            invoice_number: "INV-LEDES-ERR".to_string(),
+            due_date: Some("2026-05-10".to_string()),
+            notes: None,
+        }),
+    )
+    .await
+    .expect("save invoice draft");
+    let _ = invoices_finalize_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(invoice.invoice.id.clone()),
+    )
+    .await
+    .expect("finalize invoice");
+
+    let (status, Json(ledes)) = invoice_ledes_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(invoice.invoice.id.clone()),
+        Query(InvoiceLedesQuery {
+            format: Some("98b".to_string()),
+        }),
+    )
+    .await
+    .expect("LEDES validation should return structured response");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(ledes.format, "98b");
+    assert!(ledes.content.is_none());
+    assert_eq!(ledes.errors.len(), 1);
+    assert_eq!(
+        ledes.errors[0].time_entry_id.as_deref(),
+        Some(time_entry.id.as_str())
+    );
+    assert_eq!(
+        ledes.errors[0].missing_fields,
+        vec!["task_code".to_string(), "activity_code".to_string()]
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn finalized_invoice_preserves_rate_snapshot_after_schedule_patch() {
+    let (db, _tmp) = crate::testing::test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("test-user", Arc::clone(&db)));
+    seed_valid_matter(workspace.as_ref(), "demo").await;
+    let state =
+        test_gateway_state_with_store_and_workspace(Arc::clone(&db), Arc::clone(&workspace));
+    ensure_matter_db_row_from_workspace(state.as_ref(), "demo")
+        .await
+        .expect("sync matter row");
+
+    let (_status, Json(default_rate)) = billing_rates_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Json(CreateBillingRateScheduleRequest {
+            matter_id: None,
+            timekeeper: "Lead".to_string(),
+            rate: "425.00".to_string(),
+            effective_start: "2026-01-01".to_string(),
+            effective_end: None,
+        }),
+    )
+    .await
+    .expect("create default rate");
+
+    let _ = matter_time_create_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path("demo".to_string()),
+        Json(CreateTimeEntryRequest {
+            timekeeper: "Lead".to_string(),
+            description: "Prepare witness outline".to_string(),
+            hours: "1.00".to_string(),
+            hourly_rate: None,
+            task_code: Some("b110".to_string()),
+            activity_code: Some("a101".to_string()),
+            entry_date: "2026-04-18".to_string(),
+            billable: Some(true),
+            block_billing_flag: None,
+            block_billing_reason: None,
+        }),
+    )
+    .await
+    .expect("create time entry");
+
+    let (_status, Json(invoice)) = invoices_save_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Json(DraftInvoiceRequest {
+            matter_id: "demo".to_string(),
+            invoice_number: "INV-SNAPSHOT-1".to_string(),
+            due_date: Some("2026-05-18".to_string()),
+            notes: None,
+        }),
+    )
+    .await
+    .expect("save invoice draft");
+    let _ = invoices_finalize_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(invoice.invoice.id.clone()),
+    )
+    .await
+    .expect("finalize invoice");
+
+    let Json(updated_rate) = billing_rates_patch_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(default_rate.id.clone()),
+        Json(UpdateBillingRateScheduleRequest {
+            matter_id: None,
+            timekeeper: None,
+            rate: Some("500.00".to_string()),
+            effective_start: None,
+            effective_end: None,
+        }),
+    )
+    .await
+    .expect("patch billing rate");
+    assert_eq!(updated_rate.rate, "500.00");
+
+    let Json(detail) = invoices_get_handler(
+        State(Arc::clone(&state)),
+        owner_principal(),
+        Path(invoice.invoice.id.clone()),
+    )
+    .await
+    .expect("load finalized invoice detail");
+    let line_item = detail.line_items.first().expect("finalized line item");
+    assert_eq!(line_item.rate_source.as_deref(), Some("timekeeper_default"));
+    assert_eq!(
+        line_item
+            .resolved_rate
+            .as_deref()
+            .expect("resolved rate")
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse resolved rate"),
+        rust_decimal::Decimal::new(42500, 2)
+    );
+    assert_eq!(
+        line_item
+            .unit_price
+            .parse::<rust_decimal::Decimal>()
+            .expect("parse unit price"),
+        rust_decimal::Decimal::new(42500, 2)
+    );
 }
 
 #[cfg(feature = "libsql")]

@@ -154,14 +154,16 @@ For web-first firm workflows, matter detail now includes:
   - signs off a computed reconciliation and produces examiner-readable report content.
 - `GET /api/matters/{id}/trust/ledger`
   - returns the matter ledger, account summary, and latest reconciliation status for the primary trust account.
+- `POST /api/invoices/draft`
+  - previews draft invoice line items with matched billing-rate schedule metadata and explicit fallback reasons (`manual_override`, `no_rate_found`) before any invoice is saved.
 - `GET /api/billing/rates`
-  - lists effective-dated billing rate schedules.
+  - lists effective-dated billing rate schedules for any authenticated gateway user.
 - `POST /api/billing/rates`
-  - creates a billing rate schedule. Resolution precedence is matter override, then timekeeper default, then explicit per-entry manual rate.
+  - creates a billing rate schedule (Admin only). Resolution precedence is matter override, then timekeeper default, then explicit per-entry manual rate; overlapping effective-date windows for the same scope/timekeeper are rejected.
 - `PATCH /api/billing/rates/{id}`
-  - updates an existing billing rate schedule without rewriting historical invoice line-item snapshots.
+  - updates an existing billing rate schedule (Admin only) without rewriting historical invoice line-item snapshots; overlapping effective-date windows for the same scope/timekeeper are rejected.
 - `GET /api/invoices/{id}/ledes?format=98b`
-  - exports the invoice as LEDES98B with UTBMS task/activity codes and snapshot billing-rate data.
+  - exports the invoice as LEDES98B with UTBMS task/activity codes and snapshot billing-rate data; returns structured `422` validation errors naming the offending line items/time entries when fee entries are missing task/activity codes.
 - `POST /api/matters/{id}/exports/retrieval-packet`
   - generates matter-local CSV + plain-English retrieval artifacts for AI workflows under `matters/<id>/exports/retrieval/<timestamp>/`.
 

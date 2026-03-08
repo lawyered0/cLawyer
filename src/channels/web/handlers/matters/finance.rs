@@ -772,7 +772,7 @@ pub(crate) async fn invoices_draft_handler(
         line_items: draft
             .line_items
             .iter()
-            .map(crate::channels::web::server::invoice_line_item_params_to_info)
+            .map(crate::channels::web::server::invoice_draft_line_item_to_info)
             .collect(),
     }))
 }
@@ -1470,8 +1470,80 @@ pub(crate) async fn trust_reconciliations_signoff_handler(
     ))
 }
 
+fn require_admin_billing_rate_access(
+    principal: &crate::channels::web::auth::AuthPrincipal,
+) -> Result<(), (StatusCode, String)> {
+    if principal.role != UserRole::Admin {
+        Err((
+            StatusCode::FORBIDDEN,
+            "Only administrators can manage billing rate schedules".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn find_billing_rate_schedule(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    schedule_id: uuid::Uuid,
+) -> Result<Option<crate::db::BillingRateScheduleRecord>, (StatusCode, String)> {
+    let schedules = store
+        .list_billing_rate_schedules(user_id, None, None)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(schedules
+        .into_iter()
+        .find(|schedule| schedule.id == schedule_id))
+}
+
+async fn validate_billing_rate_schedule_request(
+    state: &GatewayState,
+    matter_id: Option<&str>,
+    timekeeper: &str,
+    effective_start: chrono::NaiveDate,
+    effective_end: Option<chrono::NaiveDate>,
+    excluding_schedule_id: Option<uuid::Uuid>,
+) -> Result<(), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    match crate::legal::billing::ensure_no_overlapping_billing_rate_schedule(
+        store.as_ref(),
+        &state.user_id,
+        matter_id,
+        timekeeper,
+        effective_start,
+        effective_end,
+        excluding_schedule_id,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(crate::legal::billing::BillingRateScheduleValidationError::InvalidRange) => Err((
+            StatusCode::BAD_REQUEST,
+            "effective_end cannot be earlier than effective_start".to_string(),
+        )),
+        Err(crate::legal::billing::BillingRateScheduleValidationError::Overlap { existing }) => {
+            let scope = existing.matter_id.as_deref().unwrap_or("default");
+            Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "Billing rate schedule overlaps existing schedule {} for timekeeper '{}' scope '{}' starting {}",
+                    existing.id, existing.timekeeper, scope, existing.effective_start
+                ),
+            ))
+        }
+        Err(crate::legal::billing::BillingRateScheduleValidationError::Database(err)) => {
+            Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+        }
+    }
+}
+
 pub(crate) async fn billing_rates_list_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(_principal): RequestPrincipal,
 ) -> Result<Json<BillingRateSchedulesResponse>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1491,8 +1563,10 @@ pub(crate) async fn billing_rates_list_handler(
 
 pub(crate) async fn billing_rates_create_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Json(req): Json<CreateBillingRateScheduleRequest>,
 ) -> Result<(StatusCode, Json<BillingRateScheduleInfo>), (StatusCode, String)> {
+    require_admin_billing_rate_access(&principal)?;
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
@@ -1514,6 +1588,15 @@ pub(crate) async fn billing_rates_create_handler(
         .as_deref()
         .map(|value| crate::channels::web::server::parse_date_only("effective_end", value))
         .transpose()?;
+    validate_billing_rate_schedule_request(
+        state.as_ref(),
+        matter_id.as_deref(),
+        &timekeeper,
+        effective_start,
+        effective_end,
+        None,
+    )
+    .await?;
     let schedule = store
         .create_billing_rate_schedule(
             &state.user_id,
@@ -1535,14 +1618,22 @@ pub(crate) async fn billing_rates_create_handler(
 
 pub(crate) async fn billing_rates_patch_handler(
     State(state): State<Arc<GatewayState>>,
+    RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Json(req): Json<UpdateBillingRateScheduleRequest>,
 ) -> Result<Json<BillingRateScheduleInfo>, (StatusCode, String)> {
+    require_admin_billing_rate_access(&principal)?;
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
     let schedule_id = crate::channels::web::server::parse_uuid(&id, "schedule_id")?;
+    let existing = find_billing_rate_schedule(store.as_ref(), &state.user_id, schedule_id)
+        .await?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Billing rate schedule not found".to_string(),
+        ))?;
     let matter_id = match req.matter_id {
         None => None,
         Some(None) => Some(None),
@@ -1577,6 +1668,21 @@ pub(crate) async fn billing_rates_patch_handler(
             &value,
         )?)),
     };
+    let merged_matter_id = matter_id.clone().unwrap_or(existing.matter_id.clone());
+    let merged_timekeeper = timekeeper
+        .clone()
+        .unwrap_or_else(|| existing.timekeeper.clone());
+    let merged_effective_start = effective_start.unwrap_or(existing.effective_start);
+    let merged_effective_end = effective_end.unwrap_or(existing.effective_end);
+    validate_billing_rate_schedule_request(
+        state.as_ref(),
+        merged_matter_id.as_deref(),
+        &merged_timekeeper,
+        merged_effective_start,
+        merged_effective_end,
+        Some(schedule_id),
+    )
+    .await?;
     let updated = store
         .update_billing_rate_schedule(
             &state.user_id,
@@ -1605,7 +1711,7 @@ pub(crate) async fn invoice_ledes_handler(
     RequestPrincipal(principal): RequestPrincipal,
     Path(id): Path<String>,
     Query(query): Query<InvoiceLedesQuery>,
-) -> Result<Json<InvoiceLedesResponse>, (StatusCode, String)> {
+) -> Result<(StatusCode, Json<InvoiceLedesResponse>), (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
@@ -1645,6 +1751,31 @@ pub(crate) async fn invoice_ledes_handler(
         .list_invoice_line_items(&state.user_id, invoice_id)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let validation_errors = crate::legal::billing::validate_ledes98b_line_items(&line_items);
+    if !validation_errors.is_empty() {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(InvoiceLedesResponse {
+                invoice_id: invoice_id.to_string(),
+                format,
+                content: None,
+                errors: validation_errors
+                    .into_iter()
+                    .map(|error| InvoiceLedesValidationErrorInfo {
+                        line_item_id: error.line_item_id.to_string(),
+                        time_entry_id: error.time_entry_id.map(|value| value.to_string()),
+                        description: error.description,
+                        sort_order: error.sort_order,
+                        missing_fields: error
+                            .missing_fields
+                            .into_iter()
+                            .map(|field| field.as_str().to_string())
+                            .collect(),
+                    })
+                    .collect(),
+            }),
+        ));
+    }
     let invoice_date = invoice
         .issued_date
         .unwrap_or_else(|| invoice.created_at.date_naive());
@@ -1732,9 +1863,13 @@ pub(crate) async fn invoice_ledes_handler(
         }),
     )
     .await;
-    Ok(Json(InvoiceLedesResponse {
-        invoice_id: invoice_id.to_string(),
-        format,
-        content,
-    }))
+    Ok((
+        StatusCode::OK,
+        Json(InvoiceLedesResponse {
+            invoice_id: invoice_id.to_string(),
+            format,
+            content: Some(content),
+            errors: Vec::new(),
+        }),
+    ))
 }
