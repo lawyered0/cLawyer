@@ -8,7 +8,7 @@ use crate::channels::web::auth::{AuthState, auth_middleware};
 use crate::channels::web::state::GatewayState;
 
 pub fn public_routes() -> Router<Arc<GatewayState>> {
-    super::gateway::public_routes()
+    super::gateway::public_routes().merge(super::routines::webhook_routes())
 }
 
 pub fn static_routes() -> Router<Arc<GatewayState>> {
