@@ -32,6 +32,49 @@ static REPORTER_CITATION_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+static CANADIAN_NEUTRAL_CITATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(\d{4})\s+(ONCA|ONSC|ONSCDC|SCC|FCA|FC|ABCA|BCCA)\s+(\d+)\b")
+        .expect("valid canadian neutral citation regex")
+});
+
+static CANADIAN_SQUARE_REPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[(\d{4})\]\s+(\d+)\s+([A-Z][A-Za-z0-9. ]{1,15})\s+(\d+)\b")
+        .expect("valid canadian square report regex")
+});
+
+static CANADIAN_PAREN_REPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\((\d{4})\),?\s+(\d+)\s+([A-Z]{1,8}(?:\s*\(\d+[A-Za-z]{0,3}\))?)\s+(\d+)\b")
+        .expect("valid canadian parenthetical report regex")
+});
+
+static CANADIAN_STATUTE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(RSO|RSC|SO|SC)\s+(\d{4}),\s+c\s+([\w.]+)\b")
+        .expect("valid canadian statute regex")
+});
+
+static ONTARIO_REGULATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bO\s+Reg\s+(\d+)/(\d{2,4})\b").expect("valid ontario regulation regex")
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CitationKind {
+    Case,
+    Statute,
+    Regulation,
+    Jurisprudence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCitation {
+    pub raw: String,
+    pub kind: CitationKind,
+    pub year: Option<u32>,
+    pub volume: Option<u32>,
+    pub reporter: Option<String>,
+    pub page: Option<u32>,
+    pub jurisdiction: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedCitation {
     pub citation_text: String,
@@ -250,6 +293,144 @@ pub fn extract_citations(content: &str) -> Vec<ExtractedCitation> {
     out
 }
 
+pub fn parse_canadian_citation(text: &str) -> Option<ParsedCitation> {
+    CANADIAN_NEUTRAL_CITATION_RE
+        .find(text)
+        .and_then(|matched| parse_canadian_match(&CANADIAN_NEUTRAL_CITATION_RE, matched.as_str()))
+        .or_else(|| {
+            CANADIAN_SQUARE_REPORT_RE.find(text).and_then(|matched| {
+                parse_canadian_match(&CANADIAN_SQUARE_REPORT_RE, matched.as_str())
+            })
+        })
+        .or_else(|| {
+            CANADIAN_PAREN_REPORT_RE.find(text).and_then(|matched| {
+                parse_canadian_match(&CANADIAN_PAREN_REPORT_RE, matched.as_str())
+            })
+        })
+        .or_else(|| {
+            CANADIAN_STATUTE_RE
+                .find(text)
+                .and_then(|matched| parse_canadian_match(&CANADIAN_STATUTE_RE, matched.as_str()))
+        })
+        .or_else(|| {
+            ONTARIO_REGULATION_RE
+                .find(text)
+                .and_then(|matched| parse_canadian_match(&ONTARIO_REGULATION_RE, matched.as_str()))
+        })
+}
+
+pub fn extract_canadian_citations(text: &str) -> Vec<ParsedCitation> {
+    let mut seen = HashSet::new();
+    let mut hits: Vec<(usize, ParsedCitation)> = Vec::new();
+
+    collect_canadian_citation_matches(&mut hits, &mut seen, &CANADIAN_NEUTRAL_CITATION_RE, text);
+    collect_canadian_citation_matches(&mut hits, &mut seen, &CANADIAN_SQUARE_REPORT_RE, text);
+    collect_canadian_citation_matches(&mut hits, &mut seen, &CANADIAN_PAREN_REPORT_RE, text);
+    collect_canadian_citation_matches(&mut hits, &mut seen, &CANADIAN_STATUTE_RE, text);
+    collect_canadian_citation_matches(&mut hits, &mut seen, &ONTARIO_REGULATION_RE, text);
+
+    hits.sort_by_key(|(start, _)| *start);
+    hits.into_iter().map(|(_, citation)| citation).collect()
+}
+
+fn collect_canadian_citation_matches(
+    out: &mut Vec<(usize, ParsedCitation)>,
+    seen: &mut HashSet<String>,
+    regex: &Regex,
+    text: &str,
+) {
+    for matched in regex.find_iter(text) {
+        let raw = matched.as_str().trim();
+        if raw.is_empty() || !seen.insert(raw.to_string()) {
+            continue;
+        }
+        if let Some(citation) = parse_canadian_match(regex, raw) {
+            out.push((matched.start(), citation));
+        }
+    }
+}
+
+fn parse_canadian_match(regex: &Regex, text: &str) -> Option<ParsedCitation> {
+    let captures = regex.captures(text)?;
+    if std::ptr::eq(regex, &*CANADIAN_NEUTRAL_CITATION_RE) {
+        return Some(ParsedCitation {
+            raw: text.to_string(),
+            kind: CitationKind::Case,
+            year: captures
+                .get(1)
+                .and_then(|value| value.as_str().parse::<u32>().ok()),
+            volume: captures
+                .get(3)
+                .and_then(|value| value.as_str().parse::<u32>().ok()),
+            reporter: None,
+            page: None,
+            jurisdiction: captures.get(2).map(|value| value.as_str().to_string()),
+        });
+    }
+
+    if std::ptr::eq(regex, &*CANADIAN_SQUARE_REPORT_RE)
+        || std::ptr::eq(regex, &*CANADIAN_PAREN_REPORT_RE)
+    {
+        return Some(ParsedCitation {
+            raw: text.to_string(),
+            kind: CitationKind::Jurisprudence,
+            year: captures
+                .get(1)
+                .and_then(|value| value.as_str().parse::<u32>().ok()),
+            volume: captures
+                .get(2)
+                .and_then(|value| value.as_str().parse::<u32>().ok()),
+            reporter: captures
+                .get(3)
+                .map(|value| value.as_str().trim().to_string()),
+            page: captures
+                .get(4)
+                .and_then(|value| value.as_str().parse::<u32>().ok()),
+            jurisdiction: None,
+        });
+    }
+
+    if std::ptr::eq(regex, &*CANADIAN_STATUTE_RE) {
+        return Some(ParsedCitation {
+            raw: text.to_string(),
+            kind: CitationKind::Statute,
+            year: captures
+                .get(2)
+                .and_then(|value| value.as_str().parse::<u32>().ok()),
+            volume: None,
+            reporter: captures.get(1).map(|value| value.as_str().to_string()),
+            page: None,
+            jurisdiction: None,
+        });
+    }
+
+    if std::ptr::eq(regex, &*ONTARIO_REGULATION_RE) {
+        let year = captures.get(2).and_then(|value| {
+            let raw = value.as_str();
+            raw.parse::<u32>().ok().map(|parsed| {
+                if raw.len() == 2 {
+                    2000 + parsed
+                } else {
+                    parsed
+                }
+            })
+        });
+        return Some(ParsedCitation {
+            raw: text.to_string(),
+            kind: CitationKind::Regulation,
+            year,
+            volume: captures
+                .get(1)
+                .and_then(|value| value.as_str().parse::<u32>().ok()),
+            reporter: Some("O Reg".to_string()),
+            page: None,
+            jurisdiction: Some("ON".to_string()),
+        });
+    }
+
+    None
+}
+
 pub async fn verify_document_with_provider<P: CitationVerificationProvider>(
     provider: &P,
     content: &str,
@@ -363,5 +544,42 @@ mod tests {
             CitationVerificationStatus::Waived
         ));
         assert_eq!(results[1].waived_by.as_deref(), Some("Attorney"));
+    }
+
+    #[test]
+    fn parses_canadian_neutral_citation() {
+        let citation = parse_canadian_citation("The court in 2023 ONCA 456 held that...")
+            .expect("citation should parse");
+        assert_eq!(citation.kind, CitationKind::Case);
+        assert_eq!(citation.year, Some(2023));
+        assert_eq!(citation.jurisdiction.as_deref(), Some("ONCA"));
+        assert_eq!(citation.volume, Some(456));
+    }
+
+    #[test]
+    fn parses_canadian_statute() {
+        let citation = parse_canadian_citation("See RSO 1990, c C.43 for definitions.")
+            .expect("citation should parse");
+        assert_eq!(citation.kind, CitationKind::Statute);
+        assert_eq!(citation.year, Some(1990));
+        assert_eq!(citation.reporter.as_deref(), Some("RSO"));
+    }
+
+    #[test]
+    fn parses_ontario_regulation() {
+        let citation =
+            parse_canadian_citation("O Reg 123/24 applies here.").expect("citation should parse");
+        assert_eq!(citation.kind, CitationKind::Regulation);
+        assert_eq!(citation.year, Some(2024));
+        assert_eq!(citation.jurisdiction.as_deref(), Some("ON"));
+    }
+
+    #[test]
+    fn extracts_multiple_canadian_citations() {
+        let citations =
+            extract_canadian_citations("See 2023 SCC 10 and 2022 ONCA 88 for background.");
+        assert_eq!(citations.len(), 2);
+        assert_eq!(citations[0].jurisdiction.as_deref(), Some("SCC"));
+        assert_eq!(citations[1].jurisdiction.as_deref(), Some("ONCA"));
     }
 }

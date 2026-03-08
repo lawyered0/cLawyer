@@ -266,6 +266,7 @@ impl TestHarnessBuilder {
         let tools = self.tools.unwrap_or_else(|| {
             let t = Arc::new(ToolRegistry::new());
             t.register_builtin_tools();
+            t.register_legal_tools(Some(Arc::clone(&db)));
             t
         });
 

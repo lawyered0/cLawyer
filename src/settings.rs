@@ -670,6 +670,10 @@ fn default_legal_jurisdiction() -> String {
     "us-general".to_string()
 }
 
+fn default_legal_allowed_domains() -> Vec<String> {
+    vec!["api.canlii.org".to_string(), "www.canlii.org".to_string()]
+}
+
 fn default_legal_hardening() -> String {
     "max_lockdown".to_string()
 }
@@ -716,7 +720,7 @@ impl Default for LegalNetworkSettings {
     fn default() -> Self {
         Self {
             deny_by_default: true,
-            allowed_domains: Vec::new(),
+            allowed_domains: default_legal_allowed_domains(),
         }
     }
 }
@@ -1273,6 +1277,22 @@ mod tests {
         assert!(!settings.embeddings.enabled);
         assert_eq!(settings.embeddings.provider, "nearai");
         assert_eq!(settings.embeddings.model, "text-embedding-3-small");
+    }
+
+    #[test]
+    fn test_legal_network_defaults_include_canlii_domains() {
+        let network = LegalNetworkSettings::default();
+        assert!(network.deny_by_default);
+        assert!(
+            network
+                .allowed_domains
+                .contains(&"api.canlii.org".to_string())
+        );
+        assert!(
+            network
+                .allowed_domains
+                .contains(&"www.canlii.org".to_string())
+        );
     }
 
     #[test]

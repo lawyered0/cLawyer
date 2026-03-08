@@ -16,11 +16,14 @@ use crate::skills::catalog::SkillCatalog;
 use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobEventsTool, JobPromptTool,
-    JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool,
-    MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool,
+    ApplyPatchTool, CanLiiSearchTool, CancelJobTool, CorporateComplianceCheckerTool,
+    CourtDeadlineCalculatorTool, CreateJobTool, EchoTool, HttpTool, JobEventsTool, JobPromptTool,
+    JobStatusTool, JsonTool, ListCourtRulesTool, ListDirTool, ListJobsTool, MemoryReadTool,
+    MemorySearchTool, MemoryTreeTool, MemoryWriteTool, OntarioCourtFormTool,
+    OntarioLimitationCalculatorTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool,
     SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool,
-    ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
+    ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, TrustComplianceCheckerTool,
+    WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolDomain};
@@ -67,6 +70,13 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "skill_search",
     "skill_install",
     "skill_remove",
+    "list_court_rules",
+    "court_deadline_calculator",
+    "ontario_limitation_calculator",
+    "ontario_court_form",
+    "corporate_compliance_checker",
+    "canlii_search",
+    "trust_compliance_checker",
 ];
 
 /// Registry of available tools.
@@ -286,6 +296,27 @@ impl ToolRegistry {
         self.register_sync(Arc::new(http));
 
         tracing::info!("Registered {} built-in tools", self.count());
+    }
+
+    /// Register legal-domain built-in tools.
+    ///
+    /// These tools are safe to run in the orchestrator and expose legal
+    /// research and compliance helpers. DB-backed tools receive the shared
+    /// store explicitly instead of reading it from `JobContext`.
+    pub fn register_legal_tools(&self, store: Option<Arc<dyn Database>>) {
+        self.register_sync(Arc::new(ListCourtRulesTool));
+        self.register_sync(Arc::new(CourtDeadlineCalculatorTool));
+        self.register_sync(Arc::new(OntarioLimitationCalculatorTool));
+        self.register_sync(Arc::new(OntarioCourtFormTool));
+        self.register_sync(Arc::new(CorporateComplianceCheckerTool));
+
+        let canlii = if let Some(ref legal) = self.legal {
+            CanLiiSearchTool::new().with_legal_policy(legal.clone())
+        } else {
+            CanLiiSearchTool::new()
+        };
+        self.register_sync(Arc::new(canlii));
+        self.register_sync(Arc::new(TrustComplianceCheckerTool::new(store)));
     }
 
     /// Register only orchestrator-domain tools (safe for the main process).

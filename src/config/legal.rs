@@ -333,6 +333,18 @@ mod tests {
         assert!(config.conflict_file_fallback_enabled);
         assert!(config.conflict_reindex_on_startup);
         assert!(config.network.deny_by_default);
+        assert!(
+            config
+                .network
+                .allowed_domains
+                .contains(&"api.canlii.org".to_string())
+        );
+        assert!(
+            config
+                .network
+                .allowed_domains
+                .contains(&"www.canlii.org".to_string())
+        );
         assert!(config.audit.enabled);
         assert!(config.audit.hash_chain);
         assert!(config.encryption.enabled);

@@ -11,7 +11,7 @@
 #                   but the last day is pushed to the next business day per
 #                   FRCP 6(a)(1)(C)
 #   version       – rule version string; bump when the underlying rule changes
-#   jurisdiction  – "FRCP" or two-letter state code (e.g. "CA")
+#   jurisdiction  – "FRCP" or jurisdiction code (e.g. "CA", "ON")
 
 # ---------------------------------------------------------------------------
 # FRCP responses (Rule 12)
@@ -135,3 +135,34 @@ offset_days = 30
 court_days = false
 version = "1"
 jurisdiction = "CA"
+
+# ---------------------------------------------------------------------------
+# Ontario Rules of Civil Procedure
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "on_rcp_48_01"
+citation = "Rules of Civil Procedure, r 48.01"
+deadline_type = "response_due"
+offset_days = 30
+court_days = false
+version = "2024"
+jurisdiction = "ON"
+
+[[rules]]
+id = "on_rcp_24_01"
+citation = "Rules of Civil Procedure, r 24.01"
+deadline_type = "internal"
+offset_days = 180
+court_days = false
+version = "2024"
+jurisdiction = "ON"
+
+[[rules]]
+id = "on_rcp_37_07_5"
+citation = "Rules of Civil Procedure, r 37.07(5)"
+deadline_type = "filing"
+offset_days = 3
+court_days = false
+version = "2024"
+jurisdiction = "ON"

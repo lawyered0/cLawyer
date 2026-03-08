@@ -379,6 +379,9 @@ GATEWAY_PORT=3000
 GATEWAY_AUTH_TOKEN=changeme           # Required for API access
 GATEWAY_USER_ID=default
 
+# CanLII (for canlii_search)
+CANLII_API_KEY=your_key_here
+
 # Docker sandbox
 SANDBOX_ENABLED=true
 SANDBOX_IMAGE=ironclaw-worker:latest
@@ -414,6 +417,30 @@ TINFOIL_MODEL=kimi-k2-5               # Default model
 ### LLM Providers
 
 IronClaw supports multiple LLM backends via the `LLM_BACKEND` env var: `nearai` (default), `openai`, `anthropic`, `ollama`, `openai_compatible`, and `tinfoil`.
+
+## Legal Tools
+
+```
+src/legal/
+├── jurisdictions.rs   # Canadian jurisdiction profiles, Ontario holidays
+├── citations.rs       # Reporter-style verification + Canadian citation parsing helpers
+├── calendar.rs        # Court rule calendar and deadline engine
+├── trust.rs           # Trust accounting parsing/report helpers
+└── court_rules.toml   # Bundled court rules (FRCP, CA, ON)
+
+src/tools/builtin/
+├── canlii.rs                # CanLII search tool
+├── court_deadline.rs        # Court deadline wrapper tools
+├── ontario_limitation.rs    # Ontario limitation period calculator
+├── ontario_forms.rs         # Ontario court form metadata
+├── corporate_compliance.rs  # OBCA / CBCA compliance helper
+└── trust_compliance.rs      # Trust compliance advisory tool
+
+skills/
+├── ontario-litigation/SKILL.md
+├── canadian-corporate/SKILL.md
+└── canlii-research/SKILL.md
+```
 
 **NEAR AI** -- Uses the Chat Completions API with dual auth support. Session token auth (default): authenticates with session tokens (`sess_xxx`) obtained via browser OAuth (GitHub/Google), base URL defaults to `https://private.near.ai`. API key auth: set `NEARAI_API_KEY` (from `cloud.near.ai`), base URL defaults to `https://cloud-api.near.ai`. Both modes use the same Chat Completions endpoint. Tool messages are flattened to plain text for compatibility. Set `NEARAI_SESSION_TOKEN` env var for hosting providers that inject tokens via environment.
 
@@ -630,6 +657,10 @@ Key test patterns:
 6. **Tool versioning workflow** - No version tracking or rollback for dynamically built tools
 7. **Webhook trigger endpoint** - Routines webhook trigger not yet exposed in web gateway
 8. **Full channel status view** - Gateway status widget exists, but no per-channel connection dashboard
+9. **CanLII search scope** - CanLII is queried one jurisdiction at a time; there is no bundled cross-jurisdiction search pass
+10. **Ontario forms registry** - Local form metadata is a static snapshot; check ontario.ca for the latest official forms
+11. **Trust compliance tool precision** - Advisory mode depends on available DB data; some checks still require manual review
+12. **Canadian citation parsing** - Parser is intentionally permissive and may produce false positives; caller-side disambiguation is deferred
 
 ## Tool Architecture
 

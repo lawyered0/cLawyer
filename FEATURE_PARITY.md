@@ -483,6 +483,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Citation verification + readiness gating | ➖ | ✅ | Reporter-style extraction, CourtListener provider abstraction, waiver audit trail, and `ready_to_file` gate on filing-package export |
 | Structured conflict report + signed clearance | ➖ | ✅ | DB-backed matter parties, relationships, hit reports, and persisted reviewer signoff with hit snapshot/report hash |
 | Billing rate schedules + UTBMS + LEDES98B | ➖ | ✅ | Admin-managed effective-dated rates with overlap validation, matter override precedence, draft-time schedule/fallback review, UTBMS task/activity codes, block-billing flags, and structured LEDES98B export validation |
+| Ontario / Canadian legal tools | ➖ | ✅ | Additive `ca-on` profile, Ontario court holidays and rules, Canadian citation parsing, CanLII search, Ontario limitation/forms tools, OBCA/CBCA checker, and trust compliance advisory tool |
 
 ### Owner: _Unassigned_
 

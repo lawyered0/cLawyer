@@ -603,7 +603,8 @@ impl SetupWizard {
         self.settings.legal.hardening = "max_lockdown".to_string();
         self.settings.legal.matter_root = "matters".to_string();
         self.settings.legal.network.deny_by_default = true;
-        self.settings.legal.network.allowed_domains.clear();
+        self.settings.legal.network.allowed_domains =
+            crate::settings::LegalNetworkSettings::default().allowed_domains;
         self.settings.legal.audit.enabled = true;
         self.settings.legal.audit.path = "logs/legal_audit.jsonl".to_string();
         self.settings.legal.audit.hash_chain = true;
@@ -2236,8 +2237,11 @@ impl SetupWizard {
 
         self.settings.legal.enabled = true;
 
-        let jurisdiction = optional_input("Default jurisdiction", Some("default: us-general"))
-            .map_err(SetupError::Io)?;
+        let jurisdiction = optional_input(
+            "Default jurisdiction",
+            Some("default: us-general (supported: us-general, ca-on)"),
+        )
+        .map_err(SetupError::Io)?;
         self.settings.legal.jurisdiction = jurisdiction
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -2280,7 +2284,7 @@ impl SetupWizard {
 
         let allowed_domains = optional_input(
             "Allowed outbound domains (comma-separated)",
-            Some("optional, e.g. courtlistener.com, sec.gov"),
+            Some("optional, e.g. api.canlii.org, courtlistener.com, sec.gov"),
         )
         .map_err(SetupError::Io)?;
         self.settings.legal.network.allowed_domains = allowed_domains
@@ -3444,7 +3448,10 @@ mod tests {
         assert_eq!(wizard.settings.legal.hardening, "max_lockdown");
         assert_eq!(wizard.settings.legal.matter_root, "matters");
         assert!(wizard.settings.legal.network.deny_by_default);
-        assert!(wizard.settings.legal.network.allowed_domains.is_empty());
+        assert_eq!(
+            wizard.settings.legal.network.allowed_domains,
+            crate::settings::LegalNetworkSettings::default().allowed_domains
+        );
         assert!(wizard.settings.legal.audit.enabled);
         assert_eq!(wizard.settings.legal.audit.path, "logs/legal_audit.jsonl");
         assert!(wizard.settings.legal.audit.hash_chain);
