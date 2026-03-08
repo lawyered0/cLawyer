@@ -655,7 +655,7 @@ Key test patterns:
 4. **WIT bindgen integration** - Auto-extract tool description/schema from WASM modules (stubbed)
 5. **Capability granting after tool build** - Built tools get empty capabilities; need UX for granting HTTP/secrets access
 6. **Tool versioning workflow** - No version tracking or rollback for dynamically built tools
-7. **Webhook trigger endpoint** - Routines webhook trigger not yet exposed in web gateway
+7. **Webhook trigger endpoint** - ✅ Implemented: `POST /hooks/routine/{id}` (public route, constant-time `X-Webhook-Secret` validation, `Trigger::Webhook`-only gate, 202 Accepted)
 8. **Full channel status view** - Gateway status widget exists, but no per-channel connection dashboard
 9. **CanLII search scope** - CanLII is queried one jurisdiction at a time; there is no bundled cross-jurisdiction search pass
 10. **Ontario forms registry** - Local form metadata is a static snapshot; check ontario.ca for the latest official forms

@@ -2044,6 +2044,9 @@ pub struct RoutineCreateRequest {
     pub schedule: Option<String>,
     pub event_pattern: Option<String>,
     pub event_channel: Option<String>,
+    /// Optional shared secret for webhook-triggered routines.
+    /// When set, callers must supply a matching `X-Webhook-Secret` header.
+    pub webhook_secret: Option<String>,
     // Action
     pub action_type: Option<String>,
     pub prompt: String,

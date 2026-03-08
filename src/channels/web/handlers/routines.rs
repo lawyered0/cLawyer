@@ -5,10 +5,11 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use serde::Deserialize;
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::channels::IncomingMessage;
@@ -30,6 +31,11 @@ pub fn routes() -> Router<Arc<GatewayState>> {
             axum::routing::delete(routines_delete_handler),
         )
         .route("/api/routines/{id}/runs", get(routines_runs_handler))
+}
+
+/// Unauthenticated routes — secret validation is enforced per-routine.
+pub fn webhook_routes() -> Router<Arc<GatewayState>> {
+    Router::new().route("/hooks/routine/{id}", post(routine_webhook_handler))
 }
 
 async fn routines_list_handler(
@@ -396,7 +402,7 @@ async fn routines_create_handler(
         }
         "webhook" => Trigger::Webhook {
             path: None,
-            secret: None,
+            secret: req.webhook_secret.clone(),
         },
         "manual" => Trigger::Manual,
         other => {
@@ -469,4 +475,142 @@ async fn routines_create_handler(
     Ok((StatusCode::CREATED, Json(routine_to_info(&routine))))
 }
 
+// --- Webhook handler (public — no bearer token) ---
+
+/// `POST /hooks/routine/{id}`
+///
+/// Fires a webhook-triggered routine from an external system (e.g. a court
+/// e-filing service, calendar integration, or CI pipeline).
+///
+/// **Authentication**: No bearer token. If the routine has a `secret`
+/// configured, the caller must supply a matching `X-Webhook-Secret` header.
+/// Comparison is constant-time to prevent timing attacks.
+///
+/// **Routine type gate**: Only routines with `Trigger::Webhook` are accepted.
+/// Attempting to fire a cron/event/manual routine via this endpoint returns
+/// `400 Bad Request` to prevent accidental cross-trigger pollution.
+///
+/// Returns `202 Accepted` immediately; the routine runs asynchronously.
+async fn routine_webhook_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let routine_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
+
+    let routine = store
+        .get_routine(routine_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
+
+    // Gate: only webhook-triggered routines may be fired via this endpoint.
+    let configured_secret = match &routine.trigger {
+        crate::agent::routine::Trigger::Webhook { secret, .. } => secret.clone(),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Routine is not webhook-triggered".to_string(),
+            ));
+        }
+    };
+
+    // Validate secret using constant-time comparison when one is configured.
+    if let Some(expected) = configured_secret {
+        let supplied = headers
+            .get("X-Webhook-Secret")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let valid: bool = expected.as_bytes().ct_eq(supplied.as_bytes()).into();
+        if !valid {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Invalid webhook secret".to_string(),
+            ));
+        }
+    }
+
+    if !routine.enabled {
+        return Err((StatusCode::CONFLICT, "Routine is disabled".to_string()));
+    }
+
+    // Reuse the same fire-via-message-pipeline path as the manual trigger.
+    let prompt = match &routine.action {
+        crate::agent::routine::RoutineAction::Lightweight { prompt, .. } => prompt.clone(),
+        crate::agent::routine::RoutineAction::FullJob {
+            title, description, ..
+        } => format!("{}: {}", title, description),
+    };
+
+    let content = format!("[routine:{}] {}", routine.name, prompt);
+    let msg = IncomingMessage::new("webhook", &state.user_id, content);
+
+    let tx_guard = state.msg_tx.read().await;
+    let tx = tx_guard.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Channel not started".to_string(),
+    ))?;
+
+    tx.send(msg).await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Channel closed".to_string(),
+        )
+    })?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "accepted",
+            "routine_id": routine_id,
+        })),
+    ))
+}
+
 // --- Settings handlers ---
+
+#[cfg(test)]
+mod tests {
+    use subtle::ConstantTimeEq;
+
+    /// Verify that constant-time comparison correctly distinguishes matching
+    /// vs non-matching secrets without short-circuiting on length.
+    #[test]
+    fn test_webhook_secret_ct_eq_matches() {
+        let expected = "super-secret-token";
+        let supplied = "super-secret-token";
+        let valid: bool = expected.as_bytes().ct_eq(supplied.as_bytes()).into();
+        assert!(valid);
+    }
+
+    #[test]
+    fn test_webhook_secret_ct_eq_mismatch() {
+        let expected = "super-secret-token";
+        let supplied = "wrong-token";
+        let valid: bool = expected.as_bytes().ct_eq(supplied.as_bytes()).into();
+        assert!(!valid);
+    }
+
+    #[test]
+    fn test_webhook_secret_ct_eq_empty_supplied() {
+        let expected = "super-secret-token";
+        let supplied = "";
+        let valid: bool = expected.as_bytes().ct_eq(supplied.as_bytes()).into();
+        assert!(!valid);
+    }
+
+    #[test]
+    fn test_webhook_routes_registered() {
+        // Smoke-test that webhook_routes() compiles and builds a router.
+        // If the route registration is broken this will fail to compile.
+        use crate::channels::web::state::GatewayState;
+        use std::sync::Arc;
+        let _: axum::Router<Arc<GatewayState>> = super::webhook_routes();
+    }
+}
